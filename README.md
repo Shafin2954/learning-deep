@@ -26,27 +26,35 @@ a floating button.
 ┌──────────────────────────────────────────────────────────────────────┐
 │  learning-deep.vercel.app  (or localhost:3000)                       │
 │                                                                      │
-│  ┌─── chapter body ─────────────────────┐  ┌── right rail ────────┐ │
-│  │  explanation                         │  │  Notebook            │ │
-│  │  ┌── TryItYourself ───────────────┐  │  │  [cell 1] ▶ Run      │ │
-│  │  │  Monaco editor + ▶ Run         │  │  │  [cell 2] ▶ Run      │ │
-│  │  └───────────────────────────────┘  │  │  + Cell              │ │
-│  │  explanation                         │  └──────────────────────┘ │
-│  └──────────────────────────────────────┘                           │
+│  ┌─── chapter body ─────────────────────┐  ┌── right rail ────────┐  │
+│  │  explanation                         │  │  Notebook            │  │
+│  │  ┌── TryItYourself ───────────────┐  │  │  [cell 1]    Run     │  │
+│  │  │  Monaco editor +  Run          │  │  │  [cell 2]    Run     │  │
+│  │  └────────────────────────────────┘  │  │  + Cell              │  │
+│  │  explanation                         │  └──────────────────────┘  │
+│  └──────────────────────────────────────┘                            │
 └──────────────────────┬───────────────────────────────────────────────┘
                        │  POST /run  { code, session_id }
                        ▼  (both widgets, same session)
               http://localhost:8000
-              ┌─────────────────────────────────┐
+              ┌──────────────────────────────────┐
               │  FastAPI  +  Jupyter kernel      │
               │  full ML/DS environment          │
               │  numpy · pandas · sklearn        │
               │  xgboost · lightgbm · catboost   │
               │  torch · transformers            │
-              └─────────────────────────────────┘
+              └──────────────────────────────────┘
 ```
 
 ## Quickstart — recommended path
+
+**Step 0 — prerequisites:**
+
+Clone the repo:
+```bash
+git clone https://github.com/Shafin2954/learning-deep.git
+cd learning-deep
+```
 
 **Step 1 — start the backend (pick one):**
 
@@ -158,3 +166,4 @@ network, read-only FS) — flags are stubbed in `docker-compose.yml`.
 
 ---
 Course contents curated by Claude Opus.
+Not implemented yet per the real order, as a competition is ahead and I need to learn deep...
