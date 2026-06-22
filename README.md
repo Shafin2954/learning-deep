@@ -85,7 +85,6 @@ cd web        # your Next.js app (app router)
 npm run dev   # http://localhost:3000
 ```
 
-
 ## API
 
 | Method | Path      | Body                                  | Returns                  |
