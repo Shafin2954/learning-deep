@@ -129,7 +129,11 @@ TOP NAV: logo · course tabs (Foundations | Bengali LLM | Tabular Kaggle | Gloss
 LEFT SIDEBAR: active course's chapters (ordered by `order`, active highlighted)
 MAIN: H1 title, then the interleaved headings/explanations/examples/outputs, then Exercise,
       then ◂ Prev / Next ▸
-RIGHT (optional): "On this page" anchors from the h2/h3
+RIGHT: Notebook right rail — `NotebookPanel.tsx`, a persistent multi-cell scratchpad.
+       Shares the same `sessionId` as the TryItYourself blocks on the page, so kernel
+       state is shared between inline Try-it blocks and Notebook cells. Cell text/outputs
+       persist across navigation via `sessionStorage` (key `notebook:v1`, in
+       `NotebookStore.tsx` only — do not add sessionStorage elsewhere).
 ```
 Routing (Next.js app router): `/[course]`, `/[course]/[chapter]`, `/glossary`.
 Prev/Next and sidebar order come from the `order` frontmatter. Ship a Bengali web font
@@ -154,11 +158,21 @@ the heading/code/output CSS above. Lazy-load Monaco so pages stay fast.
 6. Polish: right-rail anchors, responsive, progress (React state only).
 
 ## Running it
+
+**Recommended (Vercel frontend + local kernel):**
 ```
-cd mlforge && docker compose up --build           # runner on :8000
-cd web && npm i && npm i @monaco-editor/react remark-math rehype-katex katex rehype-pretty-code shiki remark-gfm
-echo 'NEXT_PUBLIC_RUNNER_URL=http://localhost:8000' > web/.env.local
-cd web && npm run dev                               # site on :3000
+docker compose up --build           # runner on :8000 (or uvicorn in code-runner/)
+# then open https://learning-deep.vercel.app — no npm needed
+```
+`web/.env.local` (committed) sets `NEXT_PUBLIC_RUNNER_URL=http://localhost:8000` so the
+Vercel build already points at the user's local machine. The backend's default CORS
+allows both `localhost:3000` and `learning-deep.vercel.app` — no extra config needed.
+
+**Local dev (frontend + backend both local):**
+```
+docker compose up --build           # runner on :8000
+cd web && npm i
+cd web && npm run dev               # site on :3000
 ```
 
 ## Guardrails

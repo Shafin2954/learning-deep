@@ -34,7 +34,8 @@ app = FastAPI(title="learning-deep code-runner", version="1.0")
 
 # Allow the local Next.js dev server (and your deployed origin) to call us.
 _origins = os.environ.get(
-    "RUNNER_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    "RUNNER_CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,https://learning-deep.vercel.app",
 ).split(",")
 app.add_middleware(
     CORSMiddleware,

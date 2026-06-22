@@ -1,115 +1,160 @@
-# Learning-Deep
+# learning-deep
 
 A W3Schools-style site for **machine learning + data science**: read a concept,
 read a worked example, then edit and **run real Python in the browser** — backed
 by a full local kernel where every import works (numpy → torch → transformers).
 
-Better than W3Schools for ML in one way: the kernel is **stateful per page**.
-Variables, imports, and trained models from an earlier example stay alive for the
-next one, like a notebook. Uses your local GPU if you have one, or CPU otherwise. The kernel is **isolated** from your system Python when running via Docker, so you can install whatever packages you want without breaking anything.
+The kernel is **stateful per page**. Variables, imports, and trained models from
+an earlier example stay alive for the next one, like a notebook. Uses your local
+GPU if you have one, or CPU otherwise. When running via Docker the kernel is
+isolated from your system Python.
 
-Each chapter page also has a **right-rail Notebook** — a multi-cell scratchpad that shares the
-same kernel session as the page. Its cells, code, and outputs persist across navigation and
-hard refreshes (stored in `sessionStorage`), so switching chapters and coming back leaves
-everything intact. Closing the browser tab clears it.
+## Interactive features
 
-```
-┌────────────────────┐   POST /run {code, session_id}   ┌──────────────────────┐
-│  Next.js web app   │ ───────────────────────────────► │   code-runner (API)  │
-│  TryItYourself.tsx │ ◄─────────────────────────────── │  FastAPI + Jupyter   │
-│  (Monaco editor)   │   {status, outputs[]}            │  one kernel/session  │
-└────────────────────┘                                  └──────────┬───────────┘
-                                                                   │ 
-                                                    imports full DS/ML environment
-                                                  (numpy, pandas, sklearn, xgboost,
-                                                     lightgbm, catboost, torch,
-                                                          transformers, …)
-```
+Two ways to run code on every chapter page, both hitting the same kernel session:
 
-## Layout
+**Try it Yourself blocks** — embedded editors inline with the lesson. Each block
+on a page shares one `sessionId` (`course/chapter`), so a later example can use
+variables set in an earlier one.
+
+**Right-rail Notebook** — a persistent multi-cell scratchpad in the right column.
+Cells, code, and outputs survive page navigation and hard refresh (stored in
+`sessionStorage`); closing the tab clears it. On mobile it opens as a sheet via
+a floating button.
 
 ```
-learning-deep/
-├── code-runner/            # the execution backend (tested, working)
-│   ├── kernel_exec.py      # stateful kernel pool, normalizes outputs
-│   ├── server.py           # FastAPI: /run /reset /health
-│   ├── requirements.txt    # runner deps
-│   └── Dockerfile
-├── environment/
-│   └── requirements.txt    # THE full ML/DS stack the kernel imports from
-├── web/
-│   ├── components/TryItYourself.tsx   # editor + run + rich output
-│   └── lib/runner.ts                  # typed API client
-├── docker-compose.yml
-└── docs/
-    └── PLAN.md             # curriculum + courses + per-course sidebar TOC
+┌──────────────────────────────────────────────────────────────────────┐
+│  learning-deep.vercel.app  (or localhost:3000)                       │
+│                                                                      │
+│  ┌─── chapter body ─────────────────────┐  ┌── right rail ────────┐ │
+│  │  explanation                         │  │  Notebook            │ │
+│  │  ┌── TryItYourself ───────────────┐  │  │  [cell 1] ▶ Run      │ │
+│  │  │  Monaco editor + ▶ Run         │  │  │  [cell 2] ▶ Run      │ │
+│  │  └───────────────────────────────┘  │  │  + Cell              │ │
+│  │  explanation                         │  └──────────────────────┘ │
+│  └──────────────────────────────────────┘                           │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │  POST /run  { code, session_id }
+                       ▼  (both widgets, same session)
+              http://localhost:8000
+              ┌─────────────────────────────────┐
+              │  FastAPI  +  Jupyter kernel      │
+              │  full ML/DS environment          │
+              │  numpy · pandas · sklearn        │
+              │  xgboost · lightgbm · catboost   │
+              │  torch · transformers            │
+              └─────────────────────────────────┘
 ```
 
-## Run it (local, fastest path)
+## Quickstart — recommended path
 
-**1. Backend — pick ONE:**
+**Step 1 — start the backend (pick one):**
 
-Docker (everything baked in):
+Docker (isolated, recommended):
 ```bash
-cd learning-deep
 docker compose up --build        # runner on http://localhost:8000
 ```
 
-Or bare metal (uses your machine's GPU directly):
+Bare metal (direct GPU access, no Docker needed):
 ```bash
-cd learning-deep
 python -m venv .venv && source .venv/bin/activate   # Win: .venv\Scripts\activate
 pip install -U pip
-# GPU first:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121   # GPU
 pip install -r environment/requirements.txt
 pip install -r code-runner/requirements.txt
 cd code-runner
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-Check it: `curl http://localhost:8000/health` → `{"ok":true,...}`
+Confirm it's up: `curl http://localhost:8000/health` → `{"ok":true,...}`
 
-**2. Frontend — pick ONE:**
+**Step 2 — open the frontend (pick one):**
 
-Use the deployed site (no npm needed):
+Use the deployed site — no npm, no build:
 ```
 https://learning-deep.vercel.app
 ```
-The site automatically points Try-it blocks at `http://localhost:8000` on your machine —
-so just start the kernel above, open the URL, and code runs locally.
+The Vercel frontend is already configured to call `http://localhost:8000` on your
+machine. Start the backend above, open the URL, and every Run button works.
 
-Or run the frontend yourself:
+Or run the frontend locally:
 ```bash
-cd web        # your Next.js app (app router)
-npm run dev   # http://localhost:3000
+cd web
+npm install
+npm run dev        # http://localhost:3000
+```
+
+## How the kernel session works
+
+Both the TryItYourself blocks and the Notebook rail call the same backend session,
+keyed to `course/chapter` (e.g. `foundations-for-llm/f02-mlp-backprop`).
+This means:
+
+- Run a cell in the Notebook → variable is available in a TryItYourself block
+  on the same page, and vice versa.
+- Navigate to a different chapter → a fresh session; the previous page's kernel
+  state is gone (but the Notebook's *cell text* persists in `sessionStorage`).
+- "Reset kernel" in either widget → clears the kernel state for that session.
+
+## Repo layout
+
+```
+learning-deep/
+├── code-runner/
+│   ├── kernel_exec.py      # stateful kernel pool, normalises outputs
+│   ├── server.py           # FastAPI: /run /reset /health + CORS
+│   ├── requirements.txt
+│   └── Dockerfile
+├── environment/
+│   └── requirements.txt    # full ML/DS stack the kernel imports
+├── web/
+│   ├── app/                # Next.js app router
+│   ├── components/
+│   │   ├── TryItYourself.tsx   # inline editor widget
+│   │   ├── NotebookPanel.tsx   # right-rail multi-cell notebook
+│   │   ├── NotebookStore.tsx   # sessionStorage persistence
+│   │   ├── NotebookMonaco.tsx  # lazy-loaded Monaco for notebook cells
+│   │   └── OutputBlock.tsx     # renders stdout/html/image/error outputs
+│   └── lib/
+│       └── runner.ts           # typed API client (runCode / resetSession)
+├── courses/                # MDX content: foundations-for-llm, bengali-llm,
+│   │                       #              tabular-kaggle, GLOSSARY.md
+├── docker-compose.yml
+└── docs/PLAN.md            # curriculum + course syllabi
 ```
 
 ## API
 
-| Method | Path      | Body                                  | Returns                  |
-|--------|-----------|---------------------------------------|--------------------------|
-| POST   | `/run`    | `{code, session_id, timeout?}`        | `{status, outputs[]}`    |
-| POST   | `/reset`  | `{session_id}`                        | `{ok: true}`             |
-| GET    | `/health` | —                                     | `{ok, sessions}`         |
+| Method | Path      | Body                           | Returns               |
+|--------|-----------|--------------------------------|-----------------------|
+| POST   | `/run`    | `{code, session_id, timeout?}` | `{status, outputs[]}` |
+| POST   | `/reset`  | `{session_id}`                 | `{ok: true}`          |
+| GET    | `/health` | —                              | `{ok, sessions}`      |
 
 `outputs[]` items: `stdout` / `stderr` / `text` / `html` (DataFrames) /
 `image` (plots, base64 PNG) / `error` (ename, evalue, traceback).
 
+## CORS / Vercel + local kernel
+
+The backend allows requests from both local dev and the Vercel deployment by
+default (`RUNNER_CORS_ORIGINS`). No configuration needed: start the backend,
+open `learning-deep.vercel.app`, run code.
+
+If you fork and deploy to a different Vercel URL, override the env var:
+```bash
+# docker-compose.yml environment section, or shell export before uvicorn:
+RUNNER_CORS_ORIGINS="http://localhost:3000,https://your-app.vercel.app"
+```
+
+Chrome's Private Network Access policy (HTTPS page → HTTP localhost) is handled
+by the `allow_private_network` middleware in `server.py`.
+
 ## Security
 
-The runner executes arbitrary Python. It is built for **your local machine,
-single user**. Do not expose port 8000 to the internet as-is. For hosted /
-multi-user, run each kernel in a locked-down container (mem/cpu/pids limits,
-no network, read-only FS) — flags are stubbed in `docker-compose.yml`.
+The runner executes arbitrary Python — it is built for **your local machine,
+single user**. Do not expose port 8000 to the internet. For hosted / multi-user
+deployment, run each kernel in a locked-down container (mem/cpu/pid limits, no
+network, read-only FS) — flags are stubbed in `docker-compose.yml`.
 
-## What's done vs next
-
-- **Done + tested:** execution engine, API, state persistence, plot + DataFrame
-  capture, error handling, environment spec, containers, editor component.
-- **Next:** build the course pages from `docs/PLAN.md` (content → example →
-  Try-it), the menu + per-course sidebar TOC, and the page-level kernel session
-  wiring. (Partially done)
 ---
 Course contents curated by Claude Opus.
-Not implemented yet per the real order, as a competition is ahead and I need to learn deep...
