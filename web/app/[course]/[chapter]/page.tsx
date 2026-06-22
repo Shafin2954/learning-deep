@@ -9,6 +9,7 @@ import TryItYourself from '@/components/TryItYourself';
 import Markdown from '@/components/Markdown';
 import MarkCompleteButton from '@/components/MarkCompleteButton';
 import NotebookPanel from '@/components/NotebookPanel';
+import ChapterClient from '@/components/ChapterClient';
 import type { Metadata } from 'next';
 
 interface Props {
@@ -128,9 +129,9 @@ export default async function ChapterPage({ params }: Props) {
       </article>
 
       {/* ── Right rail — notebook only, fills the full rail ─────────────── */}
-      <aside className="right-rail">
+      <ChapterClient>
         <NotebookPanel sessionId={`${course}/${chapter}`} />
-      </aside>
+      </ChapterClient>
     </div>
   );
 }

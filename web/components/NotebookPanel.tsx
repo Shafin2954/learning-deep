@@ -30,7 +30,6 @@ export default function NotebookPanel({ sessionId }: Props) {
   // persistent scratchpad across all chapters and pages. The sessionId prop
   // is still used for the kernel API calls (runCode / resetSession).
   const [cells, setCells] = useNotebookSession("__notebook__");
-  const [mobileOpen, setMobileOpen] = useState(false);
 
   // Per-cell DOM refs so we can scroll a cell into view after adding it
   // or running it (so the user always sees the new content appear).
@@ -119,15 +118,6 @@ export default function NotebookPanel({ sessionId }: Props) {
         >
           + Cell
         </button>
-        {mobileOpen && (
-          <button
-            className="notebook-sheet-close"
-            onClick={() => setMobileOpen(false)}
-            aria-label="Close notebook"
-          >
-            ✕
-          </button>
-        )}
       </div>
 
       <div className="notebook-cells">
@@ -183,31 +173,5 @@ export default function NotebookPanel({ sessionId }: Props) {
     </div>
   );
 
-  return (
-    <>
-      {/* Desktop / tablet: the notebook lives inside the right rail (CSS shows
-          it there on >=1024px). On smaller screens `.right-rail` is hidden and
-          we render the FAB + sheet instead. */}
-      <div className="notebook-desktop">{notebookBody}</div>
-
-      {/* Mobile FAB + sheet */}
-      {!mobileOpen && (
-        <button
-          className="notebook-fab"
-          onClick={() => setMobileOpen(true)}
-          aria-label="Open notebook"
-        >
-          ▶ Notebook
-        </button>
-      )}
-      {mobileOpen && (
-        <div className="notebook-sheet">
-          <div className="notebook-sheet-head">
-            <span className="notebook-sheet-title">Notebook</span>
-          </div>
-          <div className="notebook-sheet-body">{notebookBody}</div>
-        </div>
-      )}
-    </>
-  );
+  return notebookBody;
 }
