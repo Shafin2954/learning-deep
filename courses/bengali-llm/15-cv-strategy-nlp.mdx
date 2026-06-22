@@ -1,0 +1,153 @@
+---
+course: bengali-llm
+chapter: 15-cv-strategy-nlp
+title: "CV Strategy for NLP/LLM Competitions"
+order: 15
+---
+
+## A trustworthy validation scheme is your most valuable asset
+
+F15 gave you the leakage-and-validation discipline in general. This chapter applies it to
+*text*, where leakage is sneakier and the cost of a bad CV is the same: a great public
+score that collapses privately. For an LLM competition with expensive fine-tuning, a
+trustworthy validation scheme lets you decide offline and spend your few GPU-runs wisely.
+
+## Text leakage: hunt it before you train
+
+### Duplicate and near-duplicate text across the split
+
+Bengali web data is massively duplicated; the same sentence appears across sources, and paraphrases
+abound. Exact dedup (normalized hash, ch. 2/10) isn't enough — catch **near**-duplicates too, via
+high embedding cosine (ch. 5) or MinHash. A near-dup in both train and validation inflates your
+score and lies about generalization.
+
+```python
+import numpy as np
+# Near-duplicate detection across the split via embedding cosine (catches paraphrases
+# that exact dedup misses). (Random vectors here for mechanics; use real embeddings.)
+np.random.seed(0)
+def near_dup_pairs(emb_train, emb_test, thresh=0.9):
+    tn = emb_train / np.linalg.norm(emb_train, axis=1, keepdims=True)
+    te = emb_test  / np.linalg.norm(emb_test,  axis=1, keepdims=True)
+    sims = te @ tn.T                                   # every test vs every train
+    leaks = [(i, int(j)) for i, j in enumerate(sims.argmax(1)) if sims[i, j] > thresh]
+    return leaks
+
+emb_train = np.random.randn(50, 32)
+emb_test  = emb_train[:3] + np.random.normal(0, 0.01, (3, 32))   # 3 near-dups planted
+emb_test  = np.vstack([emb_test, np.random.randn(5, 32)])        # + 5 clean
+print("near-duplicate (test_idx, train_idx) leaks:", near_dup_pairs(emb_train, emb_test))
+# Non-empty -> those test rows leak from train. Remove or regroup before trusting CV.
+```
+
+```output
+near-duplicate (test_idx, train_idx) leaks: [(0, 0), (1, 1), (2, 2)]
+```
+
+### Source and author grouping
+
+If the same news outlet, author, or document supplies multiple rows, split by that **group** so
+the model can't "recognize the source" instead of learning the task (F15). For Bengali corpora
+scraped from a few big sites, this is the most common silent leak.
+
+### Pretraining contamination
+
+The base LLM may have seen the test text on the web — public Bengali datasets and Wikipedia are
+in pretraining corpora. Be suspicious of "too good" zero-shot scores and prefer evaluating on data
+unlikely to be memorized.
+
+### Preprocessing leakage
+
+Fit nothing (vocab, TF-IDF, target encodings, normalization statistics) on train+test together —
+fit inside the fold (F15).
+
+## Adversarial validation for text
+
+Label train rows 0, test rows 1, embed them (ch. 5), and train a classifier to tell them apart.
+$\mathrm{AUC} \approx 0.5$ → same distribution, random CV is safe. $\mathrm{AUC} \gg 0.5$ →
+train and test differ (different sources? topics? time?), and a naive CV will mislead.
+
+```python
+import numpy as np
+# Adversarial validation AUC: can a model separate train from test? (high = drift)
+def auc(scores, y):
+    o = np.argsort(scores); r = np.empty_like(o, float); r[o] = np.arange(len(scores)) + 1
+    p = y == 1; return (r[p].sum() - p.sum()*(p.sum()+1)/2) / (p.sum()*(~p).sum())
+
+rng = np.random.default_rng(1)
+train_feat = rng.normal(0.0, 1, 300)
+test_feat  = rng.normal(0.6, 1, 300)          # shifted distribution
+X = np.concatenate([train_feat, test_feat]); is_test = np.r_[np.zeros(300), np.ones(300)]
+print("adversarial AUC:", round(auc(X, is_test), 3),
+      "(~0.5 safe; >>0.5 = drift -> your CV will lie unless you adapt)")
+```
+
+```output
+adversarial AUC: 0.709 (~0.5 safe; >>0.5 = drift -> your CV will lie unless you adapt)
+```
+
+## Build the split to mirror the test set
+
+Dedup (exact + near) → group by source/author → stratify by label (F14) → only then split.
+Augment the **training** side only, and dedup **across** the boundary after augmenting (ch. 10).
+This ordering is the whole game.
+
+## Few folds when fine-tuning is expensive
+
+Full 5-fold CV of a QLoRA model may be unaffordable in a month. Acceptable compromises: a single,
+carefully built, grouped + stratified **hold-out** set you guard religiously; or fewer folds (3);
+or full CV only on cheap models (the embedding baseline, ch. 5) and a single fold for the expensive
+LLM. What you must *not* do is tune on the public leaderboard.
+
+## CV–LB correlation is your compass
+
+Track whether your CV moves *with* the public LB. If they correlate, trust your CV and make most
+decisions offline. If they diverge, investigate (leakage? distribution shift?), and when in doubt
+**trust the CV** — the public LB is a small sample you can overfit by probing it.
+
+## Try it Yourself
+
+```python
+import numpy as np
+# Track CV vs LB across experiments — are they correlated? (Trust CV if yes.)
+experiments = [   # (name, cv_score, public_lb)
+    ("baseline",      0.71, 0.69),
+    ("more data",     0.74, 0.72),
+    ("qlora",         0.77, 0.75),
+    ("qlora+aug",     0.79, 0.74),     # CV up but LB down -> suspicious
+    ("ensemble",      0.81, 0.78),
+]
+cv  = np.array([e[1] for e in experiments])
+lb  = np.array([e[2] for e in experiments])
+corr = np.corrcoef(cv, lb)[0, 1]
+print(f"CV-LB correlation: {corr:.2f}")
+for n, c, l in experiments:
+    flag = "  <- CV/LB disagree: inspect for leakage/overfit-to-aug" if (c>0.78 and l<0.75) else ""
+    print(f"  {n:12s} cv={c:.2f}  lb={l:.2f}{flag}")
+# High overall correlation -> trust CV for decisions. A single divergent row is a clue,
+# not a reason to abandon a CV that otherwise tracks the LB.
+```
+
+```output
+CV-LB correlation: 0.95
+  baseline     cv=0.71  lb=0.69
+  more data    cv=0.74  lb=0.72
+  qlora        cv=0.77  lb=0.75
+  qlora+aug    cv=0.79  lb=0.74  <- CV/LB disagree: inspect for leakage/overfit-to-aug
+  ensemble     cv=0.81  lb=0.78
+```
+
+## Submission selection
+
+Pick 1–2 final submissions by **CV**, not by public LB — choose your most robust model (best CV,
+reasonable CV variance), optionally one safe and one aggressive. The discipline of selecting on CV
+is what protects you from the private-LB shake-up.
+
+## Exercise
+
+Design the full validation scheme for your competition data as a runnable checklist:
+exact dedup, near-dup dedup (threshold), group key, stratify key, augment-train-only
+ordering, adversarial-validation check, and how many folds vs hold-out given your GPU
+budget. Then write your submission-selection rule (pick final subs by CV, with one
+safe/one aggressive). This document is what keeps you on the right side of the private-LB
+shake-up.

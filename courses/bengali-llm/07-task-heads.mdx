@@ -1,0 +1,170 @@
+---
+course: bengali-llm
+chapter: 07-task-heads
+title: "Task Heads: Mapping the Task to a Model"
+order: 7
+---
+
+## The lookup table
+
+The competition task isn't published yet (we're covering all of them). This chapter is
+the lookup table: for each task type, *which architecture, which head, which loss,
+which data format, and which metric*. Once the task is announced, you'll jump straight
+to the right row and you're 80% of the way to a baseline. Everything here rests on F12
+(architectures) and F14 (metrics).
+
+A "head" is a small output layer bolted onto the transformer body (ch. 6) that turns
+its hidden vectors into task predictions. The body is shared; the head and the loss are
+what make it a classifier vs a tagger vs a generator.
+
+## Sequence classification
+
+Sentiment, topic, NLI, intent.
+
+- **Architecture:** encoder (BanglaBERT). **Head:** pool the sequence (the `[CLS]` vector
+  or mean-pool, ch. 5) → a linear layer → $C$ logits. **Loss:** cross-entropy (F3). **Metric:**
+  accuracy or **macro-F1** (F14). **Data:** `(text, label)`.
+- HF class: `AutoModelForSequenceClassification`.
+
+## Token classification
+
+NER, POS.
+
+- **Architecture:** encoder. **Head:** a linear layer applied to *every* token's vector →
+  $T_{\text{tags}}$ logits **per token** (shape $(T, T_{\text{tags}})$). **Loss:** per-token
+  cross-entropy. **Metric:** entity-level F1 (seqeval). **Data:** `(tokens, tags)` with a BIO
+  tagging scheme. Bengali catch: align tags to **subword** tokens (ch. 3) — label the first
+  subword, mark the rest as "ignore."
+- HF class: `AutoModelForTokenClassification`.
+
+## Extractive QA
+
+Answer is a span inside a passage.
+
+- **Architecture:** encoder. **Head:** two linear layers predicting **start** and **end**
+  token positions. **Loss:** cross-entropy on start + end. **Metric:** **EM + token-F1** (F14).
+  **Data:** `(question, context, answer_span)`. Bengali catch: span offsets must be computed on
+  the *normalized* text and mapped through the tokenizer's offset mapping carefully (ch. 1).
+- HF class: `AutoModelForQuestionAnswering`.
+
+## Seq2seq
+
+Translation Bn↔En, summarization, generative QA where output is text.
+
+- **Architecture:** encoder–decoder (BanglaT5) or a decoder LLM. **Head:** the language-modeling
+  head over the vocab (F13). **Loss:** next-token cross-entropy on the *target* text. **Metric:**
+  **BLEU/chrF** (translation), **ROUGE** (summarization), BERTScore (F14). **Data:**
+  `(source_text, target_text)`.
+- HF class: `AutoModelForSeq2SeqLM`.
+
+## Causal generation / instruction tasks
+
+Open QA, chat, reasoning, "do X in Bengali."
+
+- **Architecture:** decoder LLM (TituLLM, Llama/Qwen/Gemma). **Head:** the LM head (F13).
+  **Loss:** next-token cross-entropy, usually **masked to the answer** so the prompt isn't trained
+  on. **Metric:** task-specific or LLM-judged. **Data:** instruction-formatted `(prompt, response)`
+  (ch. 10–11).
+- HF class: `AutoModelForCausalLM`.
+
+**Decision in one line:** *understanding → encoder + a small head; transduction → enc-dec; open
+generation → decoder LLM.*
+
+## Head shapes in NumPy
+
+```python
+import numpy as np
+np.random.seed(0)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+
+# How a head turns transformer outputs into predictions — three tasks, same body.
+T, d = 6, 8                                   # 6 tokens, hidden size 8
+H = np.random.randn(T, d)                     # transformer body output (per-token)
+
+# (a) sequence classification: pool -> linear -> C class logits
+pooled = H.mean(0)
+W_cls = np.random.randn(d, 3)
+print("classification logits:", softmax(pooled @ W_cls).round(3), "(1 distribution)")
+
+# (b) token classification (NER): linear on EVERY token -> (T, num_tags)
+W_tag = np.random.randn(d, 5)
+print("token-tag logits shape:", (H @ W_tag).shape, "(a tag per token)")
+
+# (c) extractive QA: two heads -> start/end position scores over the T tokens
+w_start, w_end = np.random.randn(d), np.random.randn(d)
+start = softmax(H @ w_start); end = softmax(H @ w_end)
+print("predicted answer span: tokens", start.argmax(), "to", end.argmax())
+```
+
+```output
+classification logits: [0.09  0.511 0.398] (1 distribution)
+token-tag logits shape: (6, 5) (a tag per token)
+predicted answer span: tokens 1 to 5
+```
+
+## Loading task-specific models (RUN-LOCALLY)
+
+```python
+# Each task is one HF class + the right data collator. Skeletons (run locally):
+from transformers import (AutoModelForSequenceClassification,
+                          AutoModelForTokenClassification,
+                          AutoModelForQuestionAnswering,
+                          AutoModelForSeq2SeqLM,
+                          AutoModelForCausalLM)
+
+# 1) classification
+clf = AutoModelForSequenceClassification.from_pretrained("csebuetnlp/banglabert",
+                                                         num_labels=3)
+# 2) NER (token classification)
+ner = AutoModelForTokenClassification.from_pretrained("csebuetnlp/banglabert",
+                                                      num_labels=9)   # BIO tags
+# 3) extractive QA
+qa  = AutoModelForQuestionAnswering.from_pretrained("csebuetnlp/banglabert")
+# 4) translation / summarization
+s2s = AutoModelForSeq2SeqLM.from_pretrained("csebuetnlp/banglat5")
+# 5) generative / instruction
+lm  = AutoModelForCausalLM.from_pretrained("hishab/titulm-1b")
+print("each line attaches the correct head to the same kind of transformer body.")
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+
+T, d = 6, 8
+H = np.random.randn(T, d)
+
+pooled = H.mean(0)
+W_cls = np.random.randn(d, 3)
+print("classification logits:", softmax(pooled @ W_cls).round(3), "(1 distribution)")
+
+W_tag = np.random.randn(d, 5)
+print("token-tag logits shape:", (H @ W_tag).shape, "(a tag per token)")
+
+w_start, w_end = np.random.randn(d), np.random.randn(d)
+start = softmax(H @ w_start); end = softmax(H @ w_end)
+print("predicted answer span: tokens", start.argmax(), "to", end.argmax())
+```
+
+## Exercise
+
+Build a "task → recipe" card for each of the five task types containing: architecture,
+HF model class, head shape, loss, metric, and data format. Keep it to one screen. When
+the competition drops, you fill in the model name and dataset and start — no time lost
+figuring out the wiring. (This card plus the model shortlist from ch. 4 is your day-1
+kit.)
+
+<details>
+<summary>Card skeleton</summary>
+
+| Task | Arch | HF class | Head | Loss | Metric | Data |
+|------|------|----------|------|------|--------|------|
+| Classification | encoder | …SequenceClassification | pool→linear→$C$ | CE | macro-F1 | (text, label) |
+| NER | encoder | …TokenClassification | linear per token→tags | per-token CE | entity-F1 | (tokens, BIO) |
+| Extractive QA | encoder | …QuestionAnswering | start/end | CE×2 | EM/F1 | (q, context, span) |
+| Translation/Summ | enc-dec | …Seq2SeqLM | LM head | next-token CE | BLEU/chrF/ROUGE | (src, tgt) |
+| Generation/Instruct | decoder | …CausalLM | LM head | masked next-token CE | task/LLM-judge | (prompt, response) |
+</details>

@@ -1,0 +1,175 @@
+---
+course: foundations-for-llm
+chapter: f12-transformer-block
+title: "The Transformer Block"
+order: 12
+---
+
+## The block, exactly
+
+You have every piece. This chapter assembles them into the **Transformer block** — the
+unit that, stacked $N$ times, *is* the model you'll fine-tune. After this, "a 32-layer
+7B model" means something concrete: 32 of these blocks, with weights you can nudge.
+
+A Transformer block is two sub-layers, each wrapped in a residual connection and a
+LayerNorm:
+
+$$
+\begin{aligned}
+x &\leftarrow x + \mathrm{MultiHead}(\mathrm{LayerNorm}(x)) \\
+x &\leftarrow x + \mathrm{FFN}(\mathrm{LayerNorm}(x))
+\end{aligned}
+$$
+
+The two sub-layers are:
+1. **Multi-head self-attention (F10)** — tokens exchange information; this is where
+   context mixing happens.
+2. **Feed-forward MLP (F2)** — applied to each token independently, usually $d \to 4d
+   \to d$ with a GELU/ReLU in the middle; this is where most parameters live and where
+   per-token "thinking" happens.
+
+Two wrappers make deep stacks trainable:
+- **Residual connections** ($+ x$): add the sub-layer's output back to its input. This
+  gives gradients a direct highway to flow through (no vanishing across depth) and lets
+  each block learn a small *refinement* rather than a full transformation. Without
+  residuals, deep transformers don't train. Period.
+- **LayerNorm (F5)**: keeps activations well-scaled at each sub-layer. Modern models
+  put it *before* the sub-layer ("pre-norm," shown above) for stability; this is the
+  default you should assume.
+
+Crucially, **the input and output of a block have the same shape** — that's why you can
+stack them. The whole model is: token embeddings (F8) + positional info (F11) → $N$
+identical blocks → a final LayerNorm → a linear head to logits (F1) → softmax.
+
+## Building the block in code
+
+```python
+import numpy as np
+np.random.seed(0)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+def layernorm(x, eps=1e-5):
+    mu = x.mean(-1, keepdims=True); var = x.var(-1, keepdims=True)
+    return (x - mu) / np.sqrt(var + eps)
+def attention(Q, K, V, mask=None):
+    d = Q.shape[-1]; s = Q @ K.T / np.sqrt(d)
+    if mask is not None: s = np.where(mask, s, -1e9)
+    return softmax(s) @ V
+def multihead(x, P, h=2, causal=True):
+    T, d = x.shape; dh = d // h
+    Q, K, V = x @ P['Wq'], x @ P['Wk'], x @ P['Wv']
+    m = np.tril(np.ones((T, T))).astype(bool) if causal else None
+    heads = [attention(Q[:, i*dh:(i+1)*dh], K[:, i*dh:(i+1)*dh], V[:, i*dh:(i+1)*dh], m)
+             for i in range(h)]
+    return np.concatenate(heads, -1) @ P['Wo']
+
+def transformer_block(x, P, causal=True):
+    # pre-norm + residual, twice
+    x = x + multihead(layernorm(x), P, causal=causal)               # attention sub-layer
+    ff = np.maximum(0, layernorm(x) @ P['W1'] + P['b1']) @ P['W2'] + P['b2']
+    x = x + ff                                                      # feed-forward sub-layer
+    return x
+
+T, d = 4, 8
+x = np.random.randn(T, d)
+P = {k: np.random.randn(*s) * 0.1 for k, s in {
+        'Wq':(d,d),'Wk':(d,d),'Wv':(d,d),'Wo':(d,d),
+        'W1':(d,4*d),'W2':(4*d,d)}.items()}
+P['b1'] = np.zeros(4*d); P['b2'] = np.zeros(d)
+
+out = transformer_block(x, P)
+print("block in :", x.shape)
+print("block out:", out.shape, "(same shape -> stack as many as you want)")
+
+# Stack 6 blocks = a tiny transformer.
+h = x
+for _ in range(6):
+    h = transformer_block(h, P)
+print("after 6 stacked blocks:", h.shape)
+```
+
+```output
+block in : (4, 8)
+block out: (4, 8) (same shape -> stack as many as you want)
+after 6 stacked blocks: (4, 8)
+```
+
+Shape-in equals shape-out — the block can be stacked arbitrarily deep.
+
+## Encoder vs decoder — one bit changes everything: the mask
+
+The block is the same; what differs is the attention mask (F10):
+- **Encoder** (BERT, BanglaBERT): *no* mask. Every token attends to every token,
+  including the future. Bidirectional context → best for *understanding* tasks
+  (classification, NER, sentence embeddings, extractive QA). Cannot generate
+  left-to-right.
+- **Decoder** (GPT, Llama, generative LLMs): *causal* mask. Each token sees only
+  itself and the past. This is what lets it generate one token at a time and what
+  next-token training requires (F3, F13).
+- **Encoder–decoder** (T5, BanglaT5): an encoder reads the input bidirectionally, a
+  decoder generates the output causally while *cross-attending* to the encoder. The
+  classic choice for translation/summarization.
+
+Choosing your model family for the competition is mostly choosing among these three —
+driven by whether the task is understanding (encoder) or generation (decoder / enc-dec).
+
+## KV-cache — why generation isn't quadratically slow per token
+
+At generation time, a decoder produces tokens one at a time. Naively, generating token
+$t$ re-runs attention over all $t$ previous tokens — and doing that for every new token
+is $O(n^2)$ repeated work. The fix: the **keys and values** of past tokens don't change
+once computed, so you *cache* them. To generate the next token you compute $Q/K/V$ only
+for the new token and attend against the cached $K/V$. This turns per-step cost from
+"re-process everything" into "process one token." It's why `model.generate()` is
+usable — and why long contexts cost *memory* (the cache grows with length).
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(1)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+def layernorm(x,eps=1e-5):
+    mu=x.mean(-1,keepdims=True); var=x.var(-1,keepdims=True); return (x-mu)/np.sqrt(var+eps)
+def attention(Q,K,V,mask=None):
+    d=Q.shape[-1]; s=Q@K.T/np.sqrt(d)
+    if mask is not None: s=np.where(mask,s,-1e9)
+    return softmax(s)@V
+
+# Compare ENCODER (no mask, bidirectional) vs DECODER (causal) on the same input.
+T, d = 5, 8
+x = np.random.randn(T, d)
+Wq=Wk=Wv=np.eye(d)
+Q,K,V = x@Wq, x@Wk, x@Wv
+
+enc = attention(Q, K, V, mask=None)                       # sees everything
+causal = np.tril(np.ones((T,T))).astype(bool)
+dec = attention(Q, K, V, mask=causal)                     # sees only the past
+print("encoder token 0 differs from decoder token 0?",
+      not np.allclose(enc[0], dec[0]))
+print("decoder token 0 == its own value (attends only to itself)?",
+      np.allclose(dec[0], V[0]))
+# Decoder's first token can only see itself -> output = its value. Encoder's first
+# token already mixed in the whole sequence. That single mask is the whole difference.
+```
+
+## Exercise
+
+Extend `transformer_block` into a tiny end-to-end causal language model: add a token
+embedding lookup (F8), a positional encoding (F11), a stack of blocks, a final
+LayerNorm, and a linear head to vocab-sized logits. Feed a short integer sequence and
+confirm the output shape is `(T, vocab)` — one next-token distribution per position.
+You will have built, from scratch, the exact architecture you're about to fine-tune.
+
+<details>
+<summary>Skeleton</summary>
+
+```python
+def tiny_lm(ids, E, pos_enc, blocks_P, W_head):
+    x = E[ids] + pos_enc[:len(ids)]          # embed + position (F8, F11)
+    for P in blocks_P:
+        x = transformer_block(x, P, causal=True)
+    x = layernorm(x)
+    return x @ W_head                         # (T, vocab) logits (F1)
+# Train it with the causal cross-entropy of F3/F13 and you have a real (tiny) LLM.
+```
+</details>

@@ -1,0 +1,140 @@
+---
+course: bengali-llm
+chapter: 16-ensembling-llms
+title: "Ensembling LLMs"
+order: 16
+---
+
+## Diversity makes ensembles work
+
+Ensembling — combining several models' predictions — is the most reliable way to squeeze
+the last points out of a competition. The core truth: **a blend of diverse, individually-decent
+models beats the best single model**, because their errors partly cancel. This chapter is how to
+do it for LLMs.
+
+Ensembling helps only when members make *different* errors. Two copies of the same model add
+nothing. So you engineer diversity:
+
+- **Different base models** (BanglaBERT vs a multilingual LLM vs BanglaT5) — the biggest lever.
+- **Different seeds / data folds** — same recipe, different randomness; cheap diversity.
+- **Different prompts** (ch. 11) — for prompted/generative solutions, varied phrasings.
+- **Different approaches** (fine-tuned model + RAG + embedding baseline) — orthogonal errors.
+- **Different hyperparameters** (LoRA rank, max_length).
+
+Calibration matters too (F14): poorly-calibrated members blend badly — calibrate before combining.
+
+## How to combine: pick by what you're predicting
+
+### Probability averaging (classification)
+
+Average the class probabilities, then argmax. Simple, strong, the default. Weighted average if
+some models are better.
+
+### Rank averaging (ranking/AUC metrics)
+
+Convert each model's scores to ranks and average the ranks — robust when models are on different
+scales or miscalibrated; a staple of rank-blends.
+
+```python
+import numpy as np
+
+# Probability averaging (classification) and rank averaging (ranking).
+P1 = np.array([0.7, 0.2, 0.1])      # model A class probabilities
+P2 = np.array([0.5, 0.4, 0.1])      # model B
+print("prob-avg prediction:", (0.5*P1 + 0.5*P2).argmax())
+
+def rank_average(*score_lists):
+    ranks = [np.argsort(np.argsort(s)) for s in score_lists]   # scores -> ranks
+    return np.mean(ranks, axis=0)
+a = np.array([0.9, 0.1, 0.5, 0.3]); b = np.array([0.4, 0.2, 0.95, 0.1])
+print("rank-avg order:", np.argsort(rank_average(a, b))[::-1])
+```
+
+```output
+prob-avg prediction: 0
+rank-avg order: [2 0 3 1]
+```
+
+### Weighted blend with hill-climbing
+
+Search weights (or greedily add models) to maximize your **CV** metric. Optimize weights on
+out-of-fold predictions, **never** on the data the members trained on (leakage, F15).
+
+```python
+import numpy as np
+np.random.seed(0)
+# Hill-climb blend weights on OOF predictions to maximize the metric (here AUC).
+def auc(s, y):
+    o = np.argsort(s); r = np.empty_like(o, float); r[o] = np.arange(len(s)) + 1
+    p = y == 1; return (r[p].sum() - p.sum()*(p.sum()+1)/2) / (p.sum()*(~p).sum())
+
+oof = [np.random.rand(200) for _ in range(3)]                 # 3 models' OOF preds
+y = (0.5*oof[0] + 0.3*oof[1] + 0.2*oof[2] + np.random.normal(0, .05, 200) > 0.5).astype(int)
+
+best_w, best = None, 0
+for _ in range(3000):                                          # random weight search
+    w = np.random.dirichlet([1, 1, 1])
+    score = sum(wi*oi for wi, oi in zip(w, oof))
+    if (a_ := auc(score, y)) > best:
+        best, best_w = a_, w
+print(f"best blend AUC {best:.3f} weights {best_w.round(2)} | "
+      f"best single {max(auc(o, y) for o in oof):.3f}")
+# The blend beats every single model — and the learned weights ~ the true mix.
+```
+
+```output
+best blend AUC 0.971 weights [0.47 0.29 0.24] | best single 0.846
+```
+
+## Generative-specific ensembling
+
+You can't "average" text, so:
+
+- **Self-consistency** — sample $N$ times, majority-vote the final answer (ch. 11).
+- **Multi-prompt / multi-model voting** — generate with several prompts/models, vote or pick by a
+  judge.
+- **Logit/probability averaging at the token level** — if models share a tokenizer, average
+  next-token distributions during generation (advanced, costly).
+- **Rerank candidates** — generate several, score them (a reranker or the metric), keep the best.
+
+## Pseudo-labeling (your method, used carefully)
+
+Predict on unlabeled/test data with your best model, add the **confident** predictions to training,
+retrain. It can lift scores by expanding data — but it's a leakage minefield: only use confident
+pseudo-labels, keep them out of your validation folds, and always confirm the gain on a clean CV
+(F15). Done sloppily it overfits to your own model's mistakes.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from collections import Counter
+# Self-consistency / multi-model voting for generative answers (no probabilities).
+def vote(answers):
+    c = Counter(answers); ans, n = c.most_common(1)[0]
+    return ans, n/len(answers)
+
+# e.g., 3 models x 1 sample, or 1 model x 3 samples (ch. 11)
+print(vote(["ইতিবাচক", "ইতিবাচক", "নেতিবাচক"]))        # majority + agreement
+# Diversity check: if all members always agree, the ensemble adds nothing —
+# you need members that fail differently (different base/prompt/seed).
+```
+
+```output
+('ইতিবাচক', 0.6666666666666666)
+```
+
+## The competition reality
+
+Build a strong, diverse set of single models first (each clearing the baseline, ch. 8), keep their
+**out-of-fold** predictions, then blend by CV. Don't ensemble weak or near-identical models —
+diversity and individual quality both matter. Weigh the cost: ensembling multiplies inference time
+(ch. 13), so confirm the blend fits the submission budget.
+
+## Exercise
+
+Plan your ensemble: list 3–4 *diverse* members you'd build (vary base model, approach,
+seed/prompt), state the combination method for your metric (prob-avg / rank-avg / vote /
+weighted-blend / stack), and describe the OOF discipline that keeps it leak-free (F15).
+Then decide your pseudo-labeling rule (confidence threshold, keep out of val folds, gate
+on CV). Finally, check the blend fits your inference time budget (ch. 13).

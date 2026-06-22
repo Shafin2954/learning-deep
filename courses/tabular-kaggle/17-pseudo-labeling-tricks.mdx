@@ -1,0 +1,99 @@
+---
+course: tabular-kaggle
+chapter: 17-pseudo-labeling-tricks
+title: "Pseudo-Labeling & Advanced Tricks"
+order: 17
+---
+
+## Late-stage moves — with discipline attached
+
+These are the moves that separate strong finishes from top finishes. Reach for them only after
+a solid pipeline, trustworthy CV (ch. 12), good features (ch. 9–10), and a working ensemble
+(ch. 16) are in place. Each is a leakage minefield if done sloppily.
+
+## Pseudo-labeling (semi-supervised)
+
+Use your best model to predict the **test** (or extra unlabeled) data, add the **confident**
+predictions to your training set as if they were true labels, and retrain. It expands your
+effective data and can lift the score.
+
+Discipline: (1) only add **high-confidence** predictions (near 0/1 for classification);
+(2) keep pseudo-labeled rows **out of your validation folds** — validate only on real labels;
+(3) **confirm the gain on a clean CV** before trusting it; (4) iterate once or twice, not
+endlessly (it drifts). Done carefully it's a real edge; done sloppily it overfits to your own
+model's mistakes.
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# Pseudo-labeling, done safely: only confident test predictions, validate on REAL labels only.
+def pseudo_label(model_predict, X_train, y_train, X_test, conf=0.95):
+    test_proba = model_predict(X_test)                       # your best model's test predictions
+    confident = (test_proba > conf) | (test_proba < 1 - conf)  # only near-0/near-1
+    pseudo_X = X_test[confident]
+    pseudo_y = (test_proba[confident] > 0.5).astype(int)
+    # augment TRAIN only; never put pseudo rows in validation folds
+    X_aug = np.vstack([X_train, pseudo_X])
+    y_aug = np.concatenate([y_train, pseudo_y])
+    print(f"added {confident.sum()} confident pseudo-labels of {len(X_test)} test rows")
+    return X_aug, y_aug
+
+# demo numbers
+rng = np.random.default_rng(0)
+proba = rng.random(1000)
+conf = (proba > 0.95) | (proba < 0.05)
+print(f"of 1000 test rows, {conf.sum()} are confident enough to pseudo-label")
+print("RULE: retrain on augmented train, but score CV on REAL labels only, and confirm the gain.")
+```
+
+```output
+of 1000 test rows, 93 are confident enough to pseudo-label
+RULE: retrain on augmented train, but score CV on REAL labels only, and confirm the gain.
+```
+
+## Other advanced tricks
+
+- **Adversarial-validation-driven validation (ch. 13).** When train and test differ (high
+  adversarial AUC), validate on the train rows most similar to test, or **reweight** training
+  rows toward the test distribution.
+- **Test-time augmentation (TTA).** Predict on several perturbed versions of each test row
+  (small noise, feature dropout) and average. Cheap to try.
+- **Seed averaging / bagging the whole pipeline.** Run your full model with several random seeds
+  and average the predictions — cheap variance reduction that almost always helps a little.
+- **Post-processing to the metric (ch. 14).** Threshold tuning, optimal rounding (QWK),
+  calibration — applied to the *final* ensemble predictions on OOF. Often the last free points.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# Seed averaging: run the 'model' with several seeds and average -> lower variance.
+def noisy_model(seed):                          # pretend each seed gives a slightly different model
+    rng = np.random.default_rng(seed)
+    true = rng.random(300)                       # not really seed-dependent here; illustrative
+    return true + np.random.default_rng(seed).normal(0, 0.1, 300)
+
+base_true = np.random.rand(300)
+preds = []
+for s in range(10):
+    preds.append(base_true + np.random.default_rng(s).normal(0, 0.1, 300))   # seed variation
+single_err = np.mean((preds[0] - base_true)**2)
+avg_err = np.mean((np.mean(preds, axis=0) - base_true)**2)
+print(f"single-seed MSE : {single_err:.4f}")
+print(f"10-seed avg MSE : {avg_err:.4f}  (variance reduced -> almost always a small free win)")
+```
+
+```output
+single-seed MSE : 0.0104
+10-seed avg MSE : 0.0011  (variance reduced -> almost always a small free win)
+```
+
+## Exercise
+
+Implement safe pseudo-labeling end to end: train your best model with CV, predict the test set,
+add only high-confidence predictions to training, retrain, and **measure the change on a CV that
+uses only real labels**. Keep it if (and only if) it beats your previous CV beyond noise. Then
+add seed averaging to your final model and confirm the small, reliable gain. Document both,
+including the exact OOF/real-label discipline that kept them honest.

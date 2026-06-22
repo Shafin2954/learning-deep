@@ -1,0 +1,175 @@
+---
+course: foundations-for-llm
+chapter: f06-regularization
+title: "Regularization"
+order: 6
+---
+
+## Your single biggest enemy: overfitting
+
+Your single biggest enemy in this competition is **overfitting**. Bengali is a
+modest-resource language; your labeled data will be small, your model (a pretrained
+LLM) will be huge and expressive. A big model on small data memorizes the training
+set — including its noise — and then fails on the test set. Regularization is the
+collection of techniques that fight this. For you, this chapter is not optional
+theory; it's survival.
+
+## Seeing overfitting: the U-shaped validation curve
+
+Fit polynomials of rising degree to 12 noisy points: as degree grows, training error
+keeps dropping while validation error bottoms out and then *climbs*. The model stopped
+learning the signal and started memorizing noise. Every technique below pushes its
+bottom lower and later.
+
+```python
+import numpy as np
+
+# 1) Inverted dropout keeps the expected activation unchanged.
+def dropout(x, p, train=True):
+    if not train or p == 0:
+        return x
+    mask = (np.random.rand(*x.shape) > p) / (1 - p)    # zero p%, scale the rest
+    return x * mask
+
+np.random.seed(0)
+x = np.ones(100_000)
+print("dropout p=0.5, train mean :", round(dropout(x, 0.5).mean(), 3))   # ~1.0
+print("dropout p=0.5, eval  mean :", round(dropout(x, 0.5, train=False).mean(), 3))  # 1.0
+
+# 2) The overfitting U-curve: train error falls, val error turns back up.
+rng = np.random.default_rng(1)
+xt = np.linspace(-1, 1, 12); yt = np.sin(3*xt) + rng.normal(0, 0.1, xt.size)
+xv = np.linspace(-1, 1, 50); yv = np.sin(3*xv)
+for d in [1, 3, 5, 9, 11]:
+    c = np.polyfit(xt, yt, d)
+    tr = np.mean((np.polyval(c, xt) - yt) ** 2)
+    va = np.mean((np.polyval(c, xv) - yv) ** 2)
+    flag = "  <- best val" if d == 5 else ("  <- overfit" if d == 11 else "")
+    print(f"degree {d:2d}: train={tr:.4f}  val={va:.4f}{flag}")
+```
+
+```output
+dropout p=0.5, train mean : 0.999
+dropout p=0.5, eval  mean : 1.0
+degree  1: train=0.2292  val=0.1876
+degree  3: train=0.0095  val=0.0046
+degree  5: train=0.0028  val=0.0009  <- best val
+degree  9: train=0.0012  val=0.0050
+degree 11: train=0.0000  val=0.0300  <- overfit
+```
+
+Degree 5 is best (val MSE 0.0009); degree 11 hits train MSE 0.0000 but val 0.0300.
+The U-shaped validation curve is overfitting.
+
+## Weight decay (L2 regularization)
+
+Add a penalty proportional to the squared size of the weights:
+
+$$
+\tilde{L} = L + \frac{\lambda}{2}\sum_w w^2
+$$
+
+The optimizer then prefers smaller weights unless the data really justifies large
+ones. Smaller weights = a smoother, less wiggly function = less memorization.
+In transformers you apply it as **decoupled** weight decay (AdamW, F4). Typical
+values for fine-tuning: 0.01–0.1.
+
+## Dropout
+
+During training, randomly zero a fraction $p$ of activations each step, then scale
+the survivors by $\frac{1}{1-p}$ so the expected value is unchanged:
+
+$$
+\tilde{h}_i = \begin{cases} \dfrac{h_i}{1-p} & \text{with probability } 1-p \\ 0 & \text{with probability } p \end{cases}
+$$
+
+This stops the network from relying on any single feature — it must spread its bets,
+which generalizes better. At inference, dropout is off (you use the full network).
+Transformers have dropout baked into attention and feed-forward layers; for
+fine-tuning, the default `0.1` is usually fine, and raising it slightly can help on
+tiny datasets.
+
+## Early stopping — your most reliable lever
+
+Watch validation metric every epoch; when it stops improving for a few checks
+("patience"), stop and keep the *best* checkpoint, not the last. This directly
+targets the U-curve: you halt at its bottom. On small Bengali data, where a couple
+of epochs is often all you can afford before overfitting, early stopping is the
+technique that saves you. It costs nothing and needs only a trustworthy validation
+split (F15).
+
+## Label smoothing
+
+Instead of training toward a hard one-hot target (1 for the true class, 0 elsewhere),
+use a soft target:
+
+$$
+\tilde{y}_i = \begin{cases} 1 - \varepsilon & i = \text{true class} \\ \dfrac{\varepsilon}{K - 1} & \text{otherwise} \end{cases}
+$$
+
+This stops the model from becoming overconfident, improves calibration (F14), and
+often helps classification metrics slightly. Common smoothing: $\varepsilon = 0.1$.
+
+## Data augmentation and the smallest-model principle
+
+**Data augmentation** grows the data rather than constraining the model. For Bengali
+text this is high-value because you're data-starved. Techniques (Bengali ch. 10 goes
+deep): back-translation (Bn→En→Bn to paraphrase), synonym/entity replacement,
+controlled paraphrasing with an LLM, token/word dropout, and round-trip translation.
+Caveat: bad augmentation injects noise or label errors — always validate that it
+helps on your CV, never assume.
+
+**The smallest-model principle:** prefer the smallest model and the fewest trainable
+parameters that do the job. This is exactly why **LoRA/QLoRA** (Bengali ch. 9) —
+which trains a tiny number of adapter parameters instead of the whole model — is
+*itself* a strong regularizer on small data, and why it often *out-performs* full
+fine-tuning when data is scarce.
+
+**Mental model:** weight decay and dropout limit capacity; early stopping limits
+training time; label smoothing limits confidence; augmentation adds data; small
+models limit parameters. Stack the cheap ones (early stopping + weight decay + the
+model's built-in dropout) by default, then ablate the rest on your CV.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Early stopping, simulated: a typical val curve that dips then rises.
+val = [0.62, 0.55, 0.50, 0.48, 0.47, 0.475, 0.49, 0.52]   # epoch-by-epoch val loss
+
+def early_stop(val_losses, patience=2):
+    best, best_epoch, bad = float("inf"), -1, 0
+    for epoch, v in enumerate(val_losses):
+        if v < best - 1e-4:
+            best, best_epoch, bad = v, epoch, 0
+        else:
+            bad += 1
+            if bad >= patience:
+                return best_epoch, best          # stop; keep BEST, not last
+    return best_epoch, best
+
+epoch, best = early_stop(val)
+print(f"stop and restore epoch {epoch} (val={best}). "
+      f"Training past it only overfits.")
+```
+
+```output
+stop and restore epoch 4 (val=0.47). Training past it only overfits.
+```
+
+## Exercise
+
+Add early stopping to the from-scratch MLP training loop from F2: hold out 20% as
+validation, track validation accuracy each epoch, and stop (restoring the best
+weights) when it hasn't improved for `patience` epochs. This is the exact mechanism
+you'll rely on when fine-tuning a Bengali model that overfits in 2–3 epochs.
+
+<details>
+<summary>Hint</summary>
+
+Keep a copy of the best weights: `best_state = [W.copy() for W in params]` whenever
+validation improves; on stop, copy them back. The "restore best, not last" detail is
+what makes early stopping actually work — the last epoch is usually past the U-curve's
+bottom.
+</details>

@@ -1,0 +1,168 @@
+---
+course: foundations-for-llm
+chapter: f14-metrics-cv-calibration
+title: "Metrics, Cross-Validation & Calibration"
+order: 14
+---
+
+## Match the metric to the task
+
+You optimize cross-entropy (F3), but you're **scored** on a competition metric — and
+those are different things. The team that understands the metric and builds a
+trustworthy way to estimate it usually wins, independent of model cleverness. This
+chapter is the measurement discipline.
+
+Know exactly how your metric is computed:
+- **Classification / sentiment / NLI:** accuracy if classes are balanced; otherwise
+  **macro-F1** (average of per-class F1) — the usual choice for Bengali shared tasks,
+  because it weights rare classes equally. Precision = "of what I flagged, how much was
+  right"; recall = "of what's actually positive, how much did I catch"; F1 is their
+  harmonic mean:
+
+$$
+\text{Precision} = \frac{TP}{TP + FP}, \qquad
+\text{Recall} = \frac{TP}{TP + FN}, \qquad
+F_1 = \frac{2 \cdot P \cdot R}{P + R}
+$$
+
+- **Extractive QA:** **Exact Match (EM)** and **token-level $F_1$** between predicted
+  and gold answer spans.
+- **Generation / summarization / translation:** **BLEU**/**chrF** (n-gram overlap;
+  chrF is character-level, kinder to morphologically rich Bengali), **ROUGE**
+  (recall-oriented, for summaries), and **BERTScore** (embedding similarity, captures
+  meaning beyond surface overlap). All are imperfect for Bengali — surface-overlap
+  metrics punish valid paraphrases — so read the competition's exact metric definition
+  and optimize *that*.
+- **Ranking / retrieval (RAG):** recall@k, MRR, NDCG.
+
+## Precision, recall, F1 — from scratch
+
+```python
+import numpy as np
+
+# Precision / recall / F1 from scratch — never treat these as a black box.
+def prf(y, yhat, pos=1):
+    tp = int(((yhat == pos) & (y == pos)).sum())
+    fp = int(((yhat == pos) & (y != pos)).sum())
+    fn = int(((yhat != pos) & (y == pos)).sum())
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall    = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2*precision*recall/(precision+recall) if precision+recall else 0.0
+    return precision, recall, f1
+
+y    = np.array([1, 1, 0, 1, 0, 0, 1])
+yhat = np.array([1, 0, 0, 1, 1, 0, 1])
+print("precision, recall, F1:", tuple(round(v, 3) for v in prf(y, yhat)))
+
+def macro_f1(y, yhat):
+    return np.mean([prf(y, yhat, pos=c)[2] for c in np.unique(y)])
+print("macro-F1:", round(macro_f1(y, yhat), 3))
+```
+
+```output
+precision, recall, F1: (0.75, 0.75, 0.75)
+macro-F1: 0.708
+```
+
+## Build a validation scheme that mirrors the test set
+
+Your local score must move together with the leaderboard, or you're flying blind.
+**$k$-fold cross-validation** splits the data into $k$ parts, trains on $k-1$ and
+validates on the held-out part, $k$ times, and averages — using all the data for both
+training and validation while giving a stable estimate. Two non-negotiables for it to
+be honest:
+- **Stratify** by the label so each fold has the same class balance as the whole.
+  Essential for imbalanced classes.
+- **Group** by any unit that must not be split — if the same author, document, or source
+  appears in both train and validation, you leak (F15). Use grouped folds then.
+
+For expensive LLM fine-tuning you often can't afford 5 folds; a single, carefully
+built, stratified (and grouped) **hold-out** validation set is acceptable — but guard
+it religiously and never tune on the public leaderboard (F15).
+
+## Calibration — are your probabilities honest?
+
+A model is *calibrated* if, among predictions it makes with confidence $c$, about a
+fraction $c$ are correct. Deep models are often **overconfident** — they say 0.99 and
+are right 0.90 of the time. This matters when (a) the metric uses probabilities
+(log-loss, AUC), (b) you set decision thresholds, or (c) you ensemble — miscalibrated
+members blend badly.
+
+Measure it with **Expected Calibration Error (ECE)**: bin predictions by confidence,
+compare average confidence to average accuracy per bin, and take the weighted gap:
+
+$$
+\mathrm{ECE} = \sum_{b=1}^{B} \frac{|B_b|}{n} \left|\overline{\mathrm{conf}}(B_b) - \overline{\mathrm{acc}}(B_b)\right|
+$$
+
+Fix it with **temperature scaling** — divide logits by a learned $T > 1$ to soften — or
+isotonic/Platt scaling, fit on validation.
+
+```python
+import numpy as np
+# Expected Calibration Error: gap between confidence and accuracy, per bin.
+def ece(probs, labels, bins=5):
+    edges = np.linspace(0, 1, bins + 1); total = 0.0
+    for i in range(bins):
+        m = (probs > edges[i]) & (probs <= edges[i+1])
+        if m.sum():
+            conf = probs[m].mean(); acc = labels[m].mean()
+            total += m.mean() * abs(conf - acc)         # weighted gap
+    return total
+
+probs  = np.array([0.9, 0.8, 0.3, 0.6, 0.95, 0.1, 0.7])
+labels = np.array([1,   1,   0,   1,   1,    0,   1])
+print("ECE:", round(ece(probs, labels), 3), "(0 = perfectly calibrated)")
+```
+
+```output
+ECE: 0.207 (0 = perfectly calibrated)
+```
+
+An ECE of 0.207 on this toy overconfident set — confirmed.
+
+**Put it together for the competition:** (1) read the exact metric, (2) build a
+stratified+grouped CV/hold-out that tracks the LB, (3) optimize the *metric* (tune
+thresholds/decoding to it, not just loss), (4) check calibration before you ensemble.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from collections import Counter
+
+# Stratified k-fold: each fold mirrors the overall class balance.
+def stratified_folds(y, k=3, seed=0):
+    rng = np.random.default_rng(seed)
+    folds = [[] for _ in range(k)]
+    for cls in np.unique(y):
+        idx = np.where(y == cls)[0]; rng.shuffle(idx)
+        for j, i in enumerate(idx):
+            folds[j % k].append(i)
+    return [np.array(sorted(f)) for f in folds]
+
+y = np.array([0]*8 + [1]*4)                 # imbalanced 2:1
+folds = stratified_folds(y, k=4)
+for i, f in enumerate(folds):
+    print(f"fold {i}: indices {list(f)}  class counts {dict(Counter(y[f]))}")
+# Every fold keeps ~2:1 -> validation scores are comparable and trustworthy.
+# A plain random split could hand one fold all the minority class -> useless estimate.
+```
+
+## Exercise
+
+Write `cross_validate(make_model, X, y, k=5)` that runs stratified $k$-fold, trains a
+model per fold, computes **macro-$F_1$** on each held-out fold, and returns the mean and
+standard deviation. The std is as important as the mean: a high-variance CV means your
+leaderboard position will be noisy, so you should trust improvements only when they
+exceed the fold-to-fold noise. This function is how you'll decide whether any change
+*actually* helped (F15).
+
+<details>
+<summary>Hint</summary>
+
+For each fold $f$: train on the union of the other folds, predict on fold $f$, score
+with `macro_f1`. Return `np.mean(scores), np.std(scores)`. Decision rule: accept a
+change only if $\text{new\_mean} - \text{old\_mean} > \text{old\_std}$ — otherwise it's
+within noise.
+</details>

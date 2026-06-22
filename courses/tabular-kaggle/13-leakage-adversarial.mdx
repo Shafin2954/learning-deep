@@ -1,0 +1,109 @@
+---
+course: tabular-kaggle
+chapter: 13-leakage-adversarial
+title: "Data Leakage & Adversarial Validation"
+order: 13
+---
+
+## The number-one cause of competition disasters
+
+Leakage produces a brilliant CV that evaporates on the private leaderboard. This chapter is the
+tabular-specific leak hunt, plus **adversarial validation** — the diagnostic that tells you
+whether your CV will even hold.
+
+## Tabular leakage, by type
+
+- **Target leakage** — a feature that encodes the answer because it's recorded *at or after* the
+  target. Classic examples: a "status" column derived from the outcome, an aggregate computed
+  over the whole dataset including test, a feature only populated for positive cases. Rule: if
+  a feature wouldn't exist at the moment of prediction, it leaks.
+- **Train–test contamination** — duplicate or near-duplicate rows across the split. Dedup before
+  splitting.
+- **Group leakage** — related rows (same customer/store/molecule) split across folds; the model
+  recognizes the group, not the pattern. Fix with grouped CV (ch. 12).
+- **Temporal leakage** — using future information to predict the past: features built with
+  knowledge of later rows, or a random split on time-ordered data.
+- **Preprocessing leakage** — fitting scalers, imputers, encoders, or target encodings (ch. 10)
+  on the full dataset before splitting. Fit inside the fold, always.
+- **Competition-level leaks** — flaws in *how the host built the data*: row order encodes the
+  target, ids are assigned by class, timestamps order the data. Found in EDA (ch. 8).
+
+## How to hunt leaks
+
+1. Be suspicious of any feature or model that's "too good" — investigate before celebrating.
+2. Check feature importance — a lone dominant feature is a prime suspect.
+3. Verify each feature *could exist at prediction time*.
+4. Confirm preprocessing is fold-local.
+5. Dedup.
+6. Run adversarial validation (next).
+
+## Adversarial validation
+
+Combine train and test, label train rows 0 and test rows 1, and train a classifier to tell them
+apart. The AUC tells you whether your CV will match the test:
+
+- **AUC ≈ 0.5** → the classifier can't distinguish them → same distribution → CV is trustworthy.
+- **AUC ≫ 0.5** (say > 0.7) → train and test **differ** → your CV will be optimistic and mislead
+  you. Inspect the adversarial model's feature importances to see *which features drift*, then
+  either drop them or validate on the train rows that most "look like" test.
+
+```python
+import numpy as np
+np.random.seed(1)
+
+# Adversarial validation: can a model separate train from test?
+def auc(scores, y):
+    o = np.argsort(scores); r = np.empty_like(o, float); r[o] = np.arange(len(scores)) + 1
+    p = y == 1; return (r[p].sum() - p.sum()*(p.sum()+1)/2) / (p.sum()*(~p).sum())
+
+# Case A: same distribution -> AUC ~ 0.5 (CV is safe)
+train_A = np.random.normal(0, 1, (500, 1)); test_A = np.random.normal(0, 1, (500, 1))
+# Case B: shifted distribution -> AUC >> 0.5 (CV will mislead)
+train_B = np.random.normal(0, 1, (500, 1)); test_B = np.random.normal(0.8, 1, (500, 1))
+
+def adversarial_auc(train_X, test_X):
+    X = np.vstack([train_X, test_X]).ravel()
+    is_test = np.r_[np.zeros(len(train_X)), np.ones(len(test_X))]
+    return auc(X, is_test)                              # the feature itself is the "model" here
+
+print("same distribution   -> adv AUC", round(adversarial_auc(train_A, test_A), 3), "(CV safe)")
+print("shifted distribution -> adv AUC", round(adversarial_auc(train_B, test_B), 3), "(CV will lie)")
+```
+
+```output
+same distribution   -> adv AUC 0.494 (CV safe)
+shifted distribution -> adv AUC 0.68 (CV will lie)
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# Detect a leaky feature: it correlates almost perfectly with the target ("too good").
+N = 1000
+y = np.random.randint(0, 2, N)
+good_feature = y * 0.5 + np.random.normal(0, 1, N)       # weak, honest signal
+leaky_feature = y + np.random.normal(0, 0.01, N)         # basically IS the target
+
+for name, f in [("honest feature", good_feature), ("LEAKY feature", leaky_feature)]:
+    corr = abs(np.corrcoef(f, y)[0, 1])
+    flag = "  <- SUSPICIOUS: investigate before trusting!" if corr > 0.95 else ""
+    print(f"{name:16s} corr with target = {corr:.3f}{flag}")
+# A feature ~1.0 correlated with the target is almost always leakage, not luck.
+# Ask: would this value exist at prediction time? If no -> drop it.
+```
+
+```output
+honest feature   corr with target = 0.310
+LEAKY feature    corr with target = 1.000  <- SUSPICIOUS: investigate before trusting!
+```
+
+## Exercise
+
+Run adversarial validation between a competition's train and test sets (concatenate, label
+train=0/test=1, fit a LightGBM, report AUC). If AUC ≫ 0.5, inspect which features the
+adversarial model relied on (those are the drifting ones) and decide whether to drop them or
+to validate on test-like rows. Separately, audit your top-5 features for target leakage by
+asking, for each, whether it would be available at prediction time. Document both checks — they
+protect your CV.

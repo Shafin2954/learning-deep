@@ -1,0 +1,310 @@
+---
+course: foundations-for-llm
+chapter: f02-mlp-backprop
+title: "MLP & Backpropagation"
+order: 2
+---
+
+## What backpropagation computes
+
+To train a network we use gradient descent: nudge every weight $w$ a little against its
+gradient $\dfrac{\partial L}{\partial w}$, where $L$ is the loss. So the entire job of
+backpropagation is to compute $\dfrac{\partial L}{\partial w}$ for **every** weight, efficiently.
+
+"Efficiently" is the whole point. A network is a chain of operations; the chain rule says the
+gradient w.r.t. an early quantity is the product of the local gradients along the path from the
+loss back to it. Computing those products **backwards**, reusing each intermediate result, is
+backpropagation — and it's why one backward pass costs about the same as one forward pass.
+
+We'll build it on a 2-layer MLP, deriving each piece from scratch.
+
+## The network we differentiate
+
+One hidden layer with a ReLU, then a softmax classifier:
+
+$$
+z_1 = X W_1 + b_1, \qquad h = \mathrm{ReLU}(z_1), \qquad z_2 = h W_2 + b_2, \qquad p = \mathrm{softmax}(z_2)
+$$
+
+and the loss is the cross-entropy between $p$ and the one-hot labels $Y$, averaged over the
+$N$ samples in the batch.
+
+### Forward pass in code
+
+```python
+import numpy as np
+np.random.seed(0)
+
+def relu(z): return np.maximum(0, z)
+def softmax(z):
+    z = z - z.max(axis=1, keepdims=True)        # subtract max for numerical stability
+    e = np.exp(z); return e / e.sum(axis=1, keepdims=True)
+
+X  = np.random.randn(4, 3)                       # 4 samples, 3 features
+W1 = np.random.randn(3, 5) * 0.5; b1 = np.zeros(5)
+W2 = np.random.randn(5, 2) * 0.5; b2 = np.zeros(2)
+
+z1 = X @ W1 + b1
+h  = relu(z1)
+z2 = h @ W2 + b2                                 # logits
+p  = softmax(z2)                                 # probabilities
+print("logits z2[0]:", z2[0].round(3))
+print("probs  p[0] :", p[0].round(3), " sum:", round(p[0].sum(), 3))
+```
+
+```output
+logits z2[0]: [0.268 1.121]
+probs  p[0] : [0.299 0.701]  sum: 1.0
+```
+
+The probabilities are positive and sum to 1. Now we differentiate this, starting at the loss.
+
+## Deriving the softmax–cross-entropy gradient
+
+This is the gradient everything else hangs on, so we derive it fully rather than quote it.
+
+### Softmax
+
+For logits $z = (z_1, \dots, z_K)$:
+
+$$
+p_i = \frac{e^{z_i}}{\sum_{k} e^{z_k}}
+$$
+
+Its derivative (quotient rule, splitting the two cases) is the **softmax Jacobian**:
+
+$$
+\frac{\partial p_i}{\partial z_j} =
+\begin{cases}
+p_i (1 - p_i) & i = j \\[2pt]
+- p_i\, p_j & i \neq j
+\end{cases}
+\;=\; p_i\,(\delta_{ij} - p_j)
+$$
+
+where $\delta_{ij} = 1$ if $i = j$ and $0$ otherwise.
+
+### Cross-entropy
+
+With one-hot labels $y$ (so $y_c = 1$ for the true class $c$, else $0$):
+
+$$
+L = -\sum_i y_i \log p_i = -\log p_c
+$$
+
+### Putting them together
+
+Apply the chain rule through every $p_i$:
+
+$$
+\frac{\partial L}{\partial z_j}
+= -\sum_i \frac{y_i}{p_i}\,\frac{\partial p_i}{\partial z_j}
+= -\sum_i \frac{y_i}{p_i}\, p_i(\delta_{ij} - p_j)
+= -\sum_i y_i(\delta_{ij} - p_j)
+$$
+
+Split the sum and use $\sum_i y_i = 1$ (one-hot):
+
+$$
+\frac{\partial L}{\partial z_j}
+= -y_j + p_j \sum_i y_i
+= p_j - y_j
+$$
+
+So the gradient of the logits is just
+
+$$
+\boxed{\,dz = p - y = \mathrm{softmax}(z) - \mathrm{onehot}(y)\,}
+$$
+
+A messy Jacobian and a log collapse into a subtraction. Let's confirm it numerically.
+
+```python
+y_idx = np.array([0, 1, 1, 0])
+Y = np.eye(2)[y_idx]                              # one-hot labels
+
+def ce_loss(P, Y):                               # mean cross-entropy
+    return -np.mean(np.sum(Y * np.log(P + 1e-12), axis=1))
+
+dz2_analytic = (p - Y) / len(X)                  # our derived result (averaged over N)
+
+# numerical gradient: nudge each logit by +/- eps and measure the loss change
+eps = 1e-6; dz2_num = np.zeros_like(z2)
+for i in range(z2.shape[0]):
+    for j in range(z2.shape[1]):
+        zp = z2.copy(); zp[i, j] += eps
+        zm = z2.copy(); zm[i, j] -= eps
+        dz2_num[i, j] = (ce_loss(softmax(zp), Y) - ce_loss(softmax(zm), Y)) / (2 * eps)
+
+print("max |analytic (p - y)/N  -  numerical|:", np.abs(dz2_analytic - dz2_num).max())
+```
+
+```output
+max |analytic (p - y)/N  -  numerical|: 3.4308889063083825e-11
+```
+
+Agreement to $10^{-11}$ — the derivation is correct.
+
+## Backprop is the chain rule, organized
+
+With $dz_2 = \frac{1}{N}(p - Y)$ in hand, we push it back through each operation. Every layer,
+going backward, does three things: receive the gradient w.r.t. its output, produce the gradient
+w.r.t. its weights, and pass the gradient w.r.t. its input to the layer before it.
+
+### The backward equations
+
+$$
+\begin{aligned}
+dz_2 &= \tfrac{1}{N}(p - Y) & &\text{(softmax+CE result above)}\\
+dW_2 &= h^{\top} dz_2 & &\text{(how the loss depends on } W_2)\\
+db_2 &= \textstyle\sum_n dz_2 & &\text{(sum over the batch)}\\
+dh   &= dz_2\, W_2^{\top} & &\text{(push gradient into the hidden layer)}\\
+dz_1 &= dh \odot \mathbb{1}[z_1 > 0] & &\text{(ReLU's gradient gate)}\\
+dW_1 &= X^{\top} dz_1, \quad db_1 = \textstyle\sum_n dz_1 &
+\end{aligned}
+$$
+
+Each line is the chain rule for one operation. A matmul $A B$ sends gradient to $A$ as
+$(\text{grad})B^{\top}$ and to $B$ as $A^{\top}(\text{grad})$. ReLU multiplies the incoming
+gradient by 1 where its input was positive and 0 elsewhere. That's the entire vocabulary.
+
+```python
+N = len(X)
+dz2 = (p - Y) / N
+dW2 = h.T @ dz2
+db2 = dz2.sum(0)
+dh  = dz2 @ W2.T
+dz1 = dh * (z1 > 0)                              # ReLU gate
+dW1 = X.T @ dz1
+db1 = dz1.sum(0)
+print("dW1", dW1.shape, "db1", db1.shape, "dW2", dW2.shape, "db2", db2.shape)
+```
+
+```output
+dW1 (3, 5) db1 (5,) dW2 (5, 2) db2 (2,)
+```
+
+Each gradient has the same shape as its parameter — the sanity check you do every time.
+
+A deep network, or a 32-layer transformer, is just this local rule repeated. Frameworks
+(`autograd`) automate it, but the rule is exactly what you derived.
+
+## Gradient checking — your correctness seatbelt
+
+Analytic gradients are easy to get subtly wrong. The check: perturb one weight by a tiny
+$\varepsilon$ and approximate the gradient numerically,
+
+$$
+\frac{\partial L}{\partial w} \approx \frac{L(w + \varepsilon) - L(w - \varepsilon)}{2\varepsilon}
+$$
+
+then compare to your analytic value. They should match to many decimals.
+
+```python
+def forward_loss(W1, b1, W2, b2):
+    h = relu(X @ W1 + b1); P = softmax(h @ W2 + b2); return ce_loss(P, Y)
+
+def numerical_grad(param, idx):
+    orig = param[idx]
+    param[idx] = orig + eps; Lp = forward_loss(W1, b1, W2, b2)
+    param[idx] = orig - eps; Lm = forward_loss(W1, b1, W2, b2)
+    param[idx] = orig
+    return (Lp - Lm) / (2 * eps)
+
+diffs = [abs(numerical_grad(W1, idx) - dW1[idx]) for idx in [(0, 0), (1, 2), (2, 4)]]
+print("max gradient-check diff on W1 entries:", max(diffs))
+```
+
+```output
+max gradient-check diff on W1 entries: 2.012559563446814e-11
+```
+
+A difference around $10^{-11}$ means the analytic gradient is right. If you ever see $10^{-2}$,
+you have a bug — usually a missing transpose, a wrong axis on a sum, or a dropped ReLU gate.
+
+## Training it
+
+Put forward + backward in a loop and step the weights. We use an XOR-style target, which a
+linear model **cannot** solve — it forces the hidden layer to earn its keep.
+
+```python
+np.random.seed(1)
+Xt = np.random.randn(200, 2)
+yt = ((Xt[:, 0] * Xt[:, 1]) > 0).astype(int)     # XOR pattern: needs a hidden layer
+Yt = np.eye(2)[yt]
+
+W1 = np.random.randn(2, 16) * 0.5; b1 = np.zeros(16)
+W2 = np.random.randn(16, 2) * 0.5; b2 = np.zeros(2)
+lr = 0.5
+
+def accuracy():
+    h = relu(Xt @ W1 + b1); P = softmax(h @ W2 + b2); return (P.argmax(1) == yt).mean()
+
+for ep in range(2001):
+    z1 = Xt @ W1 + b1; h = relu(z1); P = softmax(h @ W2 + b2)
+    N = len(Xt); dz2 = (P - Yt) / N              # the gradient we derived
+    dW2 = h.T @ dz2; db2 = dz2.sum(0)
+    dh = dz2 @ W2.T; dz1 = dh * (z1 > 0)
+    dW1 = Xt.T @ dz1; db1 = dz1.sum(0)
+    W1 -= lr*dW1; b1 -= lr*db1; W2 -= lr*dW2; b2 -= lr*db2   # gradient descent step
+    if ep in (0, 500, 1000, 2000):
+        print(f"epoch {ep:4d}: loss {ce_loss(P, Yt):.3f}  acc {accuracy():.3f}")
+```
+
+```output
+epoch    0: loss 0.817  acc 0.460
+epoch  500: loss 0.042  acc 1.000
+epoch 1000: loss 0.026  acc 1.000
+epoch 2000: loss 0.015  acc 1.000
+```
+
+From 46% (chance) to 100%: the gradient you derived by hand, looped, learns XOR. Everything
+larger — a transformer, an LLM — is this same loop at scale.
+
+## Try it Yourself
+
+```python
+import numpy as np
+# Break the ReLU gate on purpose and watch gradient checking catch it.
+np.random.seed(0)
+def relu(z): return np.maximum(0, z)
+def softmax(z):
+    z = z - z.max(1, keepdims=True); e = np.exp(z); return e / e.sum(1, keepdims=True)
+def ce_loss(P, Y): return -np.mean(np.sum(Y*np.log(P+1e-12), 1))
+
+X = np.random.randn(4, 3); Y = np.eye(2)[np.array([0,1,1,0])]
+W1 = np.random.randn(3,5)*0.5; b1=np.zeros(5); W2=np.random.randn(5,2)*0.5; b2=np.zeros(2)
+z1 = X@W1+b1; h = relu(z1); p = softmax(h@W2+b2)
+N=len(X); dz2=(p-Y)/N; dh=dz2@W2.T
+
+dz1_correct = dh * (z1 > 0)          # correct ReLU gate
+dz1_buggy   = dh                     # BUG: forgot the gate
+dW1_correct = X.T @ dz1_correct
+dW1_buggy   = X.T @ dz1_buggy
+
+eps=1e-6
+def num(idx):
+    o=W1[idx]; W1[idx]=o+eps; Lp=ce_loss(softmax(relu(X@W1+b1)@W2+b2),Y)
+    W1[idx]=o-eps; Lm=ce_loss(softmax(relu(X@W1+b1)@W2+b2),Y); W1[idx]=o
+    return (Lp-Lm)/(2*eps)
+idx=(1,2)
+print("correct gate diff:", abs(num(idx)-dW1_correct[idx]))   # ~1e-11  -> passes
+print("buggy   gate diff:", abs(num(idx)-dW1_buggy[idx]))     # large   -> caught!
+```
+
+## Exercise
+
+Extend this MLP to **two** hidden layers ($X \to h_1 \to h_2 \to \text{logits}$). Derive and
+implement the backward pass for the extra layer (it's the same matmul + ReLU-gate pattern),
+gradient-check every weight matrix to $\approx 10^{-10}$, and train it on the XOR data. The point:
+once you can add a layer and pass the gradient check, depth holds no mystery.
+
+<details>
+<summary>Hint</summary>
+
+Forward: $z_1 = XW_1+b_1,\ h_1=\mathrm{ReLU}(z_1),\ z_2=h_1W_2+b_2,\ h_2=\mathrm{ReLU}(z_2),\
+z_3=h_2W_3+b_3,\ p=\mathrm{softmax}(z_3)$. Backward, top down: $dz_3=\frac1N(p-Y)$;
+$dW_3=h_2^\top dz_3$; $dh_2=dz_3W_3^\top$; $dz_2=dh_2\odot\mathbb{1}[z_2>0]$; $dW_2=h_1^\top dz_2$;
+$dh_1=dz_2W_2^\top$; $dz_1=dh_1\odot\mathbb{1}[z_1>0]$; $dW_1=X^\top dz_1$. Same three moves per
+layer.
+</details>

@@ -1,0 +1,183 @@
+---
+course: bengali-llm
+chapter: 02-normalization
+title: "Text Normalization & Cleaning"
+order: 2
+---
+
+## The disease and the cure
+
+In Chapter 1 you saw the disease: visually identical Bengali text can be different bytes.
+Normalization is the cure — collapsing every encoding of "the same thing" into one
+canonical form so your model sees signal, not encoding noise. For a modest-resource
+language like Bengali, where you have far less data than English, you cannot afford to
+split your already-thin signal across encoding variants.
+
+Normalization happens in two layers. Use both.
+
+## Layer 1: Unicode NFC (free, do it always)
+
+Unicode defines canonical equivalence. NFC ("Normalized Form Composed") rewrites text
+into a single canonical sequence. It handles the cases from Chapter 1:
+
+- e-kar + aa-kar (U+09C7 U+09BE) $\to$ o-kar (U+09CB).
+- য + nukta and the precomposed য় both collapse to the same sequence.
+
+NFC is one stdlib call and costs nothing. Run it on *everything* — training data, test
+data, and anything you generate before scoring. If train is NFC and test isn't, you've
+created leakage-shaped damage.
+
+```python
+import unicodedata
+
+# Layer 1: NFC fixes canonical duplicates for free.
+variants = [
+    "ন" + "ো",            # o-kar, single code point
+    "ন" + "ে" + "া", # e-kar + aa-kar — looks identical
+]
+normed = [unicodedata.normalize("NFC", v) for v in variants]
+print("raw equal? ", variants[0] == variants[1])      # False
+print("NFC equal? ", normed[0]  == normed[1])          # True  <- collapsed
+
+# nukta: precomposed য় vs য + nukta also unify under NFC
+y1, y2 = "য়", "য়"
+print("nukta NFC equal?", unicodedata.normalize("NFC", y1) ==
+                          unicodedata.normalize("NFC", y2))   # True
+```
+
+```output
+raw equal?  False
+NFC equal?  True
+nukta NFC equal? True
+```
+
+### Why NFC works: canonical decomposition then recomposition
+
+$$
+\text{NFC}(s) = \mathrm{Compose}(\mathrm{CanonicalDecompose}(s))
+$$
+
+Any sequence of code points that represent the same abstract character collapse to the
+same composed form. The two encodings of ো both decompose to the same sequence and
+recompose to U+09CB.
+
+## Layer 2: Bengali-aware normalization
+
+NFC only fixes *canonical* equivalence. Bengali has many *non-canonical* problems NFC
+won't touch: legacy/typing variants, stray ZWNJ/ZWJ that change conjunct rendering
+without changing meaning, inconsistent use of the *khanda ta* ৎ vs ত্, assamese/bengali
+letter confusions, and punctuation and whitespace chaos.
+
+The `normalizer` library from csebuetnlp (the team behind BanglaBERT/BanglaT5) encodes
+the community-standard rules. It's the same preprocessing those models were trained
+with — so using it aligns your inputs with the model's expectations, which matters for
+tokenizer fertility and accuracy.
+
+```python
+# Layer 2 (run locally — installs from csebuetnlp):
+#   pip install git+https://github.com/csebuetnlp/normalizer
+from normalizer import normalize
+
+raw = "ডাউনলোড  করেন।।   ৫টি  ফাইল‌"   # double daṛi, extra spaces, a stray ZWNJ
+clean = normalize(raw)
+print(repr(clean))   # standardized punctuation/spaces, ZWNJ handled
+```
+
+## The cleaning pipeline
+
+Then the ordinary cleaning, in a deliberate order:
+
+1. NFC.
+2. `normalizer.normalize(...)`.
+3. Standardize digits — decide whether ০–৯ stay Bengali or map to 0–9. Be consistent
+   across train/test.
+4. Standardize punctuation — daṛi "।" vs ".", quotes, dashes.
+5. Handle **code-mixing**: real Bengali text is full of English words ("download করেন"),
+   Banglish (Bengali written in Latin letters), URLs, emojis, and hashtags. Decide per
+   task: keep English (usually yes — it carries meaning), strip URLs/emojis if noise, and
+   *never* blindly lowercase or strip non-Bengali if the task needs it.
+6. Collapse whitespace; strip control characters; drop or keep newlines deliberately.
+
+Two rules that save competitions:
+
+- **Normalize train and test with the exact same function.** Wrap it once, import it
+  everywhere. Divergence here is silent and fatal.
+- **Don't over-clean.** Aggressive cleaning (removing all English, all punctuation, all
+  digits) throws away signal. Clean to *consistency*, not to *minimalism*. Let ablations
+  on your CV (Chapter 15) decide each step, not intuition.
+
+## Try it Yourself
+
+```python
+import unicodedata, regex
+
+def basic_clean(text, bengali_digits=True):
+    # 1) NFC
+    text = unicodedata.normalize("NFC", text)
+    # 2) optional digit mapping  ০-৯ <-> 0-9
+    if not bengali_digits:
+        bn = "০১২৩৪৫৬৭৮৯"
+        text = text.translate({ord(b): str(i) for i, b in enumerate(bn)})
+    # 3) standardize sentence-end and collapse whitespace
+    text = text.replace("।", ".")               # decide per task!
+    text = regex.sub(r"\s+", " ", text).strip()
+    # 4) drop zero-width joiners/non-joiners (meaning-preserving here)
+    text = text.replace("‌", "").replace("‍", "")
+    return text
+
+samples = [
+    "আমি   বাংলায়‌ গান গাই।",
+    "৫টি আপেল ও 3টি কলা।",
+    "ডাউনলোড করেন https://x.io 🙂",
+]
+for s in samples:
+    print(repr(s), "->", repr(basic_clean(s, bengali_digits=False)))
+```
+
+```output
+'আমি   বাংলায়‌ গান গাই।' -> 'আমি বাংলায় গান গাই.'
+'৫টি আপেল ও 3টি কলা।' -> '5টি আপেল ও 3টি কলা.'
+'ডাউনলোড করেন https://x.io 🙂' -> 'ডাউনলোড করেন https://x.io 🙂'
+```
+
+This is a *starter*. In the real pipeline, slot the csebuetnlp `normalize` in as step
+1.5 (after NFC). Then ablate each step on your CV.
+
+## Exercise
+
+Build `make_normalizer(...)` — a factory that returns a single function you import
+everywhere, with toggles for: digit mapping, punctuation standardization, URL removal,
+emoji removal, and ZWNJ/ZWJ stripping. The point is one canonical entry point used
+identically on train and test.
+
+<details>
+<summary>Solution sketch</summary>
+
+```python
+import unicodedata, regex
+
+URL = regex.compile(r"https?://\S+|www\.\S+")
+EMOJI = regex.compile(r"[\p{Emoji_Presentation}\p{Extended_Pictographic}]")
+
+def make_normalizer(map_digits=False, std_punct=True, drop_url=True,
+                    drop_emoji=False, drop_zw=True, use_csebuetnlp=False):
+    bn = "০১২৩৪৫৬৭৮৯"
+    digit_map = {ord(b): str(i) for i, b in enumerate(bn)}
+    cse = None
+    if use_csebuetnlp:
+        from normalizer import normalize as cse   # noqa
+    def f(text):
+        text = unicodedata.normalize("NFC", text)
+        if cse: text = cse(text)
+        if drop_url:   text = URL.sub(" ", text)
+        if drop_emoji: text = EMOJI.sub(" ", text)
+        if drop_zw:    text = text.replace("‌","").replace("‍","")
+        if map_digits: text = text.translate(digit_map)
+        if std_punct:  text = text.replace("।", ".")
+        return regex.sub(r"\s+", " ", text).strip()
+    return f
+
+clean = make_normalizer(map_digits=True)
+TRAIN = TEST = clean       # <- the same function on both. always.
+```
+</details>

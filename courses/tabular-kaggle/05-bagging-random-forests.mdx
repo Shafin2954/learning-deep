@@ -1,0 +1,126 @@
+---
+course: tabular-kaggle
+chapter: 05-bagging-random-forests
+title: "Bagging & Random Forests"
+order: 5
+---
+
+## From one tree to many
+
+A single deep tree overfits (ch. 4) — high variance. **Bagging** and **random forests** fix
+that by averaging many trees, giving you a free validation estimate along the way.
+
+**Bagging (bootstrap aggregating).** Train many trees, each on a **bootstrap** sample — a
+dataset of the same size drawn *with replacement* from the training data. Each bootstrap omits
+~37% of rows and duplicates others, so each tree sees a slightly different dataset and makes
+slightly different errors. Average their predictions and the random errors partly cancel —
+variance drops while bias stays about the same.
+
+**Random Forest = bagging + feature subsampling.** If one feature dominates, every bagged tree
+splits on it first and the trees end up correlated — averaging correlated models helps little.
+Random forests restrict the features considered at each split (e.g. $\sqrt{D}$) to
+**decorrelate** the trees, so averaging helps more. That's the whole trick.
+
+## Out-of-bag (OOB) score — free cross-validation
+
+Because each tree's bootstrap omits ~37% of rows, those "out-of-bag" rows are a built-in
+validation set *for that tree*. Average the predictions of only the trees that didn't see each
+row and compare to the truth — you get a CV-quality estimate without a separate split.
+
+## Building a random forest from scratch
+
+```python
+import numpy as np
+np.random.seed(0)
+# reuse build() / predict() from ch. 4 (the from-scratch regression tree)
+
+def random_forest(X, y, n_trees=20, max_depth=5, min_leaf=8, seed=0):
+    rng = np.random.default_rng(seed)
+    trees = []
+    oob_pred = np.zeros(len(y)); oob_cnt = np.zeros(len(y))
+    for _ in range(n_trees):
+        idx = rng.integers(0, len(y), len(y))          # bootstrap sample (with replacement)
+        oob = np.setdiff1d(np.arange(len(y)), np.unique(idx))   # rows this tree didn't see
+        t = build(X[idx], y[idx], max_depth=max_depth, min_leaf=min_leaf)
+        trees.append(t)
+        if len(oob):
+            oob_pred[oob] += predict(t, X[oob]); oob_cnt[oob] += 1
+    mask = oob_cnt > 0
+    oob_rmse = np.sqrt(((oob_pred[mask]/oob_cnt[mask] - y[mask])**2).mean())   # FREE estimate
+    return trees, oob_rmse
+
+def rf_predict(trees, X):
+    return np.mean([predict(t, X) for t in trees], axis=0)   # average the trees
+
+N = 400; X = np.random.randn(N, 3)
+y = X[:, 0]**2 + 2*X[:, 1] + 0.3*np.random.randn(N)
+tr, va = slice(0, 300), slice(300, 100 + 300)
+trees, oob_rmse = random_forest(X[tr], y[tr], n_trees=20)
+rf_rmse  = np.sqrt(((rf_predict(trees, X[va]) - y[va])**2).mean())
+one_tree = build(X[tr], y[tr], max_depth=5, min_leaf=8)
+tree_rmse = np.sqrt(((predict(one_tree, X[va]) - y[va])**2).mean())
+print(f"single tree val RMSE : {tree_rmse:.3f}")
+print(f"random forest val RMSE: {rf_rmse:.3f}   <- averaging reduced variance")
+print(f"OOB RMSE (free estimate): {oob_rmse:.3f}  (tracks the val RMSE)")
+```
+
+```output
+single tree val RMSE : 0.956
+random forest val RMSE: 0.682   <- averaging reduced variance
+OOB RMSE (free estimate): 0.818  (tracks the val RMSE)
+```
+
+## Bagging vs boosting
+
+Bagging builds trees *independently in parallel* and averages to reduce **variance**; boosting
+(ch. 6) builds trees *sequentially*, each fixing the last, to reduce **bias**. Both are tree
+ensembles; opposite philosophies. Boosting usually wins on tabular accuracy — next chapter.
+
+Random forests are still excellent: robust, low-maintenance, and a **diverse ensemble member**
+(their bagged parallel trees make different errors than boosting's sequential ones, so blending
+RF + GBM often helps, ch. 16).
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# reuse build/predict from ch.4 and random_forest/rf_predict above
+
+# More trees -> lower, then plateauing error. Adding trees never overfits (unlike depth).
+N = 400; X = np.random.randn(N, 3)
+y = X[:, 0]**2 + 2*X[:, 1] + 0.3*np.random.randn(N)
+tr, va = slice(0, 300), slice(300, 400)
+
+for n in [1, 3, 10, 30, 60]:
+    trees, oob = random_forest(X[tr], y[tr], n_trees=n)
+    val = np.sqrt(((rf_predict(trees, X[va]) - y[va])**2).mean())
+    print(f"{n:3d} trees: val RMSE {val:.3f}  | OOB {oob:.3f}")
+# Error drops then flattens. Contrast ch.4: there, more DEPTH eventually hurt;
+# here, more TREES only helps (or plateaus). That's the safety of averaging.
+```
+
+```output
+  1 trees: val RMSE 1.014  | OOB 1.037
+  3 trees: val RMSE 0.828  | OOB 1.006
+ 10 trees: val RMSE 0.677  | OOB 0.856
+ 30 trees: val RMSE 0.661  | OOB 0.792
+ 60 trees: val RMSE 0.650  | OOB 0.757
+```
+
+## Exercise
+
+Add **feature subsampling** to your `random_forest` (consider only `max_features` random
+columns at each split — pass this down into `build`). Compare the validation RMSE and the
+*correlation between trees' predictions* with vs without subsampling. You should see
+subsampling lowers tree correlation, which is exactly what makes the average better. Then
+explain why "more trees never overfit" but "more depth does."
+
+<details>
+<summary>Why more trees never overfit</summary>
+
+Each tree is an unbiased (high-variance) estimate; averaging more of them only reduces
+variance toward a floor — it can't increase bias. More *depth*, by contrast, increases each
+tree's capacity to memorize, raising variance. So you grow the forest wide (many trees) but
+keep each tree's complexity controlled.
+</details>

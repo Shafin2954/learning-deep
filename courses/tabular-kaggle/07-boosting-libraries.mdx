@@ -1,0 +1,134 @@
+---
+course: tabular-kaggle
+chapter: 07-boosting-libraries
+title: "XGBoost / LightGBM / CatBoost"
+order: 7
+---
+
+## From your hand-built GBM to the libraries
+
+You built gradient boosting by hand (ch. 6). The three libraries that dominate tabular Kaggle
+are that algorithm with better math and serious engineering. You rarely need to choose just one
+— top solutions ensemble all three (ch. 16) because their different growth strategies make
+different errors.
+
+## XGBoost — the robust classic
+
+Grows trees **level-wise (depth-wise)**: it expands all nodes at a depth before going deeper,
+producing balanced trees. It uses a **second-order (Newton) objective** — both the gradient
+and the curvature (Hessian) of the loss to choose splits and leaf values, which is more precise
+than the first-order residual fitting you coded. Built-in L1/L2 regularization on leaf values
+(`reg_alpha`, `reg_lambda`) and a `gamma` minimum-split-gain. Reliable, well-documented, a
+strong default.
+
+## LightGBM — the fast favorite
+
+Grows trees **leaf-wise (best-first)**: it splits the single leaf that most reduces loss,
+anywhere in the tree, producing deeper, asymmetric trees that fit faster and often more
+accurately — but overfit more on small data (control with `num_leaves` and `min_data_in_leaf`,
+*not* just `max_depth`). Three speed tricks: **histogram-based splitting** (bin continuous
+features into ~255 buckets), **GOSS** (keep the high-gradient rows, subsample the well-fit
+ones), and **EFB** (bundle sparse mutually-exclusive features). Watch `num_leaves` — set it
+well below $2^{\text{max\_depth}}$ or it overfits.
+
+## CatBoost — the categorical specialist
+
+Two signature ideas. **Ordered target statistics:** a leak-safe way to target-encode
+categoricals (ch. 10) using only rows seen "before" each one in a random permutation — so it
+handles categoricals *natively*, no manual encoding, no target leak. **Ordered boosting:** a
+permutation scheme that fixes the subtle **prediction-shift** bias of standard boosting. Often
+the best out-of-the-box on categorical-heavy data with little tuning. Pass categorical columns
+via `cat_features` and let it handle them.
+
+## Parameters that actually matter
+
+Tune roughly in this order (ch. 15):
+
+1. **learning\_rate** + **n\_estimators** with **early stopping** — set a smallish LR (0.01–0.05),
+   many rounds, and let early stopping pick the count. Do this first.
+2. **Tree complexity** — `num_leaves`/`max_depth`, `min_child_samples`/`min_data_in_leaf`.
+3. **Randomness/regularization** — `subsample`/`bagging_fraction`,
+   `colsample_bytree`/`feature_fraction`, `reg_alpha`/`reg_lambda`.
+4. **objective** and **eval\_metric** must match the competition metric.
+
+## Library templates (run locally)
+
+```python
+# The three libraries, same shape (run locally). Note: all use early stopping on a val set.
+import numpy as np
+# import lightgbm as lgb, xgboost as xgb; from catboost import CatBoostClassifier
+
+def fit_lightgbm(Xtr, ytr, Xva, yva):
+    import lightgbm as lgb
+    model = lgb.LGBMClassifier(
+        learning_rate=0.03, n_estimators=5000,        # many rounds + early stopping
+        num_leaves=31, min_child_samples=30,           # leaf-wise complexity control
+        subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.0, reg_lambda=1.0, random_state=42)
+    model.fit(Xtr, ytr, eval_set=[(Xva, yva)],
+              callbacks=[lgb.early_stopping(150), lgb.log_evaluation(0)])
+    return model
+
+def fit_xgboost(Xtr, ytr, Xva, yva):
+    import xgboost as xgb
+    model = xgb.XGBClassifier(
+        learning_rate=0.03, n_estimators=5000,
+        max_depth=6, min_child_weight=5,               # level-wise complexity control
+        subsample=0.8, colsample_bytree=0.8,
+        reg_lambda=1.0, eval_metric="auc",
+        early_stopping_rounds=150, random_state=42)
+    model.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False)
+    return model
+
+def fit_catboost(Xtr, ytr, Xva, yva, cat_features):
+    from catboost import CatBoostClassifier
+    model = CatBoostClassifier(
+        learning_rate=0.03, iterations=5000, depth=6,
+        l2_leaf_reg=3.0, random_seed=42, verbose=0,
+        cat_features=cat_features)                     # native categorical handling
+    model.fit(Xtr, ytr, eval_set=(Xva, yva), early_stopping_rounds=150)
+    return model
+print("Same loop as ch.6, engineered three ways. Ensemble all three (ch.16).")
+```
+
+## Try it Yourself
+
+```python
+# Map each library's distinctive feature to WHY it helps (a study aid, runs anywhere).
+libs = {
+    "XGBoost":  ["level-wise (balanced) trees", "2nd-order (Newton) objective",
+                 "robust default, well-documented"],
+    "LightGBM": ["leaf-wise (best-first) trees -> faster, more expressive",
+                 "histogram binning + GOSS + EFB -> speed/memory",
+                 "watch num_leaves to avoid overfit"],
+    "CatBoost": ["ordered target stats -> leak-safe native categoricals",
+                 "ordered boosting -> fixes prediction-shift bias",
+                 "great out-of-the-box on categorical data"],
+}
+for name, feats in libs.items():
+    print(name)
+    for f in feats: print("   -", f)
+# Because their growth strategies differ, they make different errors -> ensemble them.
+```
+
+```output
+XGBoost
+   - level-wise (balanced) trees
+   - 2nd-order (Newton) objective
+   - robust default, well-documented
+LightGBM
+   - leaf-wise (best-first) trees -> faster, more expressive
+   - histogram binning + GOSS + EFB -> speed/memory
+   - watch num_leaves to avoid overfit
+CatBoost
+   - ordered target stats -> leak-safe native categoricals
+   - ordered boosting -> fixes prediction-shift bias
+   - great out-of-the-box on categorical data
+```
+
+## Exercise
+
+For a tabular dataset (any), train LightGBM, XGBoost, and CatBoost inside the *same* 5-fold
+CV (ch. 12), each with early stopping, and record each one's OOF score. Then average their OOF
+predictions and check whether the 3-way blend beats the best single model on CV (it usually
+does — ch. 16). Note which library was fastest and which handled categoricals with least effort.

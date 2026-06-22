@@ -1,0 +1,167 @@
+---
+course: foundations-for-llm
+chapter: f13-lm-objective-generation
+title: "The LM Objective & Generation"
+order: 13
+---
+
+## The training objective
+
+You've built the architecture (F12). This chapter is how it *learns* to be a language
+model and how it *generates* text — the two ends of every LLM. Both reduce to things
+you already know (F1, F3, F10), arranged for sequences.
+
+A causal language model is trained to predict the next token at every position. The
+trick that makes this efficient is embarrassingly simple: the **targets are the inputs
+shifted left by one**. For the sequence $[5, 2, 9, 1, 7]$:
+
+$$
+\text{inputs}  = [5, 2, 9, 1], \qquad
+\text{targets} = [2, 9, 1, 7] \quad\text{(each input's "next token")}
+$$
+
+The model produces a logit distribution at every position (F12 → $(T, \text{vocab})$),
+and you apply cross-entropy (F3) at each position against the shifted target, averaged:
+
+$$
+L = -\frac{1}{T} \sum_{t=1}^{T} \log p_\theta(x_t \mid x_{<t})
+$$
+
+Because of the causal mask (F10/F12), position $t$'s prediction only used tokens $\le t$
+— no cheating. This is called **teacher forcing**: during training you always feed the
+*true* previous tokens (not the model's own guesses), so all positions train in parallel
+in one forward pass. One sequence → $T$ next-token predictions → one loss.
+
+Pretraining does this over trillions of tokens; **fine-tuning does the exact same thing
+on your task data** — sometimes masking the loss so it only counts the *answer* tokens,
+not the prompt.
+
+**Why this single objective is so powerful.** To predict the next token well across all
+of human text, the model is forced to learn grammar, facts, reasoning patterns,
+translation, style — because all of those help reduce next-token loss. You're not
+training separate skills; they emerge from one objective. This is also why *data
+quality is everything*: the model faithfully learns to imitate whatever it's trained on
+(F3's MLE view), errors included.
+
+## Decoding strategies
+
+At inference there's no "next token" to feed, so the model generates **autoregressively**:
+run the model, get the logits for the last position, pick a token, append it, run again
+(with KV-cache, F12, so it's cheap). How you "pick" is the decoding strategy, and it
+matters a lot for output quality:
+
+- **Greedy** — always take the argmax. Deterministic, but repetitive and often dull.
+- **Temperature** — divide logits by $T$ before softmax (you saw this in F1). $T < 1$
+  sharpens (safer, more deterministic); $T > 1$ flattens (more diverse, more errors).
+- **Top-$k$** — sample only from the $k$ highest-probability tokens (zero out the rest).
+  Prevents picking absurd low-probability tokens.
+- **Top-$p$ (nucleus)** — sample from the smallest set of tokens whose cumulative
+  probability exceeds $p$ (e.g., 0.9). Adapts the candidate set to the model's
+  confidence. The common default.
+- **Beam search** — keep several candidate sequences and expand the best. Better for
+  *constrained* generation (translation, where there's a "right" answer) than for
+  open-ended text.
+
+For the competition: **match decoding to the task.** Classification/extractive answers
+→ greedy or low temperature (you want the most likely answer). Translation/summarization
+→ beam search or low-temperature sampling. Open generation → top-$p$ with moderate
+temperature. The metric (Bengali ch. 14) should drive this choice, and it's cheap to
+tune since it needs no retraining.
+
+**Repetition** is the classic generation failure — the model loops a phrase. Fixes:
+`repetition_penalty`, `no_repeat_ngram_size`, or top-$p$ sampling. Tune gently: Bengali
+legitimately repeats some words, and aggressive n-gram blocking can hurt.
+
+## Shift and decode in code
+
+```python
+import numpy as np
+np.random.seed(0)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+
+# Training targets = inputs shifted by one.
+seq = np.array([5, 2, 9, 1, 7])
+inputs, targets = seq[:-1], seq[1:]
+print("inputs :", inputs)
+print("targets:", targets, "(predict the next token at each position)")
+
+# Suppose the model output these logits for the last position (vocab size 5):
+logits = np.array([2.0, 1.0, 0.1, 3.0, 0.5])
+
+def decode(logits, strategy="greedy", T=1.0, k=None, p=None, rng=np.random):
+    l = logits / T
+    if k:                                          # top-k: keep k best
+        keep = np.argsort(l)[::-1][:k]
+        masked = np.full_like(l, -1e9); masked[keep] = l[keep]; l = masked
+    probs = softmax(l)
+    if p:                                          # top-p (nucleus)
+        order = np.argsort(probs)[::-1]
+        csum = np.cumsum(probs[order])
+        cut = order[csum <= p]; cut = cut if len(cut) else order[:1]
+        keep = np.full_like(probs, 0.0); keep[cut] = probs[cut]
+        probs = keep / keep.sum()
+    if strategy == "greedy":
+        return int(probs.argmax())
+    return int(rng.choice(len(probs), p=probs))    # sampling
+
+print("greedy        :", decode(logits, "greedy"))
+print("temp=0.7 top-k2:", decode(logits, "sample", T=0.7, k=2, rng=np.random.default_rng(1)))
+print("top-p=0.9      :", decode(logits, "sample", p=0.9, rng=np.random.default_rng(1)))
+```
+
+```output
+inputs : [5 2 9 1]
+targets: [2 9 1 7] (predict the next token at each position)
+greedy        : 3
+temp=0.7 top-k2: 3
+top-p=0.9      : 3
+```
+
+Token 3 has the highest logit (3.0) so greedy picks it; with `d=64` dimensions you'd
+see more variance across strategies.
+
+## Try it Yourself
+
+```python
+import numpy as np
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+
+# See how temperature reshapes the SAME logits -> different generation behavior.
+logits = np.array([3.0, 2.5, 1.0, 0.5, 0.2])    # token 0 slightly beats token 1
+print("temp   distribution (rounded)            argmax")
+for T in [0.3, 0.7, 1.0, 1.5, 3.0]:
+    p = softmax(logits / T)
+    print(f"{T:>4}  {np.round(p,3)}   -> {p.argmax()}")
+# Low T -> nearly always token 0 (safe, repetitive).
+# High T -> probability mass spreads (creative, riskier).
+# This single knob is often the cheapest quality lever at inference time.
+```
+
+## Exercise
+
+Implement `generate(model_logits_fn, prompt_ids, max_new, strategy)` that
+autoregressively produces `max_new` tokens: call the (mock) logits function on the
+current sequence, decode one token with your chosen strategy, append it, repeat. Add a
+`repetition_penalty` that down-weights logits of already-generated tokens. This is a
+from-scratch version of `model.generate()` — the function you'll call on your LLM at
+submission time.
+
+<details>
+<summary>Hint</summary>
+
+```python
+def generate(logits_fn, ids, max_new=20, T=1.0, rep_penalty=1.2):
+    ids = list(ids)
+    for _ in range(max_new):
+        logits = logits_fn(ids)            # (vocab,) for the next token
+        for t in set(ids):                 # repetition penalty
+            logits[t] /= rep_penalty
+        nxt = decode(logits, "sample", T=T)
+        ids.append(nxt)
+        if nxt == EOS: break
+    return ids
+```
+
+The repetition penalty divides the logit of any token already produced, making loops
+less likely — tune it gently (aggressive values suppress legitimate repetition).
+</details>

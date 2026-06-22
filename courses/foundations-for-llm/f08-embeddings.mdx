@@ -1,0 +1,183 @@
+---
+course: foundations-for-llm
+chapter: f08-embeddings
+title: "Embeddings: Tokens → Vectors"
+order: 8
+---
+
+## Why embeddings exist
+
+A model can't do math on the word "ভাষা". It does math on vectors. **Embeddings** are
+how text becomes vectors — and they're the input layer of every LLM, the heart of
+semantic search, and the thing your RAG system (Bengali ch. 12) retrieves with. This
+chapter takes you from the naive representation to the one that powers everything.
+
+## One-hot: the honest, terrible starting point
+
+Give every vocabulary token an index, and represent token $i$ as a vector of all
+zeros with a single 1 at position $i$. With a 50,000-token vocab, each token is a
+50,000-dimensional vector. Two problems, both fatal: (1) it's enormous and wasteful,
+and (2) *every pair of distinct tokens is equally dissimilar* — the one-hot vectors
+for "রাজা" (king) and "রানী" (queen) are exactly as different as "রাজা" and "টেবিল"
+(table). One-hot encodes identity but **zero meaning**. There's no notion of "close."
+
+## Dense embeddings: a learned lookup table
+
+Instead, map each token id to a short, dense vector of learned real numbers — say 768
+dimensions. This is just a matrix $E$ of shape $(\text{vocab\_size}, d)$; "embedding"
+token $i$ is literally `E[i]` — a row lookup, nothing more. The magic is that these
+numbers are **learned by training**, so the model arranges tokens in space such that
+ones used in similar ways land near each other.
+
+### Cosine similarity measures meaning
+
+Now "close in vector space" means "similar in meaning/usage," and you measure it with
+**cosine similarity** (angle between vectors):
+
+$$
+\cos(a, b) = \frac{a \cdot b}{\|a\| \cdot \|b\|}
+$$
+
+$1.0$ = identical direction, $0$ = unrelated, $-1$ = opposite. This is the
+representation the input layer of an LLM uses, and the geometry that famously makes
+`king − man + woman ≈ queen` work in classic word embeddings.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+# A dense embedding table: vocab of 6 tokens, 4-dim vectors. (Real ones are learned;
+# here we just show the mechanics.)
+vocab = {"রাজা": 0, "রানী": 1, "পুরুষ": 2, "নারী": 3, "টেবিল": 4, "চেয়ার": 5}
+E = rng.normal(size=(6, 4))
+
+# "Embedding" a sequence of token ids is just row lookup:
+ids = np.array([vocab["রাজা"], vocab["রানী"], vocab["টেবিল"]])
+print("embedded shape:", E[ids].shape)          # (3, 4) — one vector per token
+
+def cosine(a, b):
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+print("cos(রাজা, রাজা) :", round(cosine(E[0], E[0]), 3))   # 1.0 — identical
+print("cos(রাজা, টেবিল):", round(cosine(E[0], E[4]), 3))   # ~random here
+
+# One-hot, for contrast: every distinct token is equidistant — no notion of meaning.
+def onehot(i, V=6):
+    v = np.zeros(V); v[i] = 1; return v
+print("one-hot cos(রাজা, রানী) :", cosine(onehot(0), onehot(1)))   # 0.0
+print("one-hot cos(রাজা, টেবিল):", cosine(onehot(0), onehot(4)))   # 0.0  (same!)
+```
+
+```output
+embedded shape: (3, 4)
+cos(রাজা, রাজা) : 1.0
+cos(রাজা, টেবিল): 0.4
+one-hot cos(রাজা, রানী) : 0.0
+one-hot cos(রাজা, টেবিল): 0.0
+```
+
+One-hot gives cosine 0 between every distinct pair — no notion of similarity. The
+dense embedding already has structure (the random vectors differ), and learned vectors
+encode meaning.
+
+## Static vs contextual embeddings
+
+Classic embeddings (Word2Vec, GloVe) are **static**: one fixed vector per word,
+regardless of sentence. That breaks on polysemy — "কল" means both "tap/faucet" and
+"call/machine," but static embeddings give it one blurred vector. **Contextual
+embeddings**, produced by transformers (BERT and every LLM), give a *different* vector
+for a token depending on its surrounding words — because attention (F10) lets each
+token's representation absorb context. So "কল" in a plumbing sentence and "কল" in a
+phone sentence get different vectors. This is the entire reason transformer embeddings
+beat the older ones.
+
+**Sentence embedding models** (Bengali ch. 5) pool a transformer's contextual token
+vectors into one vector per sentence — what you'll use for Bengali semantic search
+and RAG retrieval.
+
+```python
+# Real contextual embeddings (run locally with a Bengali-aware model):
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer("l3cube-pune/bengali-sentence-similarity-sbert")  # example
+sents = ["আমি কল খুলে পানি নিলাম।",      # কল = tap
+         "সে আমাকে ফোনে কল করেছিল।",      # কল = call
+         "কলের পানি পরিষ্কার।"]           # কল = tap
+emb = m.encode(sents)
+import numpy as np
+cos = lambda a,b: a@b/(np.linalg.norm(a)*np.linalg.norm(b))
+print("tap vs tap :", round(float(cos(emb[0], emb[2])), 3))   # higher
+print("tap vs call:", round(float(cos(emb[0], emb[1])), 3))   # lower
+# Contextual models separate the two senses of কল; static embeddings cannot.
+```
+
+This is a RUN-LOCALLY block (requires `sentence_transformers`). Run it locally with a
+Bengali-aware model to verify the contextual vs static gap.
+
+## Where embeddings show up in your competition
+
+- **Input layer** of any model you fine-tune — token ids → embedding rows → the stack.
+- **Semantic similarity / retrieval** — embed a Bengali query and documents, rank by
+  cosine. This is the "R" in RAG (Bengali ch. 12).
+- **Features** — for a classification task, a sentence embedding + a simple classifier
+  is a strong, cheap baseline (sometimes beats fine-tuning when data is tiny).
+
+**The Bengali-specific catch.** Embedding quality depends on whether the model saw
+enough Bengali in pretraining, and on tokenization (F-Bengali ch. 3): if a Bengali
+word fragments into many subword tokens, its "word" meaning is split across pieces
+and pooling matters more. Prefer embedding models with real Bengali coverage
+(multilingual or Bengali-specific, Bengali ch. 4–5), and always evaluate retrieval on
+your own Bengali data — don't trust English-benchmark leaderboards for Bengali.
+
+## Try it Yourself
+
+```python
+import numpy as np
+rng = np.random.default_rng(1)
+
+# Build a tiny semantic search: embed "documents", embed a "query", rank by cosine.
+# (Random vectors here just to show the retrieval mechanics of RAG — Bengali ch. 12.)
+docs = ["ঢাকা বাংলাদেশের রাজধানী",
+        "পদ্মা একটি বড় নদী",
+        "মেশিন লার্নিং কম্পিউটার বিজ্ঞানের অংশ",
+        "ভাত বাঙালির প্রধান খাবার"]
+D = rng.normal(size=(len(docs), 8))            # pretend these are doc embeddings
+q = D[2] + rng.normal(0, 0.3, 8)               # a query "near" doc 2
+
+def cosine(a, b): return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+scores = [cosine(q, d) for d in D]
+order = np.argsort(scores)[::-1]
+for r in order:
+    print(f"{scores[r]:+.3f}  {docs[r]}")
+# Top result should be doc 2 — that's retrieval. Swap D for real embeddings and you
+# have the core of RAG.
+```
+
+```output
++0.903  মেশিন লার্নিং কম্পিউটার বিজ্ঞানের অংশ
++0.148  ভাত বাঙালির প্রধান খাবার
++0.088  পদ্মা একটি বড় নদী
+-0.116  ঢাকা বাংলাদেশের রাজধানী
+```
+
+## Exercise
+
+Write `top_k(query_vec, doc_matrix, k)` returning the indices of the `k` most similar
+documents by cosine similarity, computed *vectorized* (no Python loop over docs — use
+matrix ops, the F1 way). This exact function is the retrieval core you'll reuse in
+Bengali ch. 12.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+def top_k(q, D, k=3):
+    q = q / np.linalg.norm(q)
+    Dn = D / np.linalg.norm(D, axis=1, keepdims=True)
+    sims = Dn @ q                       # one matmul = all cosine sims
+    return np.argsort(sims)[::-1][:k], np.sort(sims)[::-1][:k]
+```
+
+Normalizing once, then a single matmul, gives every cosine similarity at once — this
+is how real vector search (FAISS, pgvector) scores thousands of docs fast.
+</details>

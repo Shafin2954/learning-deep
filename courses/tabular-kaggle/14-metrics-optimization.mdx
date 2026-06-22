@@ -1,0 +1,126 @@
+---
+course: tabular-kaggle
+chapter: 14-metrics-optimization
+title: "Metrics & Optimizing to the Metric"
+order: 14
+---
+
+## Know your metric cold
+
+The competition scores you on **one specific metric**, and your model is usually trained on a
+*different* loss. Closing that gap — optimizing the actual metric, not just the loss — is free
+points most competitors leave on the table. Implement the metric yourself and confirm it
+reproduces the leaderboard on a probe. Each metric rewards different behavior:
+
+- **AUC** — ranking quality; only the *order* of scores matters, not calibration.
+- **Log loss** — penalizes confident wrong probabilities; needs **calibrated** outputs.
+- **F1 / $F_\beta$** — depends on a **threshold**; the default 0.5 is almost never optimal under
+  imbalance. Tune the threshold on OOF predictions.
+- **RMSE / MAE / RMSLE** — RMSLE penalizes under-prediction and relative error; use on skewed
+  positive targets, often via training on $\log(1 + y)$ and exponentiating back.
+- **QWK (quadratic weighted kappa)** — for ordinal targets. Predict a *continuous* value and
+  **optimize the rounding thresholds** to maximize QWK rather than rounding naively.
+- **MAP@k / NDCG** — ranking/recommendation; optimize the order and the top-k.
+
+## The general pattern: post-processing on OOF
+
+Train your model on a convenient loss (log loss, MSE), then on the **out-of-fold predictions**
+find the post-processing that maximizes the *competition metric*:
+
+- **Threshold tuning** (classification): sweep the cutoff on OOF, pick the best, apply to test.
+- **Optimal rounding** (QWK / ordinal): search the cut points that maximize QWK on OOF.
+- **Calibration** (log loss): Platt/isotonic scaling on OOF.
+- **Target transform** (regression): train on $\log(1+y)$ for RMSLE; clip predictions to the
+  target's valid range.
+
+Always fit post-processing on **OOF / validation**, never on data the model trained on.
+
+## Threshold tuning for F1
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# Threshold tuning for F1 — the default 0.5 is rarely optimal under imbalance.
+def f1(y, yhat):
+    tp = ((yhat==1)&(y==1)).sum(); fp = ((yhat==1)&(y==0)).sum(); fn = ((yhat==0)&(y==1)).sum()
+    p = tp/(tp+fp) if tp+fp else 0; r = tp/(tp+fn) if tp+fn else 0
+    return 2*p*r/(p+r) if p+r else 0
+
+N = 1000
+y = (np.random.rand(N) < 0.2).astype(int)                       # 20% positive (imbalanced)
+probs = np.clip(0.2 + 0.5*y + np.random.normal(0, 0.3, N), 0, 1)  # model's OOF probabilities
+
+default = f1(y, (probs > 0.5).astype(int))
+best_t, best = 0.5, 0.0
+for t in np.linspace(0.05, 0.95, 91):                           # search the threshold on OOF
+    s = f1(y, (probs > t).astype(int))
+    if s > best: best, best_t = s, t
+print(f"F1 @ 0.5: {default:.3f}   |   best threshold {best_t:.2f} -> F1 {best:.3f}")
+# Apply best_t to the TEST predictions. Found on OOF, so it's leak-free.
+```
+
+```output
+F1 @ 0.5: 0.655   |   best threshold 0.54 -> F1 0.659
+```
+
+## QWK optimal rounding
+
+For ordinal targets, optimize the rounding cut points on OOF rather than rounding naively:
+
+```python
+import numpy as np
+np.random.seed(0)
+# QWK optimal rounding: predict continuous, then optimize where to cut into ordinal classes.
+def qwk(y, yhat, K):
+    O = np.zeros((K, K))
+    for a, b in zip(y, yhat): O[a, b] += 1
+    w = np.array([[(i-j)**2/(K-1)**2 for j in range(K)] for i in range(K)])
+    E = np.outer(O.sum(1), O.sum(0)) / O.sum()
+    return 1 - (w*O).sum() / (w*E).sum()
+
+y = np.random.randint(0, 5, 500)
+raw = y + np.random.normal(0, 0.8, 500)                         # continuous predictions
+naive = np.clip(np.round(raw), 0, 4).astype(int)
+best = qwk(y, naive, 5)
+for offset in np.linspace(-1, 1, 41):                          # search a rounding offset on OOF
+    pred = np.clip(np.round(raw + offset), 0, 4).astype(int)
+    best = max(best, qwk(y, pred, 5))
+print(f"QWK naive rounding {qwk(y, naive, 5):.3f} -> optimized {best:.3f}")
+# Real solutions optimize FOUR cut points (not one offset) -> bigger gains.
+```
+
+```output
+QWK naive rounding 0.863 -> optimized 0.872
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(1)
+# RMSLE: train on log1p(y) and exponentiate back — better than predicting y directly.
+def rmsle(y, p): return np.sqrt(np.mean((np.log1p(np.clip(p,0,None)) - np.log1p(y))**2))
+
+y = np.random.exponential(100, 500)                            # skewed positive target
+# pretend two models: one predicts y, one predicts log1p(y) then expm1
+noise = np.random.normal(0, 0.3, 500)
+pred_direct = np.clip(y + np.random.normal(0, 30, 500), 0, None)
+pred_log    = np.expm1(np.log1p(y) + noise)                    # modeled in log space
+print("RMSLE, direct target :", round(rmsle(y, pred_direct), 4))
+print("RMSLE, log1p target  :", round(rmsle(y, pred_log), 4))
+# For RMSLE/skewed targets, modeling in log space aligns the model with the metric.
+```
+
+```output
+RMSLE, direct target : 1.0194
+RMSLE, log1p target  : 0.2993
+```
+
+## Exercise
+
+Pick your competition's metric and write its optimizer: if it's threshold-based, tune the cutoff
+(or per-class cutoffs) on OOF; if ordinal, optimize the rounding cut points for QWK on OOF; if
+probabilistic, calibrate on OOF; if RMSLE, train in log space. Measure the metric before and
+after post-processing on a held-out fold, and confirm the gain transfers. Document the lift — it's
+often comparable to a tuning sweep, for far less compute.

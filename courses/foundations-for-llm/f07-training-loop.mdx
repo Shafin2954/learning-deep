@@ -1,0 +1,177 @@
+---
+course: foundations-for-llm
+chapter: f07-training-loop
+title: "The Training Loop & Surviving 8GB"
+order: 7
+---
+
+## The five-step loop
+
+Everything so far — forward (F1–F2), loss (F3), optimizer (F4), normalization (F5),
+regularization (F6) — comes together in the **training loop**. It's the same five
+steps whether you're training a toy MLP or fine-tuning a Bengali LLM. This chapter
+nails the loop and then confronts your real constraint: an **8GB RTX 3070 Ti**, which
+is small for LLMs. The tricks that make a fine-tune *fit* live here.
+
+The loop, always the same five steps:
+
+1. **Forward** — run a batch through the model to get predictions.
+2. **Loss** — compare predictions to targets (cross-entropy, F3).
+3. **Backward** — `loss.backward()` fills every parameter's `.grad` (F2's backprop).
+4. **Step** — the optimizer updates weights (`optimizer.step()`, F4); then
+   `optimizer.zero_grad()` to clear grads for the next batch.
+5. **Repeat** over batches (one full pass = an *epoch*), tracking validation for
+   early stopping (F6).
+
+That's the entire engine of deep learning. Memorize the order; the most common bug
+is forgetting `zero_grad()` (gradients accumulate across batches and the model goes
+haywire) — which, ironically, is the same mechanism we *deliberately* exploit below.
+
+**Batching.** You process data in mini-batches, not one example at a time (too slow,
+noisy) or all at once (won't fit memory). Batch size trades memory for gradient
+stability. On 8GB with an LLM, your batch size will be *small* — sometimes 1.
+
+## The four levers that make LLMs fit in 8GB
+
+### Mixed precision (fp16/bf16)
+
+Store activations/weights in 16-bit instead of 32-bit — roughly half the memory and
+faster math, with negligible accuracy loss. Prefer **bf16** if your GPU supports it
+(more stable than fp16). This is the single biggest free win.
+(`torch.cuda.amp` / `Trainer(fp16=True/bf16=True)`.)
+
+### Gradient accumulation
+
+Want an *effective* batch size of 16 but only 2 fit? Run 8 micro-batches, summing
+their gradients, and `step()` once. You get the stability of batch-16 at the memory
+of batch-2 — by *intentionally* not zeroing grads between micro-batches:
+
+$$
+\text{effective\_batch} = \text{micro\_batch} \times \text{accumulation\_steps}
+$$
+
+### Gradient checkpointing
+
+Don't store every layer's activations for the backward pass; recompute them on the
+fly. Trades ~30% more compute for a large memory saving — often the difference
+between OOM and training. (`model.gradient_checkpointing_enable()`.)
+
+### Quantization (4-bit) + LoRA = QLoRA
+
+Load the frozen base model in 4-bit (`bitsandbytes`) and train only small LoRA
+adapters. This is *the* technique for fine-tuning a 7B model on 8GB. It gets its
+own chapter (Bengali ch. 9); know here that it's a memory technique built on top of
+this loop.
+
+Also cap **`max_length`**: every token costs memory quadratically in attention, and
+Bengali's high fertility (Bengali ch. 3) inflates token counts — so choose
+`max_length` from your *actual* length distribution (F15), don't default to 512
+blindly.
+
+## A complete PyTorch fine-tuning loop
+
+```python
+# A real PyTorch fine-tuning loop (run locally on your GPU / Kaggle).
+# Reads as the five steps; the 8GB tricks are the commented flags.
+import torch
+from torch.cuda.amp import autocast, GradScaler
+
+def train(model, loader, val_loader, epochs=3, lr=2e-5,
+          accum_steps=8, patience=2):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)  # F4/F6
+    scaler = GradScaler()                                  # mixed precision (fp16)
+    model.gradient_checkpointing_enable()                 # memory: recompute acts
+    best, bad, best_state = float("inf"), 0, None
+
+    for epoch in range(epochs):
+        model.train()
+        opt.zero_grad()
+        for i, batch in enumerate(loader):
+            with autocast():                              # 16-bit forward
+                out = model(**batch)                      # 1) forward
+                loss = out.loss / accum_steps             # 2) loss (scaled for accum)
+            scaler.scale(loss).backward()                 # 3) backward (accumulates)
+            if (i + 1) % accum_steps == 0:                # step every accum_steps
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # anti-NaN
+                scaler.step(opt); scaler.update()         # 4) step
+                opt.zero_grad()
+
+        val = evaluate(model, val_loader)                 # 5) track val (F6)
+        if val < best - 1e-4:
+            best, bad, best_state = val, 0, {k: v.cpu().clone()
+                                            for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                break                                     # early stopping
+    if best_state:
+        model.load_state_dict(best_state)                 # restore BEST, not last
+    return model
+```
+
+This is a RUN-LOCALLY block (requires `torch`). Run it on your GPU or Kaggle.
+
+## Debugging a loop that won't train
+
+A short, ordered checklist saves hours:
+
+- **Loss is NaN/inf** — learning rate too high (lower it, add warmup, F4); fp16
+  overflow (switch to bf16, or add gradient clipping `max_norm=1.0`); a bad batch
+  (un-normalized text, F2 — check your data).
+- **Loss doesn't move** — learning rate too low; forgot to unfreeze the right params;
+  forgot `zero_grad()` placement; labels misaligned with inputs.
+- **Train loss falls, val loss rises** — overfitting; apply F6 (early stop first).
+- **CUDA out of memory** — smaller batch + more accumulation; enable mixed precision
+  and gradient checkpointing; shorter `max_length`; QLoRA.
+- **Overfits instantly / loss ~0 epoch 1** — label leakage (F15) or a trivial feature;
+  be suspicious of "too good."
+
+**Reproducibility.** Set all seeds, log your config, and save checkpoints. In a
+competition you *will* need to reproduce a good run; an unseeded, unlogged run that
+scored well but can't be rebuilt is worthless.
+
+## Try it Yourself
+
+```python
+# The loop's logic, runnable on CPU with the from-scratch MLP from F2.
+import numpy as np
+np.random.seed(0)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+def ce(z,y): return -np.log(softmax(z)[np.arange(len(y)),y]).mean()
+relu=lambda x: np.maximum(0,x)
+
+X=np.random.randn(400,2); y=(X[:,0]*X[:,1]>0).astype(int)
+tr,va = slice(0,300), slice(300,400)                       # train / val split
+W1=np.random.randn(2,16)*0.5; b1=np.zeros(16); W2=np.random.randn(16,2)*0.5; b2=np.zeros(2)
+
+def fwd(Xb): h=relu(Xb@W1+b1); return h@W2+b2, h
+best=1e9; bad=0; lr=0.3; batch=32
+for epoch in range(40):
+    idx=np.random.permutation(300)
+    for s in range(0,300,batch):                           # mini-batches
+        b=idx[s:s+batch]; Xb,yb=X[tr][b],y[tr][b]
+        z,h=fwd(Xb); N=len(yb)
+        dz=softmax(z); dz[np.arange(N),yb]-=1; dz/=N        # backward
+        dW2=h.T@dz; db2=dz.sum(0); dh=dz@W2.T; dh[h<=0]=0
+        dW1=Xb.T@dh; db1=dh.sum(0)
+        for p,g in [(W1,dW1),(b1,db1),(W2,dW2),(b2,db2)]: p-=lr*g  # step
+    vloss=ce(fwd(X[va])[0], y[va])                          # val (early stopping)
+    if vloss<best-1e-4: best=vloss; bad=0
+    else:
+        bad+=1
+        if bad>=3: print(f"early stop @ epoch {epoch}, best val {best:.3f}"); break
+```
+
+```output
+early stop @ epoch 26, best val 0.129
+```
+
+## Exercise
+
+Take the PyTorch skeleton and add a **linear-warmup → cosine-decay** scheduler (from
+F4) stepped every optimizer update, and log learning rate + train loss each step.
+Then describe what you'd change first if you hit CUDA OOM, and what you'd change
+first if loss goes NaN. (Answers: OOM — smaller micro-batch + more `accum_steps`,
+enable mixed precision/checkpointing, shorten `max_length`. NaN — lower LR + warmup,
+switch fp16 to bf16, ensure grad clipping is on.)

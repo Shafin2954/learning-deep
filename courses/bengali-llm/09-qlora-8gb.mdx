@@ -1,0 +1,175 @@
+---
+course: bengali-llm
+chapter: 09-qlora-8gb
+title: "QLoRA Fine-Tuning on 8GB"
+order: 9
+---
+
+## Two ideas that stack: LoRA + quantization
+
+This is the chapter you'll run on July 25. It's how you fine-tune a model far larger
+than your 8 GB RTX 3070 Ti could ever hold normally. Two ideas stack: **LoRA** (train
+tiny adapters instead of the whole model) and **quantization** (store the frozen model
+in 4-bit). Together — **QLoRA** — they let a 7–8B model fine-tune on a single 8 GB card.
+
+## LoRA: a low-rank correction
+
+Full fine-tuning updates every weight matrix $W$ (millions of numbers each). LoRA
+freezes $W$ and learns a small **low-rank** update beside it:
+
+$$
+W_{\text{eff}} = W_{\text{frozen}} + \underbrace{\frac{\alpha}{r}}_{\text{scale}} \cdot B A
+$$
+
+where $A \in \mathbb{R}^{r \times d}$, $B \in \mathbb{R}^{d \times r}$, and rank $r$ is small
+(8, 16, 32). Instead of $d^2$ parameters per matrix you train only $2dr$.
+
+Two key design points:
+
+- $B$ is **initialized to zero** — at the start the adapter contributes nothing and training
+  begins exactly at the pretrained model (stable start).
+- The update has **rank $r$** — limited capacity means limited overfitting, the reason LoRA often
+  *beats* full fine-tuning on small Bengali data (F6).
+
+You only ever save the adapters (megabytes), not the whole model.
+
+### LoRA math verified on CPU
+
+```python
+import numpy as np
+np.random.seed(0)
+d, r, alpha = 512, 8, 16
+W0 = np.random.randn(d, d)                 # frozen pretrained weight
+A  = np.random.randn(r, d) * 0.01          # down-projection
+B  = np.zeros((d, r))                       # up-projection, ZERO init
+scale = alpha / r
+
+print("full-weight params:", d*d, " adapter params:", A.size + B.size,
+      f"({100*(A.size+B.size)/(d*d):.2f}%)")
+print("delta at init is zero:", np.allclose(scale * (B @ A), 0))   # stable start
+B = np.random.randn(d, r) * 0.1            # after some training
+W_eff = W0 + scale * (B @ A)               # effective weight used in the forward pass
+print("effective weight shape:", W_eff.shape,
+      " delta rank:", np.linalg.matrix_rank(scale * (B @ A)))      # == r
+```
+
+```output
+full-weight params: 262144  adapter params: 8192 (3.12%)
+delta at init is zero: True
+effective weight shape: (512, 512)  delta rank: 8
+```
+
+## Quantization: the "Q" in QLoRA
+
+The frozen base model still needs to live in memory for the forward/backward pass. QLoRA
+loads it in **4-bit NF4** (a data type tuned for the bell-curve distribution of neural
+weights), roughly $4\times$ smaller than fp16, with **double quantization** squeezing a bit
+more. Compute happens by de-quantizing on the fly to bf16. The adapters train in bf16; the
+giant base stays frozen and tiny in memory.
+
+## The hyperparameters that matter
+
+- `r` (rank): 8–32. Higher = more capacity. Start 16.
+- `lora_alpha`: commonly $2r$ (so 32 for $r=16$).
+- `target_modules`: which matrices get adapters. For decoder LLMs: `q_proj, k_proj, v_proj,
+  o_proj` and MLP `gate_proj, up_proj, down_proj`. For BERT-style encoders: `query, key,
+  value, dense`.
+- `lora_dropout`: 0.05–0.1 (more regularization for tiny data).
+- **learning rate**: ${\approx}2 \times 10^{-4}$ for LoRA — *higher* than full fine-tuning's
+  $2 \times 10^{-5}$, because the adapters start from zero and must move (F4). With warmup +
+  cosine decay.
+- **batch**: micro-batch 1–4, gradient accumulation to an effective 16–32 (F7).
+- **optimizer**: `paged_adamw_8bit` (8-bit optimizer states, F7).
+- **precision**: bf16. **gradient checkpointing**: on (F7's 8 GB levers).
+- **epochs**: 1–3. Small data overfits fast — early stop (F6) on your CV (F15).
+
+## The full QLoRA recipe (RUN-LOCALLY)
+
+```python
+# The real QLoRA recipe (run locally on your GPU / Kaggle). Decoder LLM example.
+import torch
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, TrainingArguments)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+base = "hishab/titulm-1b"   # or a multilingual 7–8B; smaller = safer on 8GB
+
+bnb = BitsAndBytesConfig(                       # ---- the "Q": 4-bit base ----
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+tok = AutoTokenizer.from_pretrained(base)
+model = AutoModelForCausalLM.from_pretrained(base, quantization_config=bnb,
+                                            device_map="auto")
+model = prepare_model_for_kbit_training(model)   # enables checkpointing etc. (F7)
+
+lora = LoraConfig(                               # ---- the "LoRA": adapters ----
+    r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+    target_modules=["q_proj","k_proj","v_proj","o_proj",
+                    "gate_proj","up_proj","down_proj"],
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora)
+model.print_trainable_parameters()   # typically <1% of the model is trainable
+
+args = TrainingArguments(
+    output_dir="out", num_train_epochs=2,
+    per_device_train_batch_size=2, gradient_accumulation_steps=8,  # eff. batch 16 (F7)
+    learning_rate=2e-4, warmup_ratio=0.03, lr_scheduler_type="cosine",  # F4
+    bf16=True, gradient_checkpointing=True, optim="paged_adamw_8bit",   # F7
+    logging_steps=10, eval_strategy="epoch", save_strategy="epoch",
+    load_best_model_at_end=True,                # early stopping pairs with this (F6)
+)
+# Trainer(model=model, args=args, train_dataset=..., eval_dataset=...).train()
+# Then: model.save_pretrained("adapter")  # saves MB of adapters, not the base.
+```
+
+## Memory reality check
+
+A 7B model in 4-bit is ${\sim}3.5$–$4$ GB of weights; add activations, the KV/grads for adapters,
+and optimizer states, and you're near the ceiling. Keep `max_length` modest (mind Bengali
+fertility, ch. 3), micro-batch 1–2, checkpointing on. OOM fallback chain: shorten
+`max_length` → smaller micro-batch + more accumulation → Unsloth → a smaller base model.
+
+## Try it Yourself
+
+```python
+import numpy as np
+# Pick r and estimate trainable params + a rough memory feel. (Conceptual calculator.)
+def lora_budget(d_model=4096, n_layers=32, modules=7, r=16):
+    # 2*d*r params per adapted matrix, times modules per layer, times layers
+    trainable = 2 * d_model * r * modules * n_layers
+    return trainable
+
+for r in [8, 16, 32]:
+    t = lora_budget(r=r)
+    print(f"r={r:2d}: ~{t/1e6:6.1f}M trainable params "
+          f"(a 7B base has ~7000M frozen -> you train ~{100*t/7e9:.2f}%)")
+# Higher r = more capacity = more to overfit on tiny Bengali data. Start at 16,
+# drop to 8 if you see overfitting, raise to 32 only if underfitting.
+```
+
+```output
+r= 8: ~  14.7M trainable params (a 7B base has ~7000M frozen -> you train ~0.21%)
+r=16: ~  29.4M trainable params (a 7B base has ~7000M frozen -> you train ~0.42%)
+r=32: ~  58.7M trainable params (a 7B base has ~7000M frozen -> you train ~0.84%)
+```
+
+## Exercise
+
+Write your QLoRA config for the model you shortlisted (ch. 4): choose $r$, $\alpha$,
+`target_modules` (look them up for that architecture), `learning_rate`, micro-batch +
+accumulation for an effective batch of 16, and `max_length` (from your fertility check,
+ch. 3). Then write the one-line fallback chain you'll follow if it OOMs. Having this
+written means that when the data drops, you launch a run in minutes, not hours.
+
+<details>
+<summary>OOM fallback chain</summary>
+
+shorten `max_length` → micro-batch 2→1 with more `gradient_accumulation_steps` →
+enable/confirm gradient checkpointing + `paged_adamw_8bit` → switch to **Unsloth** →
+drop $r$ → choose a smaller base model. Apply in that order; each step trades a little
+speed/capacity for memory.
+</details>

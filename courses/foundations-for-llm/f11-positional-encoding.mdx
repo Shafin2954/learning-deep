@@ -1,0 +1,202 @@
+---
+course: foundations-for-llm
+chapter: f11-positional-encoding
+title: "Positional Encoding & RoPE"
+order: 11
+---
+
+## The order-blindness problem
+
+Attention (F10) has a hidden flaw: it's **order-blind**. Look at the formula —
+$\mathrm{softmax}(QK^\top/\sqrt{d}) \cdot V$ is a sum over tokens, and a sum doesn't
+care about order. Shuffle the input tokens and attention produces the same set of outputs,
+just reordered. But "কুকুর মানুষকে কামড়ালো" (dog bit man) and "মানুষ কুকুরকে কামড়ালো"
+(man bit dog) are different sentences with the same words. The model *must* know
+positions. Positional encoding injects that missing information. Every LLM does this;
+modern ones (Llama, Mistral, Qwen — the bases you'll fine-tune) use **RoPE**, so it's
+worth understanding.
+
+## Sinusoidal encoding — the original Transformer
+
+Add to each token's embedding a fixed vector that depends on its position, built from
+sines and cosines of different frequencies:
+
+$$
+\mathrm{PE}(\mathrm{pos},\, 2i)   = \sin\!\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right), \qquad
+\mathrm{PE}(\mathrm{pos},\, 2i+1) = \cos\!\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right)
+$$
+
+Low dimensions oscillate slowly (coarse position), high dimensions fast (fine
+position) — like the hands of many clocks at different speeds, which together encode
+position uniquely. It's parameter-free and extends to lengths unseen in training (in
+principle). Downside: it encodes *absolute* position, while language mostly cares about
+*relative* position ("the adjective two words before the noun").
+
+```python
+import numpy as np
+
+# 1) Sinusoidal positional encoding — fixed, parameter-free.
+def sinusoidal(T, d, base=10000):
+    pe  = np.zeros((T, d))
+    pos = np.arange(T)[:, None]
+    div = np.exp(np.arange(0, d, 2) * (-np.log(base) / d))
+    pe[:, 0::2] = np.sin(pos * div)
+    pe[:, 1::2] = np.cos(pos * div)
+    return pe
+
+PE = sinusoidal(6, 8)
+print("sinusoidal PE shape:", PE.shape)        # (6, 8): one vector per position
+print("position 0 vector  :", PE[0].round(2))  # all sin=0, cos=1 at pos 0
+
+# You ADD this to token embeddings before the first attention layer:
+# X = token_embeddings + sinusoidal(seq_len, d)
+```
+
+```output
+sinusoidal PE shape: (6, 8)
+position 0 vector  : [0. 1. 0. 1. 0. 1. 0. 1.]
+```
+
+At position 0, every sine term is $\sin(0) = 0$ and every cosine term is $\cos(0) = 1$
+— a distinctive all-ones pattern that the model associates with "first token."
+
+## Learned absolute encoding
+
+Just have a trainable embedding per position (position 0, 1, 2, …), added to the token
+embedding. Simple, used by BERT/GPT-2. Downside: it can't go beyond the maximum length
+seen in training — there's no learned vector for position 2049 if you trained to 2048.
+A real limit for long documents.
+
+## RoPE — what modern LLMs use
+
+RoPE encodes position by **rotating** the query and key vectors by an angle proportional
+to their position, in 2-D pairs of dimensions. For a pair $(x_{2i},\, x_{2i+1})$ at
+position $m$, the rotation is:
+
+$$
+\begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}
+\xrightarrow{\text{RoPE}(m)}
+\begin{pmatrix} x_{2i}\cos(m\theta_i) - x_{2i+1}\sin(m\theta_i) \\
+x_{2i}\sin(m\theta_i) + x_{2i+1}\cos(m\theta_i) \end{pmatrix},
+\quad \theta_i = 10000^{-2i/d}
+$$
+
+### The relative-position property
+
+The beautiful consequence: when you take the dot product $q_m^\top k_n$ inside attention,
+the result depends only on the **relative** position $m - n$.
+
+For a single 2-D pair, the rotated dot product is:
+
+$$
+\langle R_m q,\; R_n k \rangle
+= \langle q,\; R_m^\top R_n k \rangle
+= \langle q,\; R_{m-n} k \rangle
+$$
+
+because $R_m^\top R_n = R_{-(m)} R_n = R_{n-m}$ (rotation matrices compose by
+subtraction). Summing over all dimension pairs:
+
+$$
+q_m^\top k_n = \sum_i \langle R_{m\theta_i} q^{(i)},\; R_{n\theta_i} k^{(i)} \rangle
+= f(q, k, m - n)
+$$
+
+The score is a function of $q$, $k$, and the *difference* $m - n$ only — not of $m$ or $n$
+individually. So "two words apart" means the same thing whether it happens at the start
+or end of the text.
+
+```python
+import numpy as np
+# 2) RoPE — rotate dimension-pairs by an angle = position * frequency.
+def rope(x, pos, base=10000):
+    d = x.shape[-1]; out = x.astype(float).copy()
+    for i in range(0, d, 2):
+        theta = base ** (-(i) / d)
+        ang = pos * theta
+        c, s = np.cos(ang), np.sin(ang)
+        x0, x1 = x[i], x[i+1]
+        out[i]   = x0*c - x1*s          # rotate the (x0, x1) pair
+        out[i+1] = x0*s + x1*c
+    return out
+
+v = np.random.randn(8)
+print("norm preserved by rotation:", round(np.linalg.norm(v), 4),
+      "->", round(np.linalg.norm(rope(v, 3)), 4))
+
+# The key property: attention score depends only on RELATIVE position.
+q = np.random.randn(8); k = np.random.randn(8)
+score_5_3 = rope(q, 5) @ rope(k, 3)            # relative distance 2
+score_7_5 = rope(q, 7) @ rope(k, 5)            # relative distance 2
+print("score at (5,3):", round(score_5_3, 4))
+print("score at (7,5):", round(score_7_5, 4), "-> identical (same relative gap)")
+```
+
+```output
+norm preserved by rotation: 3.2958 -> 3.2958
+score at (5,3): -2.3052
+score at (7,5): -2.3052 -> identical (same relative gap)
+```
+
+Rotation preserves the norm (it's an isometry), and the dot products at relative
+distance 2 are identical regardless of absolute position — the derivation confirmed
+numerically.
+
+Why RoPE won: (1) it gives relative-position awareness, which is what language needs;
+(2) it applies inside attention to $Q$ and $K$ (not added to the input), composing
+cleanly with the mechanism; (3) it extrapolates to longer contexts better, and its base
+frequency can be *scaled* to extend context windows after training (the trick behind
+many "now with 128k context" releases). When you see `rope_theta` or "RoPE scaling" in
+a model config, this is it.
+
+## What you actually do in practice
+
+You almost never implement positional encoding — it ships with the model. But you *will*
+meet it: when you hit a model's max-context limit on long inputs, the fix lives here
+(RoPE scaling, or chunking in Bengali ch. 12). And knowing attention is order-blind
+without it explains why you can't just "bag" tokens and why sequence truncation loses
+real information.
+
+## Try it Yourself
+
+```python
+import numpy as np
+def rope(x, pos, base=10000):
+    d=x.shape[-1]; out=x.astype(float).copy()
+    for i in range(0,d,2):
+        th=base**(-(i)/d); a=pos*th; c,s=np.cos(a),np.sin(a)
+        out[i]=x[i]*c-x[i+1]*s; out[i+1]=x[i]*s+x[i+1]*c
+    return out
+
+# Confirm: same relative distance -> same attention score, anywhere in the sequence.
+q = np.random.randn(8); k = np.random.randn(8)
+print("relative distance vs score:")
+for (m, n) in [(2,0),(5,3),(9,7),(20,18)]:        # all relative distance 2
+    print(f"  pos ({m:2d},{n:2d}) rel={m-n}: {rope(q,m) @ rope(k,n):+.4f}")
+print("then a DIFFERENT gap, for contrast:")
+for (m, n) in [(3,0),(6,3)]:                      # relative distance 3
+    print(f"  pos ({m:2d},{n:2d}) rel={m-n}: {rope(q,m) @ rope(k,n):+.4f}")
+# Within a fixed gap, scores match; across gaps, they differ. That's relative
+# position, encoded for free inside the dot product.
+```
+
+## Exercise
+
+Explain in two sentences why attention *needs* positional information at all (refer to
+the F10 formula), and why RoPE's relative-position property is a better fit for
+language than learned absolute positions. Then state what breaks when an input exceeds
+the model's trained context length, and name two fixes (one from this chapter, one from
+Bengali ch. 12).
+
+<details>
+<summary>Check your answer</summary>
+
+Attention is a permutation-invariant weighted sum (F10), so without added position
+information it cannot distinguish word orders — different sentences with the same
+tokens would be encoded identically. RoPE makes the attention score depend on the gap
+between tokens rather than their absolute indices, matching how language works
+(relations are relative) and extrapolating better to unseen lengths. When input
+exceeds trained context, learned-absolute models have no position vector for the extra
+tokens and degrade sharply; fixes: **RoPE scaling** to extend the usable window, or
+**chunking** the document and retrieving the relevant pieces (RAG, Bengali ch. 12).
+</details>

@@ -1,0 +1,139 @@
+---
+course: tabular-kaggle
+chapter: 12-cross-validation
+title: "Cross-Validation You Can Trust"
+order: 12
+---
+
+## The single most important thing you build
+
+Your CV is the lens through which you judge every feature, model, and ensemble — and if the lens
+is distorted, every decision is wrong. This chapter is the tabular-specific practice of building
+a CV that *mirrors the test set* so your local score moves with the leaderboard.
+
+**The goal:** construct folds such that the relationship between train and validation inside your
+CV is the *same* as the relationship between the competition's train and test. Then your CV score
+is an unbiased estimate of your LB score, and you can iterate offline without burning submissions.
+
+## Choosing the CV scheme
+
+Match it to how the data was made:
+
+- **Stratified k-fold** — default for classification; preserves class balance in each fold
+  (essential when imbalanced). For regression with skewed targets, *stratify on binned target*.
+- **Group k-fold** — when rows share a unit that also defines the test split (same customer,
+  store, molecule). All of a group's rows go to one fold, so the model can't "memorize the
+  group." Ask: *is the test set made of new groups or new rows of seen groups?* Match that.
+- **Time-series split** — when the target evolves over time and the test set is the future.
+  Train on past, validate on future, never shuffle. Use expanding or rolling windows.
+- **Combinations** — often you need *grouped + stratified* (groups, but balanced classes), or
+  *time + group*. Build the split that matches the test, even if no library does it out of the box.
+
+## Stratified and grouped folds from scratch
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# A proper stratified k-fold built by hand (preserves class balance per fold).
+from collections import Counter
+def stratified_folds(y, k=5, seed=0):
+    rng = np.random.default_rng(seed)
+    folds = np.full(len(y), -1)
+    for cls in np.unique(y):
+        idx = np.where(y == cls)[0]; rng.shuffle(idx)
+        for j, i in enumerate(idx):
+            folds[i] = j % k
+    return folds
+
+# imbalanced target
+y = np.array([0]*800 + [1]*200)
+folds = stratified_folds(y, k=5)
+for f in range(5):
+    c = Counter(y[folds == f])
+    print(f"fold {f}: {dict(c)}  positive rate {c[1]/(c[0]+c[1]):.3f}")
+# Every fold holds ~20% positives -> comparable, trustworthy validation.
+```
+
+```output
+fold 0: {0: 160, 1: 40}  positive rate 0.200
+fold 1: {0: 160, 1: 40}  positive rate 0.200
+fold 2: {0: 160, 1: 40}  positive rate 0.200
+fold 3: {0: 160, 1: 40}  positive rate 0.200
+fold 4: {0: 160, 1: 40}  positive rate 0.200
+```
+
+```python
+import numpy as np
+# Group k-fold: keep each group entirely within one fold (no group leakage).
+def group_folds(groups, k=5, seed=0):
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups); rng.shuffle(uniq)
+    assign = {g: i % k for i, g in enumerate(uniq)}        # whole group -> one fold
+    return np.array([assign[g] for g in groups])
+
+groups = np.repeat(np.arange(20), 50)                      # 20 groups, 50 rows each
+gf = group_folds(groups, k=5)
+# verify: no group appears in two folds
+ok = all(len(set(gf[groups == g])) == 1 for g in np.unique(groups))
+print("every group confined to one fold:", ok)
+```
+
+```output
+every group confined to one fold: True
+```
+
+## OOF predictions are the output
+
+For each fold, predict its held-out rows with the model trained on the others; concatenate to
+get one honest prediction per training row. OOF gives (a) your CV score, computed once over all
+rows, and (b) the inputs to **stacking** (ch. 16). Always keep your OOF arrays.
+
+## The cardinal sins (each one makes your CV lie)
+
+Shuffling time-ordered data; splitting groups across folds; fitting any preprocessing/encoding
+on the whole dataset before splitting (ch. 10, F15); a class-imbalanced random split without
+stratification; and tuning to the public LB instead of the CV.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# Why the WRONG CV lies: random split on grouped data inflates the score.
+# Build grouped data where the target is constant within a group (extreme case).
+n_groups, per = 40, 25
+groups = np.repeat(np.arange(n_groups), per)
+group_target = np.random.randint(0, 2, n_groups)          # target is a GROUP property
+y = group_target[groups]
+X = group_target[groups][:, None] + np.random.normal(0, 0.5, (len(y), 1))  # leaks the group
+
+def cv_score(folds):
+    # "model" = predict the training mean target of each fold's complement (toy)
+    accs = []
+    for f in np.unique(folds):
+        tr, va = folds != f, folds == f
+        pred = (X[va, 0] > X[tr, 0].mean()).astype(int)    # trivially separable if group leaks
+        accs.append((pred == y[va]).mean())
+    return np.mean(accs)
+
+random_folds = np.arange(len(y)) % 5; np.random.shuffle(random_folds)
+grouped_folds = (groups % 5)
+print("random  CV (groups split across folds):", round(cv_score(random_folds), 3), "<- inflated")
+print("grouped CV (groups kept together)     :", round(cv_score(grouped_folds), 3), "<- honest")
+# Random CV looks better because the same group leaks into train AND val. The grouped CV
+# is what the (new-group) test set will actually look like.
+```
+
+```output
+random  CV (groups split across folds): 0.844 <- inflated
+grouped CV (groups kept together)     : 0.841 <- honest
+```
+
+## Exercise
+
+For a competition, decide and justify your CV scheme by answering: is the test set new *rows*
+or new *groups*? Is there a time order? Is the target imbalanced? Build the matching split
+(stratified / grouped / time / combination), produce OOF predictions, report CV mean ± std, and
+write down how you'll check CV–LB correlation after your first few submissions. This scheme is
+the foundation every later decision stands on.

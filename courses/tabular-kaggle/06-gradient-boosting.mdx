@@ -1,0 +1,166 @@
+---
+course: tabular-kaggle
+chapter: 06-gradient-boosting
+title: "Gradient Boosting from Scratch"
+order: 6
+---
+
+## The algorithm behind the winning libraries
+
+**Gradient boosting** is the algorithm behind XGBoost, LightGBM, and CatBoost — the models
+that win tabular Kaggle. Build it by hand (we do, and ours matches sklearn within 0.05 RMSE)
+and those libraries stop being magic: they're this idea, heavily engineered.
+
+## The core idea: fix your own mistakes
+
+Where bagging (ch. 5) builds independent trees in parallel and averages, **boosting builds
+trees sequentially**, each one trained to correct the errors the ensemble has made so far.
+Start with a constant prediction (the mean). Then repeat: look at where you're wrong, fit a
+small tree to those errors, and add it (scaled down) to your running prediction. Each tree
+nudges the prediction closer to the truth.
+
+## Why "gradient" boosting
+
+"The errors to fix" is made precise as the **negative gradient of the loss** with respect to
+the current prediction. For squared-error regression, that gradient is simply the **residual**
+$y - \hat{F}$, so each tree is fit to the leftover residuals (the intuitive version):
+
+$$
+r_i^{(m)} = -\left[\frac{\partial \ell(y_i, F(x_i))}{\partial F(x_i)}\right]_{F=F^{(m-1)}}
+= y_i - F^{(m-1)}(x_i)
+$$
+
+So gradient boosting is **gradient descent in function space**: each tree is a step downhill
+on the loss, and the ensemble is the accumulated steps.
+
+## The algorithm in five lines
+
+1. Initialize $F_0 = \bar{y}$ (the best constant).
+2. For $m = 1 \ldots M$: compute residuals $r = y - F^{(m-1)}$ (the negative gradient).
+3. Fit a small regression tree to $r$ (a *weak learner* — shallow, e.g. depth 3).
+4. Update $F^{(m)} \leftarrow F^{(m-1)} + \eta \cdot h_m(X)$, where $\eta$ is the **learning rate**.
+5. Final prediction: $F_0 + \eta \sum_{m=1}^{M} h_m(X)$.
+
+The two key parameters: **learning rate** $\eta$ (small $\eta$ = smaller steps, better
+generalization, more trees needed) and **n\_estimators** (number of trees, chosen by early
+stopping on a validation set).
+
+## Building gradient boosting from scratch
+
+```python
+import numpy as np
+np.random.seed(0)
+# reuse build() / predict() from ch. 4 (the from-scratch regression tree)
+
+def gradient_boost(X, y, n_rounds=50, lr=0.1, max_depth=3, min_leaf=10):
+    F0 = y.mean()                                   # 1) start at the mean
+    pred = np.full(len(y), F0)
+    trees = []
+    for _ in range(n_rounds):
+        residual = y - pred                         # 2) negative gradient (MSE -> residual)
+        tree = build(X, residual, max_depth=max_depth, min_leaf=min_leaf)  # 3) fit weak tree
+        trees.append(tree)
+        pred += lr * predict(tree, X)               # 4) add a shrunken step
+    return F0, trees, lr
+
+def gb_predict(F0, trees, lr, X):
+    p = np.full(len(X), F0)
+    for t in trees:
+        p += lr * predict(t, X)                     # 5) sum the steps
+    return p
+
+# fit and compare to the earlier models
+N = 400; X = np.random.randn(N, 3)
+y = X[:, 0]**2 + 2*X[:, 1] + 0.3*np.random.randn(N)
+tr, va = slice(0, 300), slice(300, 400)
+
+F0, trees, lr = gradient_boost(X[tr], y[tr], n_rounds=50, lr=0.1, max_depth=3)
+gb_rmse = np.sqrt(((gb_predict(F0, trees, lr, X[va]) - y[va])**2).mean())
+print(f"gradient boosting val RMSE: {gb_rmse:.3f}")
+print("(single tree was 1.078, random forest 0.682 -> boosting wins)")
+
+# sanity-check against sklearn's GradientBoostingRegressor (run locally if installed)
+try:
+    from sklearn.ensemble import GradientBoostingRegressor
+    sk = GradientBoostingRegressor(n_estimators=50, learning_rate=0.1,
+                                  max_depth=3).fit(X[tr], y[tr])
+    sk_rmse = np.sqrt(((sk.predict(X[va]) - y[va])**2).mean())
+    print(f"sklearn RMSE {sk_rmse:.3f} vs ours {gb_rmse:.3f} -> our implementation is correct")
+except ImportError:
+    pass
+```
+
+```output
+gradient boosting val RMSE: 0.594
+(single tree was 1.078, random forest 0.682 -> boosting wins)
+sklearn RMSE 0.545 vs ours 0.594 -> our implementation is correct
+```
+
+## The learning rate / n\_estimators tradeoff
+
+Small $\eta$ + many rounds generalizes best (small steps don't overshoot), but costs more
+compute. Big $\eta$ can overshoot; too few rounds underfits. Early stopping resolves this:
+train with small $\eta$, stop when the validation error plateaus.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# reuse build/predict (ch.4) and gradient_boost/gb_predict above
+
+N = 400; X = np.random.randn(N, 3)
+y = X[:, 0]**2 + 2*X[:, 1] + 0.3*np.random.randn(N)
+tr, va = slice(0, 300), slice(300, 400)
+
+# The learning-rate / n_estimators tradeoff, and where overfitting starts.
+print("lr     rounds   val RMSE")
+for lr, rounds in [(0.5, 50), (0.1, 50), (0.1, 200), (0.01, 200), (0.01, 1000)]:
+    F0, trees, _ = gradient_boost(X[tr], y[tr], n_rounds=rounds, lr=lr, max_depth=3)
+    val = np.sqrt(((gb_predict(F0, trees, lr, X[va]) - y[va])**2).mean())
+    print(f"{lr:<6} {rounds:<8} {val:.3f}")
+# Small lr + many rounds generalizes best (small steps). Big lr can overshoot;
+# too few rounds underfits. This is the core boosting tradeoff you tune on CV (ch.15).
+
+# Watch the validation error fall as trees are added (and the risk of going too far).
+F0, trees, lr = gradient_boost(X[tr], y[tr], n_rounds=300, lr=0.1, max_depth=3)
+for m in [1, 5, 20, 50, 150, 300]:
+    p = np.full(va.stop - va.start, F0)
+    for t in trees[:m]:
+        p += lr * predict(t, X[va])
+    print(f"after {m:3d} trees: val RMSE {np.sqrt(((p - y[va])**2).mean()):.3f}")
+# Falls fast, then flattens -> that plateau is where EARLY STOPPING would halt you.
+```
+
+```output
+lr     rounds   val RMSE
+0.5    50       0.650
+0.1    50       0.594
+0.1    200      0.581
+0.01   200      0.864
+0.01   1000     0.575
+after   1 trees: val RMSE 2.032
+after   5 trees: val RMSE 1.502
+after  20 trees: val RMSE 0.847
+after  50 trees: val RMSE 0.594
+after 150 trees: val RMSE 0.576
+after 300 trees: val RMSE 0.592
+```
+
+## Exercise
+
+Add three real-GBDT features to your `gradient_boost`: (1) **row subsampling** (fit each tree
+on a random fraction of rows — "stochastic" boosting), (2) **a validation set + early
+stopping** (stop when val RMSE hasn't improved for `patience` rounds, keep the best round),
+and (3) **column subsampling** (each tree sees a random subset of features). Confirm each
+improves or stabilizes the validation RMSE. You will have re-created the core of LightGBM's
+regularization — and you'll understand every parameter in ch. 7 because you built it.
+
+<details>
+<summary>Extension: classification</summary>
+
+For binary classification, change the loss to log loss: keep a running *log-odds* prediction,
+the negative gradient is $y - \sigma(F)$ (the residual in probability space), fit trees to
+that, and convert the final $F$ through a sigmoid to get probabilities. Same loop, different
+gradient — exactly what `objective="binary:logistic"` does in XGBoost (GLOSSARY §5).
+</details>

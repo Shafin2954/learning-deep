@@ -1,0 +1,236 @@
+---
+course: foundations-for-llm
+chapter: f10-self-attention
+title: "Self-Attention from Scratch"
+order: 10
+---
+
+## The one-sentence idea
+
+This is the most important chapter in the track. Attention is the mechanism that
+replaced recurrence, powers every LLM you'll fine-tune, and — once you've built it by
+hand — turns the Transformer from a black box into something you can reason about.
+Read slowly. Build it. After this, the rest is configuration.
+
+Each token produces a new representation by taking a **weighted average of all tokens'
+values**, where the weights say *how relevant each other token is to it*. "Self"-attention
+because the tokens attend to each other within the same sequence.
+
+## Query, Key, Value — the search metaphor
+
+For every token we compute three vectors, each via a learned linear layer (F1):
+
+- **Query (Q):** "what am I looking for?"
+- **Key (K):** "what do I offer / what am I about?"
+- **Value (V):** "what information do I carry?"
+
+The analogy is a soft dictionary lookup. Token $i$'s query is compared against every
+token's key to decide how much to retrieve from each token's value. Concretely:
+
+1. **Scores** — how well token $i$'s query matches token $j$'s key, via dot product:
+   $\text{scores} = QK^\top$. A large dot product = high relevance.
+2. **Scale** — divide by $\sqrt{d_k}$ (the key dimension). Without this, large $d_k$
+   makes dot products huge, softmax saturates into a near one-hot, and gradients vanish.
+   The $\sqrt{d_k}$ keeps the variance sane.
+3. **Softmax** — turn each row of scores into a probability distribution over tokens
+   (F1). Now each token has attention weights summing to 1 over all tokens.
+4. **Weighted sum** — multiply the weights by the values. Each token's output is a blend
+   of the values it cared about.
+
+In one equation:
+
+$$
+\mathrm{Attention}(Q, K, V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+$$
+
+That formula is the engine of the entire field.
+
+### Why divide by $\sqrt{d_k}$?
+
+With $d_k$-dimensional queries and keys, each dot product $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$
+is a sum of $d_k$ terms. If $q_i, k_i \sim \mathcal{N}(0,1)$, each product has
+$\mathbb{E}[q_i k_i] = 0$ and $\mathrm{Var}[q_i k_i] = 1$, so the full dot product has:
+
+$$
+\mathrm{Var}[q \cdot k] = d_k
+$$
+
+As $d_k$ grows (typical values: 64–128), the dot products grow as $\sqrt{d_k}$, pushing
+softmax inputs into the saturation region where $\partial \mathrm{softmax}/\partial z \approx 0$.
+Dividing by $\sqrt{d_k}$ restores unit variance:
+
+$$
+\mathrm{Var}\!\left[\frac{q \cdot k}{\sqrt{d_k}}\right] = \frac{d_k}{d_k} = 1
+$$
+
+keeping gradients healthy throughout training. This is why it is called *scaled*
+dot-product attention — not a detail, a stability requirement.
+
+```python
+import numpy as np
+np.random.seed(0)
+
+def softmax(z):
+    z = z - z.max(-1, keepdims=True); e = np.exp(z)
+    return e / e.sum(-1, keepdims=True)
+
+def attention(Q, K, V, mask=None):
+    d_k = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(d_k)          # (T, T) pairwise relevance, scaled
+    if mask is not None:
+        scores = np.where(mask, scores, -1e9)  # block forbidden positions
+    weights = softmax(scores)                 # each row sums to 1
+    return weights @ V, weights               # weighted average of values
+
+# One self-attention layer over a sequence of T=4 tokens, model dim d=8.
+T, d = 4, 8
+X  = np.random.randn(T, d)                    # token representations (e.g., embeddings)
+Wq, Wk, Wv = (np.random.randn(d, d) for _ in range(3))
+Q, K, V = X @ Wq, X @ Wk, X @ Wv              # three linear projections (F1)
+
+out, w = attention(Q, K, V)
+print("output shape :", out.shape)            # (4, 8)
+print("weight rows sum to 1:", w.sum(1).round(3))
+print("token 0 attends to  :", w[0].round(2), "(over the 4 tokens)")
+```
+
+```output
+output shape : (4, 8)
+weight rows sum to 1: [1. 1. 1. 1.]
+token 0 attends to  : [0.   0.99 0.01 0.  ] (over the 4 tokens)
+```
+
+The weights sum to 1, the output has the right shape, and token 0's output is literally
+a weighted mix of values — dominated by token 1.
+
+## The causal mask
+
+A language model predicting the next token must not look at future tokens — that would
+be cheating. So for decoder/LLM attention we **mask** the scores: before softmax, set
+every "future" position to $-\infty$ so its weight becomes 0. The result is a
+lower-triangular attention pattern: position $t$ attends only to positions $\le t$.
+
+Encoder models (BERT-style) use *no* mask — every token sees every token, which is why
+they're better for understanding tasks and worse for generation.
+
+```python
+# Causal mask: position t sees only tokens <= t (no peeking at the future).
+causal = np.tril(np.ones((T, T))).astype(bool)
+out_c, w_c = attention(Q, K, V, mask=causal)
+print("causal attention weights (upper triangle is 0):")
+print(w_c.round(2))
+```
+
+```output
+causal attention weights (upper triangle is 0):
+[[1.   0.   0.   0.  ]
+ [0.07 0.93 0.   0.  ]
+ [0.   0.   1.   0.  ]
+ [0.   0.93 0.07 0.  ]]
+```
+
+The upper triangle is exactly zero — verified.
+
+## Multi-head attention
+
+One attention operation can only learn one notion of "relevance." Real language needs
+several simultaneously (syntactic agreement, coreference, topic, position…). So we run
+attention $h$ times in parallel on *slices* of the vectors — each slice is a "head" with
+its own learned $Q/K/V$ — then concatenate the heads and pass through a final linear
+layer $W_o$. Same total compute, but the model attends in $h$ different subspaces at
+once. A "12-head" model is doing 12 parallel attentions per layer.
+
+```python
+# Multi-head attention: split d into h heads, attend per head, concat, project.
+def multihead(X, Wq, Wk, Wv, Wo, h=2, causal=True):
+    T, d = X.shape; dh = d // h
+    Q, K, V = X @ Wq, X @ Wk, X @ Wv
+    mask = np.tril(np.ones((T, T))).astype(bool) if causal else None
+    heads = []
+    for i in range(h):
+        s = slice(i*dh, (i+1)*dh)
+        o, _ = attention(Q[:, s], K[:, s], V[:, s], mask)
+        heads.append(o)
+    return np.concatenate(heads, axis=-1) @ Wo   # concat heads, final linear
+Wo = np.random.randn(d, d)
+print("multi-head output shape:", multihead(X, Wq, Wk, Wv, Wo).shape)   # (4, 8)
+```
+
+```output
+multi-head output shape: (4, 8)
+```
+
+## Why this fixes the RNN problems (F9)
+
+Token 100 attends to token 1 in a *single* matmul — a length-1 path, so no vanishing
+relay; long-range dependency is trivial. And $QK^\top$ computes *all* pairwise scores at
+once — fully parallel on a GPU.
+
+The price is the $QK^\top$ matrix is $n \times n$: **$O(n^2)$** in sequence length. That
+quadratic cost is the single most important fact about scaling LLMs, the reason long
+documents are expensive, and the problem the Mamba/MoE architectures attack.
+
+**This is 90% of a Transformer.** A Transformer block (F12) is: multi-head
+self-attention + a residual connection + LayerNorm (F5) + a feed-forward MLP (F2) +
+another residual + LayerNorm. You already have every piece except the wrapper. When
+you fine-tune an LLM, you are nudging the $Q/K/V/W_o$ and MLP weights of dozens of
+these blocks. Understanding this one mechanism is understanding the model.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(1)
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+
+def attention(Q, K, V, mask=None):
+    d_k=Q.shape[-1]; s=Q@K.T/np.sqrt(d_k)
+    if mask is not None: s=np.where(mask,s,-1e9)
+    w=softmax(s); return w@V, w
+
+# Experiment 1: WHY scale by sqrt(d_k). Compare attention sharpness with/without.
+T, d = 5, 64
+Q = np.random.randn(T, d); K = np.random.randn(T, d); V = np.random.randn(T, d)
+raw = softmax(Q @ K.T)                      # unscaled: huge logits -> near one-hot
+scaled = attention(Q, K, V)[1]              # scaled: balanced
+print("unscaled max weight per row:", raw.max(1).round(2))      # ~1.0 (saturated)
+print("scaled   max weight per row:", scaled.max(1).round(2))   # softer, learnable
+
+# Experiment 2: build the causal mask yourself and confirm token 2 ignores 3 and 4.
+causal = np.tril(np.ones((T, T))).astype(bool)
+_, w = attention(Q, K, V, mask=causal)
+print("\ntoken 2 attention weights:", w[2].round(2), "(positions 3,4 must be 0)")
+```
+
+## Exercise
+
+Implement `self_attention(X, Wq, Wk, Wv, causal=False)` end to end (projections →
+scaled scores → optional causal mask → softmax → weighted values), then verify: (a)
+every attention-weight row sums to 1, and (b) with `causal=True`, the weight matrix is
+lower-triangular. This single function is the heart of every LLM — when you fine-tune
+one, you're adjusting the `Wq`/`Wk`/`Wv` it uses.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+
+def self_attention(X, Wq, Wk, Wv, causal=False):
+    Q, K, V = X @ Wq, X @ Wk, X @ Wv
+    d_k = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(d_k)
+    if causal:
+        mask = np.tril(np.ones(scores.shape)).astype(bool)
+        scores = np.where(mask, scores, -1e9)
+    w = softmax(scores)
+    return w @ V, w
+
+X = np.random.randn(4, 8); Wq, Wk, Wv = (np.random.randn(8, 8) for _ in range(3))
+out, w = self_attention(X, Wq, Wk, Wv, causal=True)
+assert np.allclose(w.sum(1), 1)                       # (a)
+assert np.allclose(np.triu(w, 1), 0)                  # (b) upper triangle is 0
+print("verified: rows sum to 1, causal is lower-triangular")
+```
+</details>

@@ -1,0 +1,131 @@
+---
+course: tabular-kaggle
+chapter: 08-eda
+title: "EDA for Tabular Data"
+order: 8
+---
+
+## EDA is where scores are won
+
+**Exploratory data analysis (EDA)** is looking at the data before modeling — and on tabular
+Kaggle it's where you find the things that actually move the score: leaks, magic features, the
+right CV scheme, and the quirks of how the data was made. Skipping EDA to jump straight to
+LightGBM is the most common rookie mistake. An hour of good EDA routinely beats a day of tuning.
+
+## What to look at
+
+### 1. Shape and types
+
+Rows × columns, dtypes, memory. Which columns are numeric vs categorical vs datetime vs id.
+Big data → reduce memory (downcast dtypes, use Parquet/Polars) so you can iterate fast.
+
+### 2. The target
+
+Its distribution is the first thing to plot. Classification → class balance (imbalanced? →
+stratify, pick F1/AUC, consider class weights). Regression → skew/heavy tails (→ consider a
+log transform). The target's shape drives your metric handling and validation.
+
+### 3. Missingness
+
+How much, in which columns, and — crucially — *whether missingness is informative* (often it
+is: a missing value can predict the target). Add missing-indicator features (ch. 9). Check if
+train and test have the *same* missingness pattern; a difference is a distribution-shift warning
+(ch. 13).
+
+### 4. Distributions and outliers
+
+Per-feature histograms reveal skew (→ transforms), outliers (→ clip/winsorize), constant
+columns (→ drop), and high-cardinality categoricals (→ special encoding, ch. 10).
+
+### 5. Relationships to the target
+
+Correlations (numeric), group-wise target means (categorical), and simple plots of feature vs
+target expose which features carry signal — and sometimes a single **magic feature** that nearly
+solves the task. Use the right correlation: Pearson (linear), Spearman (monotonic), mutual
+information (any dependence).
+
+### 6. Train vs test comparison — do not skip
+
+Compare feature distributions between train and test. If they differ, your CV will mislead and
+you must adapt (adversarial validation, ch. 13). Also hunt for **leaks**: id columns that
+encode the target or row order, timestamps that order the data, near-duplicate rows, features
+that are suspiciously predictive.
+
+### 7. Structure in ids/time
+
+Row order, id ranges, and timestamps often hide structure (data sorted by target, ids that
+bucket by group). This is where magic features and the correct CV scheme (grouped? time-based?)
+come from. Many competitions are cracked here.
+
+## Compact EDA pass
+
+```python
+# A compact EDA pass (run locally with pandas; logic shown on synthetic data here).
+import numpy as np
+import pandas as pd
+np.random.seed(0)
+
+df = pd.DataFrame({
+    "num1": np.random.randn(500),
+    "num2": np.random.exponential(2, 500),          # skewed -> transform candidate
+    "cat":  np.random.choice(["a", "b", "c"], 500),
+    "with_missing": np.where(np.random.rand(500) < 0.3, np.nan, np.random.randn(500)),
+})
+df["target"] = ((df["num1"] + (df["cat"] == "c") * 1.5
+                 + np.random.randn(500)) > 0).astype(int)
+
+print("shape:", df.shape)
+print("\ntarget balance:\n", df["target"].value_counts(normalize=True).round(3).to_dict())
+print("\nmissing %:\n", (df.isna().mean() * 100).round(1).to_dict())
+print("\nnum1 skew:", round(df["num1"].skew(), 2), "| num2 skew:", round(df["num2"].skew(), 2))
+print("\ncategory target-means (is 'cat' predictive?):")
+print(df.groupby("cat")["target"].mean().round(3).to_dict())
+# 'c' has a higher target rate -> 'cat' is predictive -> target-encode it (ch. 10).
+# num2 is skewed -> consider a log transform (ch. 9).
+```
+
+```output
+shape: (500, 5)
+
+target balance:
+ {1: 0.624, 0: 0.376}
+
+missing %:
+ {'num1': 0.0, 'num2': 0.0, 'cat': 0.0, 'with_missing': 29.0, 'target': 0.0}
+
+num1 skew: 0.03 | num2 skew: 2.17
+
+category target-means (is 'cat' predictive?):
+{'a': 0.473, 'b': 0.5, 'c': 0.879}
+```
+
+## Try it Yourself
+
+```python
+import numpy as np, pandas as pd
+np.random.seed(1)
+# Is missingness informative? (Often yes -> add a missing-indicator feature, ch. 9.)
+df = pd.DataFrame({"x": np.random.randn(800)})
+# make missingness correlate with the target
+df["target"] = (df["x"] + np.random.randn(800) > 0).astype(int)
+missing = (np.random.rand(800) < 0.2 + 0.3 * df["target"])   # missing more when target=1
+df.loc[missing, "x"] = np.nan
+
+print("target rate where x is MISSING :", round(df.loc[df.x.isna(), "target"].mean(), 3))
+print("target rate where x is PRESENT :", round(df.loc[df.x.notna(), "target"].mean(), 3))
+# Different rates -> the FACT of being missing predicts the target.
+# Action: add df['x_was_missing'] = df['x'].isna() as a feature before imputing.
+```
+
+```output
+target rate where x is MISSING : 0.716
+target rate where x is PRESENT : 0.427
+```
+
+## Exercise
+
+Do an EDA pass on a real tabular dataset and produce a written "findings → actions" list: for
+each finding (skewed feature, informative missingness, predictive categorical, train/test
+difference, possible leak, grouping structure), write the concrete modeling action it implies
+(a transform, an indicator, an encoding, an adversarial-validation check, a CV scheme). That
+list is your feature-engineering and validation plan for ch. 9–13.

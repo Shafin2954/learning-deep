@@ -1,0 +1,169 @@
+---
+course: bengali-llm
+chapter: 10-data-for-finetuning
+title: "Data for Fine-Tuning"
+order: 10
+---
+
+## Data is the model
+
+Your model will be exactly as good as your data — MLE faithfully imitates whatever you
+feed it (F3). In a modest-resource language, **data work is where competitions are won**,
+not model tweaking. This chapter: how to format, mask, augment, clean, and split Bengali
+fine-tuning data correctly.
+
+## Format: the instruction/chat template
+
+Instruction-tuned models expect a specific structure (system / user / assistant turns
+with special tokens). You must format your `(prompt, response)` pairs with the **model's
+own chat template** — using the wrong template quietly degrades everything. Hugging Face
+gives you `tokenizer.apply_chat_template(...)`; use it rather than hand-building strings,
+so the special tokens match what the model saw in its own instruction tuning.
+
+## Loss masking: train on the answer, not the question
+
+This is the detail most people get wrong. When fine-tuning a causal model on
+`(prompt, response)`, you do **not** want the model trained to *generate the prompt* —
+only the response. So you mask the prompt tokens out of the loss by setting their labels
+to **-100** (the "ignore" value in cross-entropy). Verified: with a 4-token prompt and a
+3-token response, the loss averages over only the 3 response tokens. Skipping this makes
+the model learn to parrot prompts and wastes capacity. (For pure text completion or
+pretraining-style continuation you don't mask; for instruction tuning you do.)
+
+### Why -100 is the right mask value
+
+The cross-entropy loss over a sequence averages only positions where the label $y_i \neq -100$:
+
+$$
+L = -\frac{1}{|\mathcal{R}|} \sum_{i \in \mathcal{R}} \log p(y_i \mid y_{<i})
+$$
+
+where $\mathcal{R}$ is the set of response token positions. Prompt positions are excluded from
+the denominator and numerator alike, so the model receives zero gradient signal from them.
+
+```python
+# Loss masking: only response tokens contribute to the loss (labels = -100 on prompt).
+def build_labels(prompt_ids, response_ids):
+    input_ids = prompt_ids + response_ids
+    labels    = [-100]*len(prompt_ids) + response_ids[:]   # -100 = ignored by CE
+    return input_ids, labels
+
+inp, lab = build_labels([10,11,12,13], [20,21,22])
+print("input_ids:", inp)
+print("labels   :", lab)
+n_train = sum(1 for l in lab if l != -100)
+print(f"loss computed over {n_train} response tokens (of {len(lab)}) -> "
+      "model learns to ANSWER, not to repeat the prompt")
+```
+
+```output
+input_ids: [10, 11, 12, 13, 20, 21, 22]
+labels   : [-100, -100, -100, -100, 20, 21, 22]
+loss computed over 3 response tokens (of 7) -> model learns to ANSWER, not to repeat the prompt
+```
+
+```python
+# Use the model's OWN chat template (run locally) — don't hand-roll the format.
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("hishab/titulm-1b")
+messages = [
+    {"role": "system", "content": "আপনি একজন সহায়ক সহকারী।"},   # "You are a helpful assistant."
+    {"role": "user",   "content": "বাংলাদেশের রাজধানী কোথায়?"},
+]
+text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+print(text)   # exact special-token structure the model was instruction-tuned with
+```
+
+## Augmentation: grow your scarce Bengali data (carefully)
+
+You're data-starved (F6), so augmentation has high upside — but bad augmentation injects
+noise and label errors, so **always validate it on your CV** (F15), never assume it helps.
+Techniques, roughly in order of safety:
+
+- **Back-translation** (Bn→En→Bn through a translator): paraphrases while preserving
+  meaning. The workhorse for text augmentation.
+- **LLM paraphrasing**: ask a strong model to restate a Bengali sentence; cheap, but
+  check it doesn't drift or switch dialect/register.
+- **Synonym / entity replacement**: swap words using a Bengali lexicon (bnlp); safe for
+  classification, risky for tasks where exact words matter (QA spans, NER).
+- **Token/word dropout, light noise**: regularizes, but can corrupt meaning — keep mild.
+- **Translation of English datasets into Bengali**: imports labeled data from a
+  high-resource language; great for bootstrapping, but translation errors and
+  "translationese" can hurt — filter aggressively.
+
+Whatever you generate: **keep labels correct** (augmentation must preserve the target),
+and **never let an augmented copy of a validation example leak into train** (F15) — dedup
+*after* augmenting.
+
+## Cleaning & quality filtering (data quality beats data quantity)
+
+- **Normalize** every text with the same function (ch. 2) — train and val identically.
+- **Deduplicate** by normalized hash (verified: collapses near-identical rows); Bengali
+  web data is heavily duplicated, and dupes across the split are leakage (F15).
+- **Filter junk**: drop empties, wrong-language rows (use a script/charset check — mostly
+  non-Bengali codepoints, ch. 1), truncated/garbled text, and label-noise outliers.
+- **Balance** awareness: note class imbalance for stratified splitting (F14) and decide
+  on class weights vs resampling rather than blindly oversampling (which dupes noise).
+- **A small, clean, correctly-labeled set beats a large noisy one.** Spend your time
+  here; it has the best return of anything in the pipeline.
+
+## Splitting (the part that protects your score)
+
+Build the validation split *before* augmenting, dedup across the split, group by
+source/author, and stratify by label (F15/F14). Augment only the *training* side. This
+ordering is what keeps your CV honest.
+
+## Try it Yourself
+
+```python
+import unicodedata, hashlib
+
+# Dedup by normalized hash — kill near-duplicates that would leak across your split.
+def norm_key(t):
+    t = unicodedata.normalize("NFC", t).strip()
+    t = " ".join(t.split())                        # collapse whitespace (ch. 2)
+    return hashlib.md5(t.encode()).hexdigest()
+
+rows = [
+    ("আমি ভালো আছি", 1),
+    ("আমি ভালো আছি ", 1),      # duplicate (trailing space)
+    ("আমি  ভালো  আছি", 1),     # duplicate (double spaces)
+    ("আবহাওয়া ভালো", 0),
+]
+seen, unique = set(), []
+for text, label in rows:
+    k = norm_key(text)
+    if k not in seen:
+        seen.add(k); unique.append((text, label))
+print(f"{len(rows)} rows -> {len(unique)} after dedup")
+for t, l in unique:
+    print("  ", repr(t), l)
+# Run dedup AFTER augmenting and ACROSS the train/val boundary, never within train only.
+```
+
+```output
+4 rows -> 2 after dedup
+   'আমি ভালো আছি' 1
+   'আবহাওয়া ভালো' 0
+```
+
+## Exercise
+
+Write the data pipeline for your task as an ordered function list: `normalize →
+filter_language → dedup → split(group+stratify) → augment(train only) → dedup(across
+split) → format(chat template) → mask(labels=-100 on prompt)`. For each step, note the
+one failure it prevents. This pipeline, run correctly, is worth more than any clever
+model — it's the difference between a CV you can trust and a leaderboard collapse (F15).
+
+<details>
+<summary>Hint</summary>
+
+Each step in the ordered pipeline guards against one specific failure:
+`normalize` prevents whitespace/encoding mismatches across splits; `filter_language` removes
+non-Bengali noise; `dedup` prevents identical rows from crossing the split boundary (leakage);
+`split(group+stratify)` prevents source/author leakage and class-distribution mismatch;
+`augment(train only)` prevents augmented copies of validation examples from appearing in train;
+`dedup(across split)` catches augmentation-introduced near-duplicates; `format(chat template)`
+ensures the model sees the same token structure it was instruction-tuned with; `mask(labels=-100)`
+ensures the loss trains on answers, not prompts.
+</details>

@@ -1,0 +1,151 @@
+---
+course: bengali-llm
+chapter: 14-evaluation-by-task
+title: "Evaluation Metrics by Task"
+order: 14
+---
+
+## Optimize the competition's exact metric
+
+F14 gave you the general measurement discipline (CV, calibration, the std-vs-mean rule).
+This chapter is the Bengali/task-specific layer: *exactly which metric per task, how
+it's computed, and the Bengali traps*. The cardinal rule from F14 stands — **optimize
+the competition's exact metric, not the training loss** — and you can't optimize what
+you don't precisely understand.
+
+## Classification
+
+Sentiment, topic, NLI.
+
+**Macro-F1** is the usual Bengali shared-task metric — average per-class F1, weighting rare classes
+equally (F14). Report it, and remember accuracy lies under imbalance. Optimize by tuning the
+decision threshold per class (F14) and by fixing the worst class via error analysis.
+
+## Token classification (NER)
+
+**Entity-level F1** (via `seqeval`), not token accuracy — a near-miss on a multi-token entity
+should be penalized as a wrong entity. Bengali trap: tags are predicted on **subword** tokens
+(ch. 3); you must align predictions back to words/entities before scoring, or your F1 is
+meaningless.
+
+## Extractive QA
+
+**Exact Match** and **token-level F1** between predicted and gold spans (F14). Bengali trap: EM is
+brutal because of normalization/whitespace/matra variants (ch. 1–2) — "ঢাকায়" vs "ঢাকা য়" can
+both be "right" yet fail EM. Normalize both prediction and gold identically before scoring, exactly
+as the competition does.
+
+## Generation / translation / summarization
+
+Surface-overlap metrics, each with a job:
+
+- **chrF** — character $n$-gram F-score. **The best default for Bengali** generation/translation:
+  character-level, so it's robust to tokenization and gives *partial credit* for morphological
+  variants. Word-level BLEU would punish those variants much harder.
+- **BLEU** — word/$n$-gram precision; standard for translation but harsh on morphologically rich
+  Bengali and sensitive to tokenization. Use **sacrebleu** for reproducible, tokenization-controlled
+  BLEU.
+- **ROUGE** — recall-oriented $n$-gram overlap; the summarization standard.
+- **BERTScore** — embedding-based similarity; rewards meaning-preserving paraphrases. Use a
+  multilingual model for Bengali.
+
+### chrF implemented
+
+$$
+\mathrm{chrF}_\beta = \frac{(1 + \beta^2) \cdot P \cdot R}{\beta^2 \cdot P + R}
+$$
+
+where $P$ and $R$ are precision and recall over character $n$-grams.
+
+```python
+import numpy as np
+from collections import Counter
+
+# chrF — the Bengali-friendly generation metric. Character n-grams, partial credit.
+def char_ngrams(s, n):
+    s = s.replace(" ", "")
+    return Counter(s[i:i+n] for i in range(len(s) - n + 1))
+
+def chrf(hyp, ref, n=3, beta=2):
+    h, r = char_ngrams(hyp, n), char_ngrams(ref, n)
+    overlap = sum((h & r).values())
+    prec = overlap / max(sum(h.values()), 1)
+    rec  = overlap / max(sum(r.values()), 1)
+    return (1 + beta**2) * prec * rec / (beta**2 * prec + rec) if prec + rec else 0.0
+
+print("identical          :", round(chrf("বাংলাদেশ", "বাংলাদেশ"), 3))     # 1.0
+print("morphological variant:", round(chrf("বাংলাদেশের", "বাংলাদেশ"), 3)) # 0.938 (partial!)
+print("unrelated          :", round(chrf("আকাশ", "বাংলাদেশ"), 3))         # 0.0
+# Word-level BLEU would score the variant near 0; chrF's partial credit fits Bengali.
+```
+
+```output
+identical          : 1.0
+morphological variant: 0.938
+unrelated          : 0.0
+```
+
+## Normalization before EM scoring
+
+Always normalize before EM/F1, the way the competition does (ch. 1–2):
+
+```python
+import unicodedata, re
+def norm_answer(s):
+    s = unicodedata.normalize("NFC", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def exact_match(pred, gold):
+    return int(norm_answer(pred) == norm_answer(gold))
+
+print("EM raw   :", int("ঢাকা " == "ঢাকা"))                  # 0 (whitespace!)
+print("EM normed:", exact_match("ঢাকা ", "ঢাকা"))            # 1 (fixed)
+```
+
+```output
+EM raw   : 0
+EM normed: 1
+```
+
+## RAG evaluation
+
+Evaluate the two halves separately (ch. 12): **retrieval** — recall@$k$, precision@$k$, MRR
+(did the right chunk come back?); **generation** — groundedness/faithfulness and answer
+correctness. **RAGAS** automates these. Diagnosing separately tells you whether to fix retrieval
+or generation.
+
+## The tokenization caveat for Bengali
+
+Several metrics depend on tokenization (BLEU, perplexity from F3), and Bengali fertility (ch. 3)
+makes tokenization choices swing scores. Never compare BLEU/perplexity across systems with
+different tokenizers, and always score with the competition's tokenization, not your model's.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from collections import Counter
+# Token-level F1 for QA (overlap of predicted vs gold answer tokens).
+def token_f1(pred, gold):
+    p, g = pred.split(), gold.split()
+    common = sum((Counter(p) & Counter(g)).values())
+    if common == 0: return 0.0
+    prec, rec = common/len(p), common/len(g)
+    return 2*prec*rec/(prec+rec)
+
+print("token-F1:", round(token_f1("ঢাকা বাংলাদেশের রাজধানী", "বাংলাদেশের রাজধানী ঢাকা"), 3))
+# Partial overlap -> partial score. EM would give 0 here; token-F1 rewards the overlap.
+```
+
+```output
+token-F1: 1.0
+```
+
+## Exercise
+
+Find your competition's exact metric, then implement it from scratch and verify it on 3
+hand-built cases (a perfect prediction, a partial one, a wrong one). Build the
+normalization to match (ch. 2). Then state: which decoding/threshold choice would you
+tune to *this* metric, and how would you confirm your local metric tracks the leaderboard
+with a single probe submission? Owning the metric is owning the competition.

@@ -1,0 +1,155 @@
+---
+course: bengali-llm
+chapter: 05-embeddings-similarity
+title: "Bengali Embeddings & Semantic Similarity"
+order: 5
+---
+
+## Bengali embeddings in practice
+
+F8 taught you what embeddings are; this chapter is the Bengali-specific practice — the
+models, the pooling, and the two places embeddings win you points: as a **cheap strong
+baseline** for classification, and as the **retrieval engine** of RAG (ch. 12).
+
+## Sentence embeddings: one vector per document
+
+A transformer produces one contextual vector per token (F8, F12). For similarity and retrieval
+you need one vector per *sentence or document*. You get it by **pooling** the token vectors —
+usually **mean pooling** over the real (non-padding) tokens, sometimes the `[CLS]` token.
+Sentence-embedding models (the `sentence-transformers` family) are encoders fine-tuned specifically
+so that mean-pooled vectors of similar sentences have high cosine similarity. That fine-tuning is
+why you use them instead of pooling a raw BERT.
+
+### Mean pooling over the attention mask
+
+Pool only over real tokens — never include padding tokens, or your vectors are polluted:
+
+$$
+\hat{v} = \frac{\sum_{t=1}^{T} m_t \, h_t}{\sum_{t=1}^{T} m_t}
+$$
+
+where $m_t \in \{0, 1\}$ is the attention mask and $h_t$ is the token vector.
+
+```python
+import numpy as np
+def mean_pool(token_vecs, attention_mask):
+    m = attention_mask[:, None]                      # (T,1)
+    return (token_vecs * m).sum(0) / np.clip(m.sum(), 1, None)
+
+tok_vecs = np.random.randn(6, 384)                   # 6 tokens, 2 are padding
+mask     = np.array([1,1,1,1,0,0])
+sent_vec = mean_pool(tok_vecs, mask)
+print("sentence vector shape:", sent_vec.shape)      # (384,) — padding ignored
+```
+
+```output
+sentence vector shape: (384,)
+```
+
+## Which embedding models for Bengali
+
+- **Multilingual, strong, general:** **LaBSE** (109 languages, built for cross-lingual
+  similarity), **multilingual-E5** (`intfloat/multilingual-e5-*`, excellent retrieval, uses
+  `"query:"`/`"passage:"` prefixes), **BGE-M3** (multilingual, dense + sparse + multi-vector).
+- **Bengali / Indic specific:** L3Cube Bengali SBERT, IndicSBERT (AI4Bharat).
+- **Rule:** prefer models with real Bengali coverage and **evaluate on your own Bengali pairs** —
+  English benchmark rankings do not transfer to Bengali. Cross-lingual models (LaBSE, E5) are
+  especially useful for code-mixed Bengali text.
+
+## Bengali-specific gotchas
+
+1. **Normalize text first** (ch. 2) — un-normalized variants embed inconsistently.
+2. **Watch fertility/length** (ch. 3) — long Bengali inputs may exceed the encoder's max length
+   and silently truncate the tail.
+3. **Respect model-specific prompt prefixes** — E5 wants `"query:"` / `"passage:"`.
+4. **Mean-pool over the attention mask**, not over padding.
+
+## Bengali sentence embeddings and retrieval (RUN-LOCALLY)
+
+The real retrieval demo uses `sentence-transformers` — run this on your own machine:
+
+```python
+# Real Bengali sentence embeddings + retrieval (run locally).
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("intfloat/multilingual-e5-base")   # strong multilingual
+
+docs = ["ঢাকা বাংলাদেশের রাজধানী।",
+        "পদ্মা সেতু একটি বড় অবকাঠামো।",
+        "মেশিন লার্নিং কৃত্রিম বুদ্ধিমত্তার একটি শাখা।"]
+query = "বাংলাদেশের রাজধানী কোনটি?"
+
+# E5 convention: prefix passages and queries.
+doc_emb = model.encode(["passage: " + d for d in docs], normalize_embeddings=True)
+q_emb   = model.encode("query: " + query,               normalize_embeddings=True)
+
+scores = doc_emb @ q_emb            # cosine (already normalized) = one matmul
+order  = np.argsort(scores)[::-1]
+for r in order:
+    print(f"{scores[r]:+.3f}  {docs[r]}")
+# Top hit should be the Dhaka sentence — semantic match across different wording.
+```
+
+## Two high-value competition uses
+
+### 1. The embedding baseline
+
+Embed each training text with a frozen sentence model, then train a tiny classifier (logistic
+regression / linear head) on those vectors. No fine-tuning, trains in seconds, and on small
+Bengali datasets it is often *shockingly* competitive — sometimes beating a fine-tuned LLM (fewer
+parameters to overfit, F6). Always build this baseline first (ch. 17); it sets the bar everything
+else must clear.
+
+### 2. Retrieval for RAG (ch. 12)
+
+Embed your knowledge chunks once, embed the query, return the top-$k$ by cosine. This is the "R"
+that grounds a generative answer. For retrieval over many documents, use **FAISS** locally or
+**pgvector** — which is just an efficient approximate version of the same cosine search.
+
+Cosine similarity (F8): normalize vectors, take dot products as one matrix multiply —
+$$
+\mathrm{sim}(q, d_i) = \frac{q \cdot d_i}{\|q\|\,\|d_i\|}
+$$
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# The embedding BASELINE in miniature: linear classifier on frozen embeddings.
+# (Random 'embeddings' here just to show the mechanics — swap in real ones.)
+N, d, C = 300, 32, 3
+E = np.random.randn(N, d)                              # frozen sentence embeddings
+W_true = np.random.randn(d, C); y = (E @ W_true).argmax(1)
+
+def softmax(z): z=z-z.max(-1,keepdims=True); e=np.exp(z); return e/e.sum(-1,keepdims=True)
+W = np.random.randn(d, C)*0.01; b = np.zeros(C); lr = 0.1
+for _ in range(400):
+    p = softmax(E @ W + b); p[np.arange(N), y] -= 1; p /= N
+    W -= lr*(E.T @ p); b -= lr*p.sum(0)
+print("baseline accuracy:", round(float(((E@W+b).argmax(1)==y).mean()), 3))
+# On real frozen Bengali embeddings this same 10-line baseline is your bar to beat.
+```
+
+```output
+baseline accuracy: 0.98
+```
+
+## Exercise
+
+Build `embed_and_retrieve(query, docs, model, k=3)` that (1) normalizes Bengali text
+(ch. 2), (2) encodes with correct prefixes, (3) returns the top-k docs by cosine via a
+single matmul. Then, separately, build the embedding *baseline* classifier for a
+classification task and record its score — that number is the floor your fine-tuned
+model (ch. 8–9) must beat to justify its cost.
+
+<details>
+<summary>Hint</summary>
+
+Reuse F8's vectorized `top_k`: normalize all doc embeddings once, normalize the query,
+one matmul gives every cosine score, `argsort` for the top-k. For the baseline, frozen
+embeddings + `LogisticRegression` (sklearn) is enough — keep it dumb and fast; its job
+is to set the bar, not to win.
+</details>

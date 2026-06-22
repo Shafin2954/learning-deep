@@ -1,0 +1,114 @@
+---
+course: tabular-kaggle
+chapter: 15-hyperparameter-tuning
+title: "Hyperparameter Tuning with Optuna"
+order: 15
+---
+
+## Tune efficiently — it's the smallest lever
+
+Tuning is real, but keep it in perspective: it's the *smallest* of the big levers (after
+validation, features, and ensembling). A well-tuned LightGBM beats a default one by a little;
+a great feature beats both by a lot. Tune efficiently, on a trustworthy CV, and don't let it
+eat the month.
+
+## Search strategies
+
+- **Grid search** — try every combination on a grid. Exhaustive but explodes combinatorially;
+  avoid for more than 2–3 parameters.
+- **Random search** — sample random combinations. Usually beats grid for the same budget, because
+  most parameters don't matter equally and random sampling covers the important ones better.
+- **Bayesian optimization** — model the score as a function of the hyperparameters and propose
+  promising next trials. Sample-efficient; the right default for expensive models. **Optuna** is
+  the standard library (default sampler: **TPE**, Tree-structured Parzen Estimator).
+
+## What to tune for boosting (and in what order)
+
+1. **learning\_rate + n\_estimators with early stopping** — set a small LR, large n\_estimators,
+   let early stopping pick the count. Often you fix LR and only tune the rest, then do a final
+   low-LR / high-rounds run at the end.
+2. **Tree complexity** — `num_leaves`/`max_depth`, `min_child_samples`/`min_data_in_leaf`. The
+   biggest accuracy/overfit dial after LR.
+3. **Randomness & regularization** — `subsample`/`bagging_fraction`,
+   `colsample_bytree`/`feature_fraction`, `reg_alpha`/`reg_lambda`.
+
+## Optuna template (run locally)
+
+```python
+# Optuna tuning a LightGBM on CV with early stopping + pruning (run locally).
+import numpy as np
+# import optuna, lightgbm as lgb
+# from sklearn.model_selection import StratifiedKFold
+
+def objective(trial, X, y):
+    import lightgbm as lgb
+    from sklearn.model_selection import StratifiedKFold
+    params = {
+        "objective": "binary", "metric": "auc",
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+        "num_leaves":    trial.suggest_int("num_leaves", 16, 256, log=True),
+        "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
+        "subsample":     trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        "reg_lambda":    trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
+        "n_estimators":  5000, "verbose": -1,
+    }
+    skf = StratifiedKFold(5, shuffle=True, random_state=42)     # FIXED seed -> comparable trials
+    scores = []
+    for tr, va in skf.split(X, y):
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X[tr], y[tr], eval_set=[(X[va], y[va])],
+              callbacks=[lgb.early_stopping(150, verbose=False)])
+        from sklearn.metrics import roc_auc_score
+        scores.append(roc_auc_score(y[va], m.predict_proba(X[va])[:, 1]))
+    return np.mean(scores)                                      # CV metric -> Optuna maximizes it
+
+# study = optuna.create_study(direction="maximize",
+#             pruner=optuna.pruners.MedianPruner())
+# study.optimize(lambda t: objective(t, X, y), n_trials=100)
+# print(study.best_value, study.best_params)
+print("Objective returns the CV metric. Optuna searches; pruning kills bad trials early.")
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# Random search vs grid on a toy 2-D objective — random covers the important dim better.
+def score(lr, leaves):                         # toy: best near lr~0.03, leaves~64
+    return -((np.log10(lr) + 1.5)**2 + ((leaves - 64)/64)**2) + np.random.normal(0, 0.02)
+
+# grid: 4x4 = 16 evals
+grid = [(lr, lv) for lr in [0.005,0.02,0.05,0.2] for lv in [16,32,64,128]]
+grid_best = max(score(lr, lv) for lr, lv in grid)
+
+# random: 16 evals sampled from sensible ranges
+rng = np.random.default_rng(0)
+rand_best = max(score(10**rng.uniform(-2.5,-0.5), rng.integers(16,256)) for _ in range(16))
+print(f"grid best   (16 evals): {grid_best:.3f}")
+print(f"random best (16 evals): {rand_best:.3f}")
+# With the same budget, random search often matches or beats grid — and Bayesian (Optuna)
+# beats both by spending evals where the score is promising.
+```
+
+```output
+grid best   (16 evals): -0.021
+random best (16 evals): -0.598
+```
+
+## Don't over-tune
+
+With enough trials you can overfit even the CV — the chosen hyperparameters fit the validation
+folds' noise. Defenses: limit trials (50–200 is usually plenty), prefer a *region* of good
+values over the single best point, and remember that the gain from tuning is small relative to
+features/ensembling. If a tuning sweep gives a tiny CV bump within fold-noise, it's not real
+— move on.
+
+## Exercise
+
+Write an Optuna `objective` for your model that returns the **CV score on the competition metric**
+(ch. 12, 14) with early stopping inside folds and a fixed CV seed. Run ~50–100 trials with a
+pruner. Then sanity-check for over-tuning: is the best CV meaningfully above the default beyond
+fold-noise? Pick a *robust* configuration (a good region, not a razor-thin best point), and note
+how the tuning gain compares to what one good feature (ch. 9) bought you.

@@ -1,0 +1,131 @@
+---
+course: tabular-kaggle
+chapter: 09-feature-engineering
+title: "Feature Engineering"
+order: 9
+---
+
+## The single biggest lever
+
+Feature engineering — creating new columns that expose signal — is the **single biggest lever**
+in tabular Kaggle, above model choice and tuning. The boosting libraries are commodities;
+everyone has the same LightGBM. The edge comes from features they can't derive on their own.
+
+## Numeric transforms
+
+- **Scaling/standardization** — center and unit-scale (needed by linear/kNN/NN; irrelevant to
+  trees). Log / `log1p` — tames right-skewed positive features (income, counts).
+- **Power transforms (Box-Cox, Yeo-Johnson)** — normalize automatically.
+- **Rank/quantile transform** — robust to outliers and scale.
+- **Binning** — bucket a continuous feature (can help trees find thresholds; can also lose info).
+
+## Interactions and ratios
+
+Products, differences, and especially **ratios** of features often encode the real relationship
+(price per square foot, debt-to-income). Trees can split on each feature but can't easily
+compute $a/b$; handing it the ratio is real signal. Domain knowledge shines here.
+
+## Aggregation / groupby features — the workhorse
+
+Group by a categorical (or id) and compute stats (mean, std, count, min, max) of another column,
+then map back to each row: "average transaction amount per customer," "number of events per user."
+These encode relational structure that a single row can't see, and they're frequently the
+highest-signal features in a competition.
+
+## Datetime features
+
+From a timestamp: year/month/day/dayofweek/hour, is\_weekend, is\_holiday, and
+**time-since/until** events. **Cyclical encoding** (sin/cos of hour or month) so that 23:00
+and 00:00 are close and December and January are neighbors. For time series, **lag features**
+and **rolling-window stats** are central — but only use the past (temporal leakage, ch. 13).
+
+## Missing values
+
+**Impute** (mean/median/mode, a sentinel, or model-based) *and* add a **missing-indicator**
+column (`was_missing`), because missingness is often itself predictive (ch. 8). For
+XGBoost/LightGBM you can leave NaNs in — they learn a default direction. Fit imputers *inside*
+the CV fold (F15).
+
+## The discipline that makes features safe
+
+Any feature that uses the **target** (target encoding, target-based aggregations) must be
+computed in a **leak-free** way — cross-fold, never using a row's own target (ch. 10, F15).
+Any feature fit on data (scalers, encoders, imputers, aggregations over the whole set) must be
+fit **inside the CV fold** on training rows only.
+
+```python
+import numpy as np, pandas as pd
+np.random.seed(0)
+
+df = pd.DataFrame({
+    "user":   np.random.randint(0, 50, 1000),       # an id to group by
+    "amount": np.random.exponential(100, 1000),     # skewed -> log
+    "ts":     pd.to_datetime("2024-01-01") + pd.to_timedelta(np.random.randint(0, 365*24, 1000), "h"),
+})
+
+# 1) skew fix
+df["amount_log"] = np.log1p(df["amount"])
+
+# 2) groupby aggregation features (the workhorse)
+g = df.groupby("user")["amount"]
+df["user_amount_mean"] = df["user"].map(g.mean())
+df["user_amount_std"]  = df["user"].map(g.std())
+df["user_txn_count"]   = df["user"].map(g.count())
+df["amount_vs_user_mean"] = df["amount"] / df["user_amount_mean"]   # ratio to the group
+
+# 3) datetime features
+df["hour"]      = df["ts"].dt.hour
+df["dayofweek"] = df["ts"].dt.dayofweek
+df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
+# cyclical encoding so 23h and 0h are neighbors
+df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24)
+df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
+
+print(df[["amount_log", "user_amount_mean", "amount_vs_user_mean",
+          "is_weekend", "hour_sin"]].head(3).round(3))
+print("\nNOTE: groupby stats over the WHOLE set leak a little if the group's target")
+print("is involved. For TARGET-based aggregations, use K-fold encoding (ch. 10).")
+```
+
+```output
+   amount_log  user_amount_mean  amount_vs_user_mean  is_weekend  hour_sin
+0       4.315           149.046                0.495           0    -0.707
+1       5.006           126.181                1.175           0    -0.966
+2       5.768           111.126                2.869           0    -0.866
+
+NOTE: groupby stats over the WHOLE set leak a little if the group's target
+is involved. For TARGET-based aggregations, use K-fold encoding (ch. 10).
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# Why groupby features carry signal: the group mean can be far more predictive than the raw row.
+N = 600
+key = np.random.randint(0, 5, N)                    # a categorical id
+val = np.random.randn(N) + key                       # value depends on the group
+y   = key + np.random.randn(N) * 0.3                  # target depends on the group
+
+# raw value vs the group-mean feature
+grp_mean = {k: val[key == k].mean() for k in np.unique(key)}
+feat = np.array([grp_mean[k] for k in key])
+print("corr(raw value, target)        :", round(np.corrcoef(val,  y)[0,1], 3))
+print("corr(groupby-mean feature, y)  :", round(np.corrcoef(feat, y)[0,1], 3))
+# The aggregated feature is far more aligned with the target than the noisy raw value.
+# This is why "mean of X per group" features so often top the importance charts.
+```
+
+```output
+corr(raw value, target)        : 0.801
+corr(groupby-mean feature, y)  : 0.979
+```
+
+## Exercise
+
+For a tabular dataset, engineer at least: one log/transform feature, three groupby-aggregation
+features (mean/std/count by a key), one ratio/interaction feature, and (if there's a timestamp)
+datetime + cyclical features + one missing-indicator. Add them to a LightGBM in 5-fold CV
+(ch. 12) and check the CV gain. Critically: write next to each feature whether it could leak,
+and how you ensured it didn't (fit inside the fold; target-based ones use ch. 10's scheme).

@@ -1,0 +1,174 @@
+---
+course: bengali-llm
+chapter: 11-prompting-bengali
+title: "Prompting Bengali LLMs"
+order: 11
+---
+
+## Prompting is your cheapest lever
+
+Prompting is your cheapest lever (ch. 8) and, for some tasks, enough to win. But
+Bengali prompting has its own failure modes and its own tricks. This chapter is how to
+get reliable behavior out of a Bengali (or multilingual) LLM without touching the
+weights.
+
+## Prompt structure: roles and templates
+
+Instruction-tuned models expect roles (system / user / assistant) and special tokens;
+build prompts with the model's chat template (ch. 10), not raw strings. The **system
+message** sets behavior ("You are a Bengali assistant; answer only in Bengali; output
+JSON"), the **user message** carries the task. Getting the template right is half of
+getting good outputs.
+
+## Zero-shot vs few-shot
+
+Zero-shot: just describe the task. Few-shot: include a few worked examples in the prompt
+so the model infers the pattern (in-context learning). For Bengali, few-shot is often a
+big win because it (a) pins the output format, (b) demonstrates the label space, and
+(c) anchors the model in Bengali. Costs: examples eat context, and Bengali's high
+fertility (ch. 3) means each example is token-expensive — budget accordingly. Choose
+examples that are diverse and cover the hard/edge cases.
+
+```python
+# Build a structured-output classification prompt (run locally to call a model).
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("hishab/titulm-1b")
+
+def make_prompt(text, examples):
+    sys = ("আপনি একটি বাংলা সেন্টিমেন্ট শ্রেণিবিন্যাসকারী। "
+           "শুধু একটি শব্দে উত্তর দিন: ইতিবাচক, নেতিবাচক, অথবা নিরপেক্ষ।")
+    shots = "\n".join(f"বাক্য: {t}\nউত্তর: {l}" for t, l in examples)   # few-shot
+    user = f"{shots}\nবাক্য: {text}\nউত্তর:"
+    return tok.apply_chat_template(
+        [{"role":"system","content":sys}, {"role":"user","content":user}],
+        tokenize=False, add_generation_prompt=True)
+
+examples = [("সিনেমাটি অসাধারণ ছিল।", "ইতিবাচক"),
+            ("খাবারটি একদম বাজে।", "নেতিবাচক")]
+print(make_prompt("আবহাওয়া আজ স্বাভাবিক।", examples)[:400])
+```
+
+## English-pivot: a Bengali-specific superpower
+
+A robust empirical finding (e.g., the BEnQA bilingual benchmark): multilingual models
+often **reason better in English** than in Bengali, because most of their pretraining and
+chain-of-thought data is English. So for reasoning/QA tasks, pivoting through English can
+lift accuracy:
+
+- *Translate-then-solve:* translate the Bengali question to English, reason/answer in
+  English, translate the answer back to Bengali.
+- *Cross-lingual prompting:* keep the Bengali input but instruct the model to think in
+  English and respond in Bengali.
+
+Don't assume it helps — **A/B it on your CV** (F15). When it works, it's free accuracy;
+for surface tasks (sentiment) it usually doesn't matter, for multi-step reasoning it
+often does.
+
+## Chain-of-thought (CoT)
+
+For reasoning tasks, asking the model to "think step by step" before answering improves
+accuracy — but only for genuinely reasoning-heavy tasks, and it costs tokens and
+complicates parsing. Combine with English-pivot for Bengali reasoning. For
+classification, CoT is usually unnecessary overhead.
+
+## Structured output: make parsing reliable
+
+Competitions need a clean answer (a label, a span, JSON). Three layers of defense:
+
+1. **Instruct the format explicitly** ("Respond ONLY with one of: positive/negative/
+   neutral" or "Output JSON: {label, score}").
+2. **Few-shot the format** so the model sees exactly what's wanted.
+3. **Parse defensively** — real LLM output wraps the answer in chatter; extract with a
+   regex/JSON finder and have a fallback for malformed output (verified: pulling
+   `{...}` out of mixed Bengali text and parsing it). Never assume the model obeyed.
+
+Constrained decoding / grammars can *guarantee* valid output if your stack supports it.
+
+```python
+# Parse structured output defensively — LLMs wrap answers in chatter.
+import json, re
+def parse_json_answer(raw, fallback=None):
+    m = re.search(r"\{.*\}", raw, re.S)            # find the JSON object
+    if not m:
+        return fallback
+    try:
+        return json.loads(m.group())
+    except json.JSONDecodeError:
+        return fallback
+
+raw = 'ঠিক আছে! {"label": "positive", "score": 0.9} আশা করি সাহায্য হলো।'
+print(parse_json_answer(raw))      # {'label': 'positive', 'score': 0.9}
+print(parse_json_answer("garbage", fallback={"label": "neutral"}))
+```
+
+```output
+{'label': 'positive', 'score': 0.9}
+{'label': 'neutral'}
+```
+
+## Self-consistency: cheap accuracy from sampling
+
+For tasks with a discrete answer, sample the model several times (temperature $> 0$,
+F13) and take the **majority vote**. Different reasoning paths that converge on the same
+answer are more trustworthy. It's a mini-ensemble (ch. 16) with one model, paid for in
+inference time — often a few points of accuracy for no training.
+
+### Why majority vote works
+
+If each of $n$ independent samples is correct with probability $p > 0.5$, the probability
+the majority vote is correct is
+
+$$
+P(\text{majority correct}) = \sum_{k=\lceil n/2 \rceil}^{n} \binom{n}{k} p^k (1-p)^{n-k}
+$$
+
+which increases toward 1 as $n$ grows — as long as the individual samples are better than
+random.
+
+## Bengali robustness checks
+
+Normalize the input (ch. 2) before prompting; verify the model actually answers *in
+Bengali* when required (multilingual models drift to English — enforce in the system
+prompt and check); watch for code-mixing in outputs; and test prompts on the messy real
+distribution, not clean textbook Bengali.
+
+## Try it Yourself
+
+```python
+from collections import Counter
+
+# Self-consistency: majority vote over several sampled answers = a 1-model ensemble.
+# (Mock samples here; in practice these come from model.generate(temperature=0.7) x N.)
+samples = ["ইতিবাচক", "ইতিবাচক", "নিরপেক্ষ", "ইতিবাচক", "নেতিবাচক"]
+
+def self_consistency(samples):
+    counts = Counter(samples)
+    answer, votes = counts.most_common(1)[0]
+    return answer, votes / len(samples)          # answer + agreement (confidence)
+
+ans, conf = self_consistency(samples)
+print(f"majority answer: {ans}  (agreement {conf:.0%})")
+# Low agreement is a useful signal: those are the examples to inspect or route to a
+# stronger model. Sampling 5x and voting often beats a single greedy decode (F13).
+```
+
+```output
+majority answer: ইতিবাচক  (agreement 60%)
+```
+
+## Exercise
+
+Write three prompt variants for a plausible task (zero-shot, few-shot, and English-pivot)
+plus a robust parser, and define how you'd compare them on your CV (F14): same examples,
+same metric, measure which wins beyond noise. The output of this exercise — the winning
+prompt + parser — *is* a submittable solution if it clears your bar (ch. 8), before you
+spend a single GPU-hour on fine-tuning.
+
+<details>
+<summary>Hint</summary>
+
+Zero-shot: system message describes the task and output format; user message is the input only.
+Few-shot: prepend 2–4 `(input, label)` pairs in the user message before the real input.
+English-pivot: add an instruction like "Think in English, respond in Bengali" in the system
+message, or add a translation step in the user turn. Parser: use `re.search(r"(ইতিবাচক|নেতিবাচক|নিরপেক্ষ)", raw)` with a fallback; measure by running all three on the same CV fold with the same metric.
+</details>

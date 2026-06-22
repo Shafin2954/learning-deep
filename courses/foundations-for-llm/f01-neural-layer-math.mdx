@@ -1,0 +1,176 @@
+---
+course: foundations-for-llm
+chapter: f01-neural-layer-math
+title: "The Math of a Neural Layer"
+order: 1
+---
+
+## What an LLM actually computes
+
+You know linear algebra and probability. This chapter connects them to what a neural network —
+and an LLM — literally computes, so nothing later feels like magic. Three objects do almost all
+the work: the **linear layer**, the **softmax**, and the **cross-entropy loss**. An LLM is
+mostly these, repeated.
+
+## The linear layer is a matrix multiply
+
+A linear (dense / fully-connected) layer maps an input vector $x$ of size $d_{\text{in}}$ to an
+output of size $d_{\text{out}}$:
+
+$$
+y = xW + b, \qquad W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}},\quad b \in \mathbb{R}^{d_{\text{out}}}
+$$
+
+For a whole batch $X$ of shape $(N, d_{\text{in}})$ it's $Y = XW + b$, shape $(N, d_{\text{out}})$.
+That's it. When you hear "7 billion parameters," the overwhelming majority are entries of the $W$
+matrices in linear layers. **Attention itself is built from linear layers and matmuls** (you build
+it in F10), so being fluent with `X @ W` *is* being fluent with the core of an LLM. Get comfortable
+reading shapes — shape bugs are most deep-learning bugs.
+
+## Softmax turns scores into probabilities
+
+The final linear layer outputs raw scores called **logits**, one per class (for an LLM, one per
+vocabulary token). Softmax maps a logit vector $z$ to a probability distribution:
+
+$$
+\mathrm{softmax}(z)_i = \frac{e^{z_i}}{\sum_j e^{z_j}}
+$$
+
+The outputs are positive and sum to 1. Two properties to carry forever: it is **shift-invariant**
+(adding a constant to every logit changes nothing) and **monotonic** (bigger logit → bigger
+probability).
+
+### Numerical stability: the log-sum-exp trick
+
+$e^{z}$ overflows for moderately large $z$. Because softmax is shift-invariant, subtract the max
+logit first: $z \leftarrow z - \max(z)$. Now the largest exponent is $e^{0}=1$ — no overflow,
+identical result. The same idea defines **log-sum-exp**, which appears whenever you compute
+log-probabilities (constantly, in LLMs):
+
+$$
+\mathrm{LSE}(z) = \max(z) + \log \sum_j e^{\,z_j - \max(z)}
+$$
+
+## Cross-entropy is negative log-likelihood
+
+For a true class $y$, the cross-entropy loss is
+
+$$
+L = -\log p_y, \qquad p = \mathrm{softmax}(z)
+$$
+
+If the model puts probability 1 on the right token, loss is 0; as $p_y \to 0$, loss $\to \infty$.
+Averaged over a sequence of next-token predictions, this *is* the loss an LLM trains on. (F3
+derives why minimizing it equals maximum likelihood; F13 connects it to perplexity.)
+
+## The gradient you'll memorize
+
+The gradient of cross-entropy with respect to the logits is
+
+$$
+\boxed{\;\frac{\partial L}{\partial z} = \mathrm{softmax}(z) - \mathrm{onehot}(y)\;}
+$$
+
+"Predicted distribution minus the truth." This clean expression is why softmax and cross-entropy
+are always paired — the messy $\exp$/$\log$ derivatives cancel. (Derived in full in F2.) Every
+backward pass through an LLM's output layer starts here.
+
+### The whole forward pass in code
+
+A classifier's forward pass — and an LLM's per-token step — is `linear → softmax → cross-entropy`:
+
+```python
+import numpy as np
+
+def softmax(z):                         # stable: shift by row max
+    z = z - z.max(axis=-1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=-1, keepdims=True)
+
+def cross_entropy(logits, y):           # mean negative log-likelihood
+    p = softmax(logits)
+    return -np.log(p[np.arange(len(y)), y]).mean()
+
+np.random.seed(0)
+X = np.random.randn(3, 4)               # batch of 3, d_in = 4
+W = np.random.randn(4, 5); b = np.zeros(5)   # -> d_out = 5 (5 classes)
+logits = X @ W + b
+probs  = softmax(logits)
+y = np.array([0, 2, 4])
+
+print("logits row 0 :", logits[0].round(2))
+print("probs  row 0 :", probs[0].round(3), "sum =", probs[0].sum())
+print("loss         :", round(cross_entropy(logits, y), 4))
+
+grad = probs.copy(); grad[np.arange(3), y] -= 1; grad /= 3   # softmax - onehot
+print("dL/dlogits[0]:", grad[0].round(3))
+```
+
+```output
+logits row 0 : [ 1.69  3.05  5.96 -1.51  3.79]
+probs  row 0 : [0.012 0.046 0.845 0.    0.097] sum = 1.0
+loss         : 2.4397
+dL/dlogits[0]: [-0.329  0.015  0.282  0.     0.032]
+```
+
+The whole classifier head, in six lines.
+
+## Try it Yourself
+
+```python
+import numpy as np
+def softmax(z):
+    z = z - z.max(axis=-1, keepdims=True); e = np.exp(z); return e / e.sum(axis=-1, keepdims=True)
+
+# 1) Why max-subtraction matters: huge logits overflow naively.
+z = np.array([1000.0, 1001.0, 1002.0])
+naive = np.exp(z) / np.exp(z).sum()
+print("naive  :", naive)                  # nan (overflow)
+print("stable :", softmax(z).round(4))    # correct
+
+# 2) Shift-invariance: add 50 to every logit -> identical probabilities.
+print("shifted:", softmax(z + 50).round(4))
+
+# 3) Temperature: divide logits by T. T<1 sharpens, T>1 flattens.
+#    This is exactly the `temperature` knob in LLM generation (Bengali ch. 11).
+for T in [0.5, 1.0, 2.0]:
+    print(f"T={T}:", softmax(z / T).round(3))
+```
+
+```output
+naive  : [nan nan nan]
+stable : [0.09   0.2447 0.6652]
+shifted: [0.09   0.2447 0.6652]
+T=0.5: [0.016 0.117 0.867]
+T=1.0: [0.09  0.245 0.665]
+T=2.0: [0.186 0.307 0.506]
+```
+
+The temperature line is not a toy — it's the same parameter you set when sampling from a Bengali
+LLM at inference.
+
+## Exercise
+
+Implement `log_softmax(z)` using the log-sum-exp trick (do **not** call `log(softmax(z))` — that's
+unstable), then write `nll(logits, y)` with it and verify it matches `cross_entropy` above.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+def log_softmax(z):
+    m = z.max(axis=-1, keepdims=True)
+    return z - m - np.log(np.exp(z - m).sum(axis=-1, keepdims=True))
+
+def nll(logits, y):
+    return -log_softmax(logits)[np.arange(len(y)), y].mean()
+
+np.random.seed(0)
+logits = np.random.randn(3, 5); y = np.array([0, 2, 4])
+print(nll(logits, y))   # equals cross_entropy(logits, y)
+```
+
+`log_softmax` never forms the tiny probability before logging, so it stays accurate even when one
+logit dominates — the normal case for a confident LLM.
+</details>

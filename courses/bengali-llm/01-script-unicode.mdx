@@ -1,0 +1,159 @@
+---
+course: bengali-llm
+chapter: 01-script-unicode
+title: "The Bengali Script & Unicode"
+order: 1
+---
+
+## Before any model, there is the text
+
+Bengali text is not what your code thinks it is. Most Bengali NLP bugs are born here,
+silently, and show up later as a mysteriously low score. So we start at the bottom.
+
+Bengali is an abugida (alphasyllabary), not an alphabet. Each consonant carries an
+*inherent vowel* (অ, the "ô" sound). You don't write the vowel; it's assumed. To change
+or remove it, you attach marks. This single fact explains most of the script's behavior.
+
+## A character you see is not a character Python counts
+
+What a human reads as one unit is a *grapheme cluster*. Python's `len()` counts
+*Unicode code points*, which can be several per cluster. Take ক্ষমা ("forgiveness"):
+
+- Humans see 2 units: ক্ষ and মা.
+- Python sees 5 code points: ক + ্ + ষ + ম + া.
+
+The ্ (U+09CD) is *virama* / *hasanta* — the "kill the inherent vowel and join" mark.
+ক + ্ + ষ fuse into the conjunct ক্ষ (kṣa). Conjuncts (যুক্তাক্ষর) are the defining
+feature of the script and the reason naive character-level processing, truncation, and
+"count the letters" logic all break. If you slice a string by code point, you can cut a
+grapheme in half and produce garbage.
+
+```python
+import regex          # the third-party `regex` module — supports \X. NOT stdlib `re`.
+import unicodedata
+
+word = "ক্ষমা"   # "forgiveness"
+
+print("string         :", word)
+print("len() codepoints:", len(word))                         # 5
+print("code points    :", [f"U+{ord(c):04X}" for c in word])
+print("names          :", [unicodedata.name(c) for c in word])
+
+# What a human actually sees: grapheme clusters via \X
+graphemes = regex.findall(r"\X", word)
+print("graphemes      :", graphemes, "->", len(graphemes))    # ['ক্ষ', 'মা'] -> 2
+
+# Same look, different bytes:
+a = "নো"                              # single o-kar  (U+09CB)
+b = "ন" + "ে" + "া"         # e-kar + aa-kar (U+09C7 U+09BE)
+print("\nidentical on screen:", a, b, "| a == b ?", a == b)   # False!
+print("a:", [f"U+{ord(c):04X}" for c in a])
+print("b:", [f"U+{ord(c):04X}" for c in b])
+```
+
+```output
+string         : ক্ষমা
+len() codepoints: 5
+code points    : ['U+0995', 'U+09CD', 'U+09B7', 'U+09AE', 'U+09BE']
+names          : ['BENGALI LETTER KA', 'BENGALI SIGN VIRAMA', 'BENGALI LETTER SSA', 'BENGALI LETTER MA', 'BENGALI VOWEL SIGN AA']
+graphemes      : ['ক্ষ', 'মা'] -> 2
+
+identical on screen: নো নো | a == b ? False
+a: ['U+09A8', 'U+09CB']
+b: ['U+09A8', 'U+09C7', 'U+09BE']
+```
+
+`len("ক্ষমা") == 5`, but the word has 2 letters — and two visually identical strings
+can be unequal.
+
+## Vowel signs attach to consonants
+
+Independent vowels (অ আ ই ঈ উ...) are used at the start of a word. Everywhere else, a
+vowel is a *sign* attached to a consonant: ক + া → কা, ক + ি → কি. The sign can render
+to the *left* of the consonant (ি) even though it comes *after* it in memory. Visual
+order $\neq$ logical order. Never reason about Bengali from how it looks.
+
+## The same-looking text can be different bytes
+
+The "o-kar" ো can be stored as one code point (U+09CB) or as two (e-kar U+09C7 +
+aa-kar U+09BE). They render identically and read identically — but `==` says they're
+different, your tokenizer splits them differently, and your model sees two different
+inputs. Multiply this across thousands of training rows and your signal blurs. The fix is
+*normalization* (next chapter), but you can't fix what you can't see, so first: learn to
+look at the code points.
+
+Two invisible troublemakers also live here:
+
+- **ZWNJ** (U+200C, zero-width non-joiner) and **ZWJ** (U+200D, zero-width joiner)
+  control whether a conjunct *displays* as joined or split. They carry no sound, take no
+  space, and quietly differ between data sources.
+- The **nukta** (U+09BC) turns ড/ঢ/য into ড়/ঢ়/য় — and those can each be either a
+  single precomposed code point *or* base + nukta. Same letter, two encodings.
+
+The Bengali block is U+0980–U+09FF. Digits are ০–৯ (U+09E6–U+09EF) — your model will
+not treat "৫" and "5" as the same number unless you make it. Sentence end is the *daṛi*
+"।" (U+0964), not a period.
+
+### The Unicode block layout
+
+$$
+\underbrace{\text{U+0980–U+09FF}}_{\text{Bengali block}}
+\quad\supset\quad
+\underbrace{\text{U+09E6–U+09EF}}_{\text{Bengali digits ০–৯}}
+$$
+
+The key rule: **operate on graphemes, normalize early, and inspect code points when
+anything looks "fine but wrong."** This is the cheapest score you'll ever buy.
+
+## Try it Yourself
+
+```python
+import regex, unicodedata
+
+# Try your own words. Predict the grapheme count BEFORE running.
+for word in ["বাংলা", "জ্ঞান", "স্ত্রী", "কম্পিউটার", "৫টি"]:
+    cps = len(word)
+    graphemes = regex.findall(r"\X", word)
+    print(f"{word:12s} | codepoints={cps:2d} | graphemes={len(graphemes)} {graphemes}")
+
+# Inspect any character's identity:
+ch = "ৎ"          # try changing this
+print("\n", ch, "=", unicodedata.name(ch), f"(U+{ord(ch):04X})")
+```
+
+```output
+বাংলা        | codepoints= 5 | graphemes=2 ['বাং', 'লা']
+জ্ঞান        | codepoints= 5 | graphemes=2 ['জ্ঞা', 'ন']
+স্ত্রী       | codepoints= 6 | graphemes=1 ['স্ত্রী']
+কম্পিউটার    | codepoints= 9 | graphemes=5 ['ক', 'ম্পি', 'উ', 'টা', 'র']
+৫টি          | codepoints= 3 | graphemes=2 ['৫', 'টি']
+
+ ৎ = BENGALI LETTER KHANDA TA (U+09CE)
+```
+
+Notice জ্ঞান: জ + ্ + ঞ forms জ্ঞ (a conjunct whose sound, "gg/ggæ", isn't obvious from
+its parts) — a perfect example of why you can't decompose meaning from shape.
+
+## Exercise
+
+Write `safe_truncate(text, n)` that returns the first `n` **grapheme clusters** of a
+Bengali string (not code points), so you never cut a conjunct or detach a vowel sign.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import regex
+
+def safe_truncate(text, n):
+    graphemes = regex.findall(r"\X", text)
+    return "".join(graphemes[:n])
+
+print(safe_truncate("কম্পিউটার বিজ্ঞান", 5))   # keeps clusters whole
+# Compare the naive, broken version:
+print("কম্পিউটার বিজ্ঞান"[:5])                 # may end mid-conjunct
+```
+
+Why it matters: truncating model inputs/outputs, building char features, or displaying
+previews — all must respect grapheme boundaries.
+</details>

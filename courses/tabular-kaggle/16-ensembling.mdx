@@ -1,0 +1,128 @@
+---
+course: tabular-kaggle
+chapter: 16-ensembling
+title: "Ensembling: Blending & Stacking"
+order: 16
+---
+
+## How tabular competitions are finished
+
+A blend of **diverse, individually-decent models** beats the best single model, because their
+errors partly cancel. Diversity is the fuel: members must make *different* errors, or averaging
+does nothing. Engineer diversity by varying: the **model family** (LightGBM + XGBoost + CatBoost
++ a linear model); the **features** (different feature sets, encodings); the **seeds and folds**;
+and the **hyperparameters**. A weak-but-different model can still improve a blend.
+
+## Blending methods
+
+- **Simple average** — mean of predictions. Shockingly strong; the default.
+- **Weighted average** — weight better models more; find weights by hill-climbing the CV metric.
+- **Rank average** — average the *ranks* of predictions, not the values. Robust when models are
+  on different scales or miscalibrated; a staple for AUC metrics.
+
+## Stacking
+
+Train a small **meta-model** on the base models' **out-of-fold predictions** to learn how to
+weight and combine them — including nonlinear interactions a fixed average can't capture. The
+meta-model is usually simple (logistic/ridge regression, or a shallow LightGBM) to avoid
+overfitting.
+
+**The one rule that makes stacking safe:** the meta-model must be trained on **out-of-fold**
+predictions — each base model predicts a row only when that row was *not* in its training fold.
+If you train the meta-model on in-sample predictions, you leak massively. This is the single most
+common way stacking goes wrong.
+
+## Stacking vs simple average
+
+```python
+import numpy as np
+np.random.seed(0)
+
+def auc(s, y):
+    o = np.argsort(s); r = np.empty_like(o, float); r[o] = np.arange(len(s)) + 1
+    p = y == 1; return (r[p].sum() - p.sum()*(p.sum()+1)/2) / (p.sum()*(~p).sum())
+
+# Three base models' OOF predictions (out-of-fold, so leak-safe to stack on).
+oof = np.column_stack([np.random.rand(500) for _ in range(3)])
+y = (0.5*oof[:,0] + 0.3*oof[:,1] + 0.2*oof[:,2] + np.random.normal(0, 0.05, 500) > 0.5).astype(int)
+
+# 1) simple average
+print("simple average AUC :", round(auc(oof.mean(1), y), 3))
+
+# 2) stacking: a logistic meta-model trained on the OOF predictions
+Xb = np.c_[np.ones(500), oof]; w = np.zeros(4)
+for _ in range(1000):
+    p = 1/(1 + np.exp(-Xb @ w)); w -= 0.3 * Xb.T @ (p - y) / 500
+print("stacked (meta) AUC :", round(auc(1/(1+np.exp(-Xb@w)), y), 3), "<- learns the weights")
+print("learned meta-weights:", w[1:].round(2), "(~ the true 0.5/0.3/0.2 mix)")
+```
+
+```output
+simple average AUC : 0.947
+stacked (meta) AUC : 0.984 <- learns the weights
+learned meta-weights: [6.58 3.76 2.24] (~ the true 0.5/0.3/0.2 mix)
+```
+
+## Rank averaging
+
+```python
+import numpy as np
+# Rank averaging — robust when models are on different scales / miscalibrated.
+def rank_average(*preds):
+    ranks = [np.argsort(np.argsort(p)) for p in preds]
+    return np.mean(ranks, axis=0)
+a = np.array([0.9, 0.1, 0.5, 0.3]); b = np.array([40, 5, 95, 1])   # very different scales
+print("rank-avg order:", np.argsort(rank_average(a, b))[::-1])
+# Works despite the scale mismatch — that's why rank-blends are a Kaggle staple.
+```
+
+```output
+rank-avg order: [2 0 3 1]
+```
+
+## The practical recipe
+
+1. Build several diverse base models, each with a **trustworthy, identical CV** (same folds,
+   same seed — ch. 12). Save each one's **OOF predictions** and its **test predictions**
+   (averaged over folds).
+2. Start with a **simple average** of the OOF predictions; measure the CV metric.
+3. Try **rank/weighted average** (hill-climb weights on OOF) and **stacking** (meta-model on OOF).
+   Keep whichever wins on CV beyond noise.
+4. Apply the same combination to the saved **test predictions** for submission.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(1)
+def auc(s, y):
+    o=np.argsort(s); r=np.empty_like(o,float); r[o]=np.arange(len(s))+1
+    p=y==1; return (r[p].sum()-p.sum()*(p.sum()+1)/2)/(p.sum()*(~p).sum())
+
+# Hill-climbing weighted blend on OOF — greedily improve the CV metric.
+oof = [np.random.rand(600) for _ in range(4)]
+y = (0.4*oof[0] + 0.3*oof[1] + 0.2*oof[2] + 0.1*oof[3] + np.random.normal(0,0.05,600) > 0.5).astype(int)
+
+w = np.zeros(4); best = 0
+for _ in range(2000):                            # random-restart hill climbing
+    cand = w + np.random.normal(0, 0.1, 4); cand = np.clip(cand, 0, None)
+    if cand.sum() == 0: continue
+    score = auc(sum(ci*oi for ci, oi in zip(cand/cand.sum(), oof)), y)
+    if score > best: best, w = score, cand/cand.sum()
+print("best blend weights:", w.round(2))
+print("blend AUC:", round(best, 3), "| best single:", round(max(auc(o, y) for o in oof), 3))
+# The CV-optimized blend beats every single model — finish your competition here.
+```
+
+```output
+best blend weights: [0.37 0.31 0.23 0.09]
+blend AUC: 0.975 | best single: 0.82
+```
+
+## Exercise
+
+Build 3–4 diverse base models (vary library and features) under one shared CV, saving each one's
+**OOF** and averaged **test** predictions. Then compare, on CV: best single model, simple average,
+rank average, hill-climbed weighted average, and a logistic/ridge **stack** on the OOF. Pick the
+winner by CV (beyond fold-noise) and apply it to the test predictions. Verify your OOF discipline
+is airtight — that's what keeps the stack from leaking.

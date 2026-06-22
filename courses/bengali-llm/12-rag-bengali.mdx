@@ -1,0 +1,192 @@
+---
+course: bengali-llm
+chapter: 12-rag-bengali
+title: "RAG for Bengali"
+order: 12
+---
+
+## RAG: retrieval-augmented generation
+
+RAG keeps the model frozen and feeds it *retrieved* text so it answers from real content
+instead of hallucinating. Use it when the task needs knowledge/context the model doesn't
+hold (ch. 8). The pipeline is: **chunk → embed → index → retrieve → rerank → generate →
+(evaluate)**. Every stage has a Bengali twist.
+
+## Chunking: why Bengali makes it harder
+
+You split documents into passages small enough to embed and fit the prompt. Two
+Bengali-specific cautions: (1) **fertility** (ch. 3) means a chunk of $N$ Bengali words
+is far more tokens than $N$ English words — size chunks by *tokens*, not characters or
+words, or you'll overflow. (2) **Respect boundaries** — split on sentences (the daṛi
+"।", ch. 1), not mid-grapheme or mid-word. Use overlap (e.g., 10–20%) so answers spanning
+a boundary aren't lost. Normalize chunks (ch. 2) before embedding.
+
+## Embedding and indexing
+
+Embed each chunk with a multilingual/Bengali model (ch. 5 — E5, BGE-M3, LaBSE), store
+vectors in an index (FAISS locally, **pgvector** in your stack). At query time, embed the
+query the same way and find nearest chunks by cosine (F8). This is dense/semantic
+retrieval — great at meaning, weak at exact terms (rare names, IDs, specific Bengali
+spellings).
+
+## Hybrid retrieval: dense + lexical
+
+Dense retrieval can miss exact keyword matches; **BM25** (lexical) nails exact terms but
+misses paraphrases. Run **both** and fuse. The clean way to fuse is **Reciprocal Rank
+Fusion (RRF)**:
+
+$$
+\mathrm{score}(d) = \sum_{\text{list}} \frac{1}{k + \mathrm{rank}(d)}
+$$
+
+where $k = 60$ is a constant that dampens the influence of top ranks. This correctly
+floats docs ranked high by *either* method. Hybrid is especially valuable in Bengali
+because spelling/normalization variation hurts pure dense matching, and BM25 rescues
+exact-term queries. BGE-M3 even gives you dense + sparse from one model.
+
+```python
+import numpy as np
+
+# Hybrid retrieval: fuse dense (embedding) and lexical (BM25) rankings with RRF.
+def rrf(rank_lists, k=60):
+    scores = {}
+    for ranks in rank_lists:                 # each = doc_ids ordered best -> worst
+        for r, doc in enumerate(ranks):
+            scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + r + 1)
+    return sorted(scores, key=scores.get, reverse=True)
+
+dense   = ["d3", "d1", "d5", "d2"]           # from cosine over embeddings
+lexical = ["d1", "d3", "d4", "d5"]           # from BM25 keyword match
+print("hybrid (RRF) order:", rrf([dense, lexical]))
+# d3 and d1 rise to the top because BOTH methods liked them — robust to either failing.
+```
+
+```output
+hybrid (RRF) order: ['d3', 'd1', 'd5', 'd4', 'd2']
+```
+
+```python
+# BM25 lexical retrieval (run locally: pip install rank-bm25).
+from rank_bm25 import BM25Okapi
+# tokenized, normalized Bengali chunks (ch. 2/3 first)
+corpus = [["ঢাকা", "বাংলাদেশের", "রাজধানী"],
+          ["পদ্মা", "একটি", "নদী"],
+          ["মেশিন", "লার্নিং", "এআই"]]
+bm25 = BM25Okapi(corpus)
+scores = bm25.get_scores(["রাজধানী"])
+print("BM25 scores:", [round(s, 3) for s in scores], "-> best chunk:", int(scores.argmax()))
+```
+
+## Reranking: cheap precision
+
+Retrieve a generous top-$N$ (say 20) fast, then use a **cross-encoder reranker** (which
+reads query and doc *together*, more accurate but slower) to reorder and keep the top-$k$
+(say 4). This two-stage "retrieve wide, rerank narrow" pattern is the standard quality
+lever. Use a multilingual reranker for Bengali.
+
+## Query transformation
+
+Real queries are messy. Improve recall with: **query rewriting** (clean/expand the
+query), **HyDE** (ask the LLM to draft a hypothetical answer, embed *that*, and retrieve
+with it — often better than embedding a short question), and **decomposition** (split a
+multi-part question into sub-queries, retrieve each). For Bengali, you can also
+rewrite/expand in both Bengali and English to catch code-mixed sources.
+
+## Generation: answer from the context, faithfully
+
+Put the reranked chunks in the prompt with a clear instruction: *answer only from the
+provided context, in Bengali, and say "জানি না" (I don't know) if the answer isn't
+there.* This grounding instruction is what cuts hallucination. Keep within the context
+budget (fertility again).
+
+```python
+# The full pipeline skeleton (run locally with real models).
+def rag_answer(query, chunks, embedder, reranker, llm, k=4):
+    q = normalize(query)                                  # ch. 2
+    # 1) dense retrieve top-N
+    dense_ids = top_k_cosine(embedder.encode(q), chunk_vectors, n=20)   # F8
+    # 2) lexical retrieve top-N (BM25), 3) fuse with RRF
+    lex_ids = bm25_top(q, n=20)
+    cand = rrf([dense_ids, lex_ids])[:20]
+    # 4) rerank with a cross-encoder, keep k
+    best = reranker.rerank(q, [chunks[i] for i in cand])[:k]
+    # 5) generate, grounded
+    context = "\n\n".join(best)
+    prompt = (f"নিচের প্রসঙ্গ থেকে বাংলায় উত্তর দিন। প্রসঙ্গে না থাকলে বলুন 'জানি না'।\n\n"
+              f"প্রসঙ্গ:\n{context}\n\nপ্রশ্ন: {q}\nউত্তর:")
+    return llm.generate(prompt)
+```
+
+## Evaluating RAG
+
+Two halves: **retrieval** (recall@k, precision@k — did the right chunk get fetched?) and
+**generation** (groundedness/faithfulness — is the answer supported by the retrieved
+text? answer correctness vs gold). Diagnose separately: if retrieval recall is low, fix
+chunking/hybrid/rerank; if retrieval is good but answers are wrong, fix the generation
+prompt/model. RAGAS-style metrics automate this.
+
+## When RAG beats fine-tuning
+
+- **RAG wins:** knowledge-heavy QA, frequently-changing content, low labeled data, need
+  for citations/grounding.
+- **Fine-tuning wins:** the task is a *skill* or *style* (classification boundary, output
+  format) rather than knowledge.
+- They also stack.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# Token-aware chunking sketch: split Bengali text on sentence boundaries (daṛi),
+# packing sentences into chunks under a token budget (mind fertility, ch. 3).
+text = ("ঢাকা বাংলাদেশের রাজধানী। এটি একটি বড় শহর। পদ্মা একটি নদী। "
+        "মেশিন লার্নিং এআই এর অংশ। এটি দ্রুত বাড়ছে।")
+sentences = [s.strip() for s in text.split("।") if s.strip()]
+
+def chunk(sentences, max_tokens=6):                # max_tokens tiny for demo
+    chunks, cur, count = [], [], 0
+    for s in sentences:
+        t = len(s.split())                          # proxy; use real tokenizer live
+        if count + t > max_tokens and cur:
+            chunks.append(" । ".join(cur)); cur, count = [], 0
+        cur.append(s); count += t
+    if cur: chunks.append(" । ".join(cur))
+    return chunks
+
+for i, c in enumerate(chunk(sentences)):
+    print(f"chunk {i}: {c}")
+# Real version: count tokens with the embedder's tokenizer, add overlap, never split
+# inside a sentence or grapheme (ch. 1).
+```
+
+```output
+chunk 0: ঢাকা বাংলাদেশের রাজধানী
+chunk 1: এটি একটি বড় শহর
+chunk 2: পদ্মা একটি নদী
+chunk 3: মেশিন লার্নিং এআই এর অংশ
+chunk 4: এটি দ্রুত বাড়ছে
+```
+
+## Exercise
+
+Design your Bengali RAG pipeline end to end as a spec: chunking rule (token budget +
+overlap + boundary), embedding model (ch. 5), whether you'll use hybrid + RRF, reranker
+choice, the grounding prompt, and **how you'll evaluate retrieval vs generation
+separately** (ch. 14). Then state the one diagnostic you'd run first if answers are
+wrong — is retrieval failing or is generation failing? Knowing which half to fix is most
+of RAG debugging.
+
+<details>
+<summary>Hint</summary>
+
+Chunking: split on "।", count tokens with the embedder's tokenizer (not words — Bengali
+fertility inflates word counts), target 128–256 tokens per chunk, 10–20% overlap. Embedding:
+BGE-M3 gives both dense and sparse from one model. RRF fuses dense + BM25 scores: compute
+$\sum_{\text{list}} \frac{1}{k + \text{rank}(d)}$ and re-sort. Reranker: a multilingual
+cross-encoder (e.g., `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`). Grounding prompt:
+"Answer only from the context; say জানি না if the answer is absent." Retrieval diagnostic:
+check recall@4 on a labeled set — if the gold chunk isn't in the top 4, fix retrieval first
+before touching generation.
+</details>

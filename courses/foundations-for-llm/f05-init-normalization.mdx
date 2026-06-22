@@ -1,0 +1,181 @@
+---
+course: foundations-for-llm
+chapter: f05-init-normalization
+title: "Initialization & Normalization"
+order: 5
+---
+
+## Why initialization and normalization matter
+
+Two quiet pieces of plumbing decide whether a deep network trains at all:
+**initialization** (the starting weights) and **normalization** (keeping activations
+well-scaled as they flow through layers). They never appear in the headline
+architecture diagram, yet every Transformer block has a LayerNorm in it, and a bad
+init can stop training cold. For fine-tuning you mostly inherit these — but knowing
+why they're there tells you what's wrong when a run explodes or flatlines.
+
+## The exploding/vanishing signal problem
+
+Each layer multiplies its input by a weight matrix. Stack many layers and the
+activation magnitudes compound. If weights are a bit too large, activations (and
+gradients) grow exponentially with depth — overflow, NaNs. A bit too small — they
+vanish — no gradient — no learning. A 32-layer LLM is unforgiving here.
+
+For a linear layer $h = xW$ with $W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}}$, if each
+entry of $W$ is drawn from $\mathcal{N}(0, \sigma^2)$, the output variance is:
+
+$$
+\mathrm{Var}(h_j) = d_{\text{in}} \cdot \sigma^2 \cdot \mathrm{Var}(x_i)
+$$
+
+To keep $\mathrm{Var}(h_j) \approx \mathrm{Var}(x_i)$, set $\sigma^2 = 1/d_{\text{in}}$.
+
+## Initialization: keep variance ~1 through each layer
+
+### Xavier/Glorot and He/Kaiming initialization
+
+- **Xavier/Glorot** (for tanh/linear): $\sigma^2 = \dfrac{1}{d_{\text{in}}}$ (or $\dfrac{2}{d_{\text{in}} + d_{\text{out}}}$).
+- **He/Kaiming** (for ReLU/GELU): $\sigma^2 = \dfrac{2}{d_{\text{in}}}$ — the factor of 2 compensates for ReLU
+  zeroing roughly half of all inputs on average.
+
+### Why the factor of 2 for ReLU
+
+ReLU zeroes out all negative inputs. If $z \sim \mathcal{N}(0, \sigma^2)$, then
+$\mathrm{Var}(\mathrm{ReLU}(z)) = \tfrac{1}{2}\sigma^2$, because half the mass is killed. To keep
+output variance equal to input variance through a ReLU layer:
+
+$$
+\sigma^2_W = \frac{2}{d_{\text{in}}}
+$$
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# 1) Why init scale matters: push unit-variance data through one ReLU layer.
+d_in, d_out, N = 512, 512, 1000
+x = np.random.randn(N, d_in)                      # variance ~1
+
+W_naive = np.random.randn(d_in, d_out) * 1.0      # too big
+W_he    = np.random.randn(d_in, d_out) * np.sqrt(2 / d_in)   # He init
+
+relu = lambda z: np.maximum(0, z)
+print("activation std, naive init:", round(relu(x @ W_naive).std(), 2))   # ~13  (exploding)
+print("activation std, He   init :", round(relu(x @ W_he).std(), 2))      # ~0.8 (stable)
+
+# 2) LayerNorm: standardize across the feature dimension, per token.
+def layernorm(x, gamma=1.0, beta=0.0, eps=1e-5):
+    mu  = x.mean(-1, keepdims=True)
+    var = x.var(-1, keepdims=True)
+    return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+h = np.random.randn(4, 512) * 5 + 3               # badly scaled & shifted
+y = layernorm(h)
+print("after LayerNorm -> mean:", round(float(y.mean()), 4),
+      " std:", round(float(y.std()), 4))           # ~0 and ~1
+```
+
+```output
+activation std, naive init: 13.18
+activation std, He   init : 0.83
+after LayerNorm -> mean: -0.0  std: 1.0
+```
+
+With naive init the activation std blows up to ~13; with He init it stays ~0.83.
+Across 32 layers, that difference is the gap between "trains" and "NaN at step 3."
+
+## Normalization: standardize activations on the fly
+
+Even with good init, distributions drift during training. Normalization layers fix
+this by re-standardizing activations mid-network.
+
+### BatchNorm vs LayerNorm vs RMSNorm
+
+- **BatchNorm** normalizes each feature across the *batch*. Great for CNNs, awkward
+  for sequences/variable lengths and small batches — so LLMs don't use it.
+- **LayerNorm** normalizes across the *features* of each token, independently per
+  token. Because it's per-token, it's independent of batch size and sequence length —
+  which is why **every Transformer uses LayerNorm**.
+- **RMSNorm** skips the mean-centering and only rescales by the root-mean-square.
+  Modern LLMs (Llama, Mistral) use RMSNorm — fewer operations, same stabilizing
+  effect.
+
+### LayerNorm formula
+
+$$
+\mathrm{LN}(x) = \gamma \cdot \frac{x - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta
+\qquad \text{where } \mu, \sigma^2 \text{ are computed over the feature dimension}
+$$
+
+### RMSNorm formula
+
+$$
+\mathrm{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \varepsilon}}
+$$
+
+### Pre-norm vs post-norm
+
+Early Transformers put LayerNorm *after* the residual addition ("post-norm"); modern
+ones put it *before* the sub-layer ("pre-norm"), which makes deep stacks far more
+stable to train. If you ever build a Transformer from scratch (F12) and it won't
+train, switching to pre-norm is the first thing to try.
+
+**For the competition:** you rarely set init or norm by hand when fine-tuning — the
+pretrained model already has them. But when a fine-tune produces NaNs, the usual
+suspects are right here (too-high learning rate interacting with norm/residual scale)
+or in F4 (no warmup). And if you ever build a model from scratch, He init + pre-norm
+LayerNorm/RMSNorm is the safe default.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+relu = lambda z: np.maximum(0, z)
+
+# Stack 20 ReLU layers. Watch the activation magnitude with bad vs good init.
+def propagate(scale_fn, layers=20, d=256):
+    x = np.random.randn(512, d)
+    for _ in range(layers):
+        W = np.random.randn(d, d) * scale_fn(d)
+        x = relu(x @ W)
+    return x.std()
+
+print("std after 20 layers, naive (x1.0):", propagate(lambda d: 1.0))
+print("std after 20 layers, He (xsqrt(2/d)):", propagate(lambda d: np.sqrt(2/d)))
+# Naive explodes or collapses; He stays sane. Now imagine 32 transformer layers.
+
+# RMSNorm vs LayerNorm — compare.
+def rmsnorm(x, eps=1e-5):
+    return x / np.sqrt((x**2).mean(-1, keepdims=True) + eps)
+def layernorm(x, eps=1e-5):
+    mu=x.mean(-1,keepdims=True); var=x.var(-1,keepdims=True)
+    return (x-mu)/np.sqrt(var+eps)
+z = np.random.randn(3, 8) * 4 + 1
+print("RMSNorm row0 :", rmsnorm(z)[0].round(2))
+print("LayerNorm row0:", layernorm(z)[0].round(2))
+```
+
+```output
+std after 20 layers, naive (x1.0): 9.474343151913628e+20
+std after 20 layers, He (xsqrt(2/d)): 1.036214739003243
+RMSNorm row0 : [ 0.89 -0.15 -0.85  1.47 -0.69 -1.79 -0.25  0.73]
+LayerNorm row0: [ 0.97 -0.07 -0.77  1.56 -0.61 -1.72 -0.17  0.81]
+```
+
+## Exercise
+
+Implement the **backward pass** of LayerNorm (gradient of the normalized output
+w.r.t. its input), or — easier and just as instructive — gradient-check a forward
+LayerNorm numerically the way you did for the MLP in F2. Then answer: why does
+LayerNorm make training more robust to the learning rate?
+
+<details>
+<summary>Answer to the conceptual part</summary>
+
+By re-standardizing each token's activations to mean 0 / variance 1, LayerNorm keeps
+the input scale to every sub-layer roughly constant regardless of what the previous
+layers did. That decouples the effective step size from drifting activation
+magnitudes, so a single learning rate stays appropriate throughout the network and
+across training — a big part of why deep transformers are trainable at all.
+</details>

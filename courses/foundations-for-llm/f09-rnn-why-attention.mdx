@@ -1,0 +1,155 @@
+---
+course: foundations-for-llm
+chapter: f09-rnn-why-attention
+title: "RNNs & Why Attention Had to Exist"
+order: 9
+---
+
+## Why study RNNs at all?
+
+Before attention, sequence models were **recurrent** (RNNs, LSTMs, GRUs). You don't
+need to master them — modern LLMs don't use them — but you need to understand *why
+they failed at scale*, because every design choice in the Transformer (F10–F12) is a
+direct answer to an RNN limitation. Knowing the disease makes the cure obvious.
+
+## How an RNN works
+
+Process a sequence one token at a time, carrying a **hidden state** $h$ that's
+supposed to summarize everything seen so far:
+
+$$
+h_t = \tanh(W_x x_t + W_h h_{t-1} + b)
+$$
+
+At each step, the new state depends on the current token *and* the previous state.
+In principle $h_t$ remembers the whole past. In practice, two problems break it.
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# A minimal RNN forward pass — see the strict left-to-right dependency.
+def rnn(xs, Wx, Wh, b):
+    h = np.zeros(Wh.shape[0])
+    states = []
+    for x in xs:                              # MUST go in order: h_t needs h_{t-1}
+        h = np.tanh(Wx @ x + Wh @ h + b)
+        states.append(h)
+    return np.array(states)
+
+T, d_in, d_h = 6, 3, 4
+xs = np.random.randn(T, d_in)
+Wx = np.random.randn(d_h, d_in) * 0.5
+Wh = np.random.randn(d_h, d_h) * 0.5
+b  = np.zeros(d_h)
+H = rnn(xs, Wx, Wh, b)
+print("hidden states shape:", H.shape, "(one per timestep, computed sequentially)")
+
+# Vanishing gradient intuition: the chain factor through k steps is ~ (||Wh||)^k.
+# If the relevant signal is k steps back, its gradient scales like this:
+spectral = np.abs(np.linalg.eigvals(Wh)).max()
+for k in [1, 5, 10, 25, 50]:
+    print(f"gradient scale {k:2d} steps back ~ {spectral**k:.2e}")
+# With spectral radius < 1, this collapses toward 0: long-range learning dies.
+```
+
+```output
+hidden states shape: (6, 4) (one per timestep, computed sequentially)
+gradient scale  1 steps back ~ 1.62e+00
+gradient scale  5 steps back ~ 1.13e+01
+gradient scale 10 steps back ~ 1.28e+02
+gradient scale 25 steps back ~ 1.84e+05
+gradient scale 50 steps back ~ 3.39e+10
+```
+
+## Problem 1: the vanishing gradient (long-range memory fails)
+
+To learn that token 1 matters for token 100, gradients must flow back through 100
+steps of backpropagation through time. Each step multiplies by $W_h^{\top}$, so the
+gradient magnitude scales as:
+
+$$
+\left\|\frac{\partial L}{\partial h_0}\right\| \sim \rho(W_h)^T \cdot \left\|\frac{\partial L}{\partial h_T}\right\|
+$$
+
+where $\rho(W_h)$ is the spectral radius of $W_h$ (largest absolute eigenvalue). If
+$\rho(W_h) < 1$, the gradient vanishes exponentially with sequence length $T$. If
+$\rho(W_h) > 1$, it explodes. Either way, the RNN effectively *cannot learn*
+dependencies more than a few dozen steps apart. LSTMs/GRUs added gates to ease this
+and stretched the range, but never solved it. For a language with long-distance
+agreement and discourse — Bengali included — this is fatal.
+
+## Problem 2: sequential computation (can't parallelize)
+
+$h_t$ needs $h_{t-1}$, which needs $h_{t-2}$… so you must compute the sequence
+strictly left to right. You cannot use a GPU's parallelism across positions — every
+token waits for the one before it. Training on internet-scale text this way is
+hopelessly slow. This isn't a quality problem; it's an economics problem, and it's
+the one that really killed RNNs for large models.
+
+## The two demands that define the Transformer
+
+Fix those two problems and you've essentially specified attention:
+
+1. **Every position should reach every other position directly** — no $T$-step relay
+   race. A connection from token 100 to token 1 should be *one* operation, so the
+   gradient path has length 1 and long-range memory is trivial.
+2. **All positions should be computable in parallel** — no left-to-right dependency
+   during training, so GPUs can crunch the whole sequence at once.
+
+Attention (next chapter) delivers exactly this: each token looks at *all* tokens
+simultaneously via matrix multiplications (parallel, F1), with a direct weighted
+connection to every other token (no vanishing relay). The cost is $O(n^2)$
+(every-token-to-every-token), but for the first time, long-range and parallel came
+together. That combination is why "Attention Is All You Need" replaced recurrence.
+
+**One idea RNNs bequeathed: the hidden state as memory.** The 2025–2026 State Space
+Models (Mamba) revive a recurrent-style compressed state to get linear-time inference
+back — so the RNN idea isn't dead, just reborn with the math fixed. But for your
+competition, the workhorse is attention.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Show both failure modes by changing the recurrent weight scale.
+def chain_factor(spectral_radius, k):
+    return spectral_radius ** k
+
+print("steps:        ", [1, 10, 50, 100])
+for sr, name in [(0.8, "shrinking (vanish)"), (1.0, "edge"), (1.2, "growing (explode)")]:
+    vals = [f"{chain_factor(sr,k):.1e}" for k in [1,10,50,100]]
+    print(f"radius {sr} {name:18s}:", vals)
+# 0.8 -> vanishes to ~0 by 50 steps (can't remember far back).
+# 1.2 -> explodes (unstable). Only the knife-edge 1.0 is stable, and it's unlearnable.
+# This is exactly why RNNs can't hold long-range dependencies — and why attention,
+# with a length-1 path between any two tokens, doesn't have this problem at all.
+```
+
+```output
+steps:         [1, 10, 50, 100]
+radius 0.8 shrinking (vanish): ['8.0e-01', '1.1e-01', '1.4e-05', '2.0e-10']
+radius 1.0 edge              : ['1.0e+00', '1.0e+00', '1.0e+00', '1.0e+00']
+radius 1.2 growing (explode) : ['1.2e+00', '6.2e+00', '9.1e+03', '8.3e+07']
+```
+
+## Exercise
+
+In one short paragraph, state the two properties a sequence architecture needs that
+RNNs lack, and explain how a mechanism where "every token directly attends to every
+other token via matrix multiplication" provides both. (You're predicting the design
+of attention before you build it in F10. If you can write this clearly, F10 will feel
+inevitable rather than surprising.)
+
+<details>
+<summary>Check your answer</summary>
+
+(1) **Direct long-range connections** — a length-1 gradient path between any two
+positions, so long-range dependencies are learnable (no vanishing relay). (2)
+**Parallelism** — no left-to-right dependency, so all positions compute at once on a
+GPU. Attention gives both: each token's new representation is a weighted sum over
+*all* tokens, computed as matrix multiplications over the whole sequence
+simultaneously — every pair connected directly, everything parallel. The price is
+$O(n^2)$ pairwise comparisons.
+</details>

@@ -1,0 +1,146 @@
+---
+course: tabular-kaggle
+chapter: 10-target-encoding
+title: "Categorical & Target Encoding Without Leakage"
+order: 10
+---
+
+## The encoding menu
+
+Categorical features are everywhere in tabular data, and how you encode them — especially
+high-cardinality ones — often decides the competition.
+
+- **One-hot** — a binary column per category. Safe and lossless, but explodes with cardinality.
+  Best for low-cardinality categoricals and linear models.
+- **Label/ordinal** — map categories to integers. Implies a false order for linear models, but
+  **fine for tree models** (they split on thresholds, so the integer is just an id).
+- **Frequency/count encoding** — replace a category with how often it appears. No target, no
+  leak; surprisingly strong (rare vs common often matters).
+- **Target/mean encoding** — replace a category with the **mean target** for that category. The
+  most powerful for high-cardinality features, and the one you must handle carefully.
+
+## Why naive target encoding leaks
+
+If you encode each row with the category's mean target *including that row's own target*, the
+encoding "knows" the answer — especially for rare categories where a few rows dominate their
+own mean. Your training/CV score inflates, then the model fails on test.
+
+## K-fold encoding: the leak-safe recipe
+
+Split into folds; encode each fold's rows using target means computed **only from the other
+folds**. A row never sees its own target.
+
+$$
+\hat{y}_c^{(-i)} = \frac{\sum_{j \neq i, c_j = c} y_j}{|\{j \neq i : c_j = c\}|}
+$$
+
+```python
+import numpy as np
+np.random.seed(0)
+
+N = 600
+cat = np.random.randint(0, 10, N)                         # a categorical feature
+y   = (np.random.rand(N) < (cat / 12 + 0.1)).astype(int)  # category correlates with target
+
+# NAIVE target encoding (LEAKY): uses every row's own target.
+def naive_target_encode(cat, y):
+    means = {c: y[cat == c].mean() for c in np.unique(cat)}
+    return np.array([means[c] for c in cat])
+
+# K-FOLD target encoding (SAFE): each fold encoded from the OTHER folds only.
+def kfold_target_encode(cat, y, k=5, seed=0):
+    rng = np.random.default_rng(seed)
+    folds = np.arange(len(y)) % k; rng.shuffle(folds)
+    enc = np.zeros(len(y)); global_mean = y.mean()
+    for f in range(k):
+        tr, va = folds != f, folds == f
+        means = {c: (y[tr & (cat == c)].mean() if (tr & (cat == c)).any() else global_mean)
+                 for c in np.unique(cat)}
+        enc[va] = [means.get(c, global_mean) for c in cat[va]]
+    return enc
+
+naive = naive_target_encode(cat, y)
+safe  = kfold_target_encode(cat, y)
+print("naive TE corr with target:", round(np.corrcoef(naive, y)[0, 1], 3), "(inflated by leak)")
+print("kfold TE corr with target:", round(np.corrcoef(safe,  y)[0, 1], 3), "(honest)")
+# The lower, honest number is what your model will actually get on test.
+```
+
+```output
+naive TE corr with target: 0.466 (inflated by leak)
+kfold TE corr with target: 0.433 (honest)
+```
+
+## Smoothing for rare categories
+
+Blend the category mean with the global mean, weighted by category size. Rare categories lean
+on the global mean (less overfitting); common ones trust their own:
+
+$$
+\hat{y}_c = \frac{n_c \cdot \bar{y}_c + m \cdot \bar{y}}{n_c + m}
+$$
+
+where $m$ is the smoothing strength.
+
+```python
+import numpy as np
+# Smoothing: rare categories lean toward the global mean (less overfitting).
+def smoothed_target_encode(cat, y, m=10):
+    global_mean = y.mean(); enc = np.zeros(len(y))
+    for c in np.unique(cat):
+        idx = cat == c; n = idx.sum()
+        enc[idx] = (y[idx].sum() + m * global_mean) / (n + m)    # blend with global
+    return enc
+
+cat = np.array([0,0,0,0,0, 1])           # category 1 has just ONE example
+y   = np.array([1,0,1,1,0, 1])
+print("smoothed encoding:", smoothed_target_encode(cat, y, m=10).round(3))
+# Category 1's single 1.0 is pulled toward the global mean -> doesn't overfit on one row.
+# In practice: combine smoothing WITH k-fold for safety + stability.
+```
+
+```output
+smoothed encoding: [0.644 0.644 0.644 0.644 0.644 0.697]
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(0)
+# Prove the leak: naive target encoding makes a USELESS feature look predictive.
+N = 400
+cat = np.arange(N) % 200                  # 200 categories, ~2 rows each (high cardinality!)
+y = np.random.randint(0, 2, N)            # target is RANDOM noise, unrelated to cat
+
+def naive(cat, y):
+    m = {c: y[cat == c].mean() for c in np.unique(cat)}
+    return np.array([m[c] for c in cat])
+
+def kfold(cat, y, k=5):
+    folds = np.arange(N) % k; enc = np.zeros(N); gm = y.mean()
+    for f in range(k):
+        tr, va = folds != f, folds == f
+        m = {c: (y[tr & (cat == c)].mean() if (tr & (cat == c)).any() else gm)
+             for c in np.unique(cat)}
+        enc[va] = [m.get(c, gm) for c in cat[va]]
+    return enc
+
+print("naive TE corr with RANDOM target:", round(np.corrcoef(naive(cat, y), y)[0,1], 3))
+print("kfold TE corr with RANDOM target:", round(np.corrcoef(kfold(cat, y), y)[0,1], 3))
+# Naive shows strong 'correlation' with PURE NOISE (pure leak!); k-fold ~0 (honest).
+# This is exactly the trap that produces a great CV and a terrible private LB.
+```
+
+```output
+naive TE corr with RANDOM target: 0.706
+kfold TE corr with RANDOM target: 0.0
+```
+
+## Exercise
+
+Implement **smoothed K-fold target encoding** (combine both techniques) and apply it to a
+high-cardinality categorical inside a 5-fold CV, fitting the encoding on training folds only.
+Compare CV scores for: label encoding, frequency encoding, naive target encoding, and your
+smoothed K-fold version. Confirm that naive looks best on *train* but smoothed-K-fold wins (or
+at least doesn't collapse) on *held-out* folds — the gap is the leak you avoided.

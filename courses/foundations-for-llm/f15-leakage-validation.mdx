@@ -1,0 +1,178 @@
+---
+course: foundations-for-llm
+chapter: f15-leakage-validation
+title: "Data Leakage & Validation Strategy"
+order: 15
+---
+
+## Why this chapter decides your leaderboard position
+
+This is the chapter that decides whether you place well or collapse on the private
+leaderboard. Models are commodities; a **trustworthy validation setup** is the edge.
+Almost every catastrophic competition finish — great public score, terrible private
+score — traces to one of two things: **data leakage** or a **validation set that didn't
+mirror the test set**. Master this and you'll beat flashier solutions.
+
+## Leakage — the forms it takes
+
+Leakage is when information that won't exist at test time sneaks into training. The
+model learns to exploit it, your validation score soars, and then the real test — which
+doesn't have that information — exposes the lie. Common forms:
+
+- **Target leakage:** a feature that encodes the answer (e.g., a column derived from
+  the label, or "was\_resolved" when predicting "will\_resolve"). Rule of thumb: if a
+  feature wouldn't be available at the moment of prediction, it leaks.
+- **Train/test contamination:** the same or near-duplicate example appears in both train
+  and validation/test. In text this is rampant — duplicated sentences, the same document
+  under different ids, paraphrases, or the same text scraped from multiple sources.
+  **Deduplicate before splitting**, and dedup across train/test.
+- **Group leakage:** rows that share a hidden unit (same author, same source article,
+  same user, same image) split across train and validation. The model "recognizes the
+  author" rather than learning the task. Fix: **grouped** splits — all rows of a group
+  go to the same fold.
+- **Temporal leakage:** training on the future to predict the past. If there's any time
+  order, split by time (train on past, validate on future).
+- **Preprocessing leakage:** fitting *anything* (a scaler, a tokenizer's vocab, target
+  encodings, TF-IDF, embeddings from the full corpus) on train+test together, then
+  validating. Fit preprocessing **inside** the CV fold, on training data only.
+
+For an LLM competition specifically: watch for **pretraining contamination** (the base
+model may have *seen the test text* on the web — public benchmarks are notorious), and
+for **prompt leakage** in few-shot examples that overlap the test set.
+
+## Train/test contamination — detected and fixed
+
+```python
+import numpy as np
+
+# Train/test contamination: duplicates across the split inflate your score.
+rng = np.random.default_rng(0)
+texts = [f"বাক্য_{i}" for i in range(8)]
+data = texts + texts[:3]                      # 3 sentences DUPLICATED
+labels = [0,1,0,1,0,1,0,1, 0,1,0]
+
+# WRONG: shuffle then split -> the same sentence can land in train AND val.
+idx = rng.permutation(len(data))
+train, val = idx[:8], idx[8:]
+train_texts = {data[i] for i in train}
+leaked = [data[i] for i in val if data[i] in train_texts]
+print("leaked sentences (in both train & val):", leaked)   # non-empty -> leakage!
+
+# RIGHT: deduplicate FIRST, then split unique items.
+unique = sorted(set(data))
+uidx = rng.permutation(len(unique))
+u_train, u_val = {unique[i] for i in uidx[:8]}, {unique[i] for i in uidx[8:]}
+print("overlap after dedup-then-split:", u_train & u_val)   # empty -> clean
+```
+
+```output
+leaked sentences (in both train & val): ['বাক্য_0']
+overlap after dedup-then-split: set()
+```
+
+## Adversarial validation — detect train/test drift
+
+A sharp diagnostic. Label all training rows 0 and all test rows 1, mix them, and train
+a classifier to tell them apart. If it **can't** (AUC $\approx 0.5$), train and test
+come from the same distribution — random CV is safe. If it **can** (AUC $\gg 0.5$), they
+differ, and your CV will lie unless you account for the drift (e.g., validate on the
+train rows that most "look like" test, or reweight). This single check has saved
+countless competitors from a CV that didn't match the test set.
+
+```python
+import numpy as np
+# Adversarial validation: can a classifier tell train from test? (toy)
+# Here train ~ N(0,1), test ~ N(0.8,1) -> distributions DIFFER -> high AUC expected.
+def auc(scores, y):                             # quick rank-AUC
+    order = np.argsort(scores)
+    ranks = np.empty_like(order, float); ranks[order] = np.arange(len(scores)) + 1
+    pos = y == 1; n_pos, n_neg = pos.sum(), (~pos).sum()
+    return (ranks[pos].sum() - n_pos*(n_pos+1)/2) / (n_pos*n_neg)
+
+rng = np.random.default_rng(1)
+train_x = rng.normal(0.0, 1, 400)
+test_x  = rng.normal(0.8, 1, 400)               # shifted -> drift
+X = np.concatenate([train_x, test_x])
+is_test = np.concatenate([np.zeros(400), np.ones(400)])
+print("adversarial AUC:", round(auc(X, is_test), 3),
+      "(~0.5 = same dist; >>0.5 = train/test drift -> fix your CV)")
+```
+
+```output
+adversarial AUC: 0.726 (~0.5 = same dist; >>0.5 = train/test drift -> fix your CV)
+```
+
+AUC of 0.726 — the classifier easily tells train from test, confirming the distributions
+differ. In a real competition, this tells you to adjust your CV strategy before training
+anything.
+
+## The cardinal rule — your CV must move with the leaderboard
+
+Build the validation scheme to imitate how the test set was created. Then track the
+relationship: when your CV improves, does the public LB improve too? If they diverge,
+*trust your CV* (the public LB is a small, noisy sample you can overfit by probing it).
+A correlated, trustworthy CV lets you make dozens of decisions offline without burning
+submissions.
+
+## Submission discipline
+
+- **Freeze early.** Lock your approach with several days left; leave time for the
+  submission environment's surprises (no internet, time/memory limits).
+- **Don't probe the public LB.** Each submission tuned to the public score overfits a
+  tiny sample. Decide with CV; submit to confirm, not to search.
+- **Reproducibility (F7):** seed everything, log configs, save checkpoints. You must be
+  able to rebuild your best run for the final submission.
+- **Trust the gap:** accept a change only when CV improvement exceeds CV noise (F14).
+
+**Mental model:** leakage makes your score a lie; a mirror-the-test CV makes it the
+truth; adversarial validation tells you which you have. Build the truth, then optimize
+against it relentlessly.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from collections import defaultdict
+
+# Grouped split: keep every row of a group (e.g., same author) on one side.
+groups = np.array([0,0,1,1,1,2,2,3,3,4])        # author id per row
+y      = np.array([1,0,1,1,0,0,1,0,1,1])
+rng = np.random.default_rng(0)
+
+def grouped_split(groups, val_frac=0.3, seed=0):
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups); rng.shuffle(uniq)
+    n_val = max(1, int(len(uniq) * val_frac))
+    val_groups = set(uniq[:n_val])
+    val = np.array([i for i, g in enumerate(groups) if g in val_groups])
+    train = np.array([i for i, g in enumerate(groups) if g not in val_groups])
+    return train, val
+
+tr, va = grouped_split(groups)
+print("train groups:", sorted(set(groups[tr])))
+print("val   groups:", sorted(set(groups[va])))
+print("any group in both? ", set(groups[tr]) & set(groups[va]))   # must be empty
+# No author appears on both sides -> the model can't 'recognize the author' to cheat.
+```
+
+## Exercise
+
+You're given a Bengali text dataset with columns `text`, `label`, and `source` (which
+website each row came from). Design the validation scheme: (1) what would you
+deduplicate, (2) what would you group by, (3) would you stratify, and (4) how would you
+use adversarial validation to check it? Write it as a short checklist you'd actually
+run before training anything.
+
+<details>
+<summary>Model answer</summary>
+
+(1) **Dedup** exact and near-duplicate `text` (normalize first) across the *entire*
+dataset before splitting — Bengali web data is heavily duplicated. (2) **Group by
+`source`** so the same website doesn't appear in both train and validation (prevents
+"learn the source's style" leakage); if rows also share authors/articles, group by the
+finest such unit. (3) **Stratify by `label`** within the grouped split so class balance
+is preserved (F14). (4) Run **adversarial validation** between your train and the
+competition test: if AUC $\gg 0.5$, the test is drifted (different sources?), so
+validate on the train rows most similar to test. Only after this passes do you train —
+and you accept changes only when CV gain beats CV noise (F14).
+</details>

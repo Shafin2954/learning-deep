@@ -1,0 +1,159 @@
+---
+course: tabular-kaggle
+chapter: 03-regularization
+title: "Regularization: Ridge, Lasso, ElasticNet"
+order: 3
+---
+
+## Why regularization
+
+Plain linear/logistic regression (ch. 2) overfits whenever features are many, correlated,
+or noisy — which is almost always on real tabular data. **Regularization** adds a penalty
+on the size of the weights, trading a little training fit for much better generalization
+(the bias–variance tradeoff, F6, GLOSSARY §3). It's the difference between a linear model
+that's a toy and one that's a genuinely competitive baseline.
+
+The idea: minimize $\text{loss}(w) + \lambda \cdot \text{penalty}(w)$. The penalty pushes
+weights toward zero; $\lambda$ (the regularization strength) controls how hard. Large $\lambda$
+= simpler model (more bias, less variance); $\lambda = 0$ = ordinary regression. You tune
+$\lambda$ by CV (ch. 12).
+
+## Ridge (L2)
+
+Penalty = $\lambda \cdot \sum_j w_j^2$. Ridge shrinks all weights smoothly toward zero but never
+exactly to zero. It's the right tool when many features each contribute a little and you have
+multicollinearity — it spreads weight across correlated features stably. It also has a clean
+closed form:
+
+$$
+w = (X^\top X + \lambda I)^{-1} X^\top y
+$$
+
+The $\lambda I$ term stabilizes the otherwise ill-conditioned inverse. As $\lambda$ grows, all
+weights shrink toward zero (but never reach exactly zero — that's the L2 property):
+
+```python
+import numpy as np
+np.random.seed(0)
+
+# Ridge from scratch (closed form) — watch it shrink the weights.
+N = 200
+X = np.random.randn(N, 3)
+y = X @ np.array([2.0, -1.0, 0.5]) + 0.1 * np.random.randn(N)
+Xb = np.c_[np.ones(N), X]
+
+def ridge(Xb, y, lam):
+    I = np.eye(Xb.shape[1]); I[0, 0] = 0                       # don't penalize the bias
+    return np.linalg.solve(Xb.T @ Xb + lam * I, Xb.T @ y)
+
+for lam in [0, 1, 10, 100]:
+    w = ridge(Xb, y, lam)
+    print(f"lambda={lam:4d}: weights={w[1:].round(3)}  ||w||={np.linalg.norm(w[1:]):.3f}")
+# As lambda grows, weights shrink toward 0 (but never exactly 0). That's L2/Ridge.
+```
+
+```output
+lambda=   0: weights=[ 2.003 -1.014  0.492]  ||w||=2.298
+lambda=   1: weights=[ 1.993 -1.01   0.49 ]  ||w||=2.288
+lambda=  10: weights=[ 1.914 -0.971  0.476]  ||w||=2.198
+lambda= 100: weights=[ 1.368 -0.701  0.365]  ||w||=1.580
+```
+
+## Lasso (L1)
+
+Penalty = $\lambda \cdot \sum_j |w_j|$. Lasso's key property: it drives some weights *exactly*
+to zero, performing automatic **feature selection**. The geometry: the L1 penalty's
+diamond-shaped constraint region has corners on the axes, so the solution tends to land on a
+corner where some coordinates are zero (the L2 ball is round, so it doesn't).
+
+Lasso has no closed form — it's solved by coordinate descent via the **soft-threshold**
+operator. For a coordinate update with partial correlation $\rho$:
+
+$$
+w_j \leftarrow \text{sign}(\rho) \cdot \max(|\rho| - \lambda,\; 0)
+$$
+
+Small coefficients get zeroed entirely; that's feature selection in action:
+
+```python
+import numpy as np
+# Lasso's sparsity via the soft-threshold operator (the heart of coordinate descent).
+def soft_threshold(rho, lam):
+    return np.sign(rho) * max(abs(rho) - lam, 0.0)             # can return EXACTLY 0
+
+for rho in [-2.0, -0.3, 0.0, 0.3, 2.0]:
+    print(f"rho={rho:+.1f} -> L1 update with lam=0.5: {soft_threshold(rho, 0.5):+.2f}")
+# Small coefficients get zeroed out entirely -> feature selection. L2 would only shrink them.
+```
+
+```output
+rho=-2.0 -> L1 update with lam=0.5: -1.50
+rho=-0.3 -> L1 update with lam=0.5: -0.00
+rho=+0.0 -> L1 update with lam=0.5: +0.00
+rho=+0.3 -> L1 update with lam=0.5: +0.00
+rho=+2.0 -> L1 update with lam=0.5: +1.50
+```
+
+## ElasticNet
+
+A blend: $\lambda \cdot \bigl(\alpha \sum_j |w_j| + (1-\alpha) \sum_j w_j^2\bigr)$. It gets
+Lasso's sparsity *and* Ridge's stability with correlated features (Lasso alone arbitrarily picks
+one of a correlated group; ElasticNet keeps them together). Two knobs: overall strength $\lambda$
+and the L1/L2 mix $\alpha$. Often the best linear regularizer in practice.
+
+## Why this matters on Kaggle
+
+- Regularized linear/logistic are stronger, more stable baselines than unregularized — almost
+  always prefer them.
+- **Tree ensembles are regularized too**, just differently: `reg_alpha`/`reg_lambda` in
+  XGBoost/LightGBM are L1/L2 penalties on leaf values (GLOSSARY §5), and `subsample`,
+  `min_child_weight`, `max_depth` are all forms of regularization. The concept — penalize
+  complexity, tune the strength by CV — is exactly what you'll do when tuning boosting (ch. 7, 15).
+- Lasso/ElasticNet double as **feature selection** (ch. 11): features Lasso zeros out are
+  candidates to drop.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(1)
+
+# The regularization U-curve: CV error vs lambda. Find the sweet spot.
+N, D = 80, 30                                    # few rows, many features -> overfit risk
+Xtrue = np.random.randn(N, D)
+w_true = np.zeros(D); w_true[:5] = [3, -2, 1.5, 1, -1]   # only 5 features matter
+y = Xtrue @ w_true + 0.5 * np.random.randn(N)
+
+def ridge_cv(X, y, lam, k=5):
+    folds = np.arange(len(y)) % k
+    errs = []
+    for f in range(k):
+        tr, va = folds != f, folds == f
+        Xt = np.c_[np.ones(tr.sum()), X[tr]]
+        I = np.eye(Xt.shape[1]); I[0, 0] = 0
+        w = np.linalg.solve(Xt.T @ Xt + lam * I, Xt.T @ y[tr])
+        pred = np.c_[np.ones(va.sum()), X[va]] @ w
+        errs.append(np.mean((pred - y[va]) ** 2))
+    return np.mean(errs)
+
+for lam in [0, 0.1, 1, 5, 20, 100, 500]:
+    print(f"lambda={lam:5.1f}: CV MSE = {ridge_cv(Xtrue, y, lam):.3f}")
+# Too small -> overfits (high CV error); too big -> underfits. The minimum is your lambda.
+```
+
+```output
+lambda=  0.0: CV MSE = 0.580
+lambda=  0.1: CV MSE = 0.575
+lambda=  1.0: CV MSE = 0.568
+lambda=  5.0: CV MSE = 0.914
+lambda= 20.0: CV MSE = 2.865
+lambda=100.0: CV MSE = 8.975
+lambda=500.0: CV MSE = 16.142
+```
+
+## Exercise
+
+Take the logistic baseline from ch. 2 and add an L2 penalty (add $\lambda w$ to the gradient,
+skipping the bias). Sweep $\lambda$ over a few values with 5-fold CV and pick the one with the best
+CV AUC. Then explain, in one sentence each, when you'd reach for Lasso instead (sparse truth /
+feature selection) and ElasticNet instead (sparse + correlated features).

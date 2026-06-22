@@ -1,0 +1,113 @@
+---
+course: bengali-llm
+chapter: 06-transformer-for-finetuners
+title: "The Transformer, for Fine-Tuners"
+order: 6
+---
+
+## What a pretrained model actually gives you
+
+A checkpoint is: the token embedding table (F8), a stack of $N$ transformer blocks (F12) with
+their trained $Q/K/V/W_o$ and MLP weights, the positional scheme (F11, often RoPE), a final norm,
+and a **head**. The "body" (embeddings + blocks) holds the general language knowledge learned in
+pretraining. The **head** is the task-specific output layer (ch. 7). Fine-tuning mostly means:
+keep the body's knowledge, adapt it to your task.
+
+## Reading the config: the numbers that matter
+
+- `hidden_size` ($d$) — vector width per token. Bigger = more capacity + more memory.
+- `num_hidden_layers` ($N$) — how many blocks. Depth.
+- `num_attention_heads` ($h$) — heads per block (F10).
+- `intermediate_size` — the MLP's hidden width (usually $4d$, F12).
+- `vocab_size` — drives the embedding table and the output head.
+- `max_position_embeddings` — the context limit. Bengali fertility (ch. 3) means fewer *words*
+  fit than this number suggests; plan `max_length` accordingly.
+- `rope_theta` / position config — the positional scheme; the knob for context extension (F11).
+
+These tell you memory cost and where your inputs will truncate — both decisive on 8 GB.
+
+## Inspecting a model config (RUN-LOCALLY)
+
+```python
+# Inspect a model the way a fine-tuner should: read the config, find the knobs.
+from transformers import AutoConfig, AutoModel
+
+cfg = AutoConfig.from_pretrained("csebuetnlp/banglabert")
+for k in ["hidden_size", "num_hidden_layers", "num_attention_heads",
+          "intermediate_size", "vocab_size", "max_position_embeddings"]:
+    print(f"{k:26s}: {getattr(cfg, k, 'n/a')}")
+
+# Count parameters and see how few a head adds vs the body.
+model = AutoModel.from_pretrained("csebuetnlp/banglabert")
+total = sum(p.numel() for p in model.parameters())
+print(f"\nbody parameters: {total/1e6:.1f}M")
+# A classification head is hidden_size x num_labels — kilobytes next to this. That
+# asymmetry is exactly why head-only / LoRA training is cheap.
+```
+
+## Three fine-tuning strategies
+
+The less you change, the less you can overfit, and the less memory you need. On a
+modest-resource language with a small GPU, that pushes you *down* the list.
+
+### 1. Full fine-tuning
+
+Update *all* weights. Most capacity, most memory, most overfitting risk on small Bengali data
+(F6). Feasible on 8 GB only for small encoders (BanglaBERT). Needs the smallest learning rate
+($\approx 2 \times 10^{-5}$) and warmup (F4).
+
+### 2. Head-only / feature-based
+
+Freeze the body, train only a new head (or train a classifier on frozen embeddings, ch. 5).
+Cheapest, least overfitting, surprisingly strong on tiny data. Your baseline.
+
+### 3. Parameter-efficient (LoRA/QLoRA)
+
+Freeze the body, inject tiny trainable adapter matrices into the attention/MLP layers. Only
+${\sim}0.1$–$1\%$ of the parameters move, so it's memory-light *and* a built-in regularizer (F6).
+This is how you fine-tune a 1B–8B model on 8 GB. Full chapter next (ch. 8–9).
+
+## Freezing and learning-rate layering
+
+- **Freeze lower layers, train upper ones** — lower transformer layers encode general features,
+  upper layers are more task-specific.
+- **Discriminative learning rates** — smaller $\eta$ for early layers, larger for the head (the
+  head starts random and needs to move more). Optional but helps on small data.
+
+## Try it Yourself
+
+```python
+# Decide your strategy from model size and data size — a rule-of-thumb calculator.
+def strategy(params_millions, train_examples, vram_gb=8):
+    if params_millions <= 300 and vram_gb >= 8:
+        full = "full fine-tune feasible"
+    else:
+        full = "full fine-tune NOT feasible on this VRAM"
+    if train_examples < 2000:
+        reg = "tiny data -> prefer head-only or LoRA (less overfit, F6)"
+    elif train_examples < 20000:
+        reg = "moderate data -> LoRA/QLoRA is the sweet spot"
+    else:
+        reg = "lots of data -> full FT (if it fits) or LoRA both fine"
+    return full, reg
+
+for p, n in [(110, 1500), (1000, 5000), (7000, 800)]:
+    f, r = strategy(p, n)
+    print(f"{p:>5}M params, {n:>5} examples -> {f}; {r}")
+# Notice: big model + tiny data -> QLoRA, not full FT. The math pushes you down
+# the strategy list every time data is small or the GPU is small.
+```
+
+```output
+  110M params,  1500 examples -> full fine-tune feasible; tiny data -> prefer head-only or LoRA (less overfit, F6)
+ 1000M params,  5000 examples -> full fine-tune NOT feasible on this VRAM; moderate data -> LoRA/QLoRA is the sweet spot
+ 7000M params,   800 examples -> full fine-tune NOT feasible on this VRAM; tiny data -> prefer head-only or LoRA (less overfit, F6)
+```
+
+## Exercise
+
+Load the config of the model you shortlisted in ch. 4 and write down: its context
+limit (and roughly how many Bengali *words* that is given a fertility of ${\approx}2.5$, ch. 3),
+its parameter count, and — based on that and your expected dataset size — which of the
+three fine-tuning strategies you'll use and why. This is the decision the next two
+chapters (8–9) execute.
