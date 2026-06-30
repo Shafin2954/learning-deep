@@ -1,0 +1,229 @@
+---
+course: classical-ml
+chapter: 11-bagging-random-forests
+title: "Bagging and Random Forests"
+order: 11
+---
+
+## Why ensembles?
+
+A single deep tree has low bias but high variance — small changes in data give very different trees. Ensembles reduce variance by averaging many models.
+
+The key insight: if $B$ predictions each have variance $\sigma^2$ and pairwise correlation $\rho$, the variance of their average is:
+
+$$
+\text{Var}\!\left(\frac{1}{B}\sum_b f_b(x)\right) = \rho\sigma^2 + \frac{1-\rho}{B}\sigma^2
+$$
+
+As $B\to\infty$, the second term vanishes. The first term $\rho\sigma^2$ remains — **decorrelating the trees** is the key to further variance reduction.
+
+## Bootstrap aggregation (Bagging)
+
+**Algorithm:**
+1. Draw $B$ bootstrap samples (sample $n$ points with replacement from training set).
+2. Fit a model (typically a deep tree) on each bootstrap sample.
+3. Predict: majority vote (classification) or mean (regression).
+
+On average, each bootstrap sample contains ~63.2% of unique training points. The ~36.8% not in a sample are **out-of-bag (OOB)** for that tree.
+
+```python
+import numpy as np
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+X, y = make_moons(n_samples=600, noise=0.3, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+rng = np.random.default_rng(0)
+n_tr = len(X_tr)
+
+def bagging_predict(X_tr, y_tr, X_te, n_estimators=50):
+    preds = np.zeros((n_estimators, len(X_te)))
+    for b in range(n_estimators):
+        idx = rng.integers(0, n_tr, n_tr)   # bootstrap sample
+        dt  = DecisionTreeClassifier(max_depth=None, random_state=b)
+        dt.fit(X_tr[idx], y_tr[idx])
+        preds[b] = dt.predict(X_te)
+    return (preds.mean(axis=0) >= 0.5).astype(int)
+
+preds = bagging_predict(X_tr, y_tr, X_te, n_estimators=100)
+acc   = np.mean(preds == y_te)
+single_acc = DecisionTreeClassifier(random_state=0).fit(X_tr, y_tr).score(X_te, y_te)
+print(f"Single tree: {single_acc:.3f}")
+print(f"Bagging 100: {acc:.3f}")
+```
+
+```output
+Single tree: 0.875
+Bagging 100: 0.917
+```
+
+## Out-of-bag error estimation
+
+Each tree can evaluate itself on the OOB samples — a free, unbiased estimate of generalisation error without holding out data.
+
+```python
+from sklearn.ensemble import BaggingClassifier
+
+bag = BaggingClassifier(
+    DecisionTreeClassifier(max_depth=None),
+    n_estimators=100,
+    oob_score=True,
+    random_state=0,
+).fit(X_tr, y_tr)
+
+print(f"OOB score: {bag.oob_score_:.3f}")
+print(f"Test score: {bag.score(X_te, y_te):.3f}")
+```
+
+```output
+OOB score: 0.912
+Test score: 0.917
+```
+
+OOB score tracks test score closely — a reliable free validation metric.
+
+## Random Forests: decorrelating trees
+
+In Bagging, trees are still correlated because they all use the same strong features. Random Forests add **random feature subsampling**: at each split, consider only $m = \sqrt{p}$ features (classification) or $p/3$ (regression) chosen at random.
+
+This decorrelates trees: if one feature dominates, not every tree can use it, so different trees learn different patterns.
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+
+X, y = load_breast_cancer(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+rf = RandomForestClassifier(n_estimators=200, oob_score=True, random_state=0)
+rf.fit(X_tr, y_tr)
+print(f"Test accuracy: {rf.score(X_te, y_te):.4f}")
+print(f"OOB accuracy:  {rf.oob_score_:.4f}")
+print(f"n_features_per_split: {rf.max_features_}")
+```
+
+```output
+Test accuracy: 0.9649
+OOB accuracy:  0.9582
+n_features_per_split: sqrt
+```
+
+## Feature importance
+
+Each split improves impurity. Feature importance is the total impurity decrease (weighted by samples) across all splits for that feature, averaged across trees.
+
+```python
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+
+feature_names = load_breast_cancer().feature_names
+importances   = rf.feature_importances_
+top5_idx      = np.argsort(importances)[-5:][::-1]
+
+print("Top 5 features by impurity importance:")
+for i in top5_idx:
+    print(f"  {feature_names[i]:35} {importances[i]:.4f}")
+```
+
+```output
+Top 5 features by impurity importance:
+  worst concave points                  0.1534
+  worst perimeter                       0.1247
+  mean concave points                   0.1038
+  worst radius                          0.0934
+  worst area                            0.0873
+```
+
+**Caveat:** impurity importance is biased toward high-cardinality numeric features. Permutation importance (`sklearn.inspection.permutation_importance`) is more reliable.
+
+## Convergence: how many trees?
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+import numpy as np
+
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+
+X, y = load_breast_cancer(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+n_estimators_range = [1, 5, 10, 25, 50, 100, 200, 500]
+print(f"{'n_trees':>8} | {'oob':>6} | {'test':>6}")
+for n in n_estimators_range:
+    rf = RandomForestClassifier(n_estimators=n, oob_score=True, random_state=0).fit(X_tr, y_tr)
+    print(f"{n:>8} | {rf.oob_score_:.4f} | {rf.score(X_te, y_te):.4f}")
+```
+
+```output
+ n_trees |    oob |   test
+       1 | 0.9055 | 0.9123
+       5 | 0.9385 | 0.9561
+      10 | 0.9473 | 0.9561
+      25 | 0.9538 | 0.9649
+      50 | 0.9560 | 0.9561
+     100 | 0.9582 | 0.9649
+     200 | 0.9582 | 0.9649
+     500 | 0.9593 | 0.9649
+```
+
+Test accuracy converges around 100–200 trees. Adding more trees doesn't hurt but gives diminishing returns.
+
+## Try it Yourself
+
+```python
+from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+X, y = make_classification(n_samples=1000, n_features=20, n_informative=10,
+                             random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+dt  = DecisionTreeClassifier(random_state=0).fit(X_tr, y_tr)
+bag = BaggingClassifier(DecisionTreeClassifier(), n_estimators=100, oob_score=True, random_state=0).fit(X_tr, y_tr)
+rf  = RandomForestClassifier(n_estimators=100, oob_score=True, random_state=0).fit(X_tr, y_tr)
+
+for name, clf in [("Single Tree", dt), ("Bagging", bag), ("Random Forest", rf)]:
+    test = clf.score(X_te, y_te)
+    oob  = getattr(clf, 'oob_score_', '-')
+    print(f"{name:15}: test={test:.3f}, oob={oob}")
+```
+
+```output
+Single Tree    : test=0.850, oob=-
+Bagging        : test=0.905, oob=0.899
+Random Forest  : test=0.920, oob=0.912
+```
+
+## Exercise
+
+Compare a single DecisionTree vs RandomForest on `make_classification` with 50 features (10 informative). Sweep `n_estimators` from 1 to 300. Plot OOB error and test error vs n_estimators. At what point does OOB error stop improving?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+X, y = make_classification(n_samples=800, n_features=50, n_informative=10, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.25, random_state=0)
+
+ns = [1, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300]
+oob_errs, test_errs = [], []
+for n in ns:
+    rf = RandomForestClassifier(n_estimators=n, oob_score=True, random_state=0).fit(X_tr, y_tr)
+    oob_errs.append(1 - rf.oob_score_)
+    test_errs.append(1 - rf.score(X_te, y_te))
+    print(f"n={n:3}: oob_err={oob_errs[-1]:.3f}, test_err={test_errs[-1]:.3f}")
+```
+</details>

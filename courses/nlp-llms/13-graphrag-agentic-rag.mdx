@@ -1,0 +1,291 @@
+---
+course: nlp-llms
+chapter: 13-graphrag-agentic-rag
+title: "GraphRAG and Agentic RAG"
+order: 13
+---
+
+## Where Standard RAG Falls Short
+
+Standard RAG retrieves $k$ chunks most similar to a query. It handles single-hop fact lookup
+well but struggles with:
+
+- **Multi-hop reasoning**: "Who founded the company that makes the GPU used in GPT-4 training?"
+  — requires chaining entities across documents.
+- **Cross-document synthesis**: "Summarise the trends across all earnings reports in this corpus."
+  — requires aggregating, not just retrieving.
+- **Entity-centric queries**: "What did Researcher X collaborate on across multiple papers?"
+  — requires graph-level knowledge.
+
+GraphRAG and agentic RAG address these failure modes in different ways.
+
+## GraphRAG
+
+GraphRAG extracts a knowledge graph (KG) from the document corpus, then uses the KG for
+retrieval alongside or instead of vector search.
+
+### Pipeline
+
+```
+Documents
+  → Entity extraction (NER): people, orgs, concepts
+  → Relation extraction: (subject, predicate, object) triples
+  → Community detection: cluster related entities
+  → Summary generation: LLM summarises each community
+  → Retrieval: query → entity match + graph traversal + community summary
+```
+
+```python
+# Simulate a small knowledge graph
+from collections import defaultdict
+
+# Triples extracted from documents
+triples = [
+    ("Geoffrey Hinton", "works_at", "University of Toronto"),
+    ("Geoffrey Hinton", "invented", "Backpropagation"),
+    ("Backpropagation", "used_in", "Neural Networks"),
+    ("Yann LeCun", "invented", "ConvNets"),
+    ("ConvNets", "used_in", "Computer Vision"),
+    ("Computer Vision", "applied_to", "Image Classification"),
+    ("Yann LeCun", "works_at", "Meta AI"),
+]
+
+graph = defaultdict(list)
+for s, p, o in triples:
+    graph[s].append((p, o))
+    graph[o].append((f"inv_{p}", s))
+
+def query_graph(entity, depth=2):
+    visited, results = set(), []
+    queue = [(entity, 0)]
+    while queue:
+        node, d = queue.pop(0)
+        if node in visited or d > depth:
+            continue
+        visited.add(node)
+        for pred, obj in graph[node]:
+            results.append((node, pred, obj))
+            queue.append((obj, d + 1))
+    return results
+
+facts = query_graph("Yann LeCun")
+print("Facts about Yann LeCun (2-hop):")
+for s, p, o in facts:
+    print(f"  ({s}) --[{p}]--> ({o})")
+```
+
+```output
+Facts about Yann LeCun (2-hop):
+  (Yann LeCun) --[invented]--> (ConvNets)
+  (Yann LeCun) --[works_at]--> (Meta AI)
+  (ConvNets) --[used_in]--> (Computer Vision)
+  (Computer Vision) --[applied_to]--> (Image Classification)
+```
+
+### Community Summaries
+
+Microsoft's GraphRAG clusters entities into communities and generates a summary for each.
+Queries first retrieve community summaries (global context), then drill into specific entities.
+This enables answering high-level synthesis questions that no single chunk can answer.
+
+### When to Use GraphRAG
+
+Use GraphRAG when: entities and their relationships are the core of the query; the corpus is
+large and structured (scientific papers, legal documents, company wikis); multi-hop reasoning
+is required. Costs: extraction is expensive (LLM calls per chunk); the graph must be rebuilt
+on corpus updates.
+
+## Agentic RAG
+
+Agentic RAG adds a reasoning loop around retrieval. Instead of a single retrieve-then-generate
+pass, an agent decides: what to retrieve, whether the result is sufficient, and whether to
+retrieve again.
+
+### The Reflect-and-Retrieve Loop
+
+```python
+def agentic_rag(query, retrieve_fn, generate_fn, max_steps=3):
+    context = []
+    for step in range(max_steps):
+        # Agent decides what to search for
+        if step == 0:
+            search_query = query
+        else:
+            # Reflect: what is still missing?
+            reflection_prompt = (
+                f"Original question: {query}\n"
+                f"Retrieved so far: {context}\n"
+                "What information is still missing? Provide a search query to find it."
+            )
+            search_query = generate_fn(reflection_prompt)
+
+        # Retrieve
+        new_docs = retrieve_fn(search_query, k=2)
+        new_info = [d for d in new_docs if d not in context]
+
+        if not new_info:
+            print(f"  Step {step+1}: no new info found, stopping.")
+            break
+
+        context.extend(new_info)
+        print(f"  Step {step+1}: retrieved {len(new_info)} new doc(s) for query '{search_query[:40]}'")
+
+        # Check if we have enough to answer
+        confidence_prompt = (
+            f"Can you fully answer '{query}' with this context: {context}? "
+            "Reply YES or NO."
+        )
+        confident = generate_fn(confidence_prompt).strip().upper().startswith("YES")
+        if confident:
+            print(f"  Step {step+1}: agent is confident, generating answer.")
+            break
+
+    return generate_fn(f"Answer '{query}' using: {context}")
+
+# Simulate retrieval and generation
+docs_db = {
+    "what is backpropagation": ["Backpropagation computes gradients via chain rule.", "It is used to train neural networks."],
+    "who invented backpropagation": ["Geoffrey Hinton popularised backpropagation in the 1980s.", "Paul Werbos derived it in 1974."],
+}
+
+def mock_retrieve(q, k=2):
+    for key, docs in docs_db.items():
+        if any(w in q.lower() for w in key.split()):
+            return docs[:k]
+    return []
+
+def mock_generate(prompt):
+    if "missing" in prompt.lower():
+        return "who invented backpropagation"
+    if "fully answer" in prompt.lower():
+        return "YES"
+    return "Backpropagation was invented by Paul Werbos (1974) and popularised by Geoffrey Hinton."
+
+answer = agentic_rag("Who invented backpropagation and how does it work?", mock_retrieve, mock_generate)
+print(f"\nFinal answer: {answer}")
+```
+
+```output
+  Step 1: retrieved 2 new doc(s) for query 'Who invented backpropagation and how does it work?'
+  Step 2: retrieved 2 new doc(s) for query 'who invented backpropagation'
+  Step 2: agent is confident, generating answer.
+
+Final answer: Backpropagation was invented by Paul Werbos (1974) and popularised by Geoffrey Hinton.
+```
+
+### Self-RAG
+
+Self-RAG (Asai et al. 2023) adds special tokens to the generation:
+
+| Token | Meaning |
+|-------|---------|
+| `[Retrieve]` | Model decides to retrieve before continuing |
+| `[IsREL]` / `[IsIRREL]` | Is the retrieved passage relevant? |
+| `[IsSUP]` / `[IsNOTSUP]` | Does the passage support the claim? |
+| `[IsUSE]` | Is the overall generation useful? |
+
+The model is fine-tuned to generate these tokens inline, making retrieval decisions
+end-to-end learnable rather than hardcoded.
+
+## Choosing Between Patterns
+
+| Pattern | Best for | Cost |
+|---------|----------|------|
+| Standard RAG | Single-hop fact lookup | Low |
+| GraphRAG | Entity-centric, multi-hop, synthesis | High (extraction) |
+| Agentic RAG | Unknown query complexity, multi-step | Medium–High |
+| Self-RAG | When retrieval decision must be learned | Training cost |
+
+## Try it Yourself
+
+```python
+from collections import defaultdict
+
+triples = [
+    ("PyTorch", "developed_by", "Meta AI"),
+    ("PyTorch", "used_for", "Deep Learning"),
+    ("TensorFlow", "developed_by", "Google"),
+    ("TensorFlow", "used_for", "Deep Learning"),
+    ("Deep Learning", "requires", "Backpropagation"),
+    ("Meta AI", "located_in", "Menlo Park"),
+    ("Google", "located_in", "Mountain View"),
+]
+
+g = defaultdict(list)
+for s, p, o in triples:
+    g[s].append((p, o))
+
+def one_hop(entity):
+    return [(entity, p, o) for p, o in g.get(entity, [])]
+
+# Try querying different entities
+for entity in ["PyTorch", "Deep Learning", "Meta AI"]:
+    print(f"\n{entity}:")
+    for triple in one_hop(entity):
+        print(f"  → [{triple[1]}] {triple[2]}")
+```
+
+```output
+
+PyTorch:
+  → [developed_by] Meta AI
+  → [used_for] Deep Learning
+
+Deep Learning:
+  → [requires] Backpropagation
+
+Meta AI:
+  → [located_in] Menlo Park
+```
+
+## Exercise
+
+Extend the agentic loop above to track which sub-questions have been answered. After each
+retrieval step, maintain a list of answered and unanswered sub-questions from the original
+query (decompose the query into 2–3 sub-questions at the start). Stop only when all
+sub-questions are answered.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def decompose(query, generate_fn):
+    prompt = f"Break the following question into 2–3 simple sub-questions:\n{query}\nReturn one sub-question per line."
+    result = generate_fn(prompt)
+    return [q.strip() for q in result.strip().split("\n") if q.strip()]
+
+def agentic_rag_decomposed(query, retrieve_fn, generate_fn, max_steps=4):
+    sub_qs = decompose(query, generate_fn)
+    print(f"Sub-questions: {sub_qs}")
+    answered = {}
+    context = []
+
+    for step in range(max_steps):
+        unanswered = [q for q in sub_qs if q not in answered]
+        if not unanswered:
+            print("All sub-questions answered.")
+            break
+        search_query = unanswered[0]
+        new_docs = retrieve_fn(search_query, k=2)
+        context.extend(d for d in new_docs if d not in context)
+        answered[search_query] = new_docs
+        print(f"  Step {step+1}: answered '{search_query[:40]}'")
+
+    return generate_fn(f"Answer '{query}' using: {context}")
+
+def mock_decompose(prompt):
+    if "Break" in prompt:
+        return "What is backpropagation?\nWho invented backpropagation?"
+    return "YES"
+
+answer = agentic_rag_decomposed(
+    "Who invented backpropagation and how does it work?",
+    mock_retrieve,
+    lambda p: mock_decompose(p) if "Break" in p else mock_generate(p),
+)
+print(f"Answer: {answer}")
+```
+
+Decomposing upfront ensures the agent terminates cleanly once each specific aspect of the
+query has been addressed.
+</details>

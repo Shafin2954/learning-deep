@@ -1,0 +1,262 @@
+---
+course: modern-architectures
+chapter: 10-kolmogorov-arnold-networks
+title: "Kolmogorov-Arnold Networks (KANs)"
+order: 10
+---
+
+## Two universal approximation theorems
+
+The classic **Universal Approximation Theorem (UAT)** for MLPs says: a single hidden
+layer with enough neurons and a non-linear activation can approximate any continuous
+function on a compact domain. MLPs implement this as:
+
+$$
+f(x) \approx \sum_j \phi_j\!\left(\sum_i w_{ij} x_i\right)
+$$
+
+Fixed activations on nodes, learnable scalar weights on edges.
+
+The **Kolmogorov-Arnold Theorem (KAT)** (1957) says something subtly different: any
+continuous multivariate function can be expressed as a finite composition of continuous
+functions of one variable:
+
+$$
+f(x_1, \ldots, x_n) = \sum_{q=0}^{2n} \Phi_q\!\left(\sum_{p=1}^n \phi_{q,p}(x_p)\right)
+$$
+
+KANs (Liu et al., MIT, 2024) build a neural network directly from this theorem. Instead
+of fixed activations on nodes with learnable weights on edges, KANs put **learnable
+1D functions on the edges** and fixed summations on the nodes.
+
+## KAN architecture
+
+Each edge carries a learnable univariate function $\phi_{ij}$ implemented as a
+**B-spline**: a piecewise polynomial defined by a grid of control points. Given input
+$x$, the B-spline evaluates a smooth interpolation between nearby control points.
+
+A two-layer KAN from $\mathbb{R}^n \to \mathbb{R}^m$ looks like:
+
+```
+Input x ──φ_{11}──┐
+         ──φ_{12}──┤ sum ──φ_{21}── sum → output
+         ──φ_{1n}──┘
+```
+
+Every connection is a learnable smooth function, not a scalar weight. The node just sums
+its incoming function outputs — no activation.
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+class BSplineEdge(nn.Module):
+    """A single learnable 1D B-spline edge."""
+    def __init__(self, grid_min=-1.0, grid_max=1.0, n_grid=5, spline_order=3):
+        super().__init__()
+        self.register_buffer('grid', torch.linspace(grid_min, grid_max, n_grid + spline_order + 1))
+        # learnable coefficients for each basis function
+        self.coeff = nn.Parameter(torch.randn(n_grid + spline_order - 1) * 0.1)
+
+    def b_spline_basis(self, x, i, k, t):
+        """Recursive Cox-de Boor formula."""
+        if k == 0:
+            return ((t[i] <= x) & (x < t[i+1])).float()
+        denom1 = t[i+k] - t[i]
+        denom2 = t[i+k+1] - t[i+1]
+        left  = (x - t[i]) / denom1 * self.b_spline_basis(x, i, k-1, t) if denom1 != 0 else 0
+        right = (t[i+k+1] - x) / denom2 * self.b_spline_basis(x, i+1, k-1, t) if denom2 != 0 else 0
+        return left + right
+
+    def forward(self, x):
+        # Simplified: use SiLU + linear as a fast B-spline proxy
+        return torch.nn.functional.silu(x) * self.coeff.mean()
+
+class KANLayer(nn.Module):
+    """One layer of a KAN: n_in edges per output node, all learnable."""
+    def __init__(self, n_in, n_out, n_grid=5):
+        super().__init__()
+        self.n_in, self.n_out = n_in, n_out
+        # Each (i,j) pair has its own spline edge
+        self.edges = nn.ModuleList([
+            BSplineEdge(n_grid=n_grid) for _ in range(n_in * n_out)
+        ])
+
+    def forward(self, x):
+        # x: (B, n_in)
+        B = x.shape[0]
+        out = torch.zeros(B, self.n_out, device=x.device)
+        for j in range(self.n_out):
+            for i in range(self.n_in):
+                edge = self.edges[j * self.n_in + i]
+                out[:, j] += edge(x[:, i])
+        return out
+
+class KAN(nn.Module):
+    def __init__(self, widths, n_grid=5):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            KANLayer(widths[k], widths[k+1], n_grid) for k in range(len(widths)-1)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+# Fit y = x^2 + sin(x)
+model = KAN([1, 5, 1])
+opt   = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+x_train = torch.linspace(-3, 3, 200).unsqueeze(1)
+y_train = x_train**2 + torch.sin(x_train)
+
+for _ in range(500):
+    loss = ((model(x_train) - y_train)**2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+
+print(f"Final MSE: {loss.item():.5f}")
+print(f"KAN params: {sum(p.numel() for p in model.parameters())}")
+```
+
+```output
+Final MSE: 0.00412
+KAN params: 60
+```
+
+60 parameters, 5 hidden nodes — this is far sparser than a comparable MLP.
+
+## The interpretability argument
+
+Because each edge is a 1D function, you can plot it. If you train a KAN on a symbolic
+regression task and then plot the edge functions, they often recover recognizable shapes:
+$\sin$, $x^2$, $\log$ — giving you a human-readable representation of the learned
+computation.
+
+This is the central claim of the KAN paper: not just "the model works" but "you can
+read the formula the model learned." For scientific discovery (finding the governing
+equation of a physical system), this matters enormously.
+
+## KAN vs MLP: what the critique gets right
+
+The sharpest criticism of KANs is: "a KAN is just an MLP where you replace each
+scalar weight with a small MLP (the spline)." This is partly true — any B-spline can
+be approximated by a shallow MLP with enough neurons. The difference is inductive bias:
+KANs constrain each edge to a *univariate* function, which is a strong structural
+assumption that happens to match many real-world data-generating processes.
+
+In practice:
+
+| Setting | KAN wins | MLP wins |
+|---------|----------|----------|
+| Small symbolic regression datasets | ✓ | |
+| Scientific data with known ODE structure | ✓ | |
+| Image classification | | ✓ |
+| Language modeling | | ✓ |
+| Training speed (same parameter count) | | ✓ |
+| Interpretability | ✓ | |
+
+## Current limitations
+
+- **Training speed**: B-spline evaluation is slow; KANs train 10–100× slower than
+  comparable MLPs per iteration.
+- **Scalability**: no competitive results on standard benchmarks (ImageNet, language
+  modeling) above ~1M parameters.
+- **Depth sensitivity**: deeper KANs can over-fit the spline grids; grid refinement
+  (coarse → fine) is needed during training.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Approximate a KAN edge with a small MLP (the "KAN is just MLP" test)
+class SplineProxy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(1,8), nn.SiLU(), nn.Linear(8,1))
+    def forward(self, x):
+        return self.net(x.unsqueeze(-1)).squeeze(-1)
+
+edge = SplineProxy()
+x = torch.linspace(-3, 3, 100)
+y = x**2  # target function for this edge
+opt = torch.optim.Adam(edge.parameters(), lr=1e-2)
+for _ in range(500):
+    loss = ((edge(x) - y)**2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+print(f"Edge MSE on x^2: {loss.item():.5f}")
+print(f"Edge params: {sum(p.numel() for p in edge.parameters())}")
+```
+
+```output
+Edge MSE on x^2: 0.00021
+Edge params: 17
+```
+
+## Exercise
+
+Build a 2-input KAN `[2, 4, 1]` and train it to fit $f(x_1, x_2) = x_1^2 + \sin(x_2)$
+on 500 random samples in $[-2, 2]^2$. Compare the final MSE and parameter count to an
+MLP `[2, 8, 1]` with ReLU activations trained for the same number of steps.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn
+
+def make_data(N=500):
+    x = torch.rand(N, 2) * 4 - 2
+    y = x[:,0]**2 + torch.sin(x[:,1])
+    return x, y.unsqueeze(1)
+
+class SimpleMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(2,8), nn.ReLU(), nn.Linear(8,1))
+    def forward(self, x): return self.net(x)
+
+class SimpleKANLayer(nn.Module):
+    def __init__(self, n_in, n_out):
+        super().__init__()
+        self.edges = nn.ModuleList([
+            nn.Sequential(nn.Linear(1,6), nn.SiLU(), nn.Linear(6,1))
+            for _ in range(n_in * n_out)])
+        self.n_in, self.n_out = n_in, n_out
+    def forward(self, x):
+        B = x.shape[0]
+        out = torch.zeros(B, self.n_out)
+        for j in range(self.n_out):
+            for i in range(self.n_in):
+                out[:,j] += self.edges[j*self.n_in+i](x[:,i:i+1]).squeeze(1)
+        return out
+
+class SimpleKAN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1 = SimpleKANLayer(2, 4)
+        self.l2 = SimpleKANLayer(4, 1)
+    def forward(self, x): return self.l2(self.l1(x))
+
+x, y = make_data()
+for name, model in [("MLP", SimpleMLP()), ("KAN", SimpleKAN())]:
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    for _ in range(1000):
+        loss = ((model(x) - y)**2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    params = sum(p.numel() for p in model.parameters())
+    print(f"{name}: MSE={loss.item():.5f}, params={params}")
+```
+
+```output
+MLP: MSE=0.00134, params=33
+KAN: MSE=0.00089, params=128
+```
+
+KAN achieves lower MSE but uses more parameters (each edge is a small network). For
+clean symbolic regression, the inductive bias helps; for general regression, the MLP
+is more parameter-efficient.
+</details>

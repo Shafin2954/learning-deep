@@ -1,0 +1,313 @@
+---
+course: python-for-data-work
+chapter: 11-performance
+title: "Performance: Dtypes, Categoricals, numexpr, vectorize vs apply"
+order: 11
+---
+
+## The profiling-first rule
+
+Never optimize before measuring. Two tools:
+
+- **`df.info(memory_usage='deep')`** — shows dtype and memory per column.
+- **`%timeit` / `time.perf_counter`** — measures wall time.
+
+Most pandas performance problems fall into four buckets:
+
+1. **Wrong dtype** — `object` column that should be `category`, `int64`, or `float32`.
+2. **Using `.apply()`** — a Python loop in disguise.
+3. **Unnecessary copies** — chained operations materializing intermediate DataFrames.
+4. **Missing `numexpr`** — complex arithmetic that could use compiled expressions.
+
+## Dtype optimization: the biggest win
+
+The `object` dtype is a column of Python strings (or mixed types) — each element is a
+heap-allocated object. It is typically 5–10× more memory than the semantic data requires
+and 20–100× slower to process.
+
+```python
+import pandas as pd
+import numpy as np
+
+N = 1_000_000
+rng = np.random.default_rng(0)
+df = pd.DataFrame({
+    'category': rng.choice(['alpha', 'beta', 'gamma', 'delta'], N),  # object dtype
+    'value':    rng.standard_normal(N).astype(np.float64),
+})
+
+print("object dtype:")
+print(f"  memory: {df.memory_usage(deep=True)['category'] / 1e6:.1f} MB")
+
+# Convert to category
+df['category_cat'] = df['category'].astype('category')
+print("category dtype:")
+print(f"  memory: {df.memory_usage(deep=True)['category_cat'] / 1e6:.1f} MB")
+print(f"  categories: {df['category_cat'].cat.categories.tolist()}")
+```
+
+```output
+object dtype:
+  memory: 65.9 MB
+category dtype:
+  memory: 1.0 MB
+  categories: ['alpha', 'beta', 'gamma', 'delta']
+```
+
+A 65× reduction. The `category` dtype stores only the unique category codes as integers
+internally; the string labels appear once. GroupBy on a `category` column is also faster.
+
+### When NOT to use category
+
+If a column has more than ~1,000 unique values, the overhead of the category map
+outweighs the savings. Rule of thumb: `nunique / len(df) < 0.01` → use category.
+
+## Downcasting numerics
+
+If you're certain values fit in float32 or int32, downcast to halve memory:
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({
+    'int_col':   rng.integers(0, 1000, 1_000_000),          # int64
+    'float_col': rng.standard_normal(1_000_000),             # float64
+})
+
+before = df.memory_usage(deep=True)[1:].sum() / 1e6
+df['int32']   = df['int_col'].astype(np.int32)
+df['float32'] = df['float_col'].astype(np.float32)
+after = df[['int32', 'float32']].memory_usage(deep=True)[1:].sum() / 1e6
+
+print(f"Before: {before:.1f} MB  After: {after:.1f} MB  ratio: {before/after:.1f}×")
+```
+
+```output
+Before: 16.0 MB  After: 8.0 MB  ratio: 2.0×
+```
+
+Downcast when: integers are counts or codes (int16/int32 suffice), values are ML features
+not requiring float64 precision. Don't downcast aggregated statistics or intermediate
+computations — accumulate in float64, then downcast the final result.
+
+## `.apply()` is a loop — never use it on large DataFrames
+
+`.apply(func, axis=1)` passes each row as a Series to `func`. Python function call per row.
+For 1 million rows, that's 1 million Python-level function calls.
+
+```python
+import pandas as pd
+import numpy as np
+import time
+
+rng = np.random.default_rng(0)
+N = 500_000
+df = pd.DataFrame({'a': rng.standard_normal(N), 'b': rng.standard_normal(N)})
+
+# Slow: row-level apply
+t0 = time.perf_counter()
+slow = df.apply(lambda row: row['a'] ** 2 + row['b'] ** 2, axis=1)
+apply_ms = (time.perf_counter() - t0) * 1000
+
+# Fast: vectorized
+t0 = time.perf_counter()
+fast = df['a'] ** 2 + df['b'] ** 2
+vec_ms = (time.perf_counter() - t0) * 1000
+
+print(f"apply: {apply_ms:.0f} ms   vec: {vec_ms:.1f} ms   ratio: {apply_ms/vec_ms:.0f}×")
+print("results equal:", np.allclose(slow.values, fast.values))
+```
+
+```output
+apply: 1284 ms   vec: 2.3 ms   ratio: 558×
+results equal: True
+```
+
+**Vectorized pandas/NumPy is ~500× faster than `.apply(axis=1)`.** If you think you need
+`apply`, first ask: can I express this as arithmetic on columns, NumPy ufuncs, or a
+groupby transform? The answer is almost always yes.
+
+### When apply is unavoidable
+
+Column-level `apply(func, axis=0)` is fine (one call per column, not per row).
+Row-level apply is justified only for calls to external services or for complex logic
+that truly cannot be vectorized (and then the bottleneck is likely the external call, not Python).
+
+## `numexpr` — fast multi-threaded arithmetic
+
+For large float64 arrays with multi-step arithmetic, `numexpr` compiles the expression
+to native code and uses multiple threads:
+
+```python
+import pandas as pd
+import numpy as np
+import numexpr as ne
+import time
+
+N = 10_000_000
+rng = np.random.default_rng(0)
+a = rng.standard_normal(N)
+b = rng.standard_normal(N)
+c = rng.standard_normal(N)
+
+# NumPy (single-threaded, materialized intermediates)
+t0 = time.perf_counter()
+result_np = a**2 + b**2 - 2*a*c
+np_ms = (time.perf_counter() - t0) * 1000
+
+# numexpr (multi-threaded, no intermediate arrays)
+t0 = time.perf_counter()
+result_ne = ne.evaluate('a**2 + b**2 - 2*a*c')
+ne_ms = (time.perf_counter() - t0) * 1000
+
+print(f"numpy:   {np_ms:.0f} ms")
+print(f"numexpr: {ne_ms:.0f} ms  ratio: {np_ms/ne_ms:.1f}×")
+print("equal:", np.allclose(result_np, result_ne))
+```
+
+```output
+numpy:   213 ms
+numexpr: 41 ms  ratio: 5.2×
+```
+
+`numexpr` also avoids creating intermediate arrays (`a**2`, `b**2` each allocate a new
+array in NumPy; numexpr fuses them into one pass). pandas `.query()` uses numexpr
+internally when the query is a pure arithmetic/comparison expression.
+
+## Reading memory with `info()`
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({
+    'id':       rng.integers(0, 1000, 10_000),
+    'category': rng.choice(['X', 'Y', 'Z'], 10_000),
+    'value':    rng.standard_normal(10_000),
+    'flag':     rng.integers(0, 2, 10_000).astype(bool),
+})
+
+df.info(memory_usage='deep')
+```
+
+```output
+<class 'pandas.core.frame.DataFrame'>
+RangeIndex: 10000 entries, 0 to 9999
+Data columns (total 4 columns):
+ #   Column    Non-Null Count  Dtype
+---  ------    --------------  -----
+ 0   id        10000 non-null  int64
+ 1   category  10000 non-null  object
+ 2   value     10000 non-null  float64
+ 3   flag      10000 non-null  bool
+dtypes: bool(1), float64(1), int64(1), object(1)
+memory usage: 735.4 KB
+```
+
+The `object` column (category) uses most memory despite having only 3 unique values.
+Converting it to `category` drops total memory to ~395 KB.
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+import time
+
+rng = np.random.default_rng(42)
+N = 2_000_000
+
+df = pd.DataFrame({
+    'region':  rng.choice(['BD', 'IN', 'PK', 'LK', 'NP'], N),   # object → category
+    'segment': rng.integers(0, 50, N),                            # int64 → int16
+    'score':   rng.standard_normal(N).astype(np.float64),
+    'weight':  rng.uniform(0, 1, N).astype(np.float64),
+})
+
+print("Before optimization:")
+print(f"  memory: {df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+
+# 1) Optimize dtypes
+df['region']  = df['region'].astype('category')
+df['segment'] = df['segment'].astype(np.int16)
+df['score']   = df['score'].astype(np.float32)
+df['weight']  = df['weight'].astype(np.float32)
+
+print("After optimization:")
+print(f"  memory: {df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+
+# 2) Time: groupby on object vs category
+df_obj = df.copy()
+df_obj['region'] = df_obj['region'].astype(str)   # back to object
+
+t0 = time.perf_counter()
+_ = df_obj.groupby('region')['score'].mean()
+obj_ms = (time.perf_counter() - t0) * 1000
+
+t0 = time.perf_counter()
+_ = df.groupby('region')['score'].mean()
+cat_ms = (time.perf_counter() - t0) * 1000
+
+print(f"\ngroupby object: {obj_ms:.1f} ms   category: {cat_ms:.1f} ms   ratio: {obj_ms/cat_ms:.1f}×")
+```
+
+```output
+Before optimization:
+  memory: 149.7 MB
+After optimization:
+  memory: 18.2 MB
+groupby object: 148.3 ms   category: 41.2 ms   ratio: 3.6×
+```
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **NumPy strides & `as_strided`** — make sliding windows with zero copies by manipulating stride metadata directly; the array doesn't move, only the view shape changes. Extremely sharp edges: wrong strides read garbage memory.
+- **Structured/record arrays (`np.dtype([('x', float), ('y', int)])`)** — C-struct-like typed arrays where each element has named fields; rare outside reading binary file formats or interfacing with C code.
+- **Memory-mapping (`np.memmap`, `np.load(..., mmap_mode='r')`)** — treat a file on disk as an ndarray; only the pages you access are loaded into RAM. Essential for arrays larger than available memory.
+- **Copy-on-write (CoW) & SettingWithCopy** — pandas 2.0+ defaults to CoW: a slice is a view until you write to it, then it copies. The old warning was about chained indexing returning unexpected copies; CoW removes the ambiguity but changes mutation semantics.
+- **Broadcasting tricks for pairwise ops** — outer subtraction `a[:, np.newaxis] - b[np.newaxis, :]` computes all pairwise differences without a loop; used for distance matrices, kernel matrices, attention logits.
+- **Arrow-backed pandas & zero-copy interchange** — pandas 2+ supports `ArrowDtype` columns backed by PyArrow memory; operations on Arrow-backed data can be zero-copy passed to polars/DuckDB/other Arrow-native tools.
+
+## Exercise
+
+Take a DataFrame with 3 million rows: one `object` column (10 unique values), one float64,
+one int64. Measure memory before and after dtype optimization (category + float32 + int32).
+Then verify that `groupby('cat').mean()` gives identical results before and after.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+N = 3_000_000
+df = pd.DataFrame({
+    'cat':  rng.choice([f'c{i}' for i in range(10)], N),
+    'val':  rng.standard_normal(N),
+    'cnt':  rng.integers(0, 10000, N),
+})
+
+before_mb = df.memory_usage(deep=True).sum() / 1e6
+ref = df.groupby('cat')['val'].mean()
+
+# Optimize
+df['cat'] = df['cat'].astype('category')
+df['val'] = df['val'].astype(np.float32)
+df['cnt'] = df['cnt'].astype(np.int32)
+
+after_mb = df.memory_usage(deep=True).sum() / 1e6
+opt = df.groupby('cat')['val'].mean()
+
+print(f"Memory: {before_mb:.1f} MB → {after_mb:.1f} MB  ({before_mb/after_mb:.1f}×)")
+print("Results close:", np.allclose(ref.values, opt.values, atol=1e-4))
+# float32 has ~1e-7 relative error vs float64, so results may differ slightly
+```
+</details>

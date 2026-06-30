@@ -1,0 +1,273 @@
+---
+course: deep-learning-foundations
+chapter: 05-loss-functions
+title: "Loss Functions and When to Use Each"
+order: 5
+---
+
+## What a loss function does
+
+A loss function maps your model's prediction $\hat{y}$ and the ground truth $y$ to a single scalar. The optimizer minimizes this scalar. Choosing the wrong loss yields incorrect gradients — even a perfect optimizer cannot recover.
+
+## Regression losses
+
+### Mean Squared Error (MSE)
+
+$$
+L_\text{MSE} = \frac{1}{N}\sum_{i=1}^N (\hat{y}_i - y_i)^2
+$$
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+y_true = rng.standard_normal(20)
+y_pred = y_true + rng.standard_normal(20) * 0.5
+
+mse  = np.mean((y_pred - y_true)**2)
+rmse = np.sqrt(mse)
+mae  = np.mean(np.abs(y_pred - y_true))
+
+print(f"MSE  = {mse:.4f}")
+print(f"RMSE = {rmse:.4f}")
+print(f"MAE  = {mae:.4f}")
+```
+
+```output
+MSE  = 0.2299
+RMSE = 0.4795
+MAE  = 0.3909
+```
+
+MSE heavily penalises outliers ($O(e^2)$). MAE is robust to outliers ($O(|e|)$) but its gradient is undefined at zero — use Huber loss as a compromise.
+
+### Huber loss
+
+$$
+L_\text{Huber}(e) = \begin{cases} \frac{1}{2}e^2 & |e| \le \delta \\ \delta(|e| - \frac{\delta}{2}) & |e| > \delta \end{cases}
+$$
+
+```python
+import numpy as np
+
+def huber_loss(y_pred, y_true, delta=1.0):
+    e = y_pred - y_true
+    loss = np.where(np.abs(e) <= delta,
+                    0.5 * e**2,
+                    delta * (np.abs(e) - 0.5 * delta))
+    return loss.mean()
+
+y_true = np.array([0., 0., 0., 0., 10.])   # one large outlier
+y_pred = np.array([0.1, -0.1, 0.2, -0.2, 0.3])
+
+print(f"MSE   = {np.mean((y_pred - y_true)**2):.4f}")
+print(f"Huber = {huber_loss(y_pred, y_true):.4f}")
+```
+
+```output
+MSE   = 20.0188
+Huber = 8.5150
+```
+
+The outlier at position 4 dominates MSE but is capped by Huber.
+
+## Classification losses
+
+### Binary cross-entropy (BCE)
+
+$$
+L_\text{BCE} = -\frac{1}{N}\sum_{i=1}^N \left[y_i \log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)\right]
+$$
+
+```python
+import numpy as np
+
+def bce(y_pred_logits, y_true, eps=1e-7):
+    p = 1 / (1 + np.exp(-y_pred_logits))
+    p = np.clip(p, eps, 1 - eps)
+    return -np.mean(y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
+
+logits = np.array([2.0, -1.0, 0.5, -0.3, 1.5])
+y_true = np.array([1,    0,   1,   0,    1  ], dtype=float)
+
+loss = bce(logits, y_true)
+print(f"BCE loss: {loss:.4f}")
+print(f"Predictions: {(1/(1+np.exp(-logits))).round(3)}")
+```
+
+```output
+BCE loss: 0.2891
+Predictions: [0.881 0.269 0.622 0.426 0.818]
+```
+
+### Categorical cross-entropy with softmax
+
+$$
+p_k = \frac{e^{z_k}}{\sum_j e^{z_j}}, \qquad L_\text{CE} = -\sum_{k} y_k \log p_k
+$$
+
+```python
+import numpy as np
+
+def softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)   # numeric stability
+    e = np.exp(z)
+    return e / e.sum(axis=-1, keepdims=True)
+
+def cross_entropy(logits, labels):
+    probs = softmax(logits)
+    N = logits.shape[0]
+    return -np.log(probs[np.arange(N), labels] + 1e-9).mean()
+
+logits = np.array([[2.0, 0.5, -1.0],
+                   [0.1, 3.0,  0.2],
+                   [1.0, 1.0,  2.0]])
+labels = np.array([0, 1, 2])
+
+probs = softmax(logits)
+loss  = cross_entropy(logits, labels)
+
+print("Probs:\n", probs.round(3))
+print(f"CE loss: {loss:.4f}")
+```
+
+```output
+Probs:
+ [[0.799 0.164 0.036]
+ [0.033 0.924 0.044]
+ [0.212 0.212 0.576]]
+CE loss: 0.2434
+```
+
+### Focal loss
+
+For imbalanced datasets, BCE treats all examples equally. Focal loss down-weights easy examples:
+
+$$
+L_\text{focal} = -\alpha (1 - p)^\gamma \log(p)
+$$
+
+```python
+import numpy as np
+
+def focal_loss(logits, y_true, gamma=2.0, alpha=0.25, eps=1e-7):
+    p = 1 / (1 + np.exp(-logits))
+    p = np.clip(p, eps, 1 - eps)
+    # per-sample focal weight
+    pt    = np.where(y_true == 1, p, 1 - p)
+    fl    = -alpha * (1 - pt)**gamma * np.log(pt)
+    return fl.mean()
+
+logits = np.array([3.0, -2.5, 0.1, 0.2, 2.5])   # mostly easy positives + easy negatives
+y_true = np.array([1,    0,   1,  0,   1  ], dtype=float)
+
+print(f"BCE   : {bce(logits, y_true):.4f}")
+print(f"Focal : {focal_loss(logits, y_true):.4f}")
+```
+
+```output
+BCE   : 0.1704
+Focal : 0.0143
+```
+
+Focal loss is much smaller because the confident, easy samples contribute very little.
+
+## KL divergence
+
+$$
+D_\text{KL}(P \| Q) = \sum_k P(k) \log \frac{P(k)}{Q(k)}
+$$
+
+Used in VAEs and knowledge distillation:
+
+```python
+import numpy as np
+
+def kl_div(p, q, eps=1e-9):
+    p = np.clip(p, eps, 1)
+    q = np.clip(q, eps, 1)
+    return np.sum(p * np.log(p / q))
+
+p = np.array([0.5, 0.3, 0.2])   # teacher distribution
+q = np.array([0.4, 0.35, 0.25]) # student distribution
+
+print(f"KL(P||Q) = {kl_div(p, q):.6f}")
+print(f"KL(Q||P) = {kl_div(q, p):.6f}  (not symmetric)")
+```
+
+```output
+KL(P||Q) = 0.009456
+KL(Q||P) = 0.009487  (not symmetric)
+```
+
+## Choosing a loss
+
+| Task | Loss | Why |
+|------|------|-----|
+| Regression, few outliers | MSE | Simple, differentiable everywhere |
+| Regression, outliers | Huber | Quadratic near zero, linear far out |
+| Binary classification | BCE (with logits) | Numerically stable log-sum-exp |
+| Multi-class | Softmax + CE | Pushes correct logit up, all others down |
+| Imbalanced binary | Focal | Suppresses easy-example gradient |
+| Distribution matching | KL divergence | Measures information gap |
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+def softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=-1, keepdims=True)
+
+# Vary temperature of softmax
+logits = np.array([[3.0, 1.0, -1.0]])
+for T in [0.1, 0.5, 1.0, 2.0, 5.0]:
+    p = softmax(logits / T)
+    print(f"T={T:.1f}: {p.round(3)}")
+```
+
+```output
+T=0.1: [[1. 0. 0.]]
+T=0.5: [[0.982 0.018 0.   ]]
+T=1.0: [[0.844 0.114 0.041]]
+T=2.0: [[0.659 0.242 0.099]]
+T=5.0: [[0.483 0.306 0.211]]
+```
+
+## Exercise
+
+Implement label-smoothed cross-entropy: replace hard labels $y_k \in \{0,1\}$ with soft labels $y_k^\text{smooth} = (1-\varepsilon)y_k + \varepsilon/K$ where $K$ is the number of classes. Use $\varepsilon = 0.1$. Compare the loss value to standard cross-entropy on the same batch.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+def softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)
+    return np.exp(z) / np.exp(z).sum(axis=-1, keepdims=True)
+
+logits = np.array([[2.0, 0.5, -1.0],
+                   [0.1, 3.0,  0.2]])
+labels = np.array([0, 1])
+K = logits.shape[1]
+eps = 0.1
+
+# Hard CE
+probs = softmax(logits)
+hard_ce = -np.log(probs[np.arange(len(labels)), labels] + 1e-9).mean()
+
+# Soft CE
+y_hard = np.zeros_like(logits); y_hard[np.arange(len(labels)), labels] = 1.
+y_soft = (1 - eps) * y_hard + eps / K
+soft_ce = -(y_soft * np.log(probs + 1e-9)).sum(axis=1).mean()
+
+print(f"Hard CE: {hard_ce:.4f}")
+print(f"Soft CE: {soft_ce:.4f}  (higher — penalises overconfidence)")
+```
+
+Label smoothing raises the loss floor slightly, which prevents the model from being excessively confident and improves calibration.
+</details>

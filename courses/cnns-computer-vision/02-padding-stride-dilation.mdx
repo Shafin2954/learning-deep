@@ -1,0 +1,215 @@
+---
+course: cnns-computer-vision
+chapter: 02-padding-stride-dilation
+title: "Padding, Stride, Dilation, and Receptive Field"
+order: 2
+---
+
+## The output-size formula
+
+Every conv layer shrinks the spatial dimensions unless you add padding. The general formula for
+one spatial dimension:
+
+$$
+H_{out} = \left\lfloor \frac{H_{in} + 2p - d(k-1) - 1}{s} + 1 \right\rfloor
+$$
+
+where $p$ = padding, $d$ = dilation, $k$ = kernel size, $s$ = stride.
+
+```python
+import torch
+import torch.nn as nn
+
+def conv_output_size(H_in, k, p=0, s=1, d=1):
+    return (H_in + 2*p - d*(k-1) - 1) // s + 1
+
+print("32, k=3, p=0, s=1:", conv_output_size(32, 3))          # shrinks
+print("32, k=3, p=1, s=1:", conv_output_size(32, 3, p=1))     # same size
+print("32, k=3, p=0, s=2:", conv_output_size(32, 3, s=2))     # halves
+print("32, k=3, p=1, s=2:", conv_output_size(32, 3, p=1, s=2))
+```
+
+```output
+32, k=3, p=0, s=1: 30
+32, k=3, p=1, s=1: 32
+32, k=3, p=0, s=2: 15
+32, k=3, p=1, s=2: 16
+```
+
+## Padding
+
+**VALID** (no padding): output shrinks by $k-1$. Good when you explicitly want downsampling.
+
+**SAME** (padding = $\lfloor k/2 \rfloor$): output equals input size when stride=1. Standard default
+for convolutions that shouldn't downsample.
+
+```python
+import torch
+
+x = torch.randn(1, 1, 8, 8)
+conv_valid = nn.Conv2d(1, 1, kernel_size=3, padding=0)
+conv_same  = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+conv_same2 = nn.Conv2d(1, 1, kernel_size=3, padding='same')
+
+print("VALID output:", conv_valid(x).shape)
+print("SAME  output:", conv_same(x).shape)
+print("SAME (auto):", conv_same2(x).shape)
+```
+
+```output
+VALID output: torch.Size([1, 1, 6, 6])
+SAME  output: torch.Size([1, 1, 8, 8])
+SAME (auto): torch.Size([1, 1, 8, 8])
+```
+
+## Stride
+
+Stride $s > 1$ skips positions, effectively downsampling the output. Stride-2 convolution halves
+the spatial dimensions — a learnable alternative to max pooling, preferred in modern architectures.
+
+ResNet's first conv layer uses a $7 \times 7$ kernel with stride 2 and padding 3, immediately
+halving the $224 \times 224$ image to $112 \times 112$.
+
+```python
+x = torch.randn(1, 3, 224, 224)
+conv_s2 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
+print("ResNet stem output:", conv_s2(x).shape)   # should be (1,64,112,112)
+```
+
+```output
+ResNet stem output: torch.Size([1, 64, 112, 112])
+```
+
+## Dilation
+
+Dilation $d > 1$ inserts $d-1$ zeros between kernel elements, making a $3 \times 3$ kernel behave
+like a $(2d-1) \times (2d-1)$ kernel but with the same parameter count.
+
+Effective kernel size: $k_{\text{eff}} = d(k-1)+1$.
+
+| $k$ | $d$ | $k_{\text{eff}}$ |
+|-----|-----|---------|
+| 3 | 1 | 3 |
+| 3 | 2 | 5 |
+| 3 | 4 | 9 |
+
+Used in semantic segmentation (atrous convolution) to aggregate context without downsampling,
+and in WaveNet for large temporal receptive fields in audio.
+
+```python
+x = torch.randn(1, 1, 16, 16)
+conv_d1 = nn.Conv2d(1, 1, kernel_size=3, padding=1,  dilation=1)
+conv_d2 = nn.Conv2d(1, 1, kernel_size=3, padding=2,  dilation=2)
+conv_d4 = nn.Conv2d(1, 1, kernel_size=3, padding=4,  dilation=4)
+
+print("d=1 output:", conv_d1(x).shape)   # same spatial size
+print("d=2 output:", conv_d2(x).shape)
+print("d=4 output:", conv_d4(x).shape)
+```
+
+```output
+d=1 output: torch.Size([1, 1, 16, 16])
+d=2 output: torch.Size([1, 1, 16, 16])
+d=4 output: torch.Size([1, 1, 16, 16])
+```
+
+All same output size — but the d=4 layer sees a 9×9 area with only 9 parameters.
+
+## Receptive field grows with depth
+
+The receptive field of a unit in layer $l$ (with kernel $k$ and stride $s$) relative to the input:
+
+$$
+RF_l = RF_{l-1} + (k-1) \cdot \prod_{i=1}^{l-1} s_i
+$$
+
+For a stack of $3 \times 3$, stride-1 convs (no dilation), $RF$ grows linearly: 3, 5, 7, 9, …
+
+```python
+def receptive_field(n_layers, k=3, s=1):
+    rf = 1
+    stride_prod = 1
+    for _ in range(n_layers):
+        rf += (k - 1) * stride_prod
+        stride_prod *= s
+    return rf
+
+for n in range(1, 9):
+    print(f"{n} conv(3×3, s=1): RF = {receptive_field(n)}")
+```
+
+```output
+1 conv(3×3, s=1): RF = 3
+2 conv(3×3, s=1): RF = 5
+3 conv(3×3, s=1): RF = 7
+4 conv(3×3, s=1): RF = 9
+5 conv(3×3, s=1): RF = 11
+6 conv(3×3, s=1): RF = 13
+7 conv(3×3, s=1): RF = 15
+8 conv(3×3, s=1): RF = 17
+```
+
+Deep networks compensate by stacking many small-kernel layers. Two $3 \times 3$ layers have the
+same theoretical receptive field as one $5 \times 5$ layer but with $2 \times 9 = 18$ vs $25$ params
+and an extra nonlinearity.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+def receptive_field_dilation(n_layers, k=3, d=1):
+    """All same dilation. Each layer's effective kernel is d*(k-1)+1."""
+    k_eff = d * (k - 1) + 1
+    return 1 + n_layers * (k_eff - 1)
+
+print("Standard 3x3 (d=1), 4 layers:", receptive_field_dilation(4, d=1))
+print("Dilated  3x3 (d=2), 4 layers:", receptive_field_dilation(4, d=2))
+print("Dilated  3x3 (d=4), 4 layers:", receptive_field_dilation(4, d=4))
+
+# Verify with conv output sizes
+x = torch.randn(1, 1, 64, 64)
+net_standard = nn.Sequential(*[nn.Conv2d(1,1,3,padding=1) for _ in range(4)])
+net_dilated  = nn.Sequential(*[nn.Conv2d(1,1,3,padding=2,dilation=2) for _ in range(4)])
+print("Standard output:", net_standard(x).shape)
+print("Dilated  output:", net_dilated(x).shape)
+```
+
+```output
+Standard 3x3 (d=1), 4 layers: 9
+Dilated  3x3 (d=2), 4 layers: 17
+Dilated  3x3 (d=4), 4 layers: 33
+Standard output: torch.Size([1, 1, 64, 64])
+Dilated  output: torch.Size([1, 1, 64, 64])
+```
+
+## Exercise
+
+A network has three conv layers: $5 \times 5$ (stride 2), $3 \times 3$ (stride 1), $3 \times 3$
+(stride 1). Compute the receptive field after each layer. Then compute the output size if the
+input is $64 \times 64$ (no padding, dilation=1).
+
+<details>
+<summary>Solution</summary>
+
+```python
+def rf_and_sizes(layers, H_in=64):
+    rf, stride_prod = 1, 1
+    H = H_in
+    for k, s in layers:
+        rf += (k - 1) * stride_prod
+        stride_prod *= s
+        H = (H - k) // s + 1
+        print(f"  k={k} s={s}: RF={rf}, output size={H}")
+
+layers = [(5, 2), (3, 1), (3, 1)]
+print("Receptive fields and output sizes:")
+rf_and_sizes(layers)
+```
+
+After layer 1 (5×5, s=2): RF=5, H=30.
+After layer 2 (3×3, s=1): RF=9, H=28.
+After layer 3 (3×3, s=1): RF=13, H=26.
+The key insight: stride multiplies the RF jump of subsequent layers.
+</details>

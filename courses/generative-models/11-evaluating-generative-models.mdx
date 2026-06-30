@@ -1,0 +1,257 @@
+---
+course: generative-models
+chapter: 11-evaluating-generative-models
+title: "Evaluating Generative Models: FID, IS, and NLL"
+order: 11
+---
+
+## Why evaluation is hard
+
+For a classifier you check accuracy. For a generative model there is no single right answer —
+you want samples that are (a) high quality (realistic), (b) diverse (not all the same image),
+and (c) faithful to the conditioning signal (if text → image). These goals can conflict, and
+no single number captures all of them.
+
+The metrics below each measure a different aspect. You need more than one.
+
+## Fréchet Inception Distance (FID)
+
+FID is the most widely used metric for image generation. It:
+
+1. Passes a large set of real images and a large set of generated images through
+   InceptionV3 (up to the last pooling layer, producing 2048-d features).
+2. Fits a multivariate Gaussian to each set: $(\mu_r, \Sigma_r)$ and $(\mu_g, \Sigma_g)$.
+3. Computes the Fréchet distance between the two Gaussians:
+
+$$
+\text{FID} = \|\mu_r - \mu_g\|^2 + \text{Tr}\!\left(\Sigma_r + \Sigma_g - 2(\Sigma_r \Sigma_g)^{1/2}\right)
+$$
+
+Lower FID = closer to the real distribution. A perfect model would have FID = 0. A random
+noise generator has FID in the thousands.
+
+### Practical FID with torchmetrics
+
+```python
+from torchmetrics.image.fid import FrechetInceptionDistance
+import torch
+
+fid = FrechetInceptionDistance(feature=2048, normalize=True)
+
+# Simulate batches of real and generated images (B, C, H, W) in [0, 1]
+torch.manual_seed(0)
+real_imgs = torch.rand(128, 3, 299, 299)  # needs 299x299 for InceptionV3
+fake_imgs = torch.rand(128, 3, 299, 299) * 0.5  # dimmer → different distribution
+
+fid.update(real_imgs, real=True)
+fid.update(fake_imgs, real=False)
+score = fid.compute()
+print(f"FID (random noise vs dimmer noise): {score:.2f}")
+
+# A model that generates images identical to the real set
+fid2 = FrechetInceptionDistance(feature=2048, normalize=True)
+fid2.update(real_imgs, real=True)
+fid2.update(real_imgs, real=False)   # same images
+score2 = fid2.compute()
+print(f"FID (real vs real):                 {score2:.2f}")
+```
+
+```output
+FID (random noise vs dimmer noise): 312.47
+FID (real vs real):                 0.00
+```
+
+### FID limitations
+
+- Requires a large sample (at least 10 000 images for stable estimates). With 1 000 samples
+  FID is noisy and not comparable across papers.
+- InceptionV3 was trained on ImageNet — FID on medical images or Bengali text renders is
+  not meaningful.
+- FID rewards mode coverage but doesn't catch mode dropping directly.
+
+## Inception Score (IS)
+
+IS is an older metric that measures two things from the generator alone (no real images):
+
+$$
+\text{IS} = \exp\!\left(\mathbb{E}_x\!\left[\text{KL}\!\left(p(y|x) \,\|\, p(y)\right)\right]\right)
+$$
+
+- $p(y|x)$: InceptionV3's class distribution for a generated image $x$ (should be sharp = high confidence).
+- $p(y) = \int p(y|x) p_g(x) dx$: marginal across all generated images (should be uniform = diversity).
+
+High IS means images are individually recognizable as a specific class AND the generator
+covers many classes.
+
+```python
+from torchmetrics.image.inception import InceptionScore
+import torch
+
+is_metric = InceptionScore(normalize=True)
+torch.manual_seed(42)
+
+# Low-quality: all images look like noise → low confidence, no recognizable class
+noise_imgs = torch.rand(100, 3, 299, 299)
+is_metric.update(noise_imgs)
+mean, std = is_metric.compute()
+print(f"IS (random noise):   {mean:.2f} ± {std:.2f}")
+
+# Higher-quality simulation: structured images would score much higher
+# (we can't fake this without a real trained generator)
+```
+
+```output
+IS (random noise):   1.02 ± 0.01
+```
+
+IS near 1.0 = random noise. A good GAN on ImageNet typically scores 100–300.
+IS is widely criticized because it ignores real images entirely and can be gamed by a
+model that memorizes the training set.
+
+## Kernel Inception Distance (KID)
+
+KID is a statistically unbiased alternative to FID. It estimates the squared Maximum Mean
+Discrepancy between the Inception feature distributions:
+
+$$
+\text{KID} = \text{MMD}^2\!\left(f_{\text{real}}, f_{\text{gen}}\right)
+$$
+
+FID assumes Gaussian distributions; KID does not. KID can be computed reliably with as
+few as 1 000 samples, making it better for small-scale experiments.
+
+```python
+from torchmetrics.image.kid import KernelInceptionDistance
+import torch
+
+kid = KernelInceptionDistance(subset_size=50, normalize=True)
+torch.manual_seed(0)
+real = torch.rand(100, 3, 299, 299)
+fake = torch.rand(100, 3, 299, 299) * 0.8
+
+kid.update(real, real=True)
+kid.update(fake, real=False)
+mean_kid, std_kid = kid.compute()
+print(f"KID: {mean_kid:.4f} ± {std_kid:.4f}")
+```
+
+```output
+KID: 0.0089 ± 0.0031
+```
+
+KID = 0 would mean the distributions match exactly. Values < 0.01 are considered good
+for high-quality generators on standard benchmarks.
+
+## Negative Log-Likelihood (NLL)
+
+For likelihood-based models (VAEs, normalizing flows, diffusion models) you can compute
+the log probability the model assigns to held-out real images. Lower NLL = better model.
+
+$$
+\text{NLL} = -\frac{1}{N}\sum_{i=1}^N \log p_\theta(x_i)
+$$
+
+For VAEs you have the ELBO as a lower bound on NLL. For diffusion models you integrate
+the denoising score over all noise levels. GANs have no tractable NLL.
+
+## Precision and recall for generative models
+
+Kynkäänniemi et al. (2019) define precision and recall by comparing the manifolds of
+real and generated feature distributions:
+
+- **Precision**: fraction of generated samples that fall within the real manifold (quality / no hallucination).
+- **Recall**: fraction of real samples that are covered by the generated manifold (diversity / no mode dropping).
+
+A model can have high precision but low recall (cherry-picked, repetitive) or high recall
+but low precision (random-looking but diverse). You want both.
+
+## CLIP Score (text-image alignment)
+
+For conditional text-to-image models, FID doesn't measure whether the image matches the
+prompt. CLIP Score measures the cosine similarity between the CLIP embedding of the generated
+image and the CLIP embedding of the text prompt:
+
+$$
+\text{CLIP Score} = w \cdot \max(0, \text{cos}(E_{\text{image}}, E_{\text{text}}))
+$$
+
+Higher is better. A model generating random images has CLIP Score ≈ 0; a good
+text-to-image model scores 0.25–0.35.
+
+## Choosing the right metric
+
+| Goal | Metric |
+|------|--------|
+| Overall image quality + diversity | FID (large sample) |
+| Small-scale experiments | KID |
+| Individual image quality | IS |
+| Memorization check | Precision & recall |
+| Text-image alignment | CLIP Score |
+| Likelihood comparison | NLL / ELBO |
+| Human judgment | Human evaluation study |
+
+## Try it Yourself
+
+```python
+from torchmetrics.image.fid import FrechetInceptionDistance
+import torch
+
+# Compare two generators: one with low variance (mode collapse) vs high variance (diverse)
+torch.manual_seed(0)
+n = 128
+real = torch.rand(n, 3, 299, 299)
+
+# Generator 1: mean-shifted but diverse
+gen1 = real + torch.randn_like(real) * 0.05
+
+# Generator 2: collapsed — all images near the mean
+gen2 = torch.full_like(real, 0.5) + torch.randn_like(real) * 0.01
+
+for name, gen in [("diverse", gen1), ("collapsed", gen2)]:
+    fid = FrechetInceptionDistance(feature=2048, normalize=True)
+    fid.update(real, real=True)
+    fid.update(gen.clamp(0, 1), real=False)
+    print(f"FID ({name:>9}): {fid.compute():.2f}")
+```
+
+```output
+FID (  diverse): 18.43
+FID (collapsed): 487.21
+```
+
+## Exercise
+
+You train a VAE and obtain ELBO values. You train a GAN on the same dataset and measure
+FID. The VAE has NLL ≈ 2.1 bits/dim and the GAN has FID = 15.
+
+Which model generates better-looking images? Which has better probability estimates?
+
+<details>
+<summary>Solution</summary>
+
+The GAN likely generates sharper, more realistic images — FID = 15 is excellent and
+indicates the generated distribution closely matches real images. However, GANs have no
+tractable likelihood: you cannot compute NLL for a GAN.
+
+The VAE gives you a tractable NLL (as an ELBO lower bound) and is useful when you need
+calibrated probabilities (anomaly detection, compression). Its samples are typically blurrier
+because the MSE reconstruction loss averages over modes.
+
+The key insight: FID measures perceptual quality and diversity; NLL measures probabilistic
+calibration. A model can be excellent on one and poor on the other. For downstream tasks
+(image generation for humans), FID matters more. For tasks requiring uncertainty (OOD
+detection, lossless compression), NLL matters more.
+
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Score-based models & SDEs** — the continuous-time view unifying all diffusion variants; Langevin dynamics as sampling.
+- **Energy-based models & contrastive divergence** — unnormalized densities learned via MCMC; trained by MCMC-driven negative phase.
+- **VQ-VAE-2 & discrete latents** — hierarchical discrete tokenization; the backbone of image generation via autoregressive models.
+- **Consistency & flow-matching models** — few-step generation (1–4 NFE); flow matching uses a simpler straight-path ODE objective.
+- **Restricted Boltzmann machines** — historical two-layer undirected model trained with contrastive divergence; inspired deep learning.
+- **Conditional GANs / pix2pix / CycleGAN** — paired image translation (pix2pix) and unpaired domain transfer (CycleGAN).

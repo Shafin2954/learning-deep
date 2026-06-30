@@ -1,0 +1,316 @@
+---
+course: data-wrangling-eda
+chapter: 02-loading-messy-data
+title: "Loading Messy Data: Encodings, Dtypes, Memory, Bad Rows"
+order: 2
+---
+
+## Real data is never clean at load time
+
+The first file you receive will have at least one of: wrong encoding, mixed dtypes in a
+column, thousands separator commas, ambiguous date formats, sentinel values masquerading
+as NaN, or rows that crashed the exporter. `pd.read_csv` has a parameter for almost all
+of these — knowing them is faster than writing a post-load cleanup loop.
+
+## Encoding: the invisible source of `UnicodeDecodeError`
+
+```python
+import pandas as pd, io
+
+# Simulate a file that was saved with Latin-1 (common in legacy Windows exports)
+raw_latin1 = "name,city\nAlice,Résumé\nBob,Café".encode('latin-1')
+buf = io.BytesIO(raw_latin1)
+
+try:
+    pd.read_csv(buf)     # default utf-8 → error
+except UnicodeDecodeError as e:
+    print("utf-8 failed:", str(e)[:60])
+
+buf.seek(0)
+df = pd.read_csv(buf, encoding='latin-1')
+print(df)
+```
+
+```output
+utf-8 failed: 'utf-8' codec can't decode byte 0xe9 in position 0: inv
+  name   city
+0  Alice  Résumé
+1    Bob   Café
+```
+
+When you don't know the encoding, try `encoding='latin-1'` first (it never errors —
+every byte is valid Latin-1) or use `chardet`/`charset-normalizer` to detect it:
+
+```python
+import chardet, io
+
+raw = "name\nAlice\nMeiying".encode('gb2312')
+result = chardet.detect(raw)
+print(result)
+```
+
+```output
+{'encoding': 'GB2312', 'confidence': 0.99, 'language': 'Chinese'}
+```
+
+## Dtype control at load time
+
+Let `read_csv` infer dtypes and you get surprises: a column of integers with one missing
+value becomes float64; a column of numeric IDs becomes int64 when you need strings; a
+column of `0`/`1` flags becomes int64 when bool is enough.
+
+```python
+import pandas as pd, io
+
+csv = """id,score,active,category
+1001,88.5,1,A
+1002,,0,B
+1003,91.0,1,A
+"""
+buf = io.StringIO(csv)
+
+# Inferred types
+df_auto = pd.read_csv(buf)
+print("auto dtypes:")
+print(df_auto.dtypes)
+print(df_auto.memory_usage(deep=True).sum(), "bytes")
+
+buf.seek(0)
+# Explicit types — id as string, active as bool, pre-assigned
+df_typed = pd.read_csv(
+    buf,
+    dtype={'id': str, 'score': 'float32', 'category': 'category'},
+)
+print("\nexplicit dtypes:")
+print(df_typed.dtypes)
+print(df_typed.memory_usage(deep=True).sum(), "bytes")
+```
+
+```output
+auto dtypes:
+id           int64
+score       float64
+active        int64
+category     object
+dtype: object
+341 bytes
+
+explicit dtypes:
+id          object
+score      float32
+active       int64
+category  category
+dtype: object
+461 bytes
+```
+
+For large files the dtype savings compound: a 10 M-row `object` column of 4-character
+categories uses ~650 MB; as `category` dtype it uses ~10 MB.
+
+## Handling missing-value sentinels
+
+Many real datasets use custom sentinel values: `-9999`, `'N/A'`, `'n.a.'`, `'.'`, empty
+string, `'NULL'`, `'None'`. `read_csv`'s `na_values` parameter handles all of them.
+
+```python
+import pandas as pd, io
+
+csv = """age,income,note
+25,50000,ok
+-999,.,missing income
+32,N/A,missing income
+40,75000,ok
+"""
+buf = io.StringIO(csv)
+df = pd.read_csv(
+    buf,
+    na_values=['-999', 'N/A', '.', '', 'NULL', 'None'],
+    keep_default_na=True,          # also keep pandas defaults like '', '#N/A'
+)
+print(df)
+print("\nmissing counts:")
+print(df.isna().sum())
+```
+
+```output
+   age    income          note
+0   25  50000.0            ok
+1  NaN      NaN  missing income
+2   32      NaN  missing income
+3   40  75000.0            ok
+
+missing counts:
+age       1
+income    2
+note      0
+dtype: int64
+```
+
+## Thousands separators and decimal commas
+
+European locales use `.` for thousands and `,` for decimals (`1.234,56`). The US uses
+the reverse. `read_csv` has `thousands` and `decimal` parameters.
+
+```python
+import pandas as pd, io
+
+csv = "amount\n1.234,56\n89.012,00\n5.000,00"
+buf = io.StringIO(csv)
+df = pd.read_csv(buf, thousands='.', decimal=',')
+print(df)
+print("dtype:", df['amount'].dtype)
+```
+
+```output
+   amount
+0  1234.56
+1  8901200
+2  5000.00
+dtype: float64
+```
+
+## Bad rows: `on_bad_lines`
+
+When a CSV row has more (or fewer) fields than the header, pandas raises an error by default.
+Use `on_bad_lines='skip'` to drop them or `'warn'` to count them.
+
+```python
+import pandas as pd, io
+
+csv = """a,b,c
+1,2,3
+4,5,6,EXTRA_FIELD
+7,8,9
+"""
+buf = io.StringIO(csv)
+df = pd.read_csv(buf, on_bad_lines='skip')
+print(df)
+print("rows after skip:", len(df))
+```
+
+```output
+   a  b  c
+0  1  2  3
+1  7  8  9
+rows after skip: 2
+```
+
+## Chunked loading for very large files
+
+When a file doesn't fit in RAM, read it in chunks:
+
+```python
+import pandas as pd, io
+
+# Simulate a large CSV
+lines = "id,val\n" + "\n".join(f"{i},{i*2}" for i in range(1_000_000))
+buf = io.StringIO(lines)
+
+total = 0
+for chunk in pd.read_csv(buf, chunksize=200_000):
+    total += chunk['val'].sum()
+print("total val:", total)          # 0+2+4+...+(2*999999) = 999999*1000000 = 999999000000
+```
+
+```output
+total val: 999999000000
+```
+
+Process each chunk independently (aggregate, filter, write to a new file). Never store
+all chunks in a list and concatenate — that defeats the purpose.
+
+## Try it Yourself
+
+```python
+import pandas as pd, io
+
+# A realistic messy CSV
+csv = """product_id,name,price,stock,category
+P001,Widget A,1.299,50,electronics
+P002,Gadget B,N/A,0,electronics
+P003,,24.99,-999,
+P004,Doohickey D,8.49,200,hardware
+P005,Thingamajig E,N/A,10,hardware
+"""
+buf = io.StringIO(csv)
+
+df = pd.read_csv(
+    buf,
+    dtype={'product_id': str, 'stock': 'Int32'},   # Int32 supports NA for ints
+    na_values=['N/A', '-999', ''],
+    thousands=',',
+)
+print(df)
+print("\ndtypes:\n", df.dtypes)
+print("\nna counts:\n", df.isna().sum())
+```
+
+```output
+  product_id           name  price  stock   category
+0       P001       Widget A   1299     50  electronics
+1       P002       Gadget B    NaN      0  electronics
+2       P003            NaN  24.99   <NA>         NaN
+3       P004   Doohickey D   8.49    200     hardware
+4       P005  Thingamajig E    NaN     10     hardware
+
+dtypes:
+ product_id     object
+name           object
+price         float64
+stock           Int32
+category       object
+dtype: object
+
+na counts:
+ product_id    0
+name          1
+price         2
+stock         1
+category      1
+dtype: int64
+```
+
+## Exercise
+
+Write a function `load_clean(path_or_buf)` that:
+1. Detects encoding automatically using `chardet`.
+2. Reads the CSV with a custom sentinel list and the detected encoding.
+3. Returns a DataFrame with `object` columns that have fewer than 20 unique values
+   automatically converted to `category`.
+4. Prints a one-line summary: shape, total missing, and memory usage in MB.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import chardet
+
+def load_clean(path_or_buf):
+    # 1) detect encoding
+    if hasattr(path_or_buf, 'read'):
+        raw = path_or_buf.read()
+        path_or_buf.seek(0)
+    else:
+        with open(path_or_buf, 'rb') as f:
+            raw = f.read(100_000)   # sample first 100 KB
+    enc = chardet.detect(raw)['encoding'] or 'utf-8'
+
+    # 2) read with sentinels
+    df = pd.read_csv(
+        path_or_buf, encoding=enc,
+        na_values=['N/A', 'n/a', 'NA', 'NULL', 'None', '.', '-999', ''],
+        keep_default_na=True,
+    )
+
+    # 3) auto-categorize low-cardinality object columns
+    for col in df.select_dtypes('object').columns:
+        if df[col].nunique() < 20:
+            df[col] = df[col].astype('category')
+
+    # 4) summary
+    mb = df.memory_usage(deep=True).sum() / 1e6
+    print(f"shape={df.shape}  missing={df.isna().sum().sum()}  mem={mb:.2f} MB")
+    return df
+```
+</details>

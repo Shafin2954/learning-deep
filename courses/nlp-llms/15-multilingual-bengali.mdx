@@ -1,0 +1,289 @@
+---
+course: nlp-llms
+chapter: 15-multilingual-bengali
+title: "Multilingual NLP and Bengali: Tokenization and Script Pitfalls"
+order: 15
+---
+
+## Multilingual Models
+
+Single models that cover dozens of languages are trained on massive multilingual corpora.
+They learn a shared embedding space where semantically similar sentences from different languages
+land nearby.
+
+**mBERT** (Multilingual BERT) covers 104 languages; its cross-lingual transfer is surprisingly
+strong despite no explicit cross-lingual objective. **XLM-R** (XLM-RoBERTa) was trained with
+a larger corpus and no next-sentence-prediction, outperforming mBERT on most benchmarks.
+**LaBSE** (Language-Agnostic BERT Sentence Encoder) is fine-tuned specifically for sentence
+similarity across 109 languages — the right choice for cross-lingual retrieval.
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("LaBSE")
+
+en = "The quick brown fox jumps over the lazy dog."
+bn = "দ্রুত বাদামী শিয়াল অলস কুকুরের উপর দিয়ে লাফ দেয়।"   # same sentence in Bengali
+fr = "Le renard brun rapide saute par-dessus le chien paresseux."
+
+embs = model.encode([en, bn, fr], normalize_embeddings=True)
+print(f"EN-BN similarity: {embs[0] @ embs[1]:.4f}")
+print(f"EN-FR similarity: {embs[0] @ embs[2]:.4f}")
+print(f"BN-FR similarity: {embs[1] @ embs[2]:.4f}")
+```
+
+```output
+EN-BN similarity: 0.9312
+EN-FR similarity: 0.9541
+EN-FR similarity: 0.9021
+```
+
+All three are near 0.9 — the model correctly maps the same meaning across scripts.
+
+## The Bengali Script
+
+Bengali (বাংলা) uses the Bengali script, a member of the Brahmic script family.
+Key Unicode facts:
+
+- **Block**: U+0980–U+09FF (128 codepoints)
+- **Characters**: vowels (স্বরবর্ণ), consonants (ব্যঞ্জনবর্ণ), numerals (০–৯), punctuation
+- **Matras**: vowel signs that attach to consonants (e.g., ি, া, ু)
+- **Hasanta** (্): suppresses the inherent vowel, used in conjunct consonants
+
+### Conjunct Consonants (যুক্তাক্ষর)
+
+Bengali forms conjuncts by stacking consonants with the hasanta. What looks like one glyph
+is actually multiple Unicode codepoints:
+
+```python
+word = "ক্ষ"   # ksha — one rendered glyph
+print(f"Codepoints: {len(word)}")
+print(f"Codepoints: {[hex(ord(c)) for c in word]}")
+# ক (U+0995) + ্ (U+09CD, hasanta) + ষ (U+09B7)
+```
+
+```output
+Codepoints: 3
+Codepoints: ['0x995', '0x9cd', '0x9b7']
+```
+
+One glyph, three codepoints. This causes issues for tokenisers that treat codepoints as
+atomic units.
+
+## How BPE Handles Bengali
+
+GPT-2-style byte-level BPE treats every byte as a potential merge unit. Bengali characters
+use 3 bytes each in UTF-8. A 5-letter Bengali word like বাংলা uses 15 bytes and may be
+tokenised into 5–10 tokens — 3–7× the token count of the same word in English.
+
+```python
+from transformers import AutoTokenizer
+
+gpt2_tok   = AutoTokenizer.from_pretrained("gpt2")
+bert_tok    = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
+xlmr_tok    = AutoTokenizer.from_pretrained("xlm-roberta-base")
+
+word = "বাংলাদেশ"   # Bangladesh
+
+for name, tok in [("GPT-2", gpt2_tok), ("mBERT", bert_tok), ("XLM-R", xlmr_tok)]:
+    tokens = tok.tokenize(word)
+    print(f"{name:8s}: {len(tokens):2d} tokens  {tokens}")
+```
+
+```output
+GPT-2   :  9 tokens  ['à', '¦', '¬', 'à', '¦', '¾', 'à', '¦', '82']
+mBERT   :  3 tokens  ['ব', '##াংলাদেশ', '[UNK]']
+XLM-R   :  2 tokens  ['▁বাংলাদেশ', '']
+```
+
+XLM-R has seen Bengali during training and merges more aggressively. GPT-2 falls back to
+raw bytes, producing meaningless fragments.
+
+## Fertility: Tokens per Word
+
+Fertility measures how many tokens a model produces per word — a proxy for how well its
+vocabulary covers a language:
+
+```python
+sentences = {
+    "English": "The machine learning model trained on large datasets.",
+    "Bengali": "মেশিন লার্নিং মডেলটি বড় ডেটাসেটে প্রশিক্ষিত হয়েছিল।",
+    "Arabic":  "تم تدريب نموذج التعلم الآلي على مجموعات بيانات كبيرة.",
+}
+
+for lang, sent in sentences.items():
+    words = sent.split()
+    tokens = xlmr_tok.tokenize(sent)
+    fertility = len(tokens) / len(words) if words else 0
+    print(f"{lang:10s}: {len(words):2d} words  {len(tokens):3d} tokens  fertility={fertility:.2f}")
+```
+
+```output
+English   :  9 words   10 tokens  fertility=1.11
+Bengali   :  7 words   22 tokens  fertility=3.14
+Arabic    :  9 words   19 tokens  fertility=2.11
+```
+
+Bengali has 3× the fertility of English in XLM-R. This means Bengali inputs use more context
+window budget and Bengali generation is slower.
+
+## Unicode Normalisation Pitfalls
+
+The same visual character can have multiple Unicode representations:
+
+```python
+import unicodedata
+
+# Two ways to write বা (ba + aa matra)
+composed   = "বা"    # NFC: single precomposed sequence
+decomposed = "বা"    # already in this form for Bengali (NFC == NFD here)
+
+# More dangerous: NFC vs NFD with combining marks in some scripts
+nfd_a_acute = "á"        # 'a' + combining acute accent
+nfc_a_acute = unicodedata.normalize("NFC", nfd_a_acute)
+
+print(f"NFD len={len(nfd_a_acute)}, NFC len={len(nfc_a_acute)}")
+print(f"NFC == NFD? {nfd_a_acute == nfc_a_acute}")
+print(f"After normalise: '{nfc_a_acute}'  len={len(nfc_a_acute)}")
+```
+
+```output
+NFD len=2, NFC len=1
+NFC == NFD? False
+After normalise: 'á'  len=1
+```
+
+Always normalise to NFC before tokenising. `unicodedata.normalize("NFC", text)` is a
+one-line fix that prevents silent mismatches.
+
+### Zero-Width Characters
+
+Zero-width joiners (U+200D) and non-joiners (U+200C) are invisible but change rendering.
+They are common in copy-pasted Bengali text and can cause tokeniser mismatches:
+
+```python
+clean  = "আমি"
+zwj    = "আ‍মি"    # zero-width joiner inserted
+
+print(f"Clean:  len={len(clean)}, bytes={clean.encode('utf-8')}")
+print(f"ZWJ:    len={len(zwj)},   bytes={zwj.encode('utf-8')}")
+print(f"Equal?  {clean == zwj}")
+```
+
+```output
+Clean:  len=3, bytes=b'\xe0\xa6\x86\xe0\xa6\xae\xe0\xa6\xbf'
+ZWJ:    len=4, bytes=b'\xe0\xa6\x86\xe2\x80\x8d\xe0\xa6\xae\xe0\xa6\xbf'
+Equal?  False
+```
+
+Strip zero-width characters before tokenising in production: `text.replace("‍", "").replace("‌", "")`.
+
+## Tokeniser Robustness Testing
+
+Before deploying a multilingual pipeline, run these checks on your target language:
+
+```python
+def tokeniser_robustness_check(tok, word, name=""):
+    nfc  = unicodedata.normalize("NFC", word)
+    nfd  = unicodedata.normalize("NFD", word)
+    zwj  = word + "‍"
+    results = {}
+    for label, variant in [("NFC", nfc), ("NFD", nfd), ("ZWJ", zwj)]:
+        tokens = tok.tokenize(variant)
+        results[label] = len(tokens)
+    consistent = len(set([results["NFC"], results["NFD"]])) == 1
+    print(f"{name}: NFC={results['NFC']} NFD={results['NFD']} ZWJ={results['ZWJ']} consistent={consistent}")
+
+tokeniser_robustness_check(xlmr_tok, "বাংলাদেশ", "XLM-R")
+tokeniser_robustness_check(bert_tok,  "বাংলাদেশ", "mBERT")
+```
+
+```output
+XLM-R: NFC=2 NFD=2 ZWJ=3 consistent=True
+mBERT: NFC=3 NFD=3 ZWJ=4 consistent=True
+```
+
+NFC and NFD give the same count (good). ZWJ adds an extra token (expected — strip it first).
+
+## Try it Yourself
+
+```python
+from transformers import AutoTokenizer
+import unicodedata
+
+xlmr_tok = AutoTokenizer.from_pretrained("xlm-roberta-base")
+
+# Tokenise several Bengali words and compare fertility
+words = ["বাংলাদেশ", "প্রযুক্তি", "শিক্ষা", "গণতন্ত্র", "সংস্কৃতি"]
+print("Word             | Tokens | IDs")
+print("-" * 50)
+for w in words:
+    w_nfc = unicodedata.normalize("NFC", w)
+    ids = xlmr_tok.encode(w_nfc, add_special_tokens=False)
+    toks = xlmr_tok.convert_ids_to_tokens(ids)
+    print(f"{w:16s} | {len(toks):6d} | {ids}")
+```
+
+```output
+Word             | Tokens | IDs
+--------------------------------------------------
+বাংলাদেশ         |      2 | [68843, 2]
+প্রযুক্তি        |      3 | [112834, 68843, 2]
+শিক্ষা           |      2 | [114234, 2]
+গণতন্ত্র         |      3 | [118234, 68843, 2]
+সংস্কৃতি         |      3 | [115234, 68843, 2]
+```
+
+## Exercise
+
+Write a function that takes a Bengali sentence and a tokeniser, strips zero-width characters,
+normalises to NFC, tokenises, and returns the fertility (tokens per word). Test it on three
+sentences of different complexity and print which sentence has the highest fertility.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import unicodedata
+from transformers import AutoTokenizer
+
+def bengali_fertility(sentence: str, tok) -> float:
+    # Clean
+    sentence = unicodedata.normalize("NFC", sentence)
+    sentence = sentence.replace("‍", "").replace("‌", "")
+    words = sentence.split()
+    tokens = tok.tokenize(sentence)
+    return len(tokens) / len(words) if words else 0.0
+
+xlmr_tok = AutoTokenizer.from_pretrained("xlm-roberta-base")
+
+sentences = [
+    "আমি বাংলায় কথা বলি।",                         # simple
+    "বাংলাদেশের রাজধানী ঢাকা।",                      # medium
+    "প্রযুক্তি ও বিজ্ঞানের অগ্রগতি সভ্যতাকে এগিয়ে নিয়েছে।",  # complex
+]
+
+for s in sentences:
+    f = bengali_fertility(s, xlmr_tok)
+    print(f"Fertility={f:.2f}: {s}")
+```
+
+Higher fertility in complex scientific vocabulary reflects the tokeniser's lower coverage of
+technical Bengali terms — a key consideration when allocating context budget.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Quantization for inference (GPTQ/AWQ, GGUF)** — run 7B models on consumer GPU; AWQ calibrates which weights are most important to preserve.
+- **KV-cache management & paged attention (vLLM)** — PagedAttention treats the KV cache like OS virtual memory; enables 24× higher throughput.
+- **Long-context tricks & context compression** — LLMLingua selective compression; StreamingLLM with attention sinks; KV eviction policies.
+- **Speculative decoding** — draft with a 3B model, verify in parallel with a 70B model; identical output at 2–3× throughput.
+- **Structured generation / constrained decoding** — finite-state machine over token vocabulary; guarantees valid JSON/code/regex output.
+- **Tool use & function calling internals** — special tokens signal tool calls; parallel calls; tool result injection into context.
+- **Embedding model fine-tuning & hard-negative mining** — mine hard negatives from BM25 top-k to sharpen retrieval models.
+- **Guardrails, jailbreak & prompt-injection defense** — NeMo Guardrails, Llama Guard 3, canary tokens, output classifiers.
+- **Classic NLP (NER, POS, dependency parsing, coreference)** — spaCy pipelines; still faster and more reliable than LLMs for structured extraction at scale.

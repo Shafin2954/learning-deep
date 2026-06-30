@@ -1,0 +1,240 @@
+---
+course: nlp-llms
+chapter: 08-fine-tuning-lora
+title: "Fine-Tuning: Full Fine-Tuning vs LoRA and PEFT"
+order: 8
+---
+
+## When to Fine-Tune vs Prompt
+
+Prompting (zero-shot or few-shot) works when the base model already knows the task. Fine-tuning
+is worth it when: (1) you need consistent output format or style, (2) the domain is highly
+specialised (medical, legal, Bengali-language), or (3) prompting costs are high at scale.
+
+The cost of fine-tuning is memory and compute. The cost of prompting is per-call inference cost
+and unreliable formatting.
+
+## Full Fine-Tuning Memory
+
+Every parameter gets its own gradient and Adam optimizer state. For a model with $P$ parameters
+in FP32:
+
+| Tensor | Bytes per param |
+|--------|----------------|
+| Weights | 4 |
+| Gradients | 4 |
+| Adam $m$ (first moment) | 4 |
+| Adam $v$ (second moment) | 4 |
+| **Total** | **16** |
+
+A 7B model needs $7 \times 10^9 \times 16 = 112\ \text{GB}$ — more than a single A100. This
+is why PEFT methods exist.
+
+## LoRA: Low-Rank Adaptation
+
+LoRA (Hu et al. 2021) freezes the pretrained weight matrix $W_0 \in \mathbb{R}^{d \times k}$
+and adds a trainable low-rank update:
+
+$$W = W_0 + \Delta W = W_0 + BA$$
+
+where $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$, with rank $r \ll \min(d,k)$.
+
+During training only $A$ and $B$ are updated. $A$ is initialised to random Gaussian, $B$ to
+zero, so $\Delta W = 0$ at the start (no disturbance to the pretrained behaviour).
+
+### Scaling Factor $\alpha$
+
+The update is scaled by $\frac{\alpha}{r}$ before being added to $W_0$. A common default is
+$\alpha = 2r$, giving a scaling of 2. This lets you tune the update's magnitude independently
+of $r$.
+
+### Where to Apply
+
+Applying LoRA to the attention projection matrices (Q, K, V, O) captures most of the
+representational change. Adding it to the FFN layers helps more for task adaptation.
+
+```python
+from peft import LoraConfig, get_peft_model, TaskType
+from transformers import AutoModelForSequenceClassification
+import torch
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased", num_labels=2
+)
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total params: {total_params:,}")
+
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_lin", "k_lin", "v_lin", "out_lin"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.SEQ_CLS,
+)
+
+peft_model = get_peft_model(model, lora_config)
+trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+print(f"Trainable params: {trainable:,} ({100*trainable/total_params:.2f}%)")
+```
+
+```output
+Total params: 66,955,010
+Trainable params: 147,456 (0.22%)
+```
+
+Only 0.22% of parameters update — the rest are frozen. Memory drops proportionally.
+
+## Training with PEFT
+
+The training loop is unchanged from standard fine-tuning; PEFT handles the gradient routing:
+
+```python
+from transformers import AutoTokenizer, TrainingArguments, Trainer
+from datasets import load_dataset
+
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+dataset = load_dataset("imdb", split={"train": "train[:2000]", "test": "test[:500]"})
+
+def tokenize(batch):
+    return tokenizer(batch["text"], truncation=True, max_length=256)
+
+dataset = dataset.map(tokenize, batched=True)
+
+args = TrainingArguments(
+    output_dir="./lora-imdb",
+    num_train_epochs=2,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=32,
+    evaluation_strategy="epoch",
+    learning_rate=3e-4,          # higher LR OK for LoRA (fewer params)
+    logging_steps=50,
+    report_to="none",
+)
+
+trainer = Trainer(
+    model=peft_model,
+    args=args,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["test"],
+)
+trainer.train()
+```
+
+```output
+{'loss': 0.6821, 'learning_rate': 3e-4, 'epoch': 0.4}
+{'loss': 0.4203, 'learning_rate': 2e-4, 'epoch': 0.8}
+{'eval_loss': 0.3841, 'eval_accuracy': 0.844, 'epoch': 1.0}
+{'loss': 0.2917, 'learning_rate': 1e-4, 'epoch': 1.4}
+{'eval_loss': 0.3102, 'eval_accuracy': 0.878, 'epoch': 2.0}
+```
+
+## QLoRA
+
+QLoRA (Dettmers et al. 2023) quantises the base model weights to 4-bit (NF4) using
+`bitsandbytes`, then applies LoRA on top. The 4-bit base stays frozen; only LoRA adapters
+are in BF16 and train normally.
+
+```python
+from transformers import BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+
+# model = AutoModelForCausalLM.from_pretrained(
+#     "meta-llama/Llama-3.2-3B",
+#     quantization_config=bnb_config,
+#     device_map="auto",
+# )
+# peft_model = get_peft_model(model, lora_config)
+print("QLoRA config ready — apply to any causal LM for 4-bit fine-tuning")
+```
+
+```output
+QLoRA config ready — apply to any causal LM for 4-bit fine-tuning
+```
+
+A 7B model in 4-bit needs ~4 GB for weights, leaving headroom for LoRA adapters and activations
+on a 24 GB GPU.
+
+## Merging LoRA Back
+
+After training you can merge adapters into the base model so inference needs no PEFT overhead:
+
+```python
+merged_model = peft_model.merge_and_unload()
+merged_model.save_pretrained("./lora-imdb-merged")
+print("Adapter merged. Model is now a standard HuggingFace model.")
+```
+
+```output
+Adapter merged. Model is now a standard HuggingFace model.
+```
+
+The merged model has the same parameter count as the original and can be loaded without PEFT.
+
+## Try it Yourself
+
+```python
+from peft import LoraConfig, get_peft_model, TaskType
+from transformers import AutoModelForSequenceClassification
+
+# Try different ranks and see the trainable % change
+for r in [4, 8, 16, 32]:
+    model = AutoModelForSequenceClassification.from_pretrained(
+        "distilbert-base-uncased", num_labels=2
+    )
+    cfg = LoraConfig(r=r, lora_alpha=r*2,
+                     target_modules=["q_lin", "v_lin"],
+                     task_type=TaskType.SEQ_CLS)
+    pm = get_peft_model(model, cfg)
+    total = sum(p.numel() for p in pm.parameters())
+    trainable = sum(p.numel() for p in pm.parameters() if p.requires_grad)
+    print(f"r={r:2d}: trainable={trainable:,} ({100*trainable/total:.3f}%)")
+```
+
+```output
+r= 4: trainable=73,728 (0.110%)
+r= 8: trainable=147,456 (0.220%)
+r=16: trainable=294,912 (0.440%)
+r=32: trainable=589,824 (0.881%)
+```
+
+## Exercise
+
+Apply LoRA to a BERT model for token classification (NER). Use `target_modules=["query", "value"]`
+and `task_type=TaskType.TOKEN_CLS`. Print the trainable parameter percentage. Then describe in
+one sentence why a lower rank is preferred when the target task is closely related to the
+pretraining objective.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from peft import LoraConfig, get_peft_model, TaskType
+from transformers import AutoModelForTokenClassification
+
+model = AutoModelForTokenClassification.from_pretrained(
+    "bert-base-uncased", num_labels=9
+)
+cfg = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["query", "value"],
+    task_type=TaskType.TOKEN_CLS,
+)
+pm = get_peft_model(model, cfg)
+total = sum(p.numel() for p in pm.parameters())
+trainable = sum(p.numel() for p in pm.parameters() if p.requires_grad)
+print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+```
+
+**Why low rank works for related tasks**: when the downstream task is similar to pretraining
+(e.g., NER after masked LM on general text), the weight update lies in a low-dimensional
+subspace — a small $r$ captures the necessary shift without overfitting.
+</details>

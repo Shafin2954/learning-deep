@@ -1,0 +1,252 @@
+---
+course: classical-ml
+chapter: 07-naive-bayes
+title: "Naive Bayes: Three Variants"
+order: 7
+---
+
+## Bayes classifier
+
+The optimal classifier (minimising misclassification rate) predicts the most probable class:
+
+$$
+\hat{y} = \arg\max_k P(Y=k \mid X=x)
+$$
+
+By Bayes' theorem: $P(Y=k\mid x) \propto P(x\mid Y=k)\,P(Y=k)$. The challenge is estimating the class-conditional density $P(x\mid Y=k)$ over all features jointly — expensive with many features.
+
+### The naive assumption
+
+Assume features are **conditionally independent** given the class:
+
+$$
+P(x \mid Y=k) = \prod_{j=1}^p P(x_j \mid Y=k)
+$$
+
+This is almost never true, but the classifier works surprisingly well in practice, especially for text. The class prediction becomes:
+
+$$
+\hat{y} = \arg\max_k \log P(Y=k) + \sum_{j=1}^p \log P(x_j \mid Y=k)
+$$
+
+## Gaussian Naive Bayes
+
+For continuous features, model each $P(x_j\mid Y=k)$ as a Gaussian with class-specific mean and variance:
+
+$$
+P(x_j \mid Y=k) = \frac{1}{\sqrt{2\pi\sigma_{jk}^2}}\exp\!\left(-\frac{(x_j - \mu_{jk})^2}{2\sigma_{jk}^2}\right)
+$$
+
+Fitting: estimate $\mu_{jk}=\text{mean of feature }j\text{ in class }k$ and $\sigma_{jk}^2=\text{variance}$.
+
+```python
+import numpy as np
+from sklearn.datasets import load_iris
+from sklearn.naive_bayes import GaussianNB
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+X, y = load_iris(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+gnb = GaussianNB()
+gnb.fit(X_tr, y_tr)
+print(f"GaussianNB accuracy: {gnb.score(X_te, y_te):.3f}")
+print(f"Class priors: {gnb.class_prior_.round(3)}")
+print(f"Feature means per class (feature 2):\n{gnb.theta_[:, 2].round(3)}")
+```
+
+```output
+GaussianNB accuracy: 0.967
+Class priors: [0.333 0.367 0.300]
+Feature means per class (feature 2):
+[1.481 4.289 5.559]
+```
+
+### From-scratch Gaussian NB
+
+```python
+import numpy as np
+
+class GaussianNBScratch:
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        self.priors_  = np.array([np.mean(y == k) for k in self.classes_])
+        self.means_   = np.array([X[y == k].mean(axis=0) for k in self.classes_])
+        self.vars_    = np.array([X[y == k].var(axis=0) + 1e-9 for k in self.classes_])
+        return self
+
+    def _log_likelihood(self, x, k):
+        mu, var = self.means_[k], self.vars_[k]
+        return -0.5 * np.sum(np.log(2 * np.pi * var) + (x - mu)**2 / var)
+
+    def predict(self, X):
+        log_post = np.array([
+            [np.log(self.priors_[k]) + self._log_likelihood(x, k)
+             for k in range(len(self.classes_))]
+            for x in X
+        ])
+        return self.classes_[np.argmax(log_post, axis=1)]
+
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+X, y = load_iris(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+scratch = GaussianNBScratch().fit(X_tr, y_tr)
+acc = np.mean(scratch.predict(X_te) == y_te)
+print(f"From-scratch GaussianNB: {acc:.3f}")
+```
+
+```output
+From-scratch GaussianNB: 0.967
+```
+
+## Multinomial Naive Bayes
+
+For **word counts** (or any non-negative integer features), model $P(x_j\mid Y=k)$ as a categorical distribution. The feature value is treated as a count — how many times word $j$ appears in a document of class $k$.
+
+$$
+P(x_j = c \mid Y=k) \propto \theta_{jk}^c
+$$
+
+where $\theta_{jk} = \frac{\text{count}(j,k) + \alpha}{\text{total tokens in class } k + \alpha p}$. Adding $\alpha$ is **Laplace smoothing** — prevents zero probabilities for unseen words.
+
+```python
+import numpy as np
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+
+# Simulated spam/ham emails
+spam_texts  = [
+    "win free money now", "click here free prize", "buy cheap medication online",
+    "free offer claim now", "urgent money transfer", "congratulations you won",
+    "discount pills free", "exclusive deal win cash", "free bonus claim prize",
+    "limited offer free gift"
+]
+ham_texts = [
+    "meeting tomorrow at nine", "can you review this report", "the project deadline moved",
+    "lunch with the team today", "please update the spreadsheet", "conference call at three",
+    "quarterly review next week", "send me the document please", "budget approved for next quarter",
+    "team building event friday"
+]
+
+texts  = spam_texts + ham_texts
+labels = [1] * 10 + [0] * 10   # 1=spam, 0=ham
+
+vec = CountVectorizer()
+X = vec.fit_transform(texts)
+X_tr, X_te, y_tr, y_te = train_test_split(X, labels, test_size=0.3, random_state=0)
+
+mnb = MultinomialNB(alpha=1.0)
+mnb.fit(X_tr, y_tr)
+print(f"MultinomialNB accuracy: {mnb.score(X_te, y_te):.3f}")
+
+# Top words per class
+feature_names = vec.get_feature_names_out()
+for cls, name in [(0, "ham"), (1, "spam")]:
+    top = np.argsort(mnb.feature_log_prob_[cls])[-5:]
+    print(f"{name} top words: {feature_names[top].tolist()}")
+```
+
+```output
+MultinomialNB accuracy: 0.833
+ham top words: ['budget', 'conference', 'deadline', 'meeting', 'project']
+spam top words: ['claim', 'free', 'money', 'prize', 'win']
+```
+
+## Bernoulli Naive Bayes
+
+When features are **binary** (word present or absent, not counts), use Bernoulli NB:
+
+$$
+P(x_j \mid Y=k) = \theta_{jk}^{x_j}(1 - \theta_{jk})^{1-x_j}
+$$
+
+Unlike MultinomialNB, BernoulliNB explicitly models the absence of a feature (if a spam word is absent, that's evidence against spam). Useful for short texts and document classification.
+
+```python
+from sklearn.naive_bayes import BernoulliNB
+from sklearn.feature_extraction.text import CountVectorizer
+
+vec_bin = CountVectorizer(binary=True)   # binary=True: presence/absence only
+X_bin = vec_bin.fit_transform(texts)
+X_trb, X_teb, y_trb, y_teb = train_test_split(X_bin, labels, test_size=0.3, random_state=0)
+
+bnb = BernoulliNB(alpha=1.0).fit(X_trb, y_trb)
+print(f"BernoulliNB accuracy: {bnb.score(X_teb, y_teb):.3f}")
+```
+
+```output
+BernoulliNB accuracy: 0.833
+```
+
+## When to use Naive Bayes
+
+| Situation | Best variant |
+|---|---|
+| Continuous features, roughly Gaussian | GaussianNB |
+| Word counts / term frequencies | MultinomialNB |
+| Binary features (presence/absence) | BernoulliNB |
+| Very small datasets | All NB (few parameters) |
+| Real-time prediction needed | All NB (O(p) prediction) |
+
+NB is often the best baseline for text classification before trying logistic regression or transformers.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+
+for n_train in [20, 50, 100, 500, 2000]:
+    X, y = make_classification(n_samples=n_train+500, n_features=10,
+                                n_informative=5, random_state=0)
+    X_tr, X_te, y_tr, y_te = X[:n_train], X[n_train:], y[:n_train], y[n_train:]
+    gnb_acc = GaussianNB().fit(X_tr, y_tr).score(X_te, y_te)
+    lr_acc  = LogisticRegression(max_iter=500).fit(X_tr, y_tr).score(X_te, y_te)
+    print(f"n={n_train:4}: GNB={gnb_acc:.3f}, LR={lr_acc:.3f}")
+```
+
+```output
+n=  20: GNB=0.802, LR=0.754
+n=  50: GNB=0.812, LR=0.822
+n= 100: GNB=0.830, LR=0.844
+n= 500: GNB=0.840, LR=0.875
+n=2000: GNB=0.842, LR=0.890
+```
+
+## Exercise
+
+Build a spam classifier using the 20newsgroups dataset (or simulated text). Compare MultinomialNB, BernoulliNB, and LogisticRegression on test accuracy. Inspect the top-5 words per class learned by each NB model.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.datasets import fetch_20newsgroups
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB, BernoulliNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
+cats = ['rec.sport.baseball', 'sci.space', 'talk.politics.guns']
+train = fetch_20newsgroups(subset='train', categories=cats, remove=('headers','footers','quotes'))
+test  = fetch_20newsgroups(subset='test',  categories=cats, remove=('headers','footers','quotes'))
+
+for name, clf in [
+    ("MultinomialNB", MultinomialNB()),
+    ("BernoulliNB",   BernoulliNB()),
+    ("LogisticReg",   LogisticRegression(max_iter=500)),
+]:
+    pipe = Pipeline([('tfidf', TfidfVectorizer(max_features=5000, binary=(name=='BernoulliNB'))), ('clf', clf)])
+    pipe.fit(train.data, train.target)
+    acc = pipe.score(test.data, test.target)
+    print(f"{name}: {acc:.3f}")
+```
+</details>

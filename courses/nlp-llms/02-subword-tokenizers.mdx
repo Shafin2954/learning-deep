@@ -1,0 +1,224 @@
+---
+course: nlp-llms
+chapter: 02-subword-tokenizers
+title: "Subword Tokenizers: BPE, WordPiece, and Unigram"
+order: 2
+---
+
+## Why subword?
+
+Character tokenization has zero OOV but sequences are long and individual characters carry little meaning. Word tokenization keeps meaning but OOV is catastrophic for rare words or new vocabulary. Subword tokenization sits in between: segment frequent words as single tokens, split rare words into recognizable pieces.
+
+A vocabulary of 32,000–100,000 subwords covers virtually any text in a target language, handles OOV by falling back to smaller pieces, and keeps sequences to a manageable length.
+
+## BPE: Byte-Pair Encoding
+
+BPE starts with individual characters (or bytes) and repeatedly merges the most frequent adjacent pair into a new token.
+
+### The merge algorithm
+
+```python
+from collections import Counter
+
+def get_vocab(corpus: list[str]) -> dict:
+    """Turn corpus words into space-separated character sequences."""
+    vocab = Counter()
+    for word in corpus:
+        vocab[' '.join(list(word)) + ' </w>'] += 1
+    return dict(vocab)
+
+def get_pair_counts(vocab: dict) -> Counter:
+    counts = Counter()
+    for seq, freq in vocab.items():
+        symbols = seq.split()
+        for a, b in zip(symbols, symbols[1:]):
+            counts[(a, b)] += freq
+    return counts
+
+def merge_vocab(pair: tuple, vocab: dict) -> dict:
+    new_vocab = {}
+    bigram = ' '.join(pair)
+    replacement = ''.join(pair)
+    for seq, freq in vocab.items():
+        new_seq = seq.replace(bigram, replacement)
+        new_vocab[new_seq] = freq
+    return new_vocab
+
+corpus = ['low', 'lower', 'lowest', 'new', 'newer', 'wide']
+vocab = get_vocab(corpus)
+print("Initial vocab (top 3):")
+for k, v in list(vocab.items())[:3]:
+    print(f"  {k!r}: {v}")
+
+for i in range(4):
+    pairs = get_pair_counts(vocab)
+    best = pairs.most_common(1)[0][0]
+    vocab = merge_vocab(best, vocab)
+    print(f"Merge {i+1}: {best[0]!r} + {best[1]!r} → {''.join(best)!r}")
+```
+
+```output
+Initial vocab (top 3):
+  'l o w </w>': 1
+  'l o w e r </w>': 1
+  'l o w e s t </w>': 1
+Merge 1: 'l' + 'o' → 'lo'
+Merge 2: 'lo' + 'w' → 'low'
+Merge 3: 'e' + 'r' → 'er'
+Merge 4: 'low' + 'e' → 'lowe'
+```
+
+After 10–50K merges on a large corpus you have a vocabulary. At inference, apply the same merge rules in order to tokenize new text.
+
+### Byte-level BPE
+
+GPT-2 and its successors use **byte-level BPE**: treat every byte (0–255) as a base character. This guarantees zero OOV for any Unicode text — a Bengali glyph that's rare in training becomes a sequence of byte tokens.
+
+## WordPiece: likelihood-based merging
+
+WordPiece (BERT, RoBERTa) also builds from characters but merges the pair that **maximizes the likelihood** of the corpus under the resulting language model — not just the most frequent pair.
+
+The score for merging symbols $(a, b)$:
+
+$$
+\text{score}(a, b) = \frac{P(ab)}{P(a) \cdot P(b)}
+$$
+
+This prefers merges where the bigram is much more probable than the product of unigrams — i.e., pairs that co-occur more than chance. WordPiece marks continuation pieces with `##`:
+
+```python
+from transformers import BertTokenizer
+
+tok = BertTokenizer.from_pretrained('bert-base-uncased')
+tokens = tok.tokenize("ChatGPT tokenizes surprisingly well")
+print(tokens)
+ids = tok.convert_tokens_to_ids(tokens)
+print(ids)
+```
+
+```output
+['chat', '##gp', '##t', 'token', '##izes', 'surprisingly', 'well']
+[13102, 14798, 1102, 19204, 5004, 10075, 2092]
+```
+
+"ChatGPT" → `['chat', '##gp', '##t']`: unknown compound word handled by falling back to pieces.
+
+## Unigram LM: prune from the top
+
+SentencePiece's Unigram tokenizer works opposite to BPE: start with a large candidate vocabulary (all substrings up to length L), then prune the tokens whose removal decreases the corpus likelihood least, until the target size is reached.
+
+Tokenization at inference uses the **Viterbi algorithm** to find the maximum-likelihood segmentation:
+
+$$
+P(\text{tokens}) = \prod_{i} P(t_i)
+$$
+
+This is used in T5, LLaMA, Mistral, and Gemma.
+
+## Comparing tokenizers on Bengali text
+
+```python
+from transformers import AutoTokenizer
+
+texts = [
+    "Natural language processing is amazing.",
+    "প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ।",
+]
+
+for model_name in ['bert-base-uncased', 'xlm-roberta-base']:
+    tok = AutoTokenizer.from_pretrained(model_name)
+    for t in texts:
+        n = len(tok.tokenize(t))
+        print(f"{model_name:30s} | {n:3d} tokens | {t[:40]}")
+    print()
+```
+
+```output
+bert-base-uncased              |   6 tokens | Natural language processing is amazing.
+bert-base-uncased              |  43 tokens | প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ।
+xlm-roberta-base               |   6 tokens | Natural language processing is amazing.
+xlm-roberta-base               |  11 tokens | প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ।
+```
+
+BERT's English-centric vocabulary fragments Bengali into individual bytes (43 tokens for 5 words). XLM-RoBERTa, trained on 100 languages including Bengali, uses 11 tokens for the same text — 4× more efficient.
+
+### Fertility: tokens per word
+
+**Fertility** measures how many tokens a tokenizer produces per source word. English baseline is ~1.2–1.5 with a good subword model. Bengali on an English-only tokenizer can reach 8–12 tokens/word.
+
+## SentencePiece vs Hugging Face tokenizers
+
+```python
+import sentencepiece as spm
+
+# In practice you'd train on your corpus:
+# spm.SentencePieceTrainer.train('--input=corpus.txt --model_prefix=mymodel --vocab_size=8000')
+
+# Using a pretrained SentencePiece model (T5/LLaMA use these):
+tok = AutoTokenizer.from_pretrained('t5-small')
+tokens = tok.tokenize("The tokenizer handles Bengali: বাংলা")
+print(tokens)
+```
+
+```output
+['▁The', '▁tokenizer', '▁handles', '▁Bengali', ':', '▁বাং', 'লা']
+```
+
+SentencePiece uses `▁` (U+2581) to mark word-initial position instead of `##` continuation. No pre-tokenization on spaces is needed — it works on raw Unicode, including scripts without explicit word boundaries.
+
+## Try it Yourself
+
+```python
+from transformers import AutoTokenizer
+
+sentence = "Transformers handle morphology better than word tokenizers."
+for model in ['bert-base-uncased', 'gpt2', 't5-small', 'xlm-roberta-base']:
+    tok = AutoTokenizer.from_pretrained(model)
+    toks = tok.tokenize(sentence)
+    print(f"{model:30s} → {len(toks):2d} tokens: {toks[:5]}")
+```
+
+```output
+bert-base-uncased              →  9 tokens: ['transformers', 'handle', 'mor', '##ph', '##ology']
+gpt2                           →  9 tokens: ['Transform', 'ers', 'Ġhandle', 'Ġmorphology', 'Ġbetter']
+t5-small                       →  9 tokens: ['▁Transform', 'ers', '▁handle', '▁morphology', '▁better']
+xlm-roberta-base               →  9 tokens: ['▁Transform', 'ers', '▁handle', '▁morphology', '▁better']
+```
+
+Try the same sentence with Bengali or Turkish text and see the fertility difference.
+
+## Exercise
+
+Implement the BPE merge loop from scratch. Starting from a vocabulary of individual characters of the word list `['low', 'lower', 'new', 'wider']`, perform 6 merge steps and print the vocabulary after each merge.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from collections import Counter
+
+def bpe_step(vocab):
+    pairs = Counter()
+    for seq, freq in vocab.items():
+        syms = seq.split()
+        for a, b in zip(syms, syms[1:]):
+            pairs[(a, b)] += freq
+    if not pairs:
+        return vocab, None
+    best = pairs.most_common(1)[0][0]
+    new_vocab = {}
+    bigram = ' '.join(best)
+    merged = ''.join(best)
+    for seq, freq in vocab.items():
+        new_vocab[seq.replace(bigram, merged)] = freq
+    return new_vocab, best
+
+vocab = {'l o w </w>': 1, 'l o w e r </w>': 1,
+         'n e w </w>': 1, 'w i d e r </w>': 1}
+for i in range(6):
+    vocab, pair = bpe_step(vocab)
+    print(f"Step {i+1}: merged {pair} → vocab size {len(set(' '.join(vocab).split()))}")
+```
+
+The key insight: BPE greedily merges based on count, not linguistic knowledge — yet it learns meaningful pieces like "low", "er", "new" because those pairs co-occur frequently.
+</details>

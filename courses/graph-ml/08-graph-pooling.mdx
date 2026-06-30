@@ -1,0 +1,270 @@
+---
+course: graph-ml
+chapter: 08-graph-pooling
+title: "Graph Pooling and Graph-Level Readout"
+order: 8
+---
+
+## From node classification to graph classification
+
+Node and link tasks operate on a fixed graph. Graph classification asks: given an entire
+graph (e.g., a molecule, a social network), predict a label for the whole graph. You need to
+aggregate all node embeddings into a single graph-level vector — this is **readout** or
+**pooling**.
+
+## Global pooling: simple and surprisingly strong
+
+The three canonical flat readout functions:
+
+| Readout | Formula | Properties |
+|---------|---------|-----------|
+| Global sum | $h_G = \sum_{v} h_v$ | Sensitive to graph size |
+| Global mean | $h_G = \frac{1}{|V|}\sum_v h_v$ | Size-invariant |
+| Global max | $h_G = \max_v h_v$ (element-wise) | Robust to outliers |
+
+In practice, concatenating sum + mean + max often outperforms any single readout.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.datasets import TUDataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool, global_max_pool
+
+dataset = TUDataset(root='/tmp/MUTAG', name='MUTAG')
+print(f"Graphs: {len(dataset)}, Classes: {dataset.num_classes}")
+print(f"Node features: {dataset.num_node_features}")
+print(f"Example graph — nodes: {dataset[0].num_nodes}, edges: {dataset[0].num_edges}")
+print(f"Graph label: {dataset[0].y.item()}")
+```
+
+```output
+Graphs: 188, Classes: 2
+Node features: 7
+Example graph — nodes: 17, edges: 38
+Graph label: 1
+```
+
+## Training a GNN for graph classification
+
+```python
+dataset = dataset.shuffle()
+train_dataset = dataset[:150]
+test_dataset  = dataset[150:]
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader  = DataLoader(test_dataset,  batch_size=32)
+
+class GNNClassifier(nn.Module):
+    def __init__(self, in_ch, hidden, out_ch):
+        super().__init__()
+        self.conv1 = GCNConv(in_ch, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, hidden)
+        self.lin   = nn.Linear(hidden, out_ch)
+
+    def forward(self, x, edge_index, batch):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        x = global_mean_pool(x, batch)   # (num_graphs, hidden)
+        x = F.dropout(x, 0.5, self.training)
+        return self.lin(x)
+
+model = GNNClassifier(dataset.num_node_features, 64, dataset.num_classes)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+def train_epoch():
+    model.train()
+    total_loss = 0
+    for batch in train_loader:
+        optimizer.zero_grad()
+        out = model(batch.x, batch.edge_index, batch.batch)
+        loss = F.cross_entropy(out, batch.y)
+        loss.backward(); optimizer.step()
+        total_loss += float(loss) * batch.num_graphs
+    return total_loss / len(train_loader.dataset)
+
+@torch.no_grad()
+def test_epoch(loader):
+    model.eval()
+    correct = 0
+    for batch in loader:
+        out = model(batch.x, batch.edge_index, batch.batch)
+        correct += (out.argmax(1) == batch.y).sum().item()
+    return correct / len(loader.dataset)
+
+for epoch in range(1, 101):
+    loss = train_epoch()
+
+train_acc = test_epoch(train_loader)
+test_acc  = test_epoch(test_loader)
+print(f"Train acc: {train_acc:.3f}  Test acc: {test_acc:.3f}")
+```
+
+```output
+Train acc: 0.947  Test acc: 0.842
+```
+
+## How PyG batches graphs
+
+PyG's `DataLoader` concatenates graphs into a single disconnected "super-graph". A `batch`
+tensor maps each node to its graph index.
+
+```python
+batch = next(iter(train_loader))
+print(f"Batch contains {batch.num_graphs} graphs")
+print(f"Total nodes in batch: {batch.x.shape[0]}")
+print(f"Batch tensor (first 20): {batch.batch[:20].tolist()}")
+print(f"Graph sizes: {[(batch.batch==i).sum().item() for i in range(5)]}...")
+```
+
+```output
+Batch contains 32 graphs
+Total nodes in batch: 539
+Batch tensor (first 20): [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1]
+Graph sizes: [17, 13, 28, 21, 19]...
+```
+
+`global_mean_pool(x, batch)` computes mean over all nodes with the same batch index,
+producing one vector per graph.
+
+## Comparing readout strategies
+
+```python
+class ReadoutComparison(nn.Module):
+    def __init__(self, readout='mean'):
+        super().__init__()
+        self.readout = readout
+        self.conv1 = GCNConv(dataset.num_node_features, 64)
+        self.conv2 = GCNConv(64, 64)
+        multiplier = 3 if readout == 'concat' else 1
+        self.lin = nn.Linear(64 * multiplier, dataset.num_classes)
+
+    def forward(self, x, edge_index, batch):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        if self.readout == 'mean':
+            x = global_mean_pool(x, batch)
+        elif self.readout == 'sum':
+            x = global_add_pool(x, batch)
+        elif self.readout == 'max':
+            x = global_max_pool(x, batch)
+        elif self.readout == 'concat':
+            x = torch.cat([global_mean_pool(x, batch),
+                           global_add_pool(x, batch),
+                           global_max_pool(x, batch)], dim=-1)
+        return self.lin(x)
+
+for readout in ['mean', 'sum', 'max', 'concat']:
+    m = ReadoutComparison(readout)
+    o = torch.optim.Adam(m.parameters(), lr=0.01)
+    for _ in range(100):
+        m.train()
+        for b in train_loader:
+            o.zero_grad()
+            F.cross_entropy(m(b.x, b.edge_index, b.batch), b.y).backward(); o.step()
+    m.eval()
+    acc = test_epoch(test_loader) if False else None  # reuse test_epoch with m
+    with torch.no_grad():
+        correct = sum((m(b.x,b.edge_index,b.batch).argmax(1)==b.y).sum().item()
+                      for b in test_loader)
+    acc = correct / len(test_loader.dataset)
+    print(f"readout={readout:6s}  test acc={acc:.3f}")
+```
+
+```output
+readout=mean    test acc=0.842
+readout=sum     test acc=0.816
+readout=max     test acc=0.789
+readout=concat  test acc=0.868
+```
+
+Concatenating all three readouts wins, as expected.
+
+## Hierarchical pooling: DiffPool
+
+Instead of flat pooling, DiffPool learns a soft cluster assignment at each layer, coarsening
+the graph hierarchically. At layer $l$:
+
+$$
+S^{(l)} = \text{softmax}(\text{GNN}_{pool}(A^{(l)}, H^{(l)})) \in \mathbb{R}^{n^{(l)} \times n^{(l+1)}}
+$$
+
+$$
+A^{(l+1)} = S^{(l)T} A^{(l)} S^{(l)}, \quad H^{(l+1)} = S^{(l)T} H^{(l)}_{emb}
+$$
+
+This introduces an auxiliary link prediction loss and an entropy loss to encourage sparse,
+confident assignments. DiffPool is expressive but expensive ($O(n^2)$ per pooling step).
+
+## Try it Yourself
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch_geometric.datasets import TUDataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool
+
+dataset = TUDataset(root='/tmp/MUTAG', name='MUTAG').shuffle()
+train_l = DataLoader(dataset[:150], batch_size=32, shuffle=True)
+test_l  = DataLoader(dataset[150:], batch_size=32)
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1 = GCNConv(dataset.num_node_features, 64)
+        self.c2 = GCNConv(64, 64)
+        self.lin = nn.Linear(128, dataset.num_classes)
+    def forward(self, x, ei, batch):
+        x = F.relu(self.c1(x, ei)); x = F.relu(self.c2(x, ei))
+        return self.lin(torch.cat([global_mean_pool(x,batch), global_add_pool(x,batch)], -1))
+
+model = Net(); opt = torch.optim.Adam(model.parameters(), lr=0.01)
+for _ in range(100):
+    model.train()
+    for b in train_l:
+        opt.zero_grad(); F.cross_entropy(model(b.x,b.edge_index,b.batch),b.y).backward(); opt.step()
+model.eval()
+acc = sum((model(b.x,b.edge_index,b.batch).argmax(1)==b.y).sum().item() for b in test_l)/len(test_l.dataset)
+print(f"Test acc: {acc:.3f}")
+# Try: replace global_mean + add with just global_mean. How much does the concat help?
+```
+
+```output
+Test acc: 0.868
+```
+
+## Exercise
+
+Implement a **set2set** readout by hand: for each graph, compute $K$ rounds of an LSTM
+that attends over node embeddings. In round $t$, the LSTM hidden state $q_t$ is used as a
+query; attention weights over nodes produce a context vector $c_t$; the LSTM takes
+$[q_t, c_t]$ as input. The final $q_K$ is the graph representation. Compare to global mean
+pooling on MUTAG.
+
+<details>
+<summary>Solution</summary>
+
+```python
+# Simplified set2set sketch (full implementation uses torch_geometric.nn.Set2Set)
+from torch_geometric.nn import Set2Set
+
+class S2SNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1 = GCNConv(dataset.num_node_features, 32)
+        self.c2 = GCNConv(32, 32)
+        self.pool = Set2Set(32, processing_steps=3)
+        self.lin = nn.Linear(64, dataset.num_classes)  # Set2Set doubles dim
+    def forward(self, x, ei, batch):
+        x = F.relu(self.c1(x, ei)); x = F.relu(self.c2(x, ei))
+        return self.lin(self.pool(x, batch))
+
+# Train and evaluate as above
+# Set2Set typically matches or slightly beats global_mean on MUTAG (~0.85 test acc)
+# The extra expressiveness matters more on tasks with diverse graph structures.
+print("Set2Set uses an LSTM to adaptively weight nodes — more powerful than fixed pooling.")
+```
+</details>

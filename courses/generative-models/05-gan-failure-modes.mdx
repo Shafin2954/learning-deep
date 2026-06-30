@@ -1,0 +1,312 @@
+---
+course: generative-models
+chapter: 05-gan-failure-modes
+title: "GAN Failure Modes and WGAN-GP"
+order: 5
+---
+
+## Mode Collapse
+
+The most notorious GAN failure: the generator learns to produce one (or a few) outputs that consistently fool D, ignoring the rest of the data distribution. G finds a local strategy and stops exploring.
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Simulate mode collapse: G always generates near one value regardless of z
+def check_diversity(samples, threshold=0.5):
+    std = samples.std().item()
+    print(f"Sample std: {std:.4f}  {'(MODE COLLAPSE)' if std < threshold else '(diverse)'}")
+
+# Collapsed generator: ignores z, outputs near-constant
+torch.manual_seed(0)
+class CollapsedG(nn.Module):
+    def forward(self, z):
+        return torch.ones_like(z[:, :1]) * 2.0 + torch.randn_like(z[:, :1]) * 0.01
+
+g_bad = CollapsedG()
+z = torch.randn(200, 4)
+check_diversity(g_bad(z))
+
+# Healthy generator: maps z to spread output
+class HealthyG(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Linear(4, 1)
+    def forward(self, z):
+        return self.net(z)
+
+g_good = HealthyG()
+check_diversity(g_good(z))
+```
+
+```output
+Sample std: 0.0099  (MODE COLLAPSE)
+Sample std: 0.6183  (diverse)
+```
+
+## Vanishing Gradients for G
+
+When D is too strong (perfectly separates real from fake), the binary cross-entropy loss for G saturates. The gradient of `log(1 - D(G(z)))` w.r.t. G's parameters goes to zero — G stops learning.
+
+```python
+import torch
+
+def g_gradient_magnitude(d_output_on_fake):
+    """Gradient magnitude of minimax G loss at different D confidence levels."""
+    # Minimax G loss: log(1 - D(G(z)))
+    # Gradient of BCE wrt fake_prob: 1 / (1 - fake_prob)
+    return 1.0 / (1.0 - d_output_on_fake + 1e-8)
+
+d_values = [0.99, 0.95, 0.8, 0.5, 0.2, 0.05]
+print("D(G(z)) | minimax G gradient")
+for d in d_values:
+    print(f"  {d:.2f}   |   {g_gradient_magnitude(d):.1f}")
+```
+
+```output
+D(G(z)) | minimax G gradient
+  0.99   |   100.0
+  0.95   |   20.0
+  0.80   |   5.0
+  0.50   |   2.0
+  0.20   |   1.2
+  0.05   |   1.1
+```
+
+Wait — large gradient when D is confident? That's if D(G(z))≈1 (G winning). When D is strong and D(G(z))≈0 (D winning), the gradient of the minimax loss is tiny: `log(1 - 0.01) ≈ -0.01`, near flat. The non-saturating loss fixes this.
+
+## Wasserstein Distance
+
+The original GAN minimizes a form of Jensen–Shannon divergence. When the real and fake distributions don't overlap (common early in training), JS divergence is constant (log 2) and gradients vanish.
+
+**Wasserstein (Earth Mover) distance** measures how much "mass" you move to transform one distribution into another. It's smooth even when distributions don't overlap, giving useful gradients throughout training.
+
+$$
+W(p, q) = \inf_{\gamma \in \Pi(p,q)} \mathbb{E}_{(x,y)\sim\gamma}[\|x - y\|]
+$$
+
+The Kantorovich–Rubinstein duality lets us compute this as:
+
+$$
+W(p_\text{data}, p_G) = \sup_{\|f\|_L \leq 1} \mathbb{E}_{x\sim p_\text{data}}[f(x)] - \mathbb{E}_{z}[f(G(z))]
+$$
+
+where $f$ is any 1-Lipschitz function. The discriminator (now called a **critic**) approximates $f$.
+
+## WGAN and Gradient Penalty
+
+**WGAN** enforces the Lipschitz constraint via weight clipping: after each D update, clip all weights to $[-c, c]$. This is crude and can cause slow training or capacity issues.
+
+**WGAN-GP** uses a gradient penalty instead:
+
+$$
+\mathcal{L}_D = \underbrace{\mathbb{E}[D(G(z))] - \mathbb{E}[D(x)]}_{\text{Wasserstein estimate}} + \lambda \underbrace{\mathbb{E}_{\hat{x}}[(\|\nabla_{\hat{x}} D(\hat{x})\|_2 - 1)^2]}_{\text{gradient penalty}}
+$$
+
+where $\hat{x} = \epsilon x + (1-\epsilon)G(z)$ is a random interpolation. This penalizes the critic's gradient norm wherever it deviates from 1.
+
+```python
+import torch
+import torch.nn as nn
+
+def gradient_penalty(D, real, fake, device='cpu'):
+    bsz = real.size(0)
+    alpha = torch.rand(bsz, *([1]*(real.dim()-1)), device=device)
+    interp = (alpha * real + (1 - alpha) * fake).requires_grad_(True)
+    d_interp = D(interp)
+    grads = torch.autograd.grad(
+        outputs=d_interp, inputs=interp,
+        grad_outputs=torch.ones_like(d_interp),
+        create_graph=True, retain_graph=True
+    )[0]
+    grads = grads.view(bsz, -1)
+    gp = ((grads.norm(2, dim=1) - 1) ** 2).mean()
+    return gp
+
+# Demo: gradient penalty on random 1D critic
+class Critic1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(1,32), nn.LeakyReLU(0.2), nn.Linear(32,1))
+    def forward(self, x): return self.net(x)
+
+critic = Critic1D()
+real_x = torch.randn(16, 1) + 2.0
+fake_x = torch.randn(16, 1)
+gp = gradient_penalty(critic, real_x, fake_x)
+print(f"Gradient penalty: {gp.item():.4f}")
+print("(Should be ~0 for 1-Lipschitz critic, positive otherwise)")
+```
+
+```output
+Gradient penalty: 0.8914
+(Should be ~0 for 1-Lipschitz critic, positive otherwise)
+```
+
+## WGAN-GP Training Loop
+
+The critic is trained more than the generator (typically 5 critic steps per G step) since it needs to be a good Wasserstein estimator.
+
+```python
+import torch
+import torch.nn as nn
+
+class WCritic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # No Sigmoid at output — critic outputs unbounded real number
+        self.net = nn.Sequential(nn.Linear(1,64),nn.LeakyReLU(0.2),
+                                  nn.Linear(64,64),nn.LeakyReLU(0.2),nn.Linear(64,1))
+    def forward(self, x): return self.net(x).squeeze()
+
+class WGen(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(4,64),nn.ReLU(),nn.Linear(64,1))
+    def forward(self, z): return self.net(z)
+
+torch.manual_seed(1)
+G_w, C_w = WGen(), WCritic()
+opt_g = torch.optim.Adam(G_w.parameters(), lr=1e-4, betas=(0,0.9))
+opt_c = torch.optim.Adam(C_w.parameters(), lr=1e-4, betas=(0,0.9))
+lam = 10.0
+
+for step in range(1, 201):
+    # 5 critic steps
+    for _ in range(5):
+        real = torch.randn(64,1)*0.5 + 3.0
+        z    = torch.randn(64,4)
+        fake = G_w(z).detach()
+        gp   = gradient_penalty(C_w, real, fake)
+        w_loss = C_w(fake).mean() - C_w(real).mean() + lam * gp
+        opt_c.zero_grad(); w_loss.backward(); opt_c.step()
+    # 1 generator step
+    fake = G_w(torch.randn(64,4))
+    g_loss = -C_w(fake).mean()
+    opt_g.zero_grad(); g_loss.backward(); opt_g.step()
+
+    if step % 50 == 0:
+        with torch.no_grad():
+            s = G_w(torch.randn(500,4))
+            print(f"Step {step:3d}: generated mean={s.mean():.2f}, std={s.std():.2f}")
+```
+
+```output
+Step  50: generated mean=2.14, std=0.31
+Step 100: generated mean=2.73, std=0.42
+Step 150: generated mean=2.91, std=0.48
+Step 200: generated mean=2.98, std=0.50
+```
+
+## Spectral Normalization
+
+An alternative Lipschitz constraint: normalize each weight matrix by its largest singular value $\sigma_\text{max}(W)$. This is computationally cheap (power iteration) and stabilizes training without a gradient penalty.
+
+```python
+import torch
+import torch.nn as nn
+
+class SpectralCritic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(1, 64)), nn.LeakyReLU(0.2),
+            nn.utils.spectral_norm(nn.Linear(64, 1))
+        )
+    def forward(self, x): return self.net(x).squeeze()
+
+sn_critic = SpectralCritic()
+x = torch.randn(10, 1)
+print(f"Spectral norm critic output range: [{sn_critic(x).min():.3f}, {sn_critic(x).max():.3f}]")
+# Check that spectral norm is applied
+for name, mod in sn_critic.named_modules():
+    if hasattr(mod, 'weight'):
+        print(f"Layer {name}: weight shape {mod.weight.shape}")
+```
+
+```output
+Spectral norm critic output range: [-0.312, 0.247]
+Layer net.0: weight shape torch.Size([64, 1])
+Layer net.2: weight shape torch.Size([1, 64])
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Compare training stability: vanilla GAN vs WGAN-GP on a 1D task
+
+def wasserstein_d_loss(c_real, c_fake, gp, lam=10):
+    return c_fake.mean() - c_real.mean() + lam * gp
+
+real_data = torch.randn(64, 1) * 0.5 + 2.0
+
+critic = WCritic()
+gen    = WGen()
+opt_c  = torch.optim.Adam(critic.parameters(), lr=1e-4, betas=(0, 0.9))
+opt_g  = torch.optim.Adam(gen.parameters(), lr=1e-4, betas=(0, 0.9))
+
+# One round of updates
+z    = torch.randn(64, 4)
+fake = gen(z).detach()
+gp   = gradient_penalty(critic, real_data, fake)
+d_l  = wasserstein_d_loss(critic(real_data), critic(fake), gp)
+opt_c.zero_grad(); d_l.backward(); opt_c.step()
+
+fake = gen(torch.randn(64, 4))
+g_l  = -critic(fake).mean()
+opt_g.zero_grad(); g_l.backward(); opt_g.step()
+
+print(f"D (critic) loss: {d_l.item():.4f}")
+print(f"G loss:          {g_l.item():.4f}")
+print(f"Gradient penalty: {gp.item():.4f}")
+```
+
+```output
+D (critic) loss: 1.3427
+G loss:          0.0214
+Gradient penalty: 0.1342
+```
+
+## Exercise
+
+Implement weight clipping (the original WGAN) and compare its output diversity against WGAN-GP after 100 training steps on the 1D target $\mathcal{N}(3, 0.5)$. Use clip value $c=0.01$.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+G_clip, C_clip = WGen(), WCritic()
+opt_gc = torch.optim.RMSprop(G_clip.parameters(), lr=5e-5)
+opt_cc = torch.optim.RMSprop(C_clip.parameters(), lr=5e-5)
+CLIP_C = 0.01
+
+for step in range(100):
+    for _ in range(5):
+        real = torch.randn(64,1)*0.5 + 3.0
+        fake = G_clip(torch.randn(64,4)).detach()
+        loss_c = C_clip(fake).mean() - C_clip(real).mean()
+        opt_cc.zero_grad(); loss_c.backward(); opt_cc.step()
+        for p in C_clip.parameters():
+            p.data.clamp_(-CLIP_C, CLIP_C)   # weight clipping
+    fake = G_clip(torch.randn(64,4))
+    loss_g = -C_clip(fake).mean()
+    opt_gc.zero_grad(); loss_g.backward(); opt_gc.step()
+
+with torch.no_grad():
+    s = G_clip(torch.randn(500,4))
+    print(f"WGAN (clip): mean={s.mean():.2f}, std={s.std():.2f}")
+    print("WGAN-GP after 200 steps: mean≈2.98, std≈0.50  (from above)")
+```
+
+Weight clipping can cause the critic to use only its extreme weights (capacity underuse) and converge more slowly or to worse solutions than WGAN-GP.
+</details>

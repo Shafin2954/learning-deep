@@ -1,0 +1,237 @@
+---
+course: python-for-data-work
+chapter: 01-numpy-arrays
+title: "NumPy Arrays, Dtypes, and Memory Layout"
+order: 1
+---
+
+## What NumPy is, and why it exists
+
+Python lists are flexible but slow for numerical work: every element is a boxed Python
+object, comparisons and arithmetic invoke the interpreter per element, and nothing is
+contiguous in memory. NumPy replaces them with **ndarray** — a block of raw memory holding
+homogeneous elements, processed by compiled C/Fortran code. That's the whole story. Every
+performance advantage flows from those two decisions: one dtype, contiguous layout.
+
+## Creating arrays and reading their metadata
+
+```python
+import numpy as np
+
+# From a Python list — dtype inferred
+a = np.array([1.0, 2.0, 3.0])           # float64 by default (64-bit float)
+b = np.array([1, 2, 3], dtype=np.int32) # explicit int32
+
+print("a dtype   :", a.dtype)
+print("a shape   :", a.shape)
+print("a ndim    :", a.ndim)
+print("a size    :", a.size)             # total elements
+print("a itemsize:", a.itemsize, "bytes")
+print("a nbytes  :", a.nbytes, "bytes")  # = size * itemsize
+```
+
+```output
+a dtype   : float64
+a shape   : (3,)
+a ndim    : 1
+a size    : 3
+a itemsize: 8 bytes
+a nbytes  : 24 bytes
+```
+
+`nbytes = size × itemsize`. A float64 is 8 bytes; a float32 is 4. Choosing the right dtype
+cuts memory in half and often halves compute time (more data fits in cache).
+
+## The dtype is everything
+
+NumPy's type hierarchy starts with four families: integers, unsigned integers, floats, and
+booleans. The suffix is the bit width.
+
+```python
+import numpy as np
+
+dtypes = [np.int8, np.int16, np.int32, np.int64,
+          np.float16, np.float32, np.float64, np.bool_]
+
+for dt in dtypes:
+    info = np.iinfo(dt) if np.issubdtype(dt, np.integer) else (
+           np.finfo(dt) if np.issubdtype(dt, np.floating) else None)
+    size = np.dtype(dt).itemsize
+    if info is not None:
+        rng = f"[{info.min}, {info.max}]" if hasattr(info, 'min') else f"eps={info.eps:.2e}"
+        print(f"{dt.__name__:<12} {size} bytes  range: {rng}")
+    else:
+        print(f"{dt.__name__:<12} {size} bytes")
+```
+
+```output
+int8         1 bytes  range: [-128, 127]
+int16        2 bytes  range: [-32768, 32767]
+int32        4 bytes  range: [-2147483648, 2147483647]
+int64        8 bytes  range: [-9223372036854775808, 9223372036854775807]
+float16      2 bytes  range: eps=9.77e-04
+float32      4 bytes  range: eps=1.19e-07
+float64      8 bytes  range: eps=2.22e-16
+bool_        1 bytes
+```
+
+**Rule of thumb:** use float32 for model weights / training data (halves RAM vs float64,
+GPU-native). Use float64 for intermediate statistics where precision matters. Use int32/int64
+for indices; int8/uint8 for image pixel data.
+
+## 2-D arrays and shapes
+
+```python
+import numpy as np
+
+# shape (rows, cols)
+M = np.array([[1, 2, 3],
+              [4, 5, 6]], dtype=np.float64)   # shape (2, 3)
+
+print("shape  :", M.shape)
+print("ndim   :", M.ndim)
+print("size   :", M.size)                     # 2 * 3 = 6
+print("nbytes :", M.nbytes)                   # 6 * 8 = 48 bytes
+
+# Reshape never copies as long as layout allows
+v = M.reshape(6)     # flatten to 1-D, still the same memory
+v2 = M.reshape(3, 2) # 3 rows, 2 cols
+print("reshaped:", v2.shape)
+```
+
+```output
+shape  : (2, 3)
+ndim   : 2
+size   : 6
+nbytes : 48
+reshaped: (3, 2)
+```
+
+`reshape` returns a **view**, not a copy, whenever the data is contiguous. Modifying `v`
+modifies `M`. This is not a bug — it's a feature. Views are free; unnecessary copies
+are one of the main sources of accidental memory bloat in NumPy code.
+
+### Memory layout: row-major (C) vs column-major (F)
+
+NumPy stores 2-D arrays in **row-major** order by default: the elements of row 0 come
+first in memory, then row 1, and so on. The **strides** tell you how many bytes to jump
+to move one step along each axis.
+
+```python
+import numpy as np
+
+M = np.zeros((4, 3), dtype=np.float32)  # 4 rows, 3 cols, 4 bytes each
+
+print("strides:", M.strides)   # (bytes per row, bytes per element)
+print("layout :", "C" if M.flags['C_CONTIGUOUS'] else "F")
+
+M_F = np.asfortranarray(M)     # column-major copy
+print("F strides:", M_F.strides)
+```
+
+```output
+strides: (12, 4)
+layout : C
+F strides: (4, 16)
+```
+
+Row stride = 3 columns × 4 bytes = 12. Column stride = 4 bytes (one element). For the
+Fortran layout it flips: 4 bytes per row step, 4×4=16 bytes per column step.
+
+Why does this matter? Iterating along the axis where stride is largest (wrong direction)
+causes **cache misses**. Column-by-column iteration on a row-major array is slow; row-by-
+row is fast. NumPy operations along `axis=0` (columns) vs `axis=1` (rows) have different
+performance profiles — this is why you'll sometimes see a 10× difference just from
+changing axis order or transposing first.
+
+## Views vs copies
+
+Understanding when NumPy copies is essential for writing fast, bug-free code.
+
+```python
+import numpy as np
+
+a = np.array([10, 20, 30, 40, 50], dtype=np.int64)
+
+# Slicing gives a VIEW (same memory)
+s = a[1:4]
+s[0] = 999          # modifies a!
+print("a after slice mutation:", a)
+
+# Fancy indexing gives a COPY (new memory)
+idx = np.array([1, 3])
+c = a[idx]
+c[0] = 0            # does NOT modify a
+print("a after fancy-index mutation:", a)
+
+# .copy() forces a new allocation
+d = a[1:4].copy()
+d[0] = -1
+print("a after copy mutation:", a)
+```
+
+```output
+a after slice mutation: [ 10 999  30  40  50]
+a after fancy-index mutation: [ 10 999  30  40  50]
+a after copy mutation: [ 10 999  30  40  50]
+```
+
+The rule: **slices (`:`) give views; fancy indexing (integer arrays, booleans) gives
+copies.** Scalar/slice indexing is free; fancy indexing pays for the allocation.
+If you need to pass data to a function without risking mutation, `.copy()` it first.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# 1) Play with dtypes and observe nbytes.
+for dt in [np.float16, np.float32, np.float64]:
+    a = np.ones(1_000_000, dtype=dt)
+    print(f"{dt.__name__:<10} {a.nbytes / 1e6:.1f} MB")
+
+# 2) Strides intuition: a transposed array is a view, not a copy.
+M = np.arange(12, dtype=np.float64).reshape(3, 4)
+T = M.T            # transpose — just flips the strides
+T[0, 0] = 999
+print("M[0,0] after T mutation:", M[0, 0])   # 999 — same memory
+
+# 3) Contiguous check: T is not C-contiguous, so operations on it may be slower.
+print("M contiguous:", M.flags['C_CONTIGUOUS'])
+print("T contiguous:", T.flags['C_CONTIGUOUS'])
+# Fix: np.ascontiguousarray(T) makes a fresh C-order copy.
+```
+
+```output
+float16    2.0 MB
+float32    4.0 MB
+float64    8.0 MB
+M[0,0] after T mutation: 999.0
+M contiguous: True
+T contiguous: False
+```
+
+## Exercise
+
+A float64 array with shape `(1024, 1024)` has how many megabytes? What about float32?
+Write code to verify. Then create the array with `np.ones`, check `.nbytes`, and confirm
+the `strides` match your expectation for row-major layout.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+for dt, expected_mb in [(np.float64, 8.0), (np.float32, 4.0)]:
+    a = np.ones((1024, 1024), dtype=dt)
+    mb = a.nbytes / 1024**2
+    print(f"{dt.__name__}: {mb:.1f} MB  strides={a.strides}")
+
+# float64: 1024*1024*8 = 8_388_608 bytes = 8.0 MB
+# float32: 1024*1024*4 = 4_194_304 bytes = 4.0 MB
+```
+
+Row-major strides for (1024, 1024) float64: `(8192, 8)` — move one row = 1024×8 = 8192
+bytes; move one column = 8 bytes. For float32 it's `(4096, 4)`.
+</details>

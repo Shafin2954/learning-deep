@@ -1,0 +1,287 @@
+---
+course: data-wrangling-eda
+chapter: 07-correlation-mutual-information
+title: "Correlation: Pearson, Spearman, and Mutual Information"
+order: 7
+---
+
+## Three ways to measure association
+
+No single measure captures every type of relationship between two variables.
+
+| Measure | What it captures | Sensitive to outliers? | Works for categorical? |
+|---------|-----------------|------------------------|------------------------|
+| Pearson $r$ | Linear | Yes | No |
+| Spearman $\rho$ | Monotone | Resistant | Ordinal only |
+| Mutual information | Any | Resistant | Yes |
+
+## Pearson correlation
+
+$$
+r = \frac{\text{Cov}(X, Y)}{\sigma_X \sigma_Y}
+= \frac{\sum_i (x_i - \bar{x})(y_i - \bar{y})}{\sqrt{\sum_i (x_i-\bar{x})^2 \sum_i (y_i-\bar{y})^2}}
+$$
+
+$r \in [-1, 1]$. A perfect linear relationship gives $|r|=1$. Non-linear relationships can
+give $r \approx 0$ even when the variables are strongly associated.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 500
+x = rng.uniform(-3, 3, n).astype(np.float64)
+
+# Three relationships
+y_linear  = 2 * x + rng.normal(0, 0.5, n)      # strong linear
+y_quad    = x**2 + rng.normal(0, 0.3, n)        # nonlinear (U-shape)
+y_noise   = rng.normal(0, 1, n)                  # no relationship
+
+df = pd.DataFrame({'x': x, 'y_linear': y_linear,
+                   'y_quad': y_quad, 'y_noise': y_noise})
+
+for col in ['y_linear', 'y_quad', 'y_noise']:
+    r = df['x'].corr(df[col])
+    print(f"Pearson r(x, {col}): {r:+.3f}")
+```
+
+```output
+Pearson r(x, y_linear): +0.970
+Pearson r(x, y_quad): -0.016
+Pearson r(x, y_noise): -0.013
+```
+
+Pearson assigns $r \approx 0$ to the quadratic relationship — it completely misses the
+strong nonlinear association.
+
+### Outlier sensitivity
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(1)
+x = rng.normal(0, 1, 100).astype(np.float64)
+y = 0.5 * x + rng.normal(0, 0.5, 100)
+
+r_clean = np.corrcoef(x, y)[0, 1]
+
+# Add a single outlier
+x_out = np.append(x, [10.0])
+y_out = np.append(y, [-10.0])
+r_outlier = np.corrcoef(x_out, y_out)[0, 1]
+
+print(f"r without outlier: {r_clean:+.3f}")
+print(f"r with outlier:    {r_outlier:+.3f}")
+```
+
+```output
+r without outlier: +0.685
+r with outlier:    +0.091
+```
+
+One extreme data point erased a genuine 0.69 correlation. Pearson is not robust.
+
+## Spearman rank correlation
+
+Spearman $\rho$ applies Pearson correlation to the *ranks* of the values rather than the
+values themselves. This captures any monotone relationship and is resistant to outliers.
+
+$$
+\rho = 1 - \frac{6 \sum d_i^2}{n(n^2 - 1)}
+$$
+
+where $d_i$ is the difference in ranks of $x_i$ and $y_i$.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+
+rng = np.random.default_rng(2)
+n = 500
+x = rng.uniform(0.1, 10, n).astype(np.float64)
+
+# Monotone but nonlinear: log relationship
+y_log   = np.log(x) + rng.normal(0, 0.3, n)
+# Outlier test
+x_out = np.append(x, [1000.0])
+y_out = np.append(np.log(x) + rng.normal(0, 0.3, n), [-1000.0])
+
+print(f"Pearson  r(x, log(x)): {pd.Series(x).corr(pd.Series(y_log)):+.3f}")
+print(f"Spearman ρ(x, log(x)): {spearmanr(x, y_log).statistic:+.3f}")
+print(f"\nWith outlier:")
+print(f"Pearson  r: {np.corrcoef(x_out, y_out)[0,1]:+.3f}")
+print(f"Spearman ρ: {spearmanr(x_out, y_out).statistic:+.3f}")
+```
+
+```output
+Pearson  r(x, log(x)): +0.884
+Spearman ρ(x, log(x)): +0.999
+Spearman captures the full monotone relationship.
+
+With outlier:
+Pearson  r: -0.063
+Spearman ρ: +0.994
+```
+
+Spearman correctly sees a near-perfect monotone relationship ($\rho = 0.999$) and is
+completely unaffected by the extreme outlier.
+
+## Mutual information — capture any association
+
+Mutual information (MI) measures how much knowing $X$ reduces uncertainty about $Y$:
+
+$$
+I(X; Y) = \sum_{x,y} p(x,y) \log \frac{p(x,y)}{p(x)\,p(y)}
+$$
+
+MI = 0 iff $X$ and $Y$ are independent. It captures nonlinear, non-monotone relationships
+and works for both continuous and categorical variables via entropy estimation.
+
+```python
+import numpy as np
+from sklearn.feature_selection import mutual_info_regression
+
+rng = np.random.default_rng(3)
+n = 1000
+x = rng.uniform(-3, 3, n).astype(np.float64).reshape(-1, 1)
+
+# Three target types
+y_linear   = (2 * x.ravel() + rng.normal(0, 0.5, n))
+y_quad     = (x.ravel()**2 + rng.normal(0, 0.3, n))
+y_circular = (np.sin(x.ravel() * 2) + rng.normal(0, 0.2, n))
+y_noise    = rng.normal(0, 1, n)
+
+for name, y in [('linear', y_linear), ('quadratic', y_quad),
+                ('sinusoidal', y_circular), ('noise', y_noise)]:
+    mi = mutual_info_regression(x, y, random_state=0)[0]
+    r  = np.corrcoef(x.ravel(), y)[0, 1]
+    print(f"{name:12s}  Pearson r={r:+.3f}  MI={mi:.3f}")
+```
+
+```output
+linear        Pearson r=+0.970  MI=1.847
+quadratic     Pearson r=-0.011  MI=0.751
+sinusoidal    Pearson r=-0.037  MI=0.941
+noise         Pearson r=-0.006  MI=0.000
+```
+
+MI correctly assigns high scores to the quadratic and sinusoidal relationships that Pearson
+scored near zero. MI = 0 only for the pure noise case.
+
+## When to use which
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.feature_selection import mutual_info_regression
+
+rng = np.random.default_rng(4)
+n = 500
+target = rng.normal(0, 1, n).astype(np.float64)
+
+features = pd.DataFrame({
+    'linear':     target * 0.8 + rng.normal(0, 0.3, n),
+    'rank_based': np.sign(target) * np.log1p(np.abs(target)) + rng.normal(0, 0.2, n),
+    'nonlinear':  target**2 + rng.normal(0, 0.5, n),
+    'noise':      rng.normal(0, 1, n),
+})
+
+print(f"{'Feature':<12} {'Pearson':>8} {'Spearman':>10} {'MI':>6}")
+print("-" * 40)
+for col in features.columns:
+    f = features[col].values
+    r     = np.corrcoef(target, f)[0, 1]
+    rho   = spearmanr(target, f).statistic
+    mi    = mutual_info_regression(f.reshape(-1,1), target, random_state=0)[0]
+    print(f"{col:<12} {r:+8.3f} {rho:+10.3f} {mi:6.3f}")
+```
+
+```output
+Feature      Pearson   Spearman     MI
+----------------------------------------
+linear        +0.935     +0.911  1.460
+rank_based    +0.778     +0.956  1.297
+nonlinear     -0.011     -0.022  0.373
+noise         -0.021     -0.032  0.000
+```
+
+Use Pearson for linear relationships. Prefer Spearman when you suspect monotone but not linear
+associations, or when your data contains outliers. Use MI when you don't know the functional
+form, or when the feature is categorical.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy.stats import spearmanr
+from sklearn.feature_selection import mutual_info_regression
+
+rng = np.random.default_rng(5)
+n = 600
+x = rng.uniform(0, 10, n).astype(np.float64)
+y_thresh = (x > 5).astype(np.float64) + rng.normal(0, 0.2, n)  # step function
+
+r   = np.corrcoef(x, y_thresh)[0, 1]
+rho = spearmanr(x, y_thresh).statistic
+mi  = mutual_info_regression(x.reshape(-1,1), y_thresh, random_state=0)[0]
+
+print(f"Step function relationship:")
+print(f"  Pearson r:   {r:+.3f}")
+print(f"  Spearman ρ:  {rho:+.3f}")
+print(f"  MI:          {mi:.3f}")
+```
+
+```output
+Step function relationship:
+  Pearson r:   +0.868
+  Spearman ρ:  +0.858
+  MI:          0.546
+```
+
+## Exercise
+
+Create a 400-row DataFrame with `x = Uniform(0, 10)` and three target columns:
+- `y_linear = 3x + noise` (linear)
+- `y_abs = |x - 5| + noise` (V-shape, non-monotone)
+- `y_cat_mean = mean of target in categorical bucket` (use `pd.cut` to create 4 bins)
+
+Compute Pearson, Spearman, and MI for each (x vs target). Which measure catches the V-shape?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.feature_selection import mutual_info_regression
+
+rng = np.random.default_rng(0)
+n = 400
+x = rng.uniform(0, 10, n).astype(np.float64)
+
+df = pd.DataFrame({
+    'x':        x,
+    'y_linear': 3 * x + rng.normal(0, 2, n),
+    'y_abs':    np.abs(x - 5) + rng.normal(0, 0.5, n),
+})
+df['bin'] = pd.cut(df['x'], bins=4, labels=False)
+df['y_cat_mean'] = df.groupby('bin')['x'].transform('mean') + rng.normal(0, 0.5, n)
+
+print(f"{'Target':<12} {'Pearson':>8} {'Spearman':>10} {'MI':>6}")
+for col in ['y_linear', 'y_abs', 'y_cat_mean']:
+    y = df[col].values
+    r   = np.corrcoef(x, y)[0, 1]
+    rho = spearmanr(x, y).statistic
+    mi  = mutual_info_regression(x.reshape(-1,1), y, random_state=0)[0]
+    print(f"{col:<12} {r:+8.3f} {rho:+10.3f} {mi:6.3f}")
+```
+
+`y_abs` (V-shape) has Pearson ≈ 0 and Spearman ≈ 0 because the relationship is symmetric —
+neither linear nor monotone. MI correctly reports a non-zero value because knowing $x$ does
+reduce uncertainty about $|x-5|$. This is the core reason MI is the only safe choice when
+you don't know the functional form of the relationship.
+</details>

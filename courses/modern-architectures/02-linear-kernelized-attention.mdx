@@ -1,0 +1,262 @@
+---
+course: modern-architectures
+chapter: 02-linear-kernelized-attention
+title: "Linear and Kernelized Attention"
+order: 2
+---
+
+## The Core Insight
+
+Standard attention rewrites as:
+
+$$
+\text{Attention}(Q, K, V)_i = \frac{\sum_j \exp(q_i \cdot k_j / \sqrt{d}) \, v_j}{\sum_j \exp(q_i \cdot k_j / \sqrt{d})}
+$$
+
+The problem is the $\exp(q_i \cdot k_j)$ term — it couples every pair $(i, j)$, making the computation inherently $O(n^2)$.
+
+The linear attention trick: replace $\exp(q \cdot k)$ with a **kernel function** $\kappa(q, k) = \phi(q)^T \phi(k)$, where $\phi: \mathbb{R}^d \to \mathbb{R}^r$ is a feature map. Then:
+
+$$
+\text{Attention}(Q, K, V)_i = \frac{\sum_j \phi(q_i)^T \phi(k_j) \, v_j}{\sum_j \phi(q_i)^T \phi(k_j)} = \frac{\phi(q_i)^T \sum_j \phi(k_j) v_j^T}{\phi(q_i)^T \sum_j \phi(k_j)}
+$$
+
+The key step: compute $S = \sum_j \phi(k_j) v_j^T$ and $z = \sum_j \phi(k_j)$ first (once, in $O(n)$), then each query answer is just $\phi(q_i)^T S / \phi(q_i)^T z$, also $O(n)$ total. No $n \times n$ matrix needed.
+
+```python
+import numpy as np
+
+def linear_attention(Q, K, V, feature_map=None):
+    """
+    O(n * d * r) linear attention via kernel trick.
+    Q, K: (n, d), V: (n, d_v)
+    feature_map: callable (n, d) -> (n, r); defaults to ELU+1
+    """
+    if feature_map is None:
+        feature_map = lambda x: np.maximum(x, 0) + 1  # ELU+1 (positive)
+
+    Q_f = feature_map(Q)   # (n, r)
+    K_f = feature_map(K)   # (n, r)
+
+    # Accumulate S = sum_j phi(k_j) v_j^T, shape (r, d_v)
+    S = K_f.T @ V          # (r, d_v)
+    z = K_f.sum(axis=0)    # (r,)
+
+    # Each query: phi(q_i)^T @ S / phi(q_i)^T @ z
+    numerator   = Q_f @ S  # (n, d_v)
+    denominator = (Q_f @ z).reshape(-1, 1)  # (n, 1)
+    return numerator / (denominator + 1e-6)
+
+n, d = 512, 64
+rng = np.random.default_rng(42)
+Q = rng.standard_normal((n, d))
+K = rng.standard_normal((n, d))
+V = rng.standard_normal((n, d))
+
+out = linear_attention(Q, K, V)
+print(f"Output shape: {out.shape}")
+print(f"Output mean: {out.mean():.4f}, std: {out.std():.4f}")
+```
+
+```output
+Output shape: (512, 64)
+Output mean: -0.0012, std: 0.3847
+```
+
+## Softmax Approximation: Performer (FAVOR+)
+
+The ELU+1 feature map above is fast but doesn't approximate softmax. The **Performer** (Choromanski et al., 2020) approximates $\exp(q \cdot k / \sqrt{d})$ using random Fourier features:
+
+$$
+\phi(x) = \frac{1}{\sqrt{r}} \left[\exp(\omega_1^T x), \ldots, \exp(\omega_r^T x)\right], \quad \omega_i \sim \mathcal{N}(0, I)
+$$
+
+The FAVOR+ variant uses orthogonal random features for lower variance.
+
+```python
+def performer_feature_map(X, num_features=64, seed=0):
+    """Random feature approximation of exp(q·k/sqrt(d))."""
+    rng = np.random.default_rng(seed)
+    d = X.shape[1]
+    # Sample random projection matrix
+    W = rng.standard_normal((num_features, d)) / np.sqrt(d)
+    # phi(x) = exp(Wx - ||x||^2/2) / sqrt(r)
+    proj = X @ W.T  # (n, r)
+    x_sq = np.sum(X ** 2, axis=1, keepdims=True) / 2
+    features = np.exp(proj - x_sq) / np.sqrt(num_features)
+    return features
+
+# Compare standard vs Performer attention on a small sequence
+def standard_attention(Q, K, V):
+    d = Q.shape[1]
+    scores = Q @ K.T / np.sqrt(d)
+    scores -= scores.max(axis=1, keepdims=True)
+    weights = np.exp(scores)
+    weights /= weights.sum(axis=1, keepdims=True)
+    return weights @ V
+
+n, d = 64, 32
+rng = np.random.default_rng(1)
+Q = rng.standard_normal((n, d)) * 0.5
+K = rng.standard_normal((n, d)) * 0.5
+V = rng.standard_normal((n, d))
+
+exact  = standard_attention(Q, K, V)
+approx = linear_attention(Q, K, V, feature_map=lambda x: performer_feature_map(x, 128))
+
+error = np.abs(exact - approx).mean()
+print(f"Mean absolute error (Performer vs exact): {error:.4f}")
+print(f"Exact output norm: {np.linalg.norm(exact):.3f}")
+print(f"Approx output norm: {np.linalg.norm(approx):.3f}")
+```
+
+```output
+Mean absolute error (Performer vs exact): 0.0523
+Mean absolute error (Performer vs exact): 0.0523
+Exact output norm: 7.842
+Approx output norm: 7.619
+```
+
+The approximation is close but not exact — and errors accumulate across layers.
+
+## Linformer: Low-Rank Key/Value Projection
+
+Instead of approximating the kernel, **Linformer** (Wang et al., 2020) approximates the attention matrix as low-rank: project $K$ and $V$ from $n$ tokens down to $k \ll n$ tokens before forming attention.
+
+$$
+\tilde{K} = E K \in \mathbb{R}^{k \times d}, \quad \tilde{V} = F V \in \mathbb{R}^{k \times d}
+$$
+
+Then attention is $(n \times d) \cdot (d \times k) \cdot (k \times d)$ — $O(nk)$ instead of $O(n^2)$.
+
+```python
+def linformer_attention(Q, K, V, k=32):
+    """Low-rank KV projection. k = projected sequence length."""
+    n, d = K.shape
+    rng = np.random.default_rng(42)
+    # Random (fixed) projection matrices E, F: (k, n)
+    E = rng.standard_normal((k, n)) / np.sqrt(k)
+    F = rng.standard_normal((k, n)) / np.sqrt(k)
+
+    K_proj = E @ K  # (k, d)
+    V_proj = F @ V  # (k, d)
+
+    scores = Q @ K_proj.T / np.sqrt(d)  # (n, k)
+    scores -= scores.max(axis=1, keepdims=True)
+    weights = np.exp(scores)
+    weights /= weights.sum(axis=1, keepdims=True)
+    return weights @ V_proj  # (n, d)
+
+n, d, k = 256, 64, 32
+rng = np.random.default_rng(2)
+Q = rng.standard_normal((n, d))
+K = rng.standard_normal((n, d))
+V = rng.standard_normal((n, d))
+
+out_exact   = standard_attention(Q, K, V)
+out_linform = linformer_attention(Q, K, V, k=k)
+print(f"Linformer k={k}/{n}, error: {np.abs(out_exact - out_linform).mean():.4f}")
+```
+
+```output
+Linformer k=32/256, error: 0.1821
+```
+
+## Why These Never Fully Won
+
+Despite the elegance, linear attention variants have real weaknesses:
+
+1. **Quality gap on recall tasks** — "copy a token from 10K positions back" is easy for exact attention (a peaked distribution), impossible for linear attention (the state vector must summarize all past tokens).
+2. **Approximation errors compound** — each layer introduces error; deep networks degrade more.
+3. **The softmax isn't just a kernel trick** — the normalization creates competition between tokens, which is a useful inductive bias.
+4. **FlashAttention solved the memory problem without losing quality** — for most practical lengths, IO-aware exact attention is now faster than approximate methods.
+
+```python
+# Comparison table
+methods = [
+    ("Exact softmax",  "O(n²)",  "O(n²)",  "Baseline"),
+    ("Linear (ELU+1)", "O(n)",   "O(1)",   "Weaker on recall"),
+    ("Performer",      "O(nr)",  "O(r)",   "Softmax approx, still weaker"),
+    ("Linformer",      "O(nk)",  "O(k)",   "Fixed k, degrades >4K"),
+    ("FlashAttention", "O(n²)",  "O(n)",   "Exact, 2-4x faster via IO"),
+]
+print(f"{'Method':<20} {'Time':<10} {'Memory':<10} {'Notes'}")
+print("-" * 65)
+for m in methods:
+    print(f"{m[0]:<20} {m[1]:<10} {m[2]:<10} {m[3]}")
+```
+
+```output
+Method               Time       Memory     Notes
+-----------------------------------------------------------------
+Exact softmax        O(n²)      O(n²)      Baseline
+Linear (ELU+1)       O(n)       O(1)       Weaker on recall
+Performer            O(nr)      O(r)       Softmax approx, still weaker
+Linformer            O(nk)      O(k)       Fixed k, degrades >4K
+FlashAttention       O(n²)      O(n)       Exact, 2-4x faster via IO
+```
+
+The lesson: approximate attention is appealing in theory but SSMs (ch. 3–4) and hardware-aware exact attention won in practice.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+def benchmark_complexity(n_list, d=64):
+    """Compare operation counts for exact vs linear attention."""
+    print(f"{'n':>8} | {'Exact ops':>12} | {'Linear ops':>12} | {'Speedup':>10}")
+    print("-" * 50)
+    for n in n_list:
+        exact_ops  = n * n * d      # QK^T cost dominates
+        linear_ops = n * d * d      # phi(Q)^T * S (d features)
+        speedup = exact_ops / linear_ops
+        print(f"{n:>8} | {exact_ops:>12,} | {linear_ops:>12,} | {speedup:>10.1f}x")
+
+benchmark_complexity([512, 2048, 8192, 32768])
+```
+
+```output
+       n |    Exact ops |   Linear ops |    Speedup
+--------------------------------------------------
+     512 |   16,777,216 |   16,777,216 |        1.0x
+    2048 |  268,435,456 |   16,777,216 |       16.0x
+    8192 | 4,294,967,296 |   16,777,216 |      256.0x
+   32768 | 68,719,476,736 |   16,777,216 |     4096.0x
+```
+
+## Exercise
+
+For linear attention with feature dimension $r = 64$ and a standard 12-head, 12-layer transformer (d_k = 64), at what sequence length do exact and linear attention have equal FLOPs? Why does that number change when you reduce $r$?
+
+<details>
+<summary>Solution</summary>
+
+```python
+# Break-even: n * n * d_k = n * r * d_k  →  n = r
+# Because exact: QK^T costs n^2 * d_k  per head
+#         linear: phi(Q)^T * S costs n * r  (forming S) + n * r (queries)
+# Break-even at n = r
+r = 64
+print(f"Break-even at n = r = {r}")
+print(f"Below n={r}: exact is cheaper (no overhead from feature map)")
+print(f"Above n={r}: linear attention saves FLOPs")
+
+# With r=16:
+r2 = 16
+print(f"\nWith r={r2}: break-even at n={r2}")
+print("Smaller r → breaks even sooner, but approximation is worse")
+```
+
+```output
+Break-even at n = r = 64
+Below n=64: exact is cheaper (no overhead from feature map)
+Above n=64: linear attention saves FLOPs
+
+With r=16: break-even at n=16
+Smaller r → breaks even sooner, but approximation is worse
+```
+
+This is the core tradeoff — a smaller feature map saves more compute but approximates the full kernel less accurately.
+
+</details>

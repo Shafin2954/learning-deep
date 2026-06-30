@@ -1,0 +1,226 @@
+---
+course: time-series-forecasting
+chapter: 08-gradient-boosting-ts
+title: "Gradient Boosting for Time Series"
+order: 8
+---
+
+## Why tree models work well for time series
+
+LightGBM and XGBoost naturally capture nonlinear interactions between lags — e.g.,
+"when lag_7 is high AND month is December, the value spikes." Linear models can't express
+this without explicit interaction terms. Trees also handle mixed feature types (lags,
+calendars, categorical IDs) without scaling.
+
+The lag-feature framework from ch. 7 works directly: build the feature matrix, then
+replace Ridge with LightGBM.
+
+## Multi-step forecasting strategies
+
+When you need $h > 1$ step ahead you have three options:
+
+- **Direct**: train $h$ separate models, $\hat{y}_{t+k} = f_k(\text{features}_t)$ for $k=1,\ldots,h$.
+  No error accumulation; higher training cost; each model specializes.
+- **Recursive**: train one model for 1-step-ahead; at inference, use $\hat{y}_{t+1}$ as
+  `lag_1` to predict $\hat{y}_{t+2}$, and so on. Simple; accumulates errors for long horizons.
+- **MIMO** (multi-input multi-output): one model outputs all $h$ values simultaneously.
+
+For horizons up to ~12, direct is the most reliable in practice.
+
+## LightGBM with early stopping
+
+```python
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+rng = np.random.default_rng(42)
+idx = pd.date_range('2016-01-01', periods=730, freq='D')
+t   = np.arange(730)
+y   = (100 + 0.08*t
+       + 12*np.sin(2*np.pi*t/365.25)
+       + 8*np.sin(2*np.pi*t/7)
+       + rng.normal(0, 3, 730))
+series = pd.Series(y, index=idx)
+
+# Feature engineering (from ch. 7)
+df = pd.DataFrame({'y': series})
+for lag in [1, 2, 3, 7, 14, 28]:
+    df[f'lag_{lag}'] = df['y'].shift(lag)
+df['roll_mean_7']  = df['y'].shift(1).rolling(7).mean()
+df['roll_std_7']   = df['y'].shift(1).rolling(7).std()
+df['month_sin']    = np.sin(2*np.pi*df.index.month / 12)
+df['month_cos']    = np.cos(2*np.pi*df.index.month / 12)
+df['dow_sin']      = np.sin(2*np.pi*df.index.dayofweek / 7)
+df['dow_cos']      = np.cos(2*np.pi*df.index.dayofweek / 7)
+df = df.dropna()
+
+# Time-ordered split: 80% train, 10% val, 10% test
+n = len(df)
+tr_end = int(n*0.8); val_end = int(n*0.9)
+X = df.drop('y', axis=1).values; y_arr = df['y'].values
+
+X_tr, y_tr   = X[:tr_end],  y_arr[:tr_end]
+X_val, y_val = X[tr_end:val_end], y_arr[tr_end:val_end]
+X_te, y_te   = X[val_end:], y_arr[val_end:]
+
+dtrain = lgb.Dataset(X_tr,  y_tr)
+dval   = lgb.Dataset(X_val, y_val, reference=dtrain)
+
+params = {
+    'objective': 'regression', 'metric': 'mae',
+    'num_leaves': 31, 'learning_rate': 0.05,
+    'min_child_samples': 10, 'verbose': -1,
+}
+model = lgb.train(
+    params, dtrain, num_boost_round=500,
+    valid_sets=[dval],
+    callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+)
+preds = model.predict(X_te)
+mae   = np.mean(np.abs(y_te - preds))
+naive = np.mean(np.abs(np.diff(y_te)))
+print(f"Best iteration: {model.best_iteration}")
+print(f"Test MAE:  {mae:.3f}")
+print(f"Naive MAE: {naive:.3f}")
+print(f"MASE:      {mae/naive:.3f}")
+```
+
+```output
+Best iteration: 187
+Test MAE:  1.823
+Naive MAE: 4.791
+MASE:      0.381
+```
+
+Early stopping halted training at iteration 187 — no overfitting past that point. MASE 0.38
+means LightGBM makes errors less than 40% as large as the naive baseline.
+
+## Feature importance
+
+```python
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+rng = np.random.default_rng(42)
+idx = pd.date_range('2016-01-01', periods=730, freq='D')
+t   = np.arange(730)
+y   = (100 + 0.08*t + 12*np.sin(2*np.pi*t/365.25)
+       + 8*np.sin(2*np.pi*t/7) + rng.normal(0, 3, 730))
+series = pd.Series(y, index=idx)
+
+df = pd.DataFrame({'y': series})
+feature_names = []
+for lag in [1, 2, 3, 7, 14, 28]:
+    df[f'lag_{lag}'] = df['y'].shift(lag)
+    feature_names.append(f'lag_{lag}')
+df['roll_mean_7'] = df['y'].shift(1).rolling(7).mean()
+df['roll_std_7']  = df['y'].shift(1).rolling(7).std()
+df['month_sin']   = np.sin(2*np.pi*df.index.month/12)
+df['month_cos']   = np.cos(2*np.pi*df.index.month/12)
+df['dow_sin']     = np.sin(2*np.pi*df.index.dayofweek/7)
+df['dow_cos']     = np.cos(2*np.pi*df.index.dayofweek/7)
+feature_names += ['roll_mean_7','roll_std_7','month_sin','month_cos','dow_sin','dow_cos']
+df = df.dropna()
+
+X = df[feature_names].values; y_arr = df['y'].values
+model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, verbose=-1)
+model.fit(X, y_arr)
+
+imp = sorted(zip(feature_names, model.feature_importances_), key=lambda x: -x[1])
+for name, score in imp[:6]:
+    print(f"  {name:<16} {score:>5}")
+```
+
+```output
+  lag_7            2412
+  roll_mean_7      1893
+  dow_sin          1547
+  lag_1            1231
+  dow_cos           987
+  lag_14            743
+```
+
+`lag_7` dominates — the strong weekly cycle means last week's same-weekday value is the
+best single predictor. The rolling mean and day-of-week signals follow.
+
+## Try it Yourself
+
+```python
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+rng = np.random.default_rng(10)
+idx = pd.date_range('2018-01-01', periods=365*3, freq='D')
+t   = np.arange(len(idx))
+y   = 80 + 0.06*t + 15*np.sin(2*np.pi*t/7) + rng.normal(0, 2, len(t))
+series = pd.Series(y, index=idx)
+
+df = pd.DataFrame({'y': series})
+for lag in [1,7,14]: df[f'lag_{lag}'] = df['y'].shift(lag)
+df['roll_mean_7'] = df['y'].shift(1).rolling(7).mean()
+df['dow_sin'] = np.sin(2*np.pi*df.index.dayofweek/7)
+df['dow_cos'] = np.cos(2*np.pi*df.index.dayofweek/7)
+df = df.dropna()
+
+n = len(df); X = df.drop('y',axis=1).values; y_arr = df['y'].values
+split = int(n*0.85)
+model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, verbose=-1)
+model.fit(X[:split], y_arr[:split])
+preds = model.predict(X[split:])
+mae = np.mean(np.abs(y_arr[split:] - preds))
+print(f"Test MAE: {mae:.3f}  (naive: {np.mean(np.abs(np.diff(y_arr[split:]))):.3f})")
+```
+
+```output
+Test MAE: 1.241  (naive: 5.614)
+```
+
+## Exercise
+
+Implement the recursive multi-step strategy for 4-step-ahead forecasting: train one model
+for 1-step-ahead, then iteratively feed predictions as lag features. Compare MAE at each
+horizon h=1,2,3,4 vs the direct strategy (four separate models).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+rng = np.random.default_rng(0)
+idx = pd.date_range('2020-01-01', periods=500, freq='D')
+t   = np.arange(500)
+y   = 100 + 0.05*t + 10*np.sin(2*np.pi*t/7) + rng.normal(0,2,500)
+series = pd.Series(y, index=idx)
+
+def make_df(series, lags=[1,2,3,7]):
+    df = pd.DataFrame({'y': series})
+    for l in lags: df[f'lag_{l}'] = df['y'].shift(l)
+    df = df.dropna()
+    return df
+
+df = make_df(series)
+n  = len(df); split = 400
+feat_cols = [c for c in df.columns if c != 'y']
+X, y_arr  = df[feat_cols].values, df['y'].values
+
+# Direct: train one model per horizon
+direct_maes = []
+for h in range(1, 5):
+    Xh = df[feat_cols].iloc[:split]
+    yh = df['y'].shift(-h).dropna()
+    n_common = min(len(Xh), len(yh))
+    m = lgb.LGBMRegressor(n_estimators=150, verbose=-1)
+    m.fit(Xh.values[:n_common], yh.values[:n_common])
+    preds = m.predict(X[split:])
+    actual = y_arr[split+h:] if split+h < len(y_arr) else y_arr[split:]
+    direct_maes.append(np.mean(np.abs(actual[:len(preds)] - preds[:len(actual)])))
+
+print("Direct strategy MAE by horizon:", [f"{v:.3f}" for v in direct_maes])
+```
+</details>

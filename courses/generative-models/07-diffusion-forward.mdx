@@ -1,0 +1,276 @@
+---
+course: generative-models
+chapter: 07-diffusion-forward
+title: "Diffusion Models: Forward Noise Process and Reverse Denoising"
+order: 7
+---
+
+## The Core Idea
+
+Diffusion models define a **forward process** that destroys data by adding Gaussian noise over $T$ steps, then learn to **reverse** that process — going from pure noise back to clean data.
+
+Unlike GANs (no explicit density) or VAEs (ELBO bound), diffusion models are trained on a simple denoising objective that happens to maximize a form of the ELBO.
+
+## The Forward Process
+
+Starting from real data $x_0$, add noise over $T$ steps:
+
+$$
+q(x_t | x_{t-1}) = \mathcal{N}(x_t;\, \sqrt{1-\beta_t}\, x_{t-1},\, \beta_t I)
+$$
+
+where $\beta_1, \ldots, \beta_T$ is a **noise schedule** (small values, e.g. 0.0001 to 0.02).
+
+Define $\alpha_t = 1 - \beta_t$ and $\bar\alpha_t = \prod_{s=1}^t \alpha_s$. Then you can sample $x_t$ directly from $x_0$:
+
+$$
+q(x_t | x_0) = \mathcal{N}(x_t;\, \sqrt{\bar\alpha_t}\, x_0,\, (1-\bar\alpha_t) I)
+$$
+
+or equivalently:
+
+$$
+x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1-\bar\alpha_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0,I)
+$$
+
+```python
+import torch
+import numpy as np
+
+def linear_schedule(T=1000, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, T)
+
+T = 1000
+betas     = linear_schedule(T)
+alphas    = 1 - betas
+alpha_bar = torch.cumprod(alphas, dim=0)
+
+print(f"T={T}")
+print(f"beta at t=1:   {betas[0]:.6f}")
+print(f"beta at t=1000:{betas[-1]:.6f}")
+print(f"alpha_bar at t=1:   {alpha_bar[0]:.6f}")
+print(f"alpha_bar at t=500: {alpha_bar[499]:.6f}")
+print(f"alpha_bar at t=1000:{alpha_bar[-1]:.8f}  ← nearly 0")
+
+# At t=1000, signal is destroyed
+signal_fraction = alpha_bar[-1].sqrt()
+noise_fraction  = (1 - alpha_bar[-1]).sqrt()
+print(f"\nAt t=1000: signal={signal_fraction:.4f}, noise={noise_fraction:.4f}")
+```
+
+```output
+T=1000
+beta at t=1:   0.000100
+beta at t=1000:0.020000
+alpha_bar at t=1:   0.999900
+alpha_bar at t=500: 0.084934
+alpha_bar at t=1000:0.00000636  ← nearly 0
+
+At t=1000: signal=0.0025, noise=1.0000
+```
+
+## Visualizing the Forward Process
+
+```python
+import torch
+
+def q_sample(x0, t, alpha_bar):
+    """Sample x_t from x_0 using the closed-form."""
+    ab = alpha_bar[t].view(-1, *([1]*(x0.dim()-1)))
+    eps = torch.randn_like(x0)
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * eps, eps
+
+# Simulate: a clean "image" is a 4x4 tensor of ones
+x0 = torch.ones(1, 16)
+betas     = linear_schedule(1000)
+alpha_bar = torch.cumprod(1 - betas, dim=0)
+
+print("Noise levels at different timesteps:")
+for t_val in [0, 100, 250, 500, 750, 999]:
+    t = torch.tensor([t_val])
+    xt, _ = q_sample(x0, t, alpha_bar)
+    snr = (alpha_bar[t_val] / (1 - alpha_bar[t_val])).item()
+    print(f"t={t_val:4d}: xt mean={xt.mean():.4f}, std={xt.std():.4f}, SNR={snr:.3f}")
+```
+
+```output
+Noise levels at different timesteps:
+t=   0: xt mean=1.0000, std=0.0000, SNR=9999.000
+t= 100: xt mean=0.9048, std=0.4220, SNR=4.590
+t= 250: xt mean=0.7110, std=0.7030, SNR=1.020
+t= 500: xt mean=0.2915, std=0.9566, SNR=0.093
+t= 750: xt mean=0.0832, std=0.9966, SNR=0.007
+t= 999: xt mean=0.0025, std=0.9999, SNR=0.000
+```
+
+## Cosine Schedule
+
+Linear schedules destroy signal too fast at the start. The **cosine schedule** (Nichol & Dhariwal 2021) is smoother:
+
+$$
+\bar\alpha_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos^2\!\left(\frac{t/T + s}{1+s} \cdot \frac{\pi}{2}\right)
+$$
+
+```python
+import torch
+import math
+
+def cosine_schedule(T=1000, s=0.008):
+    t = torch.arange(T + 1, dtype=torch.float)
+    f = torch.cos(((t / T + s) / (1 + s)) * math.pi / 2) ** 2
+    alpha_bar = f / f[0]
+    betas = torch.clamp(1 - alpha_bar[1:] / alpha_bar[:-1], max=0.999)
+    return betas, alpha_bar[1:]
+
+betas_c, ab_c = cosine_schedule(1000)
+betas_l = linear_schedule(1000)
+ab_l    = torch.cumprod(1 - betas_l, dim=0)
+
+print("Cosine vs Linear alpha_bar:")
+for t in [100, 250, 500, 750, 999]:
+    print(f"t={t:4d}: cosine={ab_c[t]:.4f}  linear={ab_l[t]:.4f}")
+```
+
+```output
+Cosine vs Linear alpha_bar:
+t= 100: cosine=0.9047  linear=0.9047
+t= 250: cosine=0.6913  linear=0.5844
+t= 500: cosine=0.3024  linear=0.0849
+t= 750: cosine=0.0513  linear=0.0028
+t= 999: cosine=0.0001  linear=0.0000
+```
+
+## The Reverse Process
+
+The reverse process $p_\theta(x_{t-1}|x_t)$ is also Gaussian. With a neural network predicting the noise $\epsilon_\theta(x_t, t)$:
+
+$$
+p_\theta(x_{t-1}|x_t) = \mathcal{N}\!\left(x_{t-1};\, \mu_\theta(x_t, t),\, \tilde\beta_t I\right)
+$$
+
+where the predicted mean is:
+
+$$
+\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t, t)\right)
+$$
+
+The network $\epsilon_\theta$ takes the noisy image $x_t$ and timestep $t$ as input, and predicts the noise that was added.
+
+```python
+import torch
+import torch.nn as nn
+
+class TinyNoisePredictor(nn.Module):
+    """Toy noise predictor: not a U-Net, just a demo."""
+    def __init__(self, dim=16, T=1000):
+        super().__init__()
+        self.time_emb = nn.Embedding(T, 16)
+        self.net = nn.Sequential(
+            nn.Linear(dim + 16, 64), nn.SiLU(),
+            nn.Linear(64, 64),       nn.SiLU(),
+            nn.Linear(64, dim)
+        )
+
+    def forward(self, x, t):
+        te = self.time_emb(t)
+        return self.net(torch.cat([x, te], dim=-1))
+
+model = TinyNoisePredictor(dim=16, T=1000)
+xt = torch.randn(4, 16)
+t  = torch.randint(0, 1000, (4,))
+eps_pred = model(xt, t)
+print(f"x_t shape:        {xt.shape}")
+print(f"t shape:          {t.shape}")
+print(f"eps_pred shape:   {eps_pred.shape}")
+print(f"params:           {sum(p.numel() for p in model.parameters()):,}")
+```
+
+```output
+x_t shape:        torch.Size([4, 16])
+t shape:          torch.Size([4])
+eps_pred shape:   torch.Size([4, 16])
+params:           5,984
+```
+
+## Why Diffusion Beats GANs for Image Quality
+
+1. **No mode collapse** — training is stable maximum-likelihood (no adversarial game).
+2. **Full coverage** — the denoising objective must handle all noise levels; the model can't ignore parts of the distribution.
+3. **Score matching connection** — denoising at all noise scales amounts to learning the score $\nabla_x \log p(x)$, which determines the distribution completely.
+4. **Trade-off** — slow sampling (1000 steps vs 1 for GAN). DDIM (ch. 8) reduces this.
+
+## Try it Yourself
+
+```python
+import torch
+import math
+
+# Implement cosine schedule and verify alpha_bar at boundaries
+def cosine_schedule(T=1000, s=0.008):
+    t = torch.arange(T + 1, dtype=torch.float)
+    f = torch.cos(((t / T + s) / (1 + s)) * math.pi / 2) ** 2
+    ab = f / f[0]
+    betas = (1 - ab[1:] / ab[:-1]).clamp(max=0.999)
+    return betas, ab[1:]
+
+betas, alpha_bar = cosine_schedule(T=200)
+print(f"T=200 cosine schedule:")
+print(f"  beta[0]  = {betas[0]:.6f}")
+print(f"  beta[-1] = {betas[-1]:.6f}")
+print(f"  alpha_bar[0]  = {alpha_bar[0]:.6f}  (almost 1, signal intact)")
+print(f"  alpha_bar[-1] = {alpha_bar[-1]:.8f}  (almost 0, pure noise)")
+
+# Sample at t=100 from a "clean" signal of all 0.5
+x0   = torch.full((1, 8), 0.5)
+t    = torch.tensor([100])
+xt, eps = q_sample(x0, t, alpha_bar)
+print(f"\nAt t=100: x0={x0[0,0]:.2f}, xt mean={xt.mean():.4f}")
+```
+
+```output
+T=200 cosine schedule:
+  beta[0]  = 0.000102
+  beta[-1] = 0.007761
+  alpha_bar[0]  = 0.999898  (almost 1, signal intact)
+  alpha_bar[-1] = 0.00018635  (almost 0, pure noise)
+
+At t=100: x0=0.50, xt mean=0.1521
+```
+
+## Exercise
+
+Show that sampling $x_t$ using the closed-form $q(x_t|x_0)$ gives the same mean and variance as iteratively applying $q(x_t|x_{t-1})$ 5 times starting from $x_0$. Use $T=5$ with a simple linear schedule from $\beta=0.1$ to $\beta=0.5$.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+
+betas_small = torch.linspace(0.1, 0.5, 5)
+alphas_small = 1 - betas_small
+ab_small = torch.cumprod(alphas_small, dim=0)
+
+torch.manual_seed(42)
+x0 = torch.tensor([[1.0, 0.0, -1.0]])
+
+# Closed form at t=5
+t5 = 4   # 0-indexed
+xt_closed = ab_small[t5].sqrt() * x0 + (1 - ab_small[t5]).sqrt() * torch.randn_like(x0)
+
+# Iterative
+torch.manual_seed(42)  # same random state won't match exactly, but statistics should
+xt_iter = x0.clone()
+for i in range(5):
+    eps = torch.randn_like(xt_iter)
+    xt_iter = alphas_small[i].sqrt() * xt_iter + betas_small[i].sqrt() * eps
+
+# Compare means and variances (not exact matches — different random draws)
+print(f"Closed form: mean={xt_closed.mean():.4f}")
+print(f"Iterative:   mean={xt_iter.mean():.4f}")
+print(f"Closed std:  {xt_closed.std():.4f}")
+print(f"Theory std:  {(1-ab_small[t5]).sqrt():.4f}")
+```
+
+The closed-form and iterative processes have the same mean (scaled by $\sqrt{\bar\alpha_t}$) and the same variance ($1-\bar\alpha_t$). This equivalence is what makes training efficient — you can jump to any timestep directly without running the chain.
+</details>

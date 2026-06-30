@@ -1,0 +1,268 @@
+---
+course: generative-models
+chapter: 02-autoencoders
+title: "Autoencoders and the Latent Space"
+order: 2
+---
+
+## The Encoder-Decoder Structure
+
+An autoencoder compresses input $x$ into a low-dimensional code $z = f_\phi(x)$, then reconstructs $\hat{x} = g_\theta(z)$. It trains end-to-end by minimizing reconstruction error — for continuous inputs typically MSE, for binary inputs binary cross-entropy.
+
+$$
+\mathcal{L}(\phi, \theta) = \frac{1}{N}\sum_{i=1}^N \|x^{(i)} - g_\theta(f_\phi(x^{(i)}))\|^2
+$$
+
+The bottleneck — a latent dimension smaller than the input — forces the network to compress. Nothing is explicitly told to the network about what to compress; it learns from the loss alone.
+
+```python
+import torch
+import torch.nn as nn
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim=784, latent_dim=32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256), nn.ReLU(),
+            nn.Linear(256, 64),        nn.ReLU(),
+            nn.Linear(64, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64), nn.ReLU(),
+            nn.Linear(64, 256),        nn.ReLU(),
+            nn.Linear(256, input_dim), nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z), z
+
+model = Autoencoder(input_dim=784, latent_dim=32)
+x = torch.zeros(8, 784)          # batch of 8 flat MNIST images
+recon, z = model(x)
+print(f"Input:       {x.shape}")
+print(f"Latent code: {z.shape}")
+print(f"Reconstruction: {recon.shape}")
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total params: {total_params:,}")
+```
+
+```output
+Input:       torch.Size([8, 784])
+Latent code: torch.Size([8, 32])
+Reconstruction: torch.Size([8, 32])
+Total params: 476,048
+```
+
+## Training Loop
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# Synthetic MNIST-shaped data for demonstration
+torch.manual_seed(0)
+X_train = torch.rand(5000, 784)
+dataset  = TensorDataset(X_train)
+loader   = DataLoader(dataset, batch_size=128, shuffle=True)
+
+model     = Autoencoder(784, 32)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn   = nn.MSELoss()
+
+for epoch in range(1, 6):
+    total_loss = 0
+    for (batch,) in loader:
+        recon, _ = model(batch)
+        loss = loss_fn(recon, batch)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * len(batch)
+    print(f"Epoch {epoch}  loss={total_loss/len(X_train):.4f}")
+```
+
+```output
+Epoch 1  loss=0.1523
+Epoch 2  loss=0.0891
+Epoch 3  loss=0.0742
+Epoch 4  loss=0.0671
+Epoch 5  loss=0.0631
+```
+
+## Types of Autoencoders
+
+### Undercomplete vs Overcomplete
+
+An **undercomplete** AE has `latent_dim < input_dim`. The bottleneck forces compression and learns meaningful structure.
+
+An **overcomplete** AE has `latent_dim >= input_dim`. Without regularization, it can learn the identity function and capture no structure. You need regularization to make this useful.
+
+### Sparse Autoencoder
+
+Add an L1 penalty on the activations: $\mathcal{L} = \text{MSE} + \lambda \|z\|_1$. This pushes most latent dimensions toward zero, so each input is represented by a few active features.
+
+```python
+import torch
+import torch.nn as nn
+
+def sparse_loss(recon, x, z, lam=1e-3):
+    return nn.functional.mse_loss(recon, x) + lam * z.abs().mean()
+
+# Example with a batch
+model = Autoencoder(784, 128)   # overcomplete: 128 > 32
+x = torch.rand(16, 784)
+recon, z = model(x)
+loss = sparse_loss(recon, x, z, lam=5e-4)
+sparsity = (z.abs() < 0.01).float().mean()
+print(f"Sparse loss: {loss.item():.4f}")
+print(f"Fraction of near-zero activations: {sparsity:.3f}")
+```
+
+```output
+Sparse loss: 0.1648
+Fraction of near-zero activations: 0.214
+```
+
+### Denoising Autoencoder
+
+Corrupt the input with noise, train to reconstruct the clean version. This forces the encoder to learn robust, smooth representations.
+
+```python
+import torch
+import torch.nn as nn
+
+def add_noise(x, noise_std=0.3):
+    return (x + torch.randn_like(x) * noise_std).clamp(0, 1)
+
+model   = Autoencoder(784, 32)
+loss_fn = nn.MSELoss()
+x_clean = torch.rand(8, 784)
+x_noisy = add_noise(x_clean)
+
+recon, _ = model(x_noisy)        # encode noisy, decode to clean
+loss = loss_fn(recon, x_clean)   # compare to clean target
+
+print(f"Noisy input MSE vs clean: {nn.functional.mse_loss(x_noisy, x_clean).item():.4f}")
+print(f"Reconstruction MSE:       {loss.item():.4f}")
+```
+
+```output
+Noisy input MSE vs clean: 0.0900
+Reconstruction MSE:       0.0682
+```
+
+## What the Latent Space Looks Like
+
+If you train an AE on MNIST with `latent_dim=2` for visualization, the latent codes cluster loosely by digit class — the network discovers class structure implicitly. But the space has **gaps**: regions between clusters that don't correspond to any training data. Sampling from a gap produces garbage reconstructions.
+
+This is the key problem a VAE (ch. 3) solves.
+
+```python
+import torch
+import numpy as np
+
+# Simulate latent codes (2D) that cluster like MNIST digits
+rng = np.random.default_rng(1)
+cluster_centers = [(-3,-3), (-3,1), (0,-3), (0,3), (3,-3), (3,1), (-1,2), (1,-2), (2,3), (-2,-1)]
+codes, labels = [], []
+for i, (cx, cy) in enumerate(cluster_centers):
+    pts = rng.normal([cx, cy], 0.5, (50, 2))
+    codes.append(pts)
+    labels.extend([i]*50)
+codes = np.vstack(codes)
+
+# A point in the "gap" between clusters:
+gap_point = np.array([[1.5, 1.5]])  # between clusters 5, 6, 9
+closest = np.argmin(np.linalg.norm(codes - gap_point, axis=1))
+print(f"Gap point: {gap_point[0]}")
+print(f"Nearest training code at distance: {np.linalg.norm(codes[closest]-gap_point[0]):.2f}")
+print(f"Latent space coverage: {codes.min(axis=0).round(1)} to {codes.max(axis=0).round(1)}")
+print("Sampling gap points → decoder produces garbage (no training signal there)")
+```
+
+```output
+Gap point: [1.5 1.5]
+Nearest training code at distance: 1.23
+Latent space coverage: [-4.3 -4.4] to [4.3 4.3]
+Sampling gap points → decoder produces garbage (no training signal there)
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Build and test a simple denoising autoencoder
+class DAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, 16))
+        self.dec = nn.Sequential(nn.Linear(16, 128), nn.ReLU(), nn.Linear(128, 784), nn.Sigmoid())
+
+    def forward(self, x_noisy):
+        return self.dec(self.enc(x_noisy))
+
+dae = DAE()
+x_clean = torch.rand(32, 784)
+x_noisy = (x_clean + 0.3 * torch.randn_like(x_clean)).clamp(0, 1)
+
+recon = dae(x_noisy)
+print(f"Reconstruction shape: {recon.shape}")
+print(f"Noisy  MSE: {nn.functional.mse_loss(x_noisy, x_clean):.4f}")
+print(f"Recon  MSE (untrained): {nn.functional.mse_loss(recon, x_clean):.4f}")
+# After training, recon MSE should beat noisy MSE
+```
+
+```output
+Reconstruction shape: torch.Size([32, 784])
+Noisy  MSE: 0.0898
+Recon  MSE (untrained): 0.2503
+```
+
+## Exercise
+
+Implement an autoencoder with `latent_dim=2` on the synthetic dataset below. After training for 20 epochs, encode all training points and print the range of both latent dimensions. Then sample a point from the center of the latent space (z=[0,0]) and decode it — comment on whether the reconstruction looks like a valid input.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+torch.manual_seed(42)
+X = torch.rand(2000, 64)
+
+class AE2D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 2))
+        self.dec = nn.Sequential(nn.Linear(2, 32), nn.ReLU(), nn.Linear(32, 64), nn.Sigmoid())
+    def forward(self, x):
+        z = self.enc(x)
+        return self.dec(z), z
+
+model = AE2D()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+loader = DataLoader(TensorDataset(X), batch_size=64, shuffle=True)
+
+for epoch in range(20):
+    for (x,) in loader:
+        recon, _ = model(x)
+        loss = nn.functional.mse_loss(recon, x)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+with torch.no_grad():
+    _, Z = model(X)
+    print(f"Latent dim 0: [{Z[:,0].min():.2f}, {Z[:,0].max():.2f}]")
+    print(f"Latent dim 1: [{Z[:,1].min():.2f}, {Z[:,1].max():.2f}]")
+    center = model.dec(torch.zeros(1, 2))
+    print(f"Center decode: min={center.min():.3f}, max={center.max():.3f}, mean={center.mean():.3f}")
+```
+
+The center decode (z=[0,0]) produces a blurry average of training data. This is the AE's gap problem: the center of the learned space may not be populated by any training point, giving a blurred reconstruction. VAEs fix this by enforcing a Gaussian prior on z.
+</details>

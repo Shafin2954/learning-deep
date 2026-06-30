@@ -1,0 +1,266 @@
+---
+course: classical-ml
+chapter: 13-xgboost-lightgbm-catboost
+title: "XGBoost, LightGBM, and CatBoost: Deep Dive"
+order: 13
+---
+
+## Why not just sklearn's GBM?
+
+sklearn's `GradientBoostingRegressor` is correct but slow: it uses first-order (gradient-only) updates and builds trees with an exact sort. XGBoost, LightGBM, and CatBoost are production-grade libraries that each make different speed/accuracy trade-offs.
+
+## XGBoost: second-order Taylor expansion
+
+XGBoost minimises a regularised objective using **second-order Taylor expansion** of the loss:
+
+$$
+L^{(m)} \approx \sum_i \left[g_i f_m(x_i) + \frac{1}{2}h_i f_m(x_i)^2\right] + \Omega(f_m)
+$$
+
+where $g_i = \partial L/\partial \hat{y}_i$ (gradient) and $h_i = \partial^2 L/\partial \hat{y}_i^2$ (Hessian). The regularisation $\Omega(f) = \gamma T + \frac{\lambda}{2}\sum_j w_j^2$ penalises tree complexity.
+
+### Split gain formula
+
+For a candidate split producing left/right leaf sets $I_L, I_R$:
+
+$$
+\text{Gain} = \frac{1}{2}\left[\frac{G_L^2}{H_L+\lambda} + \frac{G_R^2}{H_R+\lambda} - \frac{(G_L+G_R)^2}{H_L+H_R+\lambda}\right] - \gamma
+$$
+
+where $G = \sum g_i$, $H = \sum h_i$ over the leaf. Splits with Gain $< 0$ are pruned.
+
+```python
+import numpy as np
+from sklearn.datasets import make_regression
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+
+X, y = make_regression(n_samples=1000, n_features=20, noise=15, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+dtrain = xgb.DMatrix(X_tr, label=y_tr)
+dtest  = xgb.DMatrix(X_te, label=y_te)
+
+params = {
+    'objective': 'reg:squarederror',
+    'eta': 0.05,           # learning rate
+    'max_depth': 4,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'lambda': 1.0,         # L2 regularization
+    'gamma': 0.0,          # min gain to split
+    'seed': 0,
+}
+evals_result = {}
+model = xgb.train(params, dtrain, num_boost_round=300,
+                   evals=[(dtrain, 'train'), (dtest, 'test')],
+                   evals_result=evals_result, verbose_eval=False,
+                   early_stopping_rounds=20)
+
+preds = model.predict(dtest)
+rmse  = np.sqrt(np.mean((preds - y_te)**2))
+print(f"XGBoost RMSE: {rmse:.2f} ({model.best_iteration} rounds)")
+```
+
+```output
+XGBoost RMSE: 15.23 (284 rounds)
+```
+
+## LightGBM: leaf-wise growth and histogram binning
+
+LightGBM makes two key algorithmic choices that make it much faster:
+
+**Leaf-wise growth:** instead of expanding all leaves at a depth (level-wise), LightGBM always expands the leaf with the largest gain. This means fewer nodes for the same reduction in loss, but can produce imbalanced trees.
+
+**Histogram binning:** continuous features are bucketed into 256 bins. Computing split scores on bin boundaries (instead of all unique values) is $O(\text{bins})$ instead of $O(n)$, and enables vectorised operations.
+
+Additional tricks:
+- **GOSS (Gradient-based One-Side Sampling):** keep all high-gradient samples, subsample low-gradient ones.
+- **EFB (Exclusive Feature Bundling):** bundle mutually exclusive sparse features into one.
+
+```python
+import lightgbm as lgb
+import numpy as np
+
+dtrain_lgb = lgb.Dataset(X_tr, label=y_tr)
+dval_lgb   = lgb.Dataset(X_te, label=y_te, reference=dtrain_lgb)
+
+params_lgb = {
+    'objective': 'regression',
+    'metric': 'rmse',
+    'num_leaves': 31,       # max leaves per tree (controls complexity for LGB)
+    'learning_rate': 0.05,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'reg_lambda': 1.0,
+    'verbose': -1,
+    'seed': 0,
+}
+
+callbacks = [lgb.early_stopping(20, verbose=False), lgb.log_evaluation(period=-1)]
+model_lgb = lgb.train(params_lgb, dtrain_lgb, num_boost_round=500,
+                       valid_sets=[dval_lgb], callbacks=callbacks)
+
+preds_lgb = model_lgb.predict(X_te)
+rmse_lgb  = np.sqrt(np.mean((preds_lgb - y_te)**2))
+print(f"LightGBM RMSE: {rmse_lgb:.2f} (best iter: {model_lgb.best_iteration})")
+```
+
+```output
+LightGBM RMSE: 14.87 (best iter: 291)
+```
+
+### Feature importance in LightGBM
+
+```python
+import numpy as np
+
+fi = model_lgb.feature_importance(importance_type='gain')
+top = np.argsort(fi)[-5:][::-1]
+print("Top 5 features by gain:")
+for i in top:
+    print(f"  feature_{i}: {fi[i]:.1f}")
+```
+
+```output
+Top 5 features by gain:
+  feature_7: 3412.8
+  feature_2: 2891.4
+  feature_15: 2234.9
+  feature_4: 1887.2
+  feature_11: 1623.6
+```
+
+## CatBoost: ordered boosting and native categoricals
+
+CatBoost introduces **ordered boosting**: to avoid target leakage when computing leaf values, it uses a random permutation of the data and builds each tree using only the samples that appeared *before* each sample in the permutation. This is more expensive but avoids overfitting on small datasets.
+
+**Native categorical handling:** CatBoost converts categoricals to numeric using ordered target statistics (a permutation-based form of target encoding that avoids leakage), so you don't need to one-hot encode.
+
+```python
+from catboost import CatBoostRegressor
+import numpy as np
+
+cb = CatBoostRegressor(
+    iterations=500,
+    learning_rate=0.05,
+    depth=4,
+    l2_leaf_reg=1.0,
+    random_seed=0,
+    verbose=0,
+    early_stopping_rounds=20,
+)
+cb.fit(X_tr, y_tr, eval_set=(X_te, y_te))
+preds_cb = cb.predict(X_te)
+rmse_cb  = np.sqrt(np.mean((preds_cb - y_te)**2))
+print(f"CatBoost RMSE: {rmse_cb:.2f} (best iter: {cb.best_iteration_})")
+```
+
+```output
+CatBoost RMSE: 15.06 (best iter: 276)
+```
+
+## Key hyperparameters compared
+
+| Parameter | XGBoost | LightGBM | CatBoost | Effect |
+|---|---|---|---|---|
+| Trees | `num_boost_round` | `num_boost_round` | `iterations` | More trees → better (with early stopping) |
+| Learning rate | `eta` | `learning_rate` | `learning_rate` | Smaller → better, need more trees |
+| Depth | `max_depth` | `num_leaves` | `depth` | LGB uses leaves not depth |
+| Row subsample | `subsample` | `bagging_fraction` | `subsample` | 0.7–0.9 typical |
+| Col subsample | `colsample_bytree` | `feature_fraction` | `rsm` | 0.7–0.9 typical |
+| L2 penalty | `lambda` | `reg_lambda` | `l2_leaf_reg` | Regularisation |
+
+## Early stopping pattern
+
+```python
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+X_tr2, X_val, y_tr2, y_val = train_test_split(X_tr, y_tr, test_size=0.2, random_state=0)
+
+d2 = lgb.Dataset(X_tr2, label=y_tr2)
+dv = lgb.Dataset(X_val, label=y_val, reference=d2)
+
+m = lgb.train({'objective': 'regression', 'metric': 'rmse',
+                'num_leaves': 31, 'learning_rate': 0.05, 'verbose': -1},
+               d2, num_boost_round=1000,
+               valid_sets=[dv],
+               callbacks=[lgb.early_stopping(50, verbose=False),
+                           lgb.log_evaluation(period=-1)])
+print(f"Best iteration: {m.best_iteration}, best val RMSE: {m.best_score['valid_0']['rmse']:.2f}")
+```
+
+```output
+Best iteration: 312, best val RMSE: 14.93
+```
+
+## Try it Yourself
+
+```python
+import lightgbm as lgb
+import numpy as np
+from sklearn.datasets import make_regression
+from sklearn.model_selection import train_test_split
+
+X, y = make_regression(n_samples=2000, n_features=30, n_informative=10,
+                        noise=20, random_state=42)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+X_tr2, X_val, y_tr2, y_val = train_test_split(X_tr, y_tr, test_size=0.15, random_state=0)
+
+for num_leaves in [15, 31, 63, 127]:
+    d = lgb.Dataset(X_tr2, y_tr2)
+    dv = lgb.Dataset(X_val, y_val, reference=d)
+    m = lgb.train({'objective':'regression','metric':'rmse',
+                   'num_leaves':num_leaves,'learning_rate':0.05,'verbose':-1},
+                  d, 500, valid_sets=[dv],
+                  callbacks=[lgb.early_stopping(30,verbose=False),lgb.log_evaluation(-1)])
+    p = m.predict(X_te)
+    rmse = np.sqrt(np.mean((p-y_te)**2))
+    print(f"num_leaves={num_leaves:3}: RMSE={rmse:.2f} ({m.best_iteration} iters)")
+```
+
+```output
+num_leaves= 15: RMSE=22.84 (231 iters)
+num_leaves= 31: RMSE=21.57 (287 iters)
+num_leaves= 63: RMSE=21.23 (312 iters)
+num_leaves=127: RMSE=21.41 (298 iters)
+```
+
+## Exercise
+
+Using `make_regression` (1500 samples, 25 features, noise=20), tune a LightGBM model: sweep `num_leaves` ∈ {15,31,63} and `learning_rate` ∈ {0.01, 0.05, 0.1} using early stopping (patience=30). Report the best combination and its test RMSE. Compare to a baseline `GradientBoostingRegressor` with default settings.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import lightgbm as lgb
+import numpy as np
+from sklearn.datasets import make_regression
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+
+X, y = make_regression(n_samples=1500, n_features=25, noise=20, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+X_tr2, X_val, y_tr2, y_val = train_test_split(X_tr, y_tr, test_size=0.2, random_state=0)
+
+best = {'rmse': np.inf}
+for nl in [15, 31, 63]:
+    for lr in [0.01, 0.05, 0.1]:
+        d  = lgb.Dataset(X_tr2, y_tr2)
+        dv = lgb.Dataset(X_val, y_val, reference=d)
+        m  = lgb.train({'objective':'regression','metric':'rmse','num_leaves':nl,
+                         'learning_rate':lr,'verbose':-1}, d, 1000, valid_sets=[dv],
+                        callbacks=[lgb.early_stopping(30,verbose=False),lgb.log_evaluation(-1)])
+        rmse = np.sqrt(np.mean((m.predict(X_te)-y_te)**2))
+        if rmse < best['rmse']:
+            best = {'rmse': rmse, 'nl': nl, 'lr': lr, 'iters': m.best_iteration}
+
+print(f"Best: num_leaves={best['nl']}, lr={best['lr']}, RMSE={best['rmse']:.2f} ({best['iters']} iters)")
+baseline = GradientBoostingRegressor(random_state=0).fit(X_tr, y_tr)
+print(f"sklearn GBM baseline RMSE: {np.sqrt(np.mean((baseline.predict(X_te)-y_te)**2)):.2f}")
+```
+</details>

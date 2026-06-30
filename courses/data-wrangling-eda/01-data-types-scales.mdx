@@ -1,0 +1,255 @@
+---
+course: data-wrangling-eda
+chapter: 01-data-types-scales
+title: "Data Types & Measurement Scales"
+order: 1
+---
+
+## Why measurement scales matter
+
+The operations you can legally perform on a variable depend on what kind of thing it
+measures. Averaging a list of ZIP codes is nonsense; averaging temperatures is not. The
+four measurement scales — **nominal, ordinal, interval, ratio** — tell you exactly which
+arithmetic operations are valid, which visualizations apply, and which ML model assumptions
+are reasonable.
+
+## The four scales
+
+### Nominal — categories with no order
+
+Values are labels only. No ranking, no distance.
+
+Examples: country, product category, blood type, species.
+
+Legal operations: `==`, `!=`, `count`, `mode`. Nothing else.
+
+```python
+import pandas as pd
+
+s = pd.Series(['cat', 'dog', 'cat', 'bird', 'dog', 'cat'])
+print(s.value_counts())               # legal: count
+print("mode:", s.mode()[0])           # legal: mode
+# s.mean()  ← illegal: meaningless
+```
+
+```output
+cat     3
+dog     2
+bird    1
+Name: count, dtype: int64
+mode: cat
+```
+
+You encode nominal variables as **one-hot** (ch. 9) for most models. Order-insensitive.
+
+### Ordinal — categories with a meaningful order
+
+Values have a rank, but the gaps between ranks are not guaranteed to be equal.
+
+Examples: education level (high school < bachelor < master < PhD), satisfaction score
+(1–5 stars), cancer stage (I < II < III < IV).
+
+Legal operations: all nominal ops, plus `<`, `>`, `median`, `rank`.
+
+```python
+import pandas as pd
+
+edu = pd.Categorical(
+    ['bachelor', 'high_school', 'phd', 'master', 'bachelor'],
+    categories=['high_school', 'bachelor', 'master', 'phd'],
+    ordered=True,
+)
+s = pd.Series(edu)
+print(s.min(), s.max())      # legal: order-based min/max
+print(s.sort_values().values)
+# s.mean()  ← technically illegal, but widely abused for Likert scales
+```
+
+```output
+high_school phd
+['high_school' 'bachelor' 'bachelor' 'master' 'phd']
+```
+
+Encoding ordinal variables: use integer codes that preserve the order (ch. 9), not one-hot.
+
+### Interval — ordered with equal gaps, but no true zero
+
+Equal numeric differences are meaningful; ratios are not.
+
+Examples: temperature in °C (20°C is not "twice as hot" as 10°C), calendar year, IQ score.
+
+Legal operations: all ordinal ops, plus `mean`, `std`, `+`, `-`. NOT division/ratios.
+
+```python
+import numpy as np
+
+# Celsius: 0°C is not "no temperature"
+temps_c = np.array([0.0, 10.0, 20.0, 30.0])
+print("mean:", temps_c.mean())
+print("std :", temps_c.std().round(2))
+
+# Converting to Kelvin makes it a ratio scale (true zero)
+temps_k = temps_c + 273.15
+print("ratio meaningful in K:", temps_k[2] / temps_k[0])   # 293.15/273.15 ≈ 1.073
+```
+
+```output
+mean: 15.0
+std : 11.18
+ratio meaningful in K: 1.0732600732600733
+```
+
+### Ratio — ordered, equal gaps, and a true absolute zero
+
+The most powerful scale. All arithmetic is valid.
+
+Examples: height, weight, age, income, distance, duration, count.
+
+Legal operations: everything, including ratios (`income_A / income_B` is meaningful).
+
+```python
+import numpy as np
+
+incomes = np.array([30_000, 60_000, 90_000], dtype=np.float64)
+print("mean:", incomes.mean())
+print("ratio (second vs first):", incomes[1] / incomes[0])  # 2.0 — meaningful
+print("log transform meaningful:", np.log(incomes).round(2)) # compress skew
+```
+
+```output
+mean: 60000.0
+ratio (second vs first): 2.0
+log transform meaningful: [10.31 11.   11.41]
+```
+
+Log transforms are valid only for ratio-scale variables. Taking `log(temperature_C)` is
+invalid because log(0°C) = −∞ and negative Celsius temperatures produce imaginary logs.
+
+## Statistical dtype vs measurement scale
+
+pandas dtypes (`int64`, `float64`, `object`, `category`) describe storage, not semantics.
+A column of integers can be nominal (ZIP code), ordinal (rank), or ratio (count).
+A `category` dtype does not mean "nominal" — it means "limited set of values stored
+efficiently" (it can be ordered or unordered).
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'zip_code':   [1200, 1300, 1100, 1200],   # nominal — stored as int64, don't average
+    'rating':     [3, 1, 4, 2],               # ordinal — int64, but only rank-ops valid
+    'age':        [25, 32, 28, 41],           # ratio  — int64, all ops valid
+    'edu':        pd.Categorical(
+                      ['bachelor', 'phd', 'master', 'bachelor'],
+                      categories=['high_school', 'bachelor', 'master', 'phd'],
+                      ordered=True),
+})
+print(df.dtypes)
+```
+
+```output
+zip_code      int64
+rating        int64
+age           int64
+edu        category
+dtype: object
+```
+
+`zip_code` and `age` have the same dtype but completely different semantics. You must track
+measurement scale separately from dtype — it determines every downstream decision.
+
+## Identifying scale in practice
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({
+    'user_id':    rng.integers(1000, 9999, 100),   # nominal
+    'click_rank': rng.integers(1, 6, 100),          # ordinal (1=top click)
+    'revenue':    rng.exponential(50, 100).round(2),# ratio
+    'temp_c':     rng.normal(25, 5, 100).round(1), # interval
+    'category':   rng.choice(['A', 'B', 'C'], 100), # nominal
+})
+
+# What stats are valid for each?
+for col in df.columns:
+    nuniq = df[col].nunique()
+    print(f"{col:<12} nuniq={nuniq:<4} dtype={str(df[col].dtype):<8}")
+```
+
+```output
+user_id      nuniq=100  dtype=int64
+click_rank   nuniq=5    dtype=int64
+revenue      nuniq=98   dtype=float64
+temp_c       nuniq=93   dtype=float64
+category     nuniq=3    dtype=object
+```
+
+Low `nunique` relative to row count is a signal of nominal/ordinal. High cardinality
+with continuous values is interval or ratio. But only domain knowledge confirms which.
+
+## Try it Yourself
+
+```python
+import pandas as pd
+
+# A real ambiguity: Likert-scale ratings (1–5 stars)
+# Ordinal by definition, but researchers routinely compute means
+ratings = pd.Series([4, 5, 3, 4, 1, 5, 4, 2, 5, 4])
+
+# Ordinal-valid stats
+print("median (ordinal):", ratings.median())
+print("mode   (ordinal):", ratings.mode()[0])
+
+# Mean is technically invalid but widely used — note the caveat
+print("mean   (abused) :", ratings.mean())
+
+# At least check: does treating it as interval change your conclusion?
+print("high satisfaction (>=4):", (ratings >= 4).mean().round(2))
+```
+
+```output
+median (ordinal): 4.0
+mode   (ordinal): 4
+mean   (abused) : 3.7
+high satisfaction (>=4): 0.6
+```
+
+## Exercise
+
+Given a dataset with columns: `customer_id`, `age`, `city`, `monthly_spend`, `satisfaction`
+(1–5), `subscription_tier` (bronze < silver < gold). For each column:
+
+1. Identify the measurement scale.
+2. State what summary statistics are valid.
+3. Identify what encoding you would use for an ML model.
+
+<details>
+<summary>Solution</summary>
+
+| Column | Scale | Valid stats | Encoding |
+|--------|-------|-------------|----------|
+| `customer_id` | Nominal | count, mode | drop (it's an ID) |
+| `age` | Ratio | all | standardize or as-is |
+| `city` | Nominal | count, mode | one-hot or target encoding |
+| `monthly_spend` | Ratio | all (log-transform if skewed) | standardize / log |
+| `satisfaction` | Ordinal | median, mode (mean debatable) | ordinal integer codes |
+| `subscription_tier` | Ordinal | median, mode | ordinal codes (0=bronze,1=silver,2=gold) |
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'subscription_tier': pd.Categorical(
+        ['silver', 'bronze', 'gold', 'silver'],
+        categories=['bronze', 'silver', 'gold'], ordered=True),
+})
+df['tier_code'] = df['subscription_tier'].cat.codes   # 0, 1, 2
+print(df)
+```
+
+Ordinal codes preserve the rank information that one-hot would destroy. One-hot treats
+bronze and gold as equally different from silver, which is wrong for an ordered variable.
+</details>

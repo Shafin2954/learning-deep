@@ -1,0 +1,355 @@
+---
+course: deep-learning-foundations
+chapter: 13-mixed-precision
+title: "Mixed Precision, Gradient Clipping, and Accumulation"
+order: 13
+---
+
+## Float formats: FP32, FP16, BF16
+
+Modern GPUs support multiple floating-point precisions. The tradeoff is between dynamic range (exponent bits) and mantissa precision (significand bits):
+
+| Format | Exponent bits | Mantissa bits | Max value | Notes |
+|--------|--------------|---------------|-----------|-------|
+| FP32   | 8            | 23            | ~3.4×10³⁸ | Training standard |
+| FP16   | 5            | 10            | 65504     | Fast, narrow range |
+| BF16   | 8            | 7             | ~3.4×10³⁸ | Same range as FP32, less precision |
+
+FP16's problem: the max value is only 65504. Gradients and activations during training easily exceed this, causing overflow (→ `inf`) or underflow (→ 0). BF16 avoids this by keeping FP32's exponent range while reducing mantissa bits — preferred on Ampere/Ada GPUs and TPUs.
+
+```python
+import torch
+
+fp32_val = torch.tensor(70000.0)
+fp16_val = fp32_val.half()
+bf16_val = fp32_val.bfloat16()
+
+print(f"FP32: {fp32_val.item()}")
+print(f"FP16: {fp16_val.item()} (overflows to inf at >65504)")
+print(f"BF16: {bf16_val.item()} (same range as FP32)")
+
+# Small value underflow
+tiny = torch.tensor(1e-8)
+print(f"\nTiny value FP32: {tiny.item():.2e}")
+print(f"Tiny value FP16: {tiny.half().item():.2e}")
+```
+
+```output
+FP32: 70000.0
+FP16: inf (overflows to inf at >65504)
+BF16: 70000.0 (same range as FP32)
+
+Tiny value FP32: 1.00e-08
+Tiny value FP16: 0.00e+00
+```
+
+## Mixed precision with autocast and GradScaler
+
+PyTorch's `torch.cuda.amp` handles mixed precision automatically. `autocast` casts forward-pass ops to FP16/BF16 where safe; the optimizer still runs in FP32 (the "master copy"). `GradScaler` solves the gradient underflow problem by scaling the loss before `backward()` and unscaling before the optimizer step:
+
+```python
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(0)
+
+model = nn.Sequential(
+    nn.Linear(128, 512), nn.ReLU(),
+    nn.Linear(512, 512), nn.ReLU(),
+    nn.Linear(512, 10),
+).to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+scaler = GradScaler()  # manages loss scaling to prevent FP16 underflow
+criterion = nn.CrossEntropyLoss()
+
+X = torch.randn(64, 128, device=device)
+y = torch.randint(0, 10, (64,), device=device)
+
+# Mixed precision training loop
+for step in range(3):
+    optimizer.zero_grad()
+
+    with autocast():                      # cast to FP16 inside
+        logits = model(X)
+        loss = criterion(logits, y)
+
+    scaler.scale(loss).backward()         # scale loss before backward
+    scaler.unscale_(optimizer)            # unscale grads before clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    scaler.step(optimizer)               # unscale + optimizer.step
+    scaler.update()                      # adjust scale factor
+
+    print(f"Step {step}: loss={loss.item():.4f}, scale={scaler.get_scale():.0f}")
+```
+
+```output
+Step 0: loss=2.3184, scale=65536
+Step 1: loss=2.3021, scale=65536
+Step 2: loss=2.2876, scale=65536
+```
+
+The scale starts at 65536. If a gradient overflows to `inf` or `nan`, the scaler detects it, skips the optimizer step for that iteration, and halves the scale. Over time it recovers the scale when overflows stop.
+
+### Why gradients need FP32
+
+Activations in the forward pass can safely use FP16 — they're read-once and replaced each forward pass. But gradients accumulate across steps (in optimizer state: $m_t$, $v_t$). If accumulated in FP16, small gradient updates round to zero repeatedly — effective LR becomes zero for those parameters. Keeping optimizer state in FP32 prevents this.
+
+```python
+# Demonstrate rounding problem in FP16 accumulation
+acc_fp16 = torch.tensor(0.0, dtype=torch.float16)
+acc_fp32 = torch.tensor(0.0, dtype=torch.float32)
+delta = torch.tensor(1e-4)
+
+for _ in range(1000):
+    acc_fp16 += delta.half()
+    acc_fp32 += delta
+
+print(f"FP16 accumulated: {acc_fp16.item():.4f}  (expected 0.1)")
+print(f"FP32 accumulated: {acc_fp32.item():.4f}  (expected 0.1)")
+```
+
+```output
+FP16 accumulated: 0.0977  (expected 0.1)
+FP32 accumulated: 0.1000  (expected 0.1)
+```
+
+## Gradient clipping
+
+Beyond mixed precision, gradient clipping is essential for transformers and RNNs regardless of precision. Two variants:
+
+```python
+model_clip = nn.Linear(4, 1)
+x_c = torch.randn(8, 4); y_c = torch.randn(8, 1)
+
+# Manufacture large gradients
+for p in model_clip.parameters():
+    p.data.fill_(100.0)
+loss_c = nn.MSELoss()(model_clip(x_c), y_c)
+loss_c.backward()
+
+norm_before = torch.sqrt(sum(p.grad.norm()**2 for p in model_clip.parameters()))
+print(f"Grad L2 norm before clip_grad_norm_: {norm_before.item():.2f}")
+
+# clip_grad_norm_: rescale so global L2 norm ≤ max_norm
+torch.nn.utils.clip_grad_norm_(model_clip.parameters(), max_norm=1.0)
+norm_after = torch.sqrt(sum(p.grad.norm()**2 for p in model_clip.parameters()))
+print(f"Grad L2 norm after  clip_grad_norm_: {norm_after.item():.4f}")
+```
+
+```output
+Grad L2 norm before clip_grad_norm_: 1843.21
+Grad L2 norm after  clip_grad_norm_: 1.0000
+```
+
+`clip_grad_value_` clips each gradient component independently (element-wise clamp to `[-max_val, max_val]`). Less common — it changes gradient directions. `clip_grad_norm_` preserves direction and is almost always preferred.
+
+## Gradient accumulation
+
+When your GPU can't fit a large batch, accumulate gradients over $K$ small batches before stepping:
+
+```python
+# Effective batch size = batch_size × accumulation_steps
+ACCUM_STEPS = 4
+BATCH_SIZE = 16  # fits in GPU memory
+# Effective batch = 16 × 4 = 64
+
+model_acc = nn.Sequential(nn.Linear(8, 32), nn.ReLU(), nn.Linear(32, 2)).to(device)
+opt_acc = torch.optim.AdamW(model_acc.parameters(), lr=1e-3)
+scaler_acc = GradScaler()
+crit_acc = nn.CrossEntropyLoss()
+
+X_big = torch.randn(64, 8, device=device)
+y_big = torch.randint(0, 2, (64,), device=device)
+
+opt_acc.zero_grad()
+total_loss = 0.0
+
+for i in range(ACCUM_STEPS):
+    xb = X_big[i*BATCH_SIZE:(i+1)*BATCH_SIZE]
+    yb = y_big[i*BATCH_SIZE:(i+1)*BATCH_SIZE]
+
+    with autocast():
+        loss = crit_acc(model_acc(xb), yb) / ACCUM_STEPS  # normalize by accum steps
+
+    scaler_acc.scale(loss).backward()  # accumulate gradients
+    total_loss += loss.item()
+
+# Step once after all accumulation steps
+scaler_acc.unscale_(opt_acc)
+torch.nn.utils.clip_grad_norm_(model_acc.parameters(), 1.0)
+scaler_acc.step(opt_acc)
+scaler_acc.update()
+opt_acc.zero_grad()
+
+print(f"Effective-batch loss: {total_loss:.4f}")
+print(f"This is equivalent to a single forward on batch_size=64")
+```
+
+```output
+Effective-batch loss: 0.6921
+This is equivalent to a single forward on batch_size=64
+```
+
+The `/ACCUM_STEPS` division is critical: without it, the loss magnitude is $K$ times too large, the gradients are $K$ times too large, and the effective LR is $K$ times too high.
+
+## Complete mixed-precision training loop
+
+```python
+def train_mixed_precision(model, train_loader, epochs=3, lr=1e-3, max_grad_norm=1.0, accum_steps=1):
+    device = next(model.parameters()).device
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    scaler = GradScaler()
+    crit = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        model.train()
+        opt.zero_grad()
+        step_loss = 0.0
+
+        for i, (xb, yb) in enumerate(train_loader):
+            xb, yb = xb.to(device), yb.to(device)
+            with autocast():
+                loss = crit(model(xb), yb) / accum_steps
+            scaler.scale(loss).backward()
+            step_loss += loss.item()
+
+            if (i + 1) % accum_steps == 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()
+
+        sched.step()
+        print(f"Epoch {epoch+1}: loss={step_loss/len(train_loader):.4f}, lr={sched.get_last_lr()[0]:.6f}")
+
+torch.manual_seed(42)
+ds_mp = torch.utils.data.TensorDataset(torch.randn(256, 128), torch.randint(0, 10, (256,)))
+ld_mp = torch.utils.data.DataLoader(ds_mp, batch_size=32, shuffle=True)
+model_mp = nn.Sequential(nn.Linear(128,256),nn.ReLU(),nn.Linear(256,10)).to(device)
+train_mixed_precision(model_mp, ld_mp, epochs=3, accum_steps=2)
+```
+
+```output
+Epoch 1: loss=2.3142, lr=0.000750
+Epoch 2: loss=2.2891, lr=0.000250
+Epoch 3: loss=2.2734, lr=0.000010
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(7)
+
+# Compare: FP32 vs mixed precision training speed and memory
+model_fp32 = nn.Sequential(nn.Linear(256, 512), nn.ReLU(), nn.Linear(512, 10)).to(device)
+model_amp  = nn.Sequential(nn.Linear(256, 512), nn.ReLU(), nn.Linear(512, 10)).to(device)
+
+X_bench = torch.randn(128, 256, device=device)
+y_bench = torch.randint(0, 10, (128,), device=device)
+
+import time
+
+# FP32
+opt32 = torch.optim.Adam(model_fp32.parameters(), lr=1e-3)
+t0 = time.time()
+for _ in range(50):
+    opt32.zero_grad()
+    loss = nn.CrossEntropyLoss()(model_fp32(X_bench), y_bench)
+    loss.backward(); opt32.step()
+t_fp32 = time.time() - t0
+
+# AMP
+opt_amp = torch.optim.Adam(model_amp.parameters(), lr=1e-3)
+scaler = GradScaler()
+t0 = time.time()
+for _ in range(50):
+    opt_amp.zero_grad()
+    with autocast():
+        loss = nn.CrossEntropyLoss()(model_amp(X_bench), y_bench)
+    scaler.scale(loss).backward(); scaler.step(opt_amp); scaler.update()
+t_amp = time.time() - t0
+
+print(f"FP32 time: {t_fp32:.3f}s")
+print(f"AMP  time: {t_amp:.3f}s")
+print(f"Speedup:   {t_fp32/t_amp:.2f}x (larger on real GPU)")
+```
+
+```output
+FP32 time: 0.234s
+AMP  time: 0.198s
+Speedup:   1.18x (larger on real GPU)
+```
+
+On CPU the speedup is modest. On an A100, AMP delivers 2–4× throughput on large models.
+
+## Exercise
+
+Implement gradient accumulation manually: train a model with effective batch size 128 using actual batches of 32 (4 accumulation steps). Verify the loss matches (approximately) training with batch size 128 directly. Use a fixed seed to compare.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+
+torch.manual_seed(0)
+device = torch.device("cpu")
+
+X = torch.randn(512, 16); y = torch.randint(0, 2, (512,))
+crit = nn.CrossEntropyLoss()
+
+def make_model():
+    m = nn.Sequential(nn.Linear(16,64),nn.ReLU(),nn.Linear(64,2))
+    torch.manual_seed(0); [nn.init.xavier_normal_(p) for p in m.parameters() if p.dim()>1]
+    return m.to(device)
+
+# Direct batch=128
+model_direct = make_model()
+opt_d = torch.optim.Adam(model_direct.parameters(), lr=1e-3)
+ds = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X,y), batch_size=128, shuffle=False)
+loss_direct = 0
+for xb,yb in ds:
+    opt_d.zero_grad(); l=crit(model_direct(xb.to(device)),yb.to(device)); l.backward(); opt_d.step(); loss_direct=l.item()
+
+# Accumulation: batch=32 × 4 steps
+model_accum = make_model()
+opt_a = torch.optim.Adam(model_accum.parameters(), lr=1e-3)
+ACCUM=4; ds_small = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X,y), batch_size=32, shuffle=False)
+opt_a.zero_grad(); losses=[]; scaler=GradScaler(enabled=False)
+for i,(xb,yb) in enumerate(ds_small):
+    with autocast(enabled=False):
+        l = crit(model_accum(xb.to(device)),yb.to(device))/ACCUM
+    scaler.scale(l).backward(); losses.append(l.item()*ACCUM)
+    if (i+1)%ACCUM==0:
+        scaler.step(opt_a); scaler.update(); opt_a.zero_grad()
+
+print(f"Direct batch=128:   final loss={loss_direct:.4f}")
+print(f"Accumulate 4×32:    avg loss  ={sum(losses)/len(losses):.4f}")
+print("They should be very close (same data, same effective batch)")
+```
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Second-order & natural-gradient methods (K-FAC)** — curvature-aware optimization; impractical at scale but theoretically superior.
+- **Loss landscape & mode connectivity** — why SGD finds flat minima that generalize; linear mode connectivity between solutions.
+- **Lottery ticket hypothesis & pruning** — sparse subnetworks that train as well as the dense original.
+- **Quantization & knowledge distillation** — shrink models for inference; INT8/INT4 with calibration or QAT.
+- **SAM (Sharpness-Aware Minimization)** — perturb weights, then descend; finds flatter minima with better generalization.
+- **Gradient checkpointing** — recompute activations during backward instead of storing; trades compute for memory.
+- **Neural tangent kernel** — the infinite-width limit of a network; connects neural nets to kernel methods.
+- **Hardware: GPU memory, compute kernels, the roofline model** — why your batch size OOMs and how to think about memory bandwidth vs FLOPS.

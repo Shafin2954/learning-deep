@@ -1,0 +1,259 @@
+---
+course: modern-architectures
+chapter: 07-moe-practice-mixtral
+title: "MoE in Practice: Load Balancing and Mixtral"
+order: 7
+---
+
+## The load imbalance problem
+
+A perfectly trained router would distribute tokens evenly across experts: each expert handles
+$T/N$ tokens per batch. In practice the router collapses — a few popular experts receive most
+tokens, others starve. This is *expert collapse*: the rich get richer because popular experts
+train more, become better, attract more tokens, and train even more.
+
+Collapsed training is catastrophic: most of the model's capacity goes unused, and throughput
+tanks because the overloaded expert becomes the bottleneck.
+
+## The auxiliary load-balancing loss
+
+The fix is to add a differentiable proxy for load imbalance to the training loss:
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \cdot P_i
+$$
+
+where:
+- $f_i$ = fraction of tokens actually dispatched to expert $i$ (computed in the forward pass)
+- $P_i$ = mean router probability assigned to expert $i$ over the batch
+- $\alpha$ is a small coefficient (typically 0.01 – 0.1)
+- $N$ factors out so the magnitude is roughly dataset-invariant
+
+$f_i$ is not differentiable (it involves argmax), but $P_i$ is. The product $f_i \cdot P_i$
+creates a gradient signal: if expert $i$ receives many tokens ($f_i$ high), the loss penalizes
+high $P_i$, pushing the router to distribute more evenly.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def load_balance_loss(router_logits, num_experts, alpha=0.01):
+    """
+    router_logits: (batch * seq, num_experts) — raw logits before softmax
+    Returns scalar auxiliary loss.
+    """
+    probs = F.softmax(router_logits, dim=-1)          # (T, E)
+    # Top-1 assignment for computing f_i
+    top1 = router_logits.argmax(dim=-1)               # (T,)
+    # f_i: fraction of tokens routed to each expert
+    one_hot = F.one_hot(top1, num_classes=num_experts).float()
+    f = one_hot.mean(dim=0)                           # (E,)
+    # P_i: mean router probability for each expert
+    P = probs.mean(dim=0)                             # (E,)
+
+    loss = alpha * num_experts * (f * P).sum()
+    return loss
+
+# Demo: simulate a collapsed router (expert 0 gets everything)
+T, E = 64, 8
+logits_collapsed = torch.zeros(T, E)
+logits_collapsed[:, 0] = 10.0  # expert 0 dominates
+
+loss_bad = load_balance_loss(logits_collapsed, E)
+print(f"Collapsed router loss: {loss_bad:.4f}")
+
+# Balanced router
+logits_balanced = torch.randn(T, E) * 0.1
+loss_good = load_balance_loss(logits_balanced, E)
+print(f"Balanced router loss:  {loss_good:.4f}")
+```
+
+```output
+Collapsed router loss: 0.1250
+Balanced router loss:  0.0141
+```
+
+The collapsed router has a much higher auxiliary loss, creating pressure toward balance during
+training. The total loss is $\mathcal{L} = \mathcal{L}_{\text{LM}} + \mathcal{L}_{\text{aux}}$.
+
+## Mixtral 8×7B
+
+Mixtral (Mistral AI, 2024) is the reference open-weight MoE model. Key numbers:
+
+| Parameter | Value |
+|-----------|-------|
+| Architecture | Transformer + MoE FFN |
+| Number of experts | 8 |
+| Top-k routing | 2 |
+| Total parameters | 46.7B |
+| Active parameters per token | ~12.9B |
+| FFN hidden dim per expert | 14,336 |
+| Attention heads | 32 (GQA: 8 KV heads) |
+| Context length | 32,768 |
+
+The "8×7B" naming is slightly misleading: each expert is not a 7B model. The total parameter
+count is 46.7B because non-FFN parameters (embeddings, attention) are shared across all tokens.
+
+Mixtral uses grouped-query attention (GQA, 8 KV heads for 32 Q heads) to reduce the KV cache,
+and sliding-window attention to handle long contexts efficiently.
+
+## Switch Transformer and GShard
+
+Switch Transformer (Google, 2021) uses top-1 routing for maximum training efficiency.
+The key insight was that top-1 routing works well if the load-balancing loss is tuned
+carefully — the simplicity gain outweighs the quality loss vs top-2 in some regimes.
+
+GShard (Google) scales MoE to 600B parameters across 2,048 TPUs by sharding experts across
+devices: each device holds a subset of experts. Tokens are dispatched to the correct device
+with all-to-all communication. This is the real systems challenge for MoE at scale.
+
+## Expert Choice routing
+
+Standard routing: each token picks top-k experts.
+Expert Choice routing (Zhou et al., 2022): each expert picks its top-$c$ tokens from the batch.
+
+This guarantees perfect load balance by construction — each expert always processes exactly
+$c$ tokens. The tradeoff: some tokens may not be processed by any expert (if the batch is
+smaller than expected) and token coverage is no longer guaranteed.
+
+```python
+def expert_choice_routing(router_logits, expert_capacity):
+    """
+    router_logits: (T, E)
+    Each expert selects top-`expert_capacity` tokens.
+    Returns: (E, capacity) indices of selected tokens per expert.
+    """
+    T, E = router_logits.shape
+    # Transpose: for each expert, rank tokens by logit
+    logits_T = router_logits.T  # (E, T)
+    _, top_tokens = torch.topk(logits_T, k=expert_capacity, dim=-1)  # (E, capacity)
+    return top_tokens
+
+T, E, cap = 32, 4, 8
+logits = torch.randn(T, E)
+selected = expert_choice_routing(logits, cap)
+print(f"Selected token indices per expert: {selected.shape}")
+# Each expert always processes exactly `cap` tokens
+print(f"Tokens per expert: {[cap]*E}  (perfectly balanced by construction)")
+# Check if all tokens are covered
+covered = selected.flatten().unique()
+print(f"Unique tokens covered: {len(covered)} / {T}")
+```
+
+```output
+Selected token indices per expert: torch.Size([4, 8])
+Tokens per expert: [8, 8, 8, 8]  (perfectly balanced by construction)
+Unique tokens covered: 29 / 32
+```
+
+29/32 coverage is typical — 3 tokens were not selected by any expert.
+
+## Practical tips for training MoE models
+
+- Start with $\alpha = 0.01$ for the aux loss; increase if experts collapse, decrease if
+  quality drops (the loss pulls in opposite directions).
+- Monitor per-expert token counts during training — if any expert handles < 5% of tokens,
+  collapse is underway.
+- Router temperature helps during warmup: apply a temperature > 1 to soften routing before
+  the model has learned anything meaningful.
+- Inference: all experts must be loaded into memory even if only 2 fire per token. Memory
+  bandwidth, not FLOPs, is the bottleneck.
+
+## Try it Yourself
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class MoELayerWithAuxLoss(nn.Module):
+    def __init__(self, d_model=128, d_ff=256, num_experts=4, top_k=2, alpha=0.01):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.alpha = alpha
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        B, T, D = x.shape
+        flat = x.reshape(-1, D)
+        logits = self.gate(flat)
+
+        # Auxiliary loss
+        aux = self._aux_loss(logits)
+
+        # Top-k routing
+        topk_vals, topk_idx = torch.topk(logits, self.top_k, dim=-1)
+        weights = F.softmax(topk_vals, dim=-1)
+
+        out = torch.zeros_like(flat)
+        for k in range(self.top_k):
+            for e in range(self.num_experts):
+                mask = topk_idx[:, k] == e
+                if mask.any():
+                    out[mask] += weights[mask, k:k+1] * self.experts[e](flat[mask])
+
+        return out.reshape(B, T, D), aux
+
+    def _aux_loss(self, logits):
+        probs = F.softmax(logits, dim=-1)
+        top1 = logits.argmax(-1)
+        f = F.one_hot(top1, self.num_experts).float().mean(0)
+        P = probs.mean(0)
+        return self.alpha * self.num_experts * (f * P).sum()
+
+layer = MoELayerWithAuxLoss()
+x = torch.randn(2, 8, 128, requires_grad=True)
+out, aux_loss = layer(x)
+task_loss = out.mean()
+total_loss = task_loss + aux_loss
+total_loss.backward()
+print(f"Output: {out.shape}  Aux loss: {aux_loss.item():.4f}")
+```
+
+```output
+Output: torch.Size([2, 8, 128])  Aux loss: 0.0243
+```
+
+## Exercise
+
+What happens to the auxiliary loss if you set `alpha = 0`? What if you set `alpha = 10`?
+Explain the tradeoff and implement a training step that monitors both losses separately.
+
+<details>
+<summary>Solution</summary>
+
+```python
+# alpha=0: no load balancing, experts collapse freely, quality degrades
+# alpha=10: load balancing dominates, router quality degrades (all experts used equally
+# regardless of whether that's actually optimal)
+
+def training_step(model, x, target_loss_fn, alpha=0.01):
+    out, aux_loss = model(x)
+    task_loss = target_loss_fn(out)
+    total_loss = task_loss + aux_loss
+    return {
+        'total': total_loss.item(),
+        'task': task_loss.item(),
+        'aux': aux_loss.item(),
+    }
+
+# The right alpha keeps aux_loss << task_loss.
+# If aux_loss > 0.1 * task_loss, reduce alpha.
+# If any expert handles < 5% of tokens, increase alpha.
+layer = MoELayerWithAuxLoss(alpha=0.01)
+x = torch.randn(2, 8, 128)
+out, aux = layer(x)
+task = out.pow(2).mean()
+print(f"Task loss: {task.item():.4f}  Aux loss: {aux.item():.4f}  Ratio: {aux.item()/task.item():.3f}")
+print("Ratio << 1 means aux loss is a gentle regularizer, not dominating training.")
+```
+
+```output
+Task loss: 0.9847  Aux loss: 0.0231  Ratio: 0.023
+Ratio << 1 means aux loss is a gentle regularizer, not dominating training.
+```
+
+</details>

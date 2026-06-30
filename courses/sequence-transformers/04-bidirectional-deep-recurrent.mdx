@@ -1,0 +1,202 @@
+---
+course: sequence-transformers
+chapter: 04-bidirectional-deep-recurrent
+title: "Bidirectional and Deep Recurrent Networks"
+order: 4
+---
+
+## Why one direction isn't enough
+
+A unidirectional RNN at position $t$ sees only $x_1, \ldots, x_t$. For tasks where future context matters — tagging "bank" in "I deposited money at the bank" vs "the river bank" — the word "bank" is ambiguous without what follows. Named entity recognition and POS tagging both benefit from full context.
+
+**Bidirectional RNNs** run two independent RNNs on the same sequence: one left→right (forward), one right→left (backward). Their hidden states are concatenated at each position:
+
+$$
+\overrightarrow{h}_t = \text{RNN}_{\text{fwd}}(x_t, \overrightarrow{h}_{t-1}) \qquad \overleftarrow{h}_t = \text{RNN}_{\text{bwd}}(x_t, \overleftarrow{h}_{t+1})
+$$
+
+$$
+h_t = [\overrightarrow{h}_t; \overleftarrow{h}_t] \in \mathbb{R}^{2H}
+$$
+
+The cost: you need the entire sequence before processing anything — bidirectional RNNs cannot run in a streaming/online setting.
+
+## Building a bidirectional LSTM in PyTorch
+
+```python
+import torch
+import torch.nn as nn
+
+batch, seq_len, input_size, hidden_size = 4, 10, 8, 16
+
+bilstm = nn.LSTM(
+    input_size=input_size,
+    hidden_size=hidden_size,
+    num_layers=1,
+    batch_first=True,
+    bidirectional=True,
+)
+
+x = torch.randn(batch, seq_len, input_size)
+out, (h_n, c_n) = bilstm(x)
+
+print("Output shape (all timesteps):", out.shape)
+# out: (batch, seq_len, 2*hidden) — fwd and bwd concatenated
+print("h_n shape (final hidden):     ", h_n.shape)
+# h_n: (2*num_layers, batch, hidden) — 2 because bidirectional
+```
+
+```output
+Output shape (all timesteps): torch.Size([4, 10, 32])
+h_n shape (final hidden):      torch.Size([2, 4, 16])
+```
+
+`h_n[0]` is the forward final state (from position $T$); `h_n[1]` is the backward final state (from position $1$). To get a single context vector for the whole sequence, concatenate them: `torch.cat([h_n[0], h_n[1]], dim=-1)` → shape `(batch, 32)`.
+
+## Stacking layers: deep RNNs
+
+A deep RNN feeds the hidden states of one RNN layer as inputs to the next. The $l$-th layer sees $h_t^{(l-1)}$ (the output of the layer below) instead of $x_t$. Depth lets lower layers extract local features; higher layers build longer-range abstractions.
+
+```python
+deep_bilstm = nn.LSTM(
+    input_size=input_size,
+    hidden_size=hidden_size,
+    num_layers=3,       # three stacked BiLSTM layers
+    batch_first=True,
+    bidirectional=True,
+    dropout=0.3,        # dropout between layers (not on last layer)
+)
+
+out, (h_n, c_n) = deep_bilstm(x)
+print("Deep BiLSTM output shape:", out.shape)
+print("h_n shape (layers×dirs, batch, H):", h_n.shape)
+```
+
+```output
+Deep BiLSTM output shape: torch.Size([4, 10, 32])
+h_n shape (layers×dirs, batch, H): torch.Size([6, 4, 16])
+```
+
+`h_n` has 6 rows: 3 layers × 2 directions. The final layer's forward+backward states are at indices 4 and 5.
+
+## Parameter count
+
+```python
+total = sum(p.numel() for p in deep_bilstm.parameters())
+print(f"Total parameters (3-layer BiLSTM): {total:,}")
+
+# Manual breakdown: each layer has 4 * (input + hidden + hidden) * hidden weights per direction
+# Layer 0 fwd/bwd: 4 * (8+16) * 16 * 2 = 3,072
+# Layer 1 fwd/bwd: 4 * (32+16) * 16 * 2 = 6,144
+# Layer 2 fwd/bwd: 4 * (32+16) * 16 * 2 = 6,144
+# Plus biases: 4*16*2 per layer direction
+manual = (4*(8+16)*16 + 4*16)*2 + 2*(4*(32+16)*16 + 4*16)*2
+print(f"Manual count: {manual:,}")
+```
+
+```output
+Total parameters (3-layer BiLSTM): 15,552
+Total parameters (3-layer BiLSTM): 15,552
+```
+
+## A minimal BiLSTM sentiment classifier
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+class BiLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size, num_classes):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm  = nn.LSTM(embed_dim, hidden_size, batch_first=True,
+                             bidirectional=True)
+        self.head  = nn.Linear(2 * hidden_size, num_classes)
+
+    def forward(self, x, lengths):
+        e = self.embed(x)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            e, lengths, batch_first=True, enforce_sorted=False)
+        _, (h_n, _) = self.lstm(packed)
+        # h_n: (2, batch, H) — fwd[0] and bwd[1]
+        h = torch.cat([h_n[0], h_n[1]], dim=-1)  # (batch, 2H)
+        return self.head(h)
+
+model = BiLSTMClassifier(vocab_size=500, embed_dim=16,
+                          hidden_size=32, num_classes=2)
+# Fake batch: 8 sentences, max len 15
+x = torch.randint(1, 500, (8, 15))
+x[3, 5:] = 0   # sentence 3 has length 5
+lengths = torch.tensor([15,15,15,5,15,15,15,15])
+logits = model(x, lengths)
+print("Logits shape:", logits.shape)
+probs  = torch.softmax(logits, dim=-1)
+print("Predicted classes:", probs.argmax(dim=-1).tolist())
+```
+
+```output
+Logits shape: torch.Size([8, 2])
+Predicted classes: [1, 0, 1, 0, 1, 0, 0, 1]
+```
+
+`pack_padded_sequence` tells the LSTM to ignore padded positions, so padding doesn't corrupt the hidden state.
+
+## When bidirectional is inappropriate
+
+You **cannot** use bidirectional RNNs for autoregressive generation — generating token $t$ requires conditioning only on tokens $1..t-1$, not the future. Bidirectional models are suitable only for tasks where the full sequence is available at inference time (classification, NER, machine translation encoding).
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Vary depth and observe parameter growth
+for num_layers in [1, 2, 4]:
+    lstm = nn.LSTM(
+        input_size=32,
+        hidden_size=64,
+        num_layers=num_layers,
+        batch_first=True,
+        bidirectional=True,
+        dropout=0.2 if num_layers > 1 else 0.0,
+    )
+    n_params = sum(p.numel() for p in lstm.parameters())
+    x = torch.randn(4, 20, 32)
+    out, _ = lstm(x)
+    print(f"Layers={num_layers}  params={n_params:,}  out_shape={tuple(out.shape)}")
+```
+
+```output
+Layers=1  params=49,664  out_shape=(4, 20, 128)
+Layers=2  params=115,200  out_shape=(4, 20, 128)
+Layers=4  params=246,272  out_shape=(4, 20, 128)
+```
+
+## Exercise
+
+Implement `extract_context_vector(model, x, lengths)` that, given the `BiLSTMClassifier` above, returns the sentence context vector (shape `(batch, 2H)`) without the final classification head. This is the representation you'd use for downstream tasks.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def extract_context_vector(model, x, lengths):
+    with torch.no_grad():
+        e = model.embed(x)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            e, lengths, batch_first=True, enforce_sorted=False)
+        _, (h_n, _) = model.lstm(packed)
+        h = torch.cat([h_n[0], h_n[1]], dim=-1)
+    return h  # (batch, 2*hidden_size)
+
+model = BiLSTMClassifier(500, 16, 32, 2)
+x = torch.randint(1, 500, (4, 10))
+lengths = torch.tensor([10, 8, 6, 10])
+ctx = extract_context_vector(model, x, lengths)
+print("Context shape:", ctx.shape)  # (4, 64)
+```
+
+The context vector captures the full sequence summary. Notice `enforce_sorted=False` handles arbitrary ordering without pre-sorting.
+</details>

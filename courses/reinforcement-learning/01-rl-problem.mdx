@@ -1,0 +1,192 @@
+---
+course: reinforcement-learning
+chapter: 01-rl-problem
+title: "The RL Problem: Agent, Environment, and Reward"
+order: 1
+---
+
+## The agent-environment loop
+
+Reinforcement learning is the problem of learning to act. An **agent** observes a **state** $S_t$, takes an **action** $A_t$, and receives a **reward** $R_{t+1}$ along with a new state $S_{t+1}$ from the **environment**. This loop repeats until the episode ends or indefinitely.
+
+The diagram is simple: Agent → Action → Environment → (State, Reward) → Agent.
+
+Every RL algorithm is a different answer to the same question: given the history of states, actions, and rewards you've seen, what action should you take next?
+
+## The reward hypothesis
+
+The reward hypothesis is RL's central assumption: every goal can be expressed as the maximization of expected **cumulative reward**. Winning a game, controlling a robot, managing a portfolio — all of these reduce to a scalar signal the agent should maximize.
+
+The **return** $G_t$ is the total discounted reward from time $t$:
+
+$$
+G_t = R_{t+1} + \gamma R_{t+2} + \gamma^2 R_{t+3} + \cdots = \sum_{k=0}^{\infty} \gamma^k R_{t+k+1}
+$$
+
+The **discount factor** $\gamma \in [0, 1)$ controls how much the agent values future rewards. $\gamma = 0$ makes the agent myopic (only immediate reward). $\gamma \to 1$ makes it far-sighted. Most practical settings use $\gamma = 0.99$.
+
+### Episodic vs continuing tasks
+
+**Episodic tasks** have a natural end (a game ends, a robot reaches the goal). Return is the sum of rewards in the episode.
+
+**Continuing tasks** go on forever (stock trading, process control). You need discounting to keep the return finite.
+
+## The Markov property
+
+The **Markov property** says the current state $S_t$ is sufficient to predict the future — you don't need the full history. Formally:
+
+$$
+P(S_{t+1} | S_t, A_t, S_{t-1}, A_{t-1}, \ldots) = P(S_{t+1} | S_t, A_t)
+$$
+
+If the state fully captures the relevant history, the process is **Markov**. This is an assumption — raw pixel frames from Atari technically need frame stacking to be approximately Markov (velocity isn't visible in a single frame).
+
+## The gymnasium API
+
+`gymnasium` (the maintained fork of OpenAI gym) provides a standard interface for RL environments.
+
+```python
+import gymnasium as gym
+
+env = gym.make("CartPole-v1")
+obs, info = env.reset(seed=42)
+print("Observation space:", env.observation_space)
+print("Action space:     ", env.action_space)
+print("Initial obs shape:", obs.shape)
+```
+
+```output
+Observation space: Box([-4.8       -inf -0.41887903       -inf], [4.8       inf 0.41887903       inf], (4,), float64)
+Action space:      Discrete(2)
+Initial obs shape: (4,)
+```
+
+CartPole's observation is `[cart_pos, cart_vel, pole_angle, pole_angular_vel]`. Actions are 0 (push left) or 1 (push right).
+
+### Running a random policy
+
+```python
+import gymnasium as gym
+import numpy as np
+
+env = gym.make("CartPole-v1")
+total_rewards = []
+
+for episode in range(10):
+    obs, _ = env.reset()
+    total_reward = 0
+    done = False
+    while not done:
+        action = env.action_space.sample()  # random action
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        done = terminated or truncated
+    total_rewards.append(total_reward)
+
+print(f"Mean reward (random): {np.mean(total_rewards):.1f} ± {np.std(total_rewards):.1f}")
+print(f"Max possible:         500")
+```
+
+```output
+Mean reward (random): 22.3 ± 9.7
+Max possible:         500
+```
+
+A random policy averages about 22 steps before the pole falls. A trained agent achieves 500 (the episode cap). That gap is what learning must close.
+
+### The step loop in detail
+
+```python
+import gymnasium as gym
+
+env = gym.make("CartPole-v1")
+obs, _ = env.reset()
+
+for t in range(5):
+    action = env.action_space.sample()
+    next_obs, reward, terminated, truncated, info = env.step(action)
+    print(f"t={t}  action={action}  reward={reward:.0f}  terminated={terminated}")
+    obs = next_obs
+    if terminated or truncated:
+        break
+```
+
+```output
+t=0  action=1  reward=1  terminated=False
+t=1  action=0  reward=1  terminated=False
+t=2  action=0  reward=1  terminated=False
+t=3  action=1  reward=1  terminated=False
+t=4  action=0  reward=1  terminated=True
+```
+
+Each step gives reward +1 for staying upright. `terminated=True` means the pole fell or the cart left bounds.
+
+## State, action, and reward design
+
+The environment you interact with defines the MDP. As a practitioner you sometimes design the reward signal (reward shaping), which is tricky — reward what you actually want, not a proxy that the agent can exploit.
+
+Classic pitfall: reward a cleaning robot for *seeing* dirt as clean, and it learns to close its eyes.
+
+## Try it Yourself
+
+```python
+import gymnasium as gym
+import numpy as np
+
+# Try a right-biased policy and compare to random
+env = gym.make("CartPole-v1")
+
+def right_biased_policy(obs):
+    # Always push right — terrible, but instructive
+    return 1
+
+rewards = []
+for _ in range(20):
+    obs, _ = env.reset()
+    total, done = 0, False
+    while not done:
+        action = right_biased_policy(obs)
+        obs, r, terminated, truncated, _ = env.step(action)
+        total += r
+        done = terminated or truncated
+    rewards.append(total)
+
+print(f"Right-only policy: mean={np.mean(rewards):.1f}, std={np.std(rewards):.1f}")
+```
+
+```output
+Right-only policy: mean=10.2, std=3.8
+```
+
+## Exercise
+
+Implement an **angle-based heuristic**: if the pole angle (index 2 of observation) is positive, push right; otherwise push left. Run 20 episodes and report mean reward. Does this simple rule beat random?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import gymnasium as gym
+import numpy as np
+
+env = gym.make("CartPole-v1")
+
+def angle_policy(obs):
+    return 1 if obs[2] > 0 else 0  # push in direction pole is falling
+
+rewards = []
+for _ in range(20):
+    obs, _ = env.reset()
+    total, done = 0, False
+    while not done:
+        action = angle_policy(obs)
+        obs, r, terminated, truncated, _ = env.step(action)
+        total += r
+        done = terminated or truncated
+    rewards.append(total)
+
+print(f"Angle policy: mean={np.mean(rewards):.1f}, std={np.std(rewards):.1f}")
+```
+
+This heuristic achieves ~40–80 mean reward — better than random (≈22) but far below a trained agent (500). The pole angle alone doesn't capture cart position drift, which eventually causes failure.
+</details>

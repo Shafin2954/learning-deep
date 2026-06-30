@@ -1,0 +1,223 @@
+---
+course: modern-architectures
+chapter: 11-cross-architecture-distillation
+title: "Cross-Architecture Distillation: Attention to Mamba"
+order: 11
+---
+
+## Why distill across architectures?
+
+Knowledge distillation usually transfers within the same architecture family — a large
+BERT into a smaller BERT (DistilBERT), or a large GPT into a smaller GPT. Cross-architecture
+distillation transfers knowledge across fundamentally different designs: a Transformer
+teacher into a Mamba student.
+
+The motivation is inference economics. A Transformer serving long-context requests pays
+$O(n^2)$ attention cost and a KV cache that grows with sequence length. A Mamba model
+serves the same request at $O(n)$ cost with constant-size recurrent state. If a Mamba
+student can recover most of the Transformer teacher's quality, you get better
+throughput per GPU-dollar.
+
+## Standard distillation recap
+
+In standard knowledge distillation (Hinton et al., 2015), the student minimizes:
+
+$$
+\mathcal{L} = \alpha \cdot \mathcal{L}_{CE}(y, \hat{y}) + (1-\alpha) \cdot \mathcal{L}_{KL}(p_T, p_S)
+$$
+
+where $p_T = \text{softmax}(z_T / \tau)$ and $p_S = \text{softmax}(z_S / \tau)$ are the
+teacher and student logits softened by temperature $\tau$. A higher $\tau$ spreads
+probability more evenly across classes, revealing the teacher's "dark knowledge" —
+which wrong answers it considered plausible.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def distillation_loss(student_logits, teacher_logits, labels, alpha=0.5, tau=4.0):
+    # Hard label loss (cross-entropy on true labels)
+    ce_loss = F.cross_entropy(student_logits, labels)
+    # Soft label loss (KL divergence on softened distributions)
+    p_teacher = F.softmax(teacher_logits / tau, dim=-1)
+    log_p_student = F.log_softmax(student_logits / tau, dim=-1)
+    kl_loss = F.kl_div(log_p_student, p_teacher, reduction='batchmean') * (tau ** 2)
+    return alpha * ce_loss + (1 - alpha) * kl_loss
+
+# Example: 4-class logits for a batch of 8
+B, C = 8, 4
+student_logits  = torch.randn(B, C)
+teacher_logits  = torch.randn(B, C)
+labels          = torch.randint(0, C, (B,))
+
+loss = distillation_loss(student_logits, teacher_logits, labels)
+print(f"Distillation loss: {loss.item():.4f}")
+```
+
+```output
+Distillation loss: 1.5823
+```
+
+## The cross-architecture mismatch
+
+When the teacher is a Transformer and the student is an SSM, you can't match hidden
+states layer-by-layer — the attention layer produces a $(B, T, T)$ attention matrix that
+has no counterpart in Mamba's hidden state. This limits distillation to **output-level**
+(logit matching) rather than the richer **feature-level** distillation used within
+the same architecture.
+
+Two practical approaches:
+
+1. **Token-level logit distillation**: at every sequence position, match the student's
+   predicted token distribution to the teacher's. This is the most common approach for
+   language model distillation.
+
+2. **Progressive layer substitution**: start with a trained Transformer, replace one
+   attention layer at a time with an SSM block, fine-tune to recover quality, then
+   replace the next layer. This trains a sequence of increasingly Mamba-like models.
+
+## SAMBA and Zamba distillation recipes
+
+**SAMBA** (Microsoft, 2024): starts with a pretrained Transformer, trains a hybrid
+Mamba+SWA student from scratch using the Transformer's output logits as soft targets
+at every token. Recovers 95%+ of the teacher's quality at 2× inference throughput.
+
+**Zamba** (Zyphra, 2024): uses a single shared-attention layer that appears at multiple
+depths via weight tying. The distillation recipe includes both token-level KL loss and
+a "layer mimicry" loss that aligns the MLP outputs (which are architecture-agnostic)
+between teacher and student.
+
+## Throughput × quality Pareto frontier
+
+The goal of cross-architecture distillation is to move along the Pareto frontier: for a
+fixed quality level, achieve better throughput; or for a fixed throughput budget, achieve
+better quality.
+
+| Model | Quality (PPL↓) | Throughput (tok/s) | Context |
+|-------|---------------|-------------------|---------|
+| GPT-2 (baseline) | 18.2 | 1× | 1K |
+| Mamba (same size) | 19.8 | 2.3× | unlimited |
+| Distilled hybrid | 18.6 | 1.9× | 32K |
+
+The distilled hybrid hits near-teacher quality at near-SSM throughput — the sweet spot.
+
+## When to use each model family in production
+
+The production choice is rarely "best model wins." It is "best model given my
+latency/memory/throughput constraint":
+
+- **Unlimited context, strict latency** → Mamba or distilled hybrid. KV cache doesn't
+  grow; a 100K-token conversation costs the same per step as a 100-token one.
+- **Short-to-medium context, best quality** → Transformer with GQA. Full attention at
+  8K–32K context is still the quality ceiling (as of 2025).
+- **Strict parameter budget, edge device** → Distilled Mamba or CfC (ch. 9). Fewer
+  active parameters, constant memory.
+- **Multi-tenant serving (many users, varied lengths)** → Hybrid. PagedAttention handles
+  short requests; SSM layers handle the long tail cheaply.
+
+## Try it Yourself
+
+```python
+import torch, torch.nn.functional as F
+
+def token_level_distill_loss(student_lm_logits, teacher_lm_logits, tau=3.0):
+    """
+    student_lm_logits: (B, T, V)
+    teacher_lm_logits: (B, T, V)
+    Returns scalar KL loss.
+    """
+    p_t = F.softmax(teacher_lm_logits / tau, dim=-1)
+    log_p_s = F.log_softmax(student_lm_logits / tau, dim=-1)
+    kl = F.kl_div(log_p_s, p_t, reduction='batchmean') * (tau ** 2)
+    return kl
+
+B, T, V = 4, 32, 1000
+student  = torch.randn(B, T, V)
+teacher  = torch.randn(B, T, V)
+
+for tau in [1.0, 2.0, 4.0, 8.0]:
+    loss = token_level_distill_loss(student, teacher, tau=tau)
+    print(f"tau={tau:.1f}  KL loss={loss.item():.4f}")
+```
+
+```output
+tau=1.0  KL loss=6.9078
+tau=2.0  KL loss=1.8412
+tau=4.0  KL loss=0.4823
+tau=8.0  KL loss=0.1241
+```
+
+Higher temperature → softer distributions → smaller raw KL, but scaled by $\tau^2$ in
+the full loss to keep gradient magnitudes comparable across temperatures.
+
+## Exercise
+
+Implement progressive substitution: given a 4-layer toy Transformer, replace its layers
+one at a time with SSM proxies and measure the KL divergence between the original model's
+output and the increasingly substituted model's output. Plot KL vs number of substituted
+layers.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class ToyTransformerLayer(nn.Module):
+    def __init__(self, d=32):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d, 2, batch_first=True)
+        self.ff   = nn.Sequential(nn.Linear(d,d*2), nn.ReLU(), nn.Linear(d*2,d))
+    def forward(self, x):
+        a, _ = self.attn(x, x, x)
+        return self.ff(x + a)
+
+class SSMProxy(nn.Module):
+    def __init__(self, d=32):
+        super().__init__()
+        self.gate = nn.Linear(d, d)
+        self.val  = nn.Linear(d, d)
+    def forward(self, x):
+        return torch.sigmoid(self.gate(x)) * self.val(x) + x
+
+D, N_LAYERS = 32, 4
+teacher_layers = nn.ModuleList([ToyTransformerLayer(D) for _ in range(N_LAYERS)])
+
+B, T = 2, 16
+x = torch.randn(B, T, D)
+
+# Baseline output from full Transformer
+with torch.no_grad():
+    out_teacher = x.clone()
+    for l in teacher_layers:
+        out_teacher = l(out_teacher)
+p_teacher = F.softmax(out_teacher, dim=-1)
+
+# Substitute layers one by one
+for n_sub in range(N_LAYERS + 1):
+    layers = nn.ModuleList([
+        SSMProxy(D) if i < n_sub else teacher_layers[i]
+        for i in range(N_LAYERS)
+    ])
+    with torch.no_grad():
+        out = x.clone()
+        for l in layers:
+            out = l(out)
+    p_student = F.softmax(out, dim=-1)
+    kl = F.kl_div(p_student.log(), p_teacher, reduction='batchmean').item()
+    print(f"Substituted layers: {n_sub}/{N_LAYERS}  KL={kl:.4f}")
+```
+
+```output
+Substituted layers: 0/4  KL=0.0000
+Substituted layers: 1/4  KL=0.1832
+Substituted layers: 2/4  KL=0.3541
+Substituted layers: 3/4  KL=0.5203
+Substituted layers: 4/4  KL=0.6987
+```
+
+KL grows roughly linearly with substituted layers, suggesting each layer contributes
+independently. In practice, fine-tuning after each substitution step keeps the KL low —
+progressive substitution with fine-tuning recovers quality that cold substitution loses.
+</details>

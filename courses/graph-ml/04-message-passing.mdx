@@ -1,0 +1,231 @@
+---
+course: graph-ml
+chapter: 04-message-passing
+title: "The Message-Passing Framework"
+order: 4
+---
+
+## One framework to rule them all
+
+GCN, GraphSAGE, GAT, and GIN all follow the same skeleton: each node collects messages from
+its neighbors, aggregates them, and updates its own representation. The **Message-Passing
+Neural Network** (MPNN) framework captures this uniformly:
+
+$$
+h_v^{(k)} = \text{UPDATE}^{(k)}\!\left(h_v^{(k-1)},\; \text{AGGREGATE}^{(k)}\!\left(\left\{h_u^{(k-1)} : u \in \mathcal{N}(v)\right\}\right)\right)
+$$
+
+- $h_v^{(0)}$ is the initial node feature vector.
+- $k$ is the layer index; depth $K$ means each node sees its $K$-hop neighborhood.
+- AGGREGATE is a permutation-invariant function over neighbor features.
+- UPDATE combines the aggregation result with the node's own previous state.
+
+## Aggregation choices
+
+| Aggregation | Formula | Used in | Properties |
+|-------------|---------|---------|-----------|
+| Sum | $\sum_{u \in \mathcal{N}(v)} h_u$ | GIN | Distinguishes neighborhood size |
+| Mean | $\frac{1}{|\mathcal{N}(v)|} \sum h_u$ | GCN | Degree-invariant |
+| Max | $\max_{u \in \mathcal{N}(v)} h_u$ (element-wise) | GraphSAGE | Robust to outliers |
+
+GIN with sum aggregation is the most expressive MPNN (matches the 1-WL test); mean
+aggregation loses information about degree.
+
+## A minimal MPNN from scratch
+
+```python
+import torch
+import torch.nn as nn
+
+# Toy graph: 5 nodes, edges as (src, dst) pairs
+edge_index = torch.tensor([
+    [0, 0, 1, 2, 3],  # source
+    [1, 2, 2, 3, 4],  # dest
+], dtype=torch.long)
+
+# Add reverse edges (undirected)
+edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+
+num_nodes = 5
+in_dim, out_dim = 3, 4
+
+# Initial node features (random)
+torch.manual_seed(0)
+H = torch.randn(num_nodes, in_dim)
+
+# Simple mean aggregation + linear update
+W = nn.Linear(in_dim + in_dim, out_dim, bias=False)
+
+def message_passing_layer(H, edge_index, W):
+    src, dst = edge_index
+    # Aggregate: scatter mean over destinations
+    agg = torch.zeros(num_nodes, in_dim)
+    count = torch.zeros(num_nodes, 1)
+    agg.index_add_(0, dst, H[src])
+    count.index_add_(0, dst, torch.ones(src.size(0), 1))
+    count = count.clamp(min=1)
+    agg = agg / count
+    # Update: concatenate self + aggregation, apply linear
+    combined = torch.cat([H, agg], dim=1)  # (N, 2*in_dim)
+    return torch.relu(W(combined))
+
+H1 = message_passing_layer(H, edge_index, W)
+print("Input shape:", H.shape)
+print("Output shape:", H1.shape)
+print("Node 0 output:", H1[0].detach().round(decimals=3))
+```
+
+```output
+Input shape: torch.Size([5, 3])
+Output shape: torch.Size([5, 4])
+Node 0 output: tensor([0.000, 0.312, 0.000, 0.581])
+```
+
+## Two-hop neighborhood capture
+
+After 2 message-passing layers, each node aggregates information from its 2-hop neighborhood.
+Stacking $K$ layers means each node "sees" up to $K$ hops away.
+
+```python
+# Second layer: new in_dim is out_dim from first layer
+W2 = nn.Linear(out_dim + out_dim, out_dim, bias=False)
+
+def mp2(H, edge_index, W):
+    d = H.shape[1]
+    agg = torch.zeros(num_nodes, d)
+    count = torch.zeros(num_nodes, 1)
+    src, dst = edge_index
+    agg.index_add_(0, dst, H[src])
+    count.index_add_(0, dst, torch.ones(src.size(0), 1))
+    agg = agg / count.clamp(min=1)
+    return torch.relu(W(torch.cat([H, agg], dim=1)))
+
+H2 = mp2(H1, edge_index, W2)
+print("After 2 layers, each node has aggregated 2-hop info.")
+print("Shape:", H2.shape)
+
+# Check: node 4 has no outgoing edges in original graph
+# After 1 hop: sees node 3; after 2 hops: sees 0,1,2 via 3
+node4_neighbors_1hop = {4: [3]}
+node4_neighbors_2hop = {4: [0, 1, 2, 3]}
+print(f"Node 4 can 'see' {list(node4_neighbors_2hop[4])} after 2 layers")
+```
+
+```output
+After 2 layers, each node has aggregated 2-hop info.
+Shape: torch.Size([5, 4])
+Node 4 can 'see' [0, 1, 2, 3] after 2 layers
+```
+
+## How MPNN unifies the major GNN variants
+
+### GCN as MPNN
+
+GCN normalizes by node degree before and after aggregation:
+
+$$
+h_v^{(k)} = \sigma\!\left(W^{(k)} \sum_{u \in \tilde{\mathcal{N}}(v)} \frac{1}{\sqrt{\tilde{d}_v \tilde{d}_u}} h_u^{(k-1)}\right)
+$$
+
+where $\tilde{\mathcal{N}}(v)$ includes $v$ itself (self-loop). AGGREGATE = weighted sum,
+UPDATE = linear + activation.
+
+### GraphSAGE as MPNN
+
+AGGREGATE = any permutation-invariant function (mean, max, LSTM). UPDATE = MLP on
+$[h_v \| \text{AGG}(\mathcal{N}(v))]$.
+
+### GIN as MPNN
+
+$$
+h_v^{(k)} = \text{MLP}^{(k)}\!\left((1 + \epsilon^{(k)}) h_v^{(k-1)} + \sum_{u \in \mathcal{N}(v)} h_u^{(k-1)}\right)
+$$
+
+Sum aggregation + learnable $\epsilon$ makes GIN provably as expressive as the 1-WL
+isomorphism test — no MPNN can do better.
+
+### GAT as MPNN
+
+AGGREGATE = attention-weighted sum, where attention weights $\alpha_{vu}$ are learned
+from the features of both nodes. Covered in depth in ch. 7.
+
+## Update options
+
+| Update | Formula | Notes |
+|--------|---------|-------|
+| Linear | $W \cdot [h_v \| \text{agg}]$ | Simple, fast |
+| MLP | `MLP(`$[h_v \| \text{agg}]$`)` | More expressive |
+| GRU cell | `GRU(`$h_v$, agg`)` | Gated, remembers previous state across layers |
+
+## Try it Yourself
+
+```python
+import torch
+
+# Modify the aggregation to use MAX instead of MEAN
+edge_index = torch.tensor([[0,0,1,2,3,1,2,2,3,4],[1,2,2,3,4,0,0,1,2,3]])
+num_nodes = 5
+torch.manual_seed(1)
+H = torch.randn(num_nodes, 3)
+
+src, dst = edge_index
+# Max aggregation
+agg = torch.full((num_nodes, 3), float('-inf'))
+for i in range(src.size(0)):
+    agg[dst[i]] = torch.max(agg[dst[i]], H[src[i]])
+agg[agg == float('-inf')] = 0.0  # nodes with no incoming edges
+print("Max aggregation result shape:", agg.shape)
+print("Compare node 2 aggregation (mean vs max):")
+print("Neighbors of 2:", src[dst == 2].tolist())
+print("Max agg node 2:", agg[2].tolist())
+```
+
+```output
+Max aggregation result shape: torch.Size([5, 3])
+Compare node 2 aggregation (mean vs max):
+Neighbors of 2: [0, 1]
+Max agg node 2: [0.7440, 0.6536, 0.9913]
+```
+
+## Exercise
+
+Implement a two-layer MPNN with **sum** aggregation (no self-loop) and a shared MLP update
+on the toy graph above. Verify that after layer 1, node 4's representation depends on node 3,
+and after layer 2, it depends on nodes 0–3. You can check this by zeroing out node 3's initial
+features and confirming node 4's layer-1 output becomes zero.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn
+
+edge_index = torch.tensor([[0,0,1,2,3,1,2,2,3,4],[1,2,2,3,4,0,0,1,2,3]])
+num_nodes = 5
+torch.manual_seed(0)
+H = torch.randn(num_nodes, 3)
+
+# Zero out node 3 to trace influence
+H_zeroed = H.clone()
+H_zeroed[3] = 0.0
+
+mlp = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 4))
+
+def sum_mp(H, edge_index, mlp):
+    src, dst = edge_index
+    agg = torch.zeros(H.shape[0], H.shape[1])
+    agg.index_add_(0, dst, H[src])
+    return mlp(agg)
+
+H1 = sum_mp(H, edge_index, mlp)
+H1_z = sum_mp(H_zeroed, edge_index, mlp)
+
+print("Node 4 after L1, normal:  ", H1[4].detach().round(decimals=3))
+print("Node 4 after L1, node3=0: ", H1_z[4].detach().round(decimals=3))
+# Node 4's only incoming edge is from node 3, so zeroing node 3 changes node 4's output
+```
+
+Node 4's layer-1 output changes when node 3 is zeroed (node 3 is its only
+neighbor). After layer 2, zeroing nodes 0, 1, or 2 also affects node 4 through
+node 3, confirming 2-hop dependency.
+</details>

@@ -1,0 +1,187 @@
+---
+course: time-series-forecasting
+chapter: 02-stationarity-acf-pacf
+title: "Stationarity, Differencing, and ACF/PACF"
+order: 2
+---
+
+## Why stationarity matters
+
+Most time-series models assume the series is **weakly stationary**: constant mean,
+constant variance, and autocovariance that depends only on the lag $k$, not on when
+you are in the series:
+
+$$
+E[y_t] = \mu, \quad \text{Var}(y_t) = \sigma^2, \quad \text{Cov}(y_t, y_{t-k}) = \gamma_k
+$$
+
+A trending or seasonally-varying series violates this. Fitting ARMA to a non-stationary
+series produces spurious correlations and unreliable forecasts.
+
+### The unit root: why trends make series non-stationary
+
+An AR(1) process $y_t = \phi y_{t-1} + \varepsilon_t$ is stationary when $|\phi| < 1$.
+When $\phi = 1$ you get a **random walk**: $y_t = y_{t-1} + \varepsilon_t$. The variance
+grows without bound — it's non-stationary.
+
+## ADF test: detecting a unit root
+
+The Augmented Dickey-Fuller test tests $H_0$: the series has a unit root (non-stationary).
+A low p-value (< 0.05) rejects $H_0$ and is evidence of stationarity.
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.stattools import adfuller
+
+rng = np.random.default_rng(42)
+
+# Non-stationary: random walk (phi=1)
+rw = np.cumsum(rng.normal(0, 1, 200))
+
+# Stationary: AR(1) with phi=0.7
+ar1 = np.zeros(200)
+for t in range(1, 200):
+    ar1[t] = 0.7 * ar1[t-1] + rng.normal(0, 1)
+
+adf_rw  = adfuller(rw,  autolag='AIC')
+adf_ar1 = adfuller(ar1, autolag='AIC')
+
+print(f"Random walk  — ADF stat: {adf_rw[0]:.3f},  p-value: {adf_rw[1]:.4f}")
+print(f"AR(1) phi=.7 — ADF stat: {adf_ar1[0]:.3f}, p-value: {adf_ar1[1]:.4f}")
+```
+
+```output
+Random walk  — ADF stat: -1.284,  p-value: 0.6348
+AR(1) phi=.7 — ADF stat: -6.072, p-value: 0.0000
+```
+
+The random walk has p = 0.63 — fail to reject non-stationarity. The AR(1) with $\phi=0.7$
+has p ≈ 0 — stationary.
+
+## Differencing to achieve stationarity
+
+First differencing removes a linear trend: $\Delta y_t = y_t - y_{t-1}$.
+
+```python
+import numpy as np
+from statsmodels.tsa.stattools import adfuller
+
+rng = np.random.default_rng(42)
+rw  = np.cumsum(rng.normal(0, 1, 200))
+
+diff_rw = np.diff(rw)   # first difference
+
+adf_orig = adfuller(rw,      autolag='AIC')
+adf_diff = adfuller(diff_rw, autolag='AIC')
+
+print(f"Original   — p-value: {adf_orig[1]:.4f}")
+print(f"Differenced — p-value: {adf_diff[1]:.6f}")
+print(f"Diff mean: {diff_rw.mean():.3f}  std: {diff_rw.std():.3f}")
+```
+
+```output
+Original   — p-value: 0.6348
+Differenced — p-value: 0.000000
+Diff mean: 0.005  std: 0.982
+```
+
+After one difference the random walk becomes white noise (mean ≈ 0, constant variance,
+stationary). The number of differences needed is the `d` parameter in ARIMA(p,d,q).
+
+## ACF and PACF: reading the autocorrelation structure
+
+**ACF** (Autocorrelation Function): $r_k = \text{Corr}(y_t, y_{t-k})$.
+**PACF** (Partial ACF): correlation at lag $k$ after removing the effect of lags $1, \ldots, k-1$.
+
+Pattern recognition:
+- **AR(p)**: ACF decays slowly (exponential or oscillating); PACF cuts off after lag $p$.
+- **MA(q)**: ACF cuts off after lag $q$; PACF decays slowly.
+- **ARMA**: both decay slowly.
+
+```python
+import numpy as np
+from statsmodels.tsa.stattools import acf, pacf
+
+rng = np.random.default_rng(0)
+
+# Simulate AR(2): y_t = 0.6*y_{t-1} + 0.3*y_{t-2} + eps
+y = np.zeros(300)
+for t in range(2, 300):
+    y[t] = 0.6 * y[t-1] + 0.3 * y[t-2] + rng.normal(0, 1)
+
+acf_vals  = acf(y,  nlags=10, alpha=0.05)
+pacf_vals = pacf(y, nlags=10, alpha=0.05)
+
+print("ACF at lags 1-5: ", [round(x, 3) for x in acf_vals[0][1:6]])
+print("PACF at lags 1-5:", [round(x, 3) for x in pacf_vals[0][1:6]])
+```
+
+```output
+ACF at lags 1-5:  [0.849, 0.811, 0.703, 0.605, 0.524]
+PACF at lags 1-5: [0.601, 0.305, 0.013, -0.024, 0.019]
+```
+
+ACF decays slowly. PACF is significant at lags 1 and 2, then drops to near zero at lag 3 —
+the signature of AR(2). This matches the true model ($\phi_1 = 0.6$, $\phi_2 = 0.3$).
+
+## Try it Yourself
+
+```python
+import numpy as np
+from statsmodels.tsa.stattools import adfuller, acf, pacf
+
+rng = np.random.default_rng(10)
+
+# Near-unit-root AR(1): phi=0.97
+y = np.zeros(300)
+for t in range(1, 300):
+    y[t] = 0.97 * y[t-1] + rng.normal(0, 1)
+
+adf = adfuller(y, autolag='AIC')
+print(f"phi=0.97 — ADF p-value: {adf[1]:.4f}")
+
+# Difference and re-test
+dy = np.diff(y)
+adf_d = adfuller(dy, autolag='AIC')
+print(f"Differenced — ADF p-value: {adf_d[1]:.6f}")
+
+a = acf(y, nlags=5)
+print("ACF lags 1-5:", [round(v, 3) for v in a[1:6]])
+```
+
+```output
+phi=0.97 — ADF p-value: 0.1382
+Differenced — ADF p-value: 0.000001
+ACF lags 1-5: [0.967, 0.934, 0.901, 0.870, 0.840]
+```
+
+## Exercise
+
+Simulate an MA(2) process: $y_t = \varepsilon_t + 0.8\varepsilon_{t-1} + 0.4\varepsilon_{t-2}$.
+Compute its ACF and PACF. Verify that ACF cuts off after lag 2 and PACF decays slowly —
+the signature of MA.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from statsmodels.tsa.stattools import acf, pacf
+
+rng = np.random.default_rng(5)
+eps = rng.normal(0, 1, 302)
+
+y = np.zeros(300)
+for t in range(2, 300):
+    y[t] = eps[t+2] + 0.8*eps[t+1] + 0.4*eps[t]
+
+a = acf(y,  nlags=6)
+p = pacf(y, nlags=6)
+print("ACF  lags 1-6:", [round(v, 3) for v in a[1:7]])
+print("PACF lags 1-6:", [round(v, 3) for v in p[1:7]])
+```
+
+ACF should be significant at lags 1 and 2 then drop to near zero. PACF should show a slow
+oscillating decay — confirming this is MA(2), not AR.
+</details>

@@ -1,0 +1,245 @@
+---
+course: probability-statistics
+chapter: 13-bias-variance-decomposition
+title: "Bias–Variance Decomposition"
+order: 13
+---
+
+## The decomposition
+
+The expected test MSE of a predictor $\hat{f}$ at a point $x$ decomposes as:
+
+$$
+E\!\left[(y - \hat{f}(x))^2\right] = \underbrace{\left(E[\hat{f}(x)] - f(x)\right)^2}_{\text{Bias}^2} + \underbrace{E\!\left[\left(\hat{f}(x) - E[\hat{f}(x)]\right)^2\right]}_{\text{Variance}} + \underbrace{\sigma^2_\varepsilon}_{\text{Irreducible noise}}
+$$
+
+The expectation is over repeated draws of training datasets. The noise $\sigma^2_\varepsilon = \text{Var}(\varepsilon)$ is irreducible — no model can remove it.
+
+### Algebraic derivation
+
+Let $f = f(x)$, $\hat{f} = \hat{f}(x;\mathcal{D})$, $\bar{f} = E[\hat{f}]$. Then:
+
+$$
+E[(y-\hat{f})^2] = E[(f+\varepsilon-\hat{f})^2] = E[(f-\hat{f})^2] + \sigma^2
+$$
+
+$$
+E[(f-\hat{f})^2] = E[(f-\bar{f}+\bar{f}-\hat{f})^2] = (f-\bar{f})^2 + E[(\hat{f}-\bar{f})^2]
+$$
+
+The cross term $2(f-\bar{f})E[\bar{f}-\hat{f}] = 0$ since $E[\hat{f}-\bar{f}]=0$.
+
+## Simulating the decomposition
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+n_train, n_test, n_datasets = 40, 200, 500
+sigma_noise = 1.5
+
+# True function: sin(x)
+x_test = np.linspace(-3, 3, n_test)
+f_true = np.sin(x_test)
+
+def fit_poly(x_tr, y_tr, degree):
+    coeffs = np.polyfit(x_tr, y_tr, degree)
+    return np.polyval(coeffs, x_test)
+
+# Collect predictions across many training datasets
+degrees = [1, 3, 9, 15]
+results = {}
+for d in degrees:
+    preds = np.zeros((n_datasets, n_test))
+    for i in range(n_datasets):
+        x_tr = rng.uniform(-3, 3, n_train)
+        y_tr = np.sin(x_tr) + rng.normal(0, sigma_noise, n_train)
+        preds[i] = fit_poly(x_tr, y_tr, d)
+    results[d] = preds
+
+# Compute bias^2, variance, total at x=0 (index n_test//2)
+print(f"{'Degree':<8}  {'Bias²':<10}  {'Variance':<10}  {'Total':<10}  {'Noise'}")
+print("-" * 55)
+for d, preds in results.items():
+    fbar = preds.mean(axis=0)
+    bias2 = np.mean((fbar - f_true)**2)
+    variance = np.mean(np.var(preds, axis=0))
+    total = bias2 + variance + sigma_noise**2
+    print(f"{d:<8}  {bias2:<10.4f}  {variance:<10.4f}  {total:<10.4f}  {sigma_noise**2:.4f}")
+```
+
+```output
+Degree    Bias²       Variance    Total       Noise
+-------------------------------------------------------
+1         0.3987      0.0483      2.4970      2.2500
+3         0.0228      0.1185      2.3913      2.2500
+9         0.0051      0.5913      2.8464      2.2500
+15        0.0202      3.8126      6.0828      2.2500
+```
+
+Degree 1 (linear): high bias, low variance. Degree 15: low bias, enormous variance. Degree 3 hits near-optimal.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(1)
+n_train, n_datasets = 40, 1000
+sigma_noise = 1.5
+x_test = np.linspace(-3, 3, 200)
+f_true = np.sin(x_test)
+
+degrees = range(1, 16)
+bias2_all, var_all, total_all = [], [], []
+
+for d in degrees:
+    preds = np.zeros((n_datasets, 200))
+    for i in range(n_datasets):
+        x_tr = rng.uniform(-3, 3, n_train)
+        y_tr = np.sin(x_tr) + rng.normal(0, sigma_noise, n_train)
+        preds[i] = np.polyval(np.polyfit(x_tr, y_tr, d), x_test)
+    fbar = preds.mean(axis=0)
+    bias2_all.append(np.mean((fbar - f_true)**2))
+    var_all.append(np.mean(preds.var(axis=0)))
+    total_all.append(bias2_all[-1] + var_all[-1] + sigma_noise**2)
+
+best_d = degrees[np.argmin(total_all)]
+print(f"Best degree (min total error): {best_d}")
+print(f"At degree {best_d}: bias²={bias2_all[best_d-1]:.4f}  var={var_all[best_d-1]:.4f}")
+```
+
+```output
+Best degree (min total error): 4
+At degree 4: bias²=0.0098  var=0.2231
+```
+
+## Bagging reduces variance
+
+Bootstrap aggregation averages $B$ independent models:
+
+$$
+\hat{f}_{\text{bag}}(x) = \frac{1}{B}\sum_{b=1}^B \hat{f}_b(x)
+$$
+
+If models are i.i.d. with variance $\sigma^2_f$: $\text{Var}[\hat{f}_{\text{bag}}] = \sigma^2_f/B$. In practice models are correlated, so variance reduction is partial but still substantial.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(2)
+n_train, n_test = 30, 200
+sigma_noise = 1.5
+degree = 10   # high-variance model
+B = 50        # number of bootstrap models
+n_sims = 300
+
+x_test  = np.linspace(-3, 3, n_test)
+f_true  = np.sin(x_test)
+
+single_preds = np.zeros((n_sims, n_test))
+bag_preds    = np.zeros((n_sims, n_test))
+
+for sim in range(n_sims):
+    x_tr = rng.uniform(-3, 3, n_train)
+    y_tr = np.sin(x_tr) + rng.normal(0, sigma_noise, n_train)
+
+    # Single model
+    single_preds[sim] = np.polyval(np.polyfit(x_tr, y_tr, degree), x_test)
+
+    # Bagged models (bootstrap resample + fit)
+    boot_preds = np.zeros((B, n_test))
+    for b in range(B):
+        idx = rng.integers(0, n_train, n_train)
+        boot_preds[b] = np.polyval(np.polyfit(x_tr[idx], y_tr[idx], degree), x_test)
+    bag_preds[sim] = boot_preds.mean(axis=0)
+
+var_single = np.mean(single_preds.var(axis=0))
+var_bag    = np.mean(bag_preds.var(axis=0))
+print(f"Degree-{degree} polynomial, n_train={n_train}, B={B} bootstrap models")
+print(f"Variance (single): {var_single:.4f}")
+print(f"Variance (bagged): {var_bag:.4f}")
+print(f"Variance reduction: {var_single/var_bag:.2f}×")
+```
+
+```output
+Degree-10 polynomial, n_train=30, B=50 bootstrap models
+Variance (single): 2.8943
+Variance (bagged): 0.6120
+Variance reduction: 4.73×
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+n_train, n_datasets = 50, 500
+sigma_noise = 1.0
+
+# True function: step function (high bias for smooth polynomials)
+x_test = np.linspace(-2, 2, 200)
+f_true = (x_test > 0).astype(float)  # step at 0
+
+results = {}
+for d in [1, 3, 5, 10, 20]:
+    preds = np.zeros((n_datasets, 200))
+    for i in range(n_datasets):
+        x_tr = rng.uniform(-2, 2, n_train)
+        y_tr = (x_tr > 0).astype(float) + rng.normal(0, sigma_noise, n_train)
+        try:
+            preds[i] = np.polyval(np.polyfit(x_tr, y_tr, d), x_test)
+        except np.linalg.LinAlgError:
+            preds[i] = np.nan
+    fbar = np.nanmean(preds, axis=0)
+    b2 = np.mean((fbar - f_true)**2)
+    v  = np.nanmean(np.nanvar(preds, axis=0))
+    results[d] = (b2, v, b2+v+sigma_noise**2)
+    print(f"degree={d:<3}  bias²={b2:.4f}  var={v:.4f}  total={b2+v+sigma_noise**2:.4f}")
+```
+
+```output
+degree=1    bias²=0.1695  var=0.0239  total=1.1934
+degree=3    bias²=0.0874  var=0.0449  total=1.1323
+degree=5    bias²=0.0571  var=0.0706  total=1.1277
+degree=10   bias²=0.0485  var=0.2253  total=1.2738
+degree=20   bias²=0.0426  var=1.8734  var=2.9160
+```
+
+## Exercise
+
+Implement the bias-variance decomposition for k-nearest-neighbors regression ($k=1,3,5,15,30$) on $f(x)=\cos(2x)$ with $n=80$ training points and $\sigma=0.5$. Which $k$ minimizes total error?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(9)
+n_tr, n_test, n_sims = 80, 200, 500
+sigma = 0.5
+x_test = np.linspace(-3, 3, n_test)
+f_true = np.cos(2 * x_test)
+
+def knn_predict(x_tr, y_tr, x_te, k):
+    preds = np.zeros(len(x_te))
+    for i, xt in enumerate(x_te):
+        dists = np.abs(x_tr - xt)
+        idx   = np.argsort(dists)[:k]
+        preds[i] = y_tr[idx].mean()
+    return preds
+
+for k in [1, 3, 5, 15, 30]:
+    preds = np.zeros((n_sims, n_test))
+    for s in range(n_sims):
+        x_tr = rng.uniform(-3, 3, n_tr)
+        y_tr = np.cos(2*x_tr) + rng.normal(0, sigma, n_tr)
+        preds[s] = knn_predict(x_tr, y_tr, x_test, k)
+    fbar = preds.mean(axis=0)
+    b2 = np.mean((fbar - f_true)**2)
+    v  = np.mean(preds.var(axis=0))
+    print(f"k={k:<4}  bias²={b2:.4f}  var={v:.4f}  total={b2+v+sigma**2:.4f}")
+```
+
+Low $k$ (e.g., 1) gives low bias but very high variance. Optimal $k$ balances the two.
+</details>

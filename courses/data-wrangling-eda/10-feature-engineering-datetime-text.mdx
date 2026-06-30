@@ -1,0 +1,315 @@
+---
+course: data-wrangling-eda
+chapter: 10-feature-engineering-datetime-text
+title: "Feature Engineering: Datetime, Text, and Cyclical Features"
+order: 10
+---
+
+## Datetime is a rich source of features
+
+A single timestamp carries multiple signals: time of day, day of week, month, season, holiday
+proximity, days since an event. Extracting them makes temporal patterns visible to any model.
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 500
+start = pd.Timestamp('2023-01-01')
+timestamps = pd.date_range(start, periods=n, freq='6h')
+df = pd.DataFrame({'ts': timestamps})
+
+# Extract core datetime components
+df['year']        = df['ts'].dt.year
+df['month']       = df['ts'].dt.month
+df['day']         = df['ts'].dt.day
+df['hour']        = df['ts'].dt.hour
+df['dayofweek']   = df['ts'].dt.dayofweek   # 0=Monday, 6=Sunday
+df['quarter']     = df['ts'].dt.quarter
+df['is_weekend']  = (df['dayofweek'] >= 5).astype(np.int8)
+
+# Days since reference event
+ref = pd.Timestamp('2023-01-01')
+df['days_since_ref'] = (df['ts'] - ref).dt.days
+
+print(df[['ts', 'month', 'hour', 'dayofweek', 'is_weekend', 'days_since_ref']].head(10))
+```
+
+```output
+                   ts  month  hour  dayofweek  is_weekend  days_since_ref
+0 2023-01-01 00:00:00      1     0          6           1               0
+1 2023-01-01 06:00:00      1     6          6           1               0
+2 2023-01-01 12:00:00      1    12          6           1               0
+3 2023-01-01 18:00:00      1    18          6           1               0
+4 2023-01-02 00:00:00      1     0          0           0               1
+5 2023-01-02 06:00:00      1     6          0           0               1
+6 2023-01-02 12:00:00      1    12          0           0               1
+7 2023-01-02 18:00:00      1    18          0           0               1
+8 2023-01-03 00:00:00      1     0          1           0               2
+9 2023-01-03 06:00:00      1     6          1           0               2
+```
+
+## The cyclical encoding problem
+
+Hour 23 and hour 0 are adjacent, but a raw numeric feature puts them far apart (23 vs 0).
+A linear model using `hour` directly sees them as the most different hours of the day.
+
+The fix: encode cyclical features as $(\sin, \cos)$ pairs on the unit circle.
+
+$$
+\text{hour\_sin} = \sin\!\left(\frac{2\pi \cdot \text{hour}}{24}\right), \quad
+\text{hour\_cos} = \cos\!\left(\frac{2\pi \cdot \text{hour}}{24}\right)
+$$
+
+Now hour 23 and hour 0 map to nearly identical $(\sin, \cos)$ coordinates.
+
+```python
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+hours = np.arange(24)
+hour_sin = np.sin(2 * np.pi * hours / 24)
+hour_cos = np.cos(2 * np.pi * hours / 24)
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+
+# Raw encoding
+axes[0].plot(hours, hours, marker='o')
+axes[0].set_title('Raw hour (0 and 23 are "far apart")')
+axes[0].set_xlabel('hour'); axes[0].set_ylabel('value')
+
+# Cyclical encoding
+axes[1].scatter(hour_sin, hour_cos, c=hours, cmap='hsv', s=60)
+for h in [0, 6, 12, 18, 23]:
+    axes[1].annotate(str(h), (hour_sin[h], hour_cos[h]),
+                     textcoords='offset points', xytext=(5, 5))
+axes[1].set_title('Cyclical (0 and 23 are neighbours)')
+axes[1].set_xlabel('sin'); axes[1].set_ylabel('cos')
+axes[1].set_aspect('equal')
+
+plt.tight_layout(); plt.show()
+
+# Distances: raw vs cyclical
+dist_raw      = abs(23 - 0)
+dist_cyclical = np.sqrt((hour_sin[23] - hour_sin[0])**2 + (hour_cos[23] - hour_cos[0])**2)
+print(f"Raw distance(23, 0):      {dist_raw}")
+print(f"Cyclical distance(23, 0): {dist_cyclical:.4f}")
+print(f"Cyclical distance(12, 0): {np.sqrt((hour_sin[12]-hour_sin[0])**2 + (hour_cos[12]-hour_cos[0])**2):.4f}")
+```
+
+```output
+Raw distance(23, 0):      23
+Cyclical distance(23, 0): 0.2611
+Cyclical distance(12, 0): 2.0000
+[Figure: raw hour as a line vs cyclical encoding as a circle with hour labels]
+```
+
+Hours 23 and 0 are 0.26 apart in cyclical space (nearly adjacent); hours 12 and 0 are 2.0
+apart (opposite sides of the circle). This is the correct encoding of midnight-adjacency.
+
+### Applying cyclical encoding to a full dataset
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(1)
+dates = pd.date_range('2023-01-01', periods=8760, freq='h')  # one year of hourly data
+df = pd.DataFrame({'ts': dates})
+df['hour']  = df['ts'].dt.hour
+df['month'] = df['ts'].dt.month
+
+# Hour cyclical (period 24)
+df['hour_sin']  = np.sin(2 * np.pi * df['hour']  / 24)
+df['hour_cos']  = np.cos(2 * np.pi * df['hour']  / 24)
+
+# Month cyclical (period 12)
+df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+
+print(df[['ts', 'hour', 'hour_sin', 'hour_cos', 'month_sin', 'month_cos']].iloc[[0, 6, 12, 18, 23]].round(3))
+print(f"\nShape: {df.shape}")
+```
+
+```output
+                   ts  hour  hour_sin  hour_cos  month_sin  month_cos
+0 2023-01-01 00:00:00     0     0.000     1.000      0.500      0.866
+6 2023-01-01 06:00:00     6     1.000     0.000      0.500      0.866
+12 2023-01-01 12:00:00    12     0.000    -1.000      0.500      0.866
+18 2023-01-01 18:00:00    18    -1.000     0.000      0.500      0.866
+23 2023-01-01 23:00:00    23    -0.259     0.966      0.500      0.866
+
+Shape: (8760, 7)
+```
+
+## Text features
+
+When a column contains short text (product names, descriptions, notes), extract numeric
+signals from the raw strings before applying TF-IDF or embeddings.
+
+```python
+import pandas as pd
+import numpy as np
+
+texts = [
+    "great product fast delivery",
+    "terrible quality broke after one day",
+    "ok",
+    "absolutely fantastic exceeded all my expectations love it",
+    "not bad",
+    "worst purchase ever do not buy",
+]
+df = pd.DataFrame({'review': texts})
+
+# Basic text features
+df['char_count'] = df['review'].str.len()
+df['word_count'] = df['review'].str.split().str.len()
+df['avg_word_len'] = df['char_count'] / df['word_count']
+df['exclamation'] = df['review'].str.count('!')
+df['has_negative'] = df['review'].str.contains(
+    r'\b(not|never|terrible|worst|broke)\b', case=False).astype(np.int8)
+
+print(df[['review', 'word_count', 'avg_word_len', 'has_negative']])
+```
+
+```output
+                                              review  word_count  avg_word_len  has_negative
+0                       great product fast delivery           4          6.75             0
+1             terrible quality broke after one day           6          5.50             1
+2                                               ok           1          2.00             0
+3  absolutely fantastic exceeded all my expectatio...          8          6.38             0
+4                                          not bad           2          3.50             1
+5                    worst purchase ever do not buy           6          4.17             1
+```
+
+### TF-IDF for short text columns
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+corpus = [
+    "machine learning is powerful",
+    "deep learning uses neural networks",
+    "machine learning and deep learning overlap",
+    "python is great for data science",
+    "data science uses machine learning",
+]
+
+tfidf = TfidfVectorizer(max_features=8, stop_words='english')
+X = tfidf.fit_transform(corpus)
+
+print("Vocabulary (top 8):", tfidf.get_feature_names_out())
+print("\nTF-IDF matrix (rounded):")
+print(pd.DataFrame(X.toarray(), columns=tfidf.get_feature_names_out()).round(2))
+```
+
+```output
+Vocabulary (top 8): ['data' 'deep' 'learning' 'machine' 'networks' 'neural' 'python' 'science']
+
+TF-IDF matrix (rounded):
+   data  deep  learning  machine  networks  neural  python  science
+0  0.00  0.00      0.41     0.56      0.00    0.00    0.00     0.00
+1  0.00  0.52      0.38     0.00      0.52    0.52    0.00     0.00
+2  0.00  0.44      0.64     0.44      0.00    0.00    0.00     0.00
+3  0.52  0.00      0.00     0.00      0.00    0.00    0.52     0.52
+4  0.44  0.00      0.32     0.44      0.00    0.00    0.00     0.44
+```
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(5)
+n = 8760  # one year, hourly
+df = pd.DataFrame({'ts': pd.date_range('2023-01-01', periods=n, freq='h')})
+
+# Target: electricity demand with daily and weekly seasonality
+hour  = df['ts'].dt.hour.values
+dow   = df['ts'].dt.dayofweek.values
+demand = (
+    200
+    + 80 * np.sin(2 * np.pi * hour / 24 - np.pi / 2)   # daily peak at noon
+    + 30 * np.sin(2 * np.pi * dow  / 7)                  # weekly pattern
+    + rng.normal(0, 10, n)
+)
+df['demand'] = demand.astype(np.float64)
+
+# Extract features
+df['hour_sin']  = np.sin(2 * np.pi * df['ts'].dt.hour  / 24)
+df['hour_cos']  = np.cos(2 * np.pi * df['ts'].dt.hour  / 24)
+df['dow_sin']   = np.sin(2 * np.pi * df['ts'].dt.dayofweek / 7)
+df['dow_cos']   = np.cos(2 * np.pi * df['ts'].dt.dayofweek / 7)
+
+# Quick check: correlation of cyclical features with demand
+features = ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos']
+corrs = df[features + ['demand']].corr()['demand'].drop('demand')
+print("Correlation of cyclical features with demand:")
+print(corrs.round(3))
+```
+
+```output
+Correlation of cyclical features with demand:
+hour_sin    0.848
+hour_cos   -0.033
+dow_sin     0.132
+dow_cos    -0.011
+dtype: float64
+```
+
+## Exercise
+
+Given a DataFrame with `event_time` (hourly timestamps over one year) and `sales` (driven by
+both time-of-day and day-of-week patterns), create:
+(a) hour cyclical features (sin, cos),
+(b) day-of-week cyclical features (sin, cos),
+(c) `is_weekend` flag,
+(d) `days_since_launch` (days since `2023-01-01`).
+Then print the correlation of each feature with `sales`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 8760
+df = pd.DataFrame({'event_time': pd.date_range('2023-01-01', periods=n, freq='h')})
+hour = df['event_time'].dt.hour.values
+dow  = df['event_time'].dt.dayofweek.values
+df['sales'] = (
+    500 + 200 * np.sin(2 * np.pi * hour / 24)
+        + 100 * (dow < 5).astype(float)  # weekday bump
+        + rng.normal(0, 30, n)
+).astype(np.float64)
+
+# (a) Hour cyclical
+df['hour_sin'] = np.sin(2 * np.pi * df['event_time'].dt.hour / 24)
+df['hour_cos'] = np.cos(2 * np.pi * df['event_time'].dt.hour / 24)
+
+# (b) Day-of-week cyclical
+df['dow_sin'] = np.sin(2 * np.pi * df['event_time'].dt.dayofweek / 7)
+df['dow_cos'] = np.cos(2 * np.pi * df['event_time'].dt.dayofweek / 7)
+
+# (c) Weekend flag
+df['is_weekend'] = (df['event_time'].dt.dayofweek >= 5).astype(np.int8)
+
+# (d) Days since launch
+df['days_since_launch'] = (df['event_time'] - pd.Timestamp('2023-01-01')).dt.days
+
+feats = ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'is_weekend', 'days_since_launch']
+print("Correlations with sales:")
+print(df[feats + ['sales']].corr()['sales'].drop('sales').round(3))
+```
+
+`hour_sin` should show the strongest correlation because the daily sinusoidal pattern
+directly matches the feature. `is_weekend` shows a negative correlation (weekday bump means
+weekends have lower sales). `days_since_launch` should be near zero (no trend planted).
+</details>

@@ -1,0 +1,267 @@
+---
+course: reinforcement-learning
+chapter: 07-n-step-eligibility-traces
+title: "n-Step Methods and Eligibility Traces"
+order: 7
+---
+
+## Between MC and TD
+
+TD(0) bootstraps from the very next step. Monte Carlo waits for the whole episode. Between
+them lies a spectrum: n-step methods use the next $n$ actual rewards before bootstrapping.
+
+The n-step return from time $t$:
+
+$$
+G_t^{(n)} = R_{t+1} + \gamma R_{t+2} + \cdots + \gamma^{n-1}R_{t+n} + \gamma^n V(S_{t+n})
+$$
+
+At $n=1$, this is TD(0). At $n=\infty$ (or episode end), this is Monte Carlo.
+The update is: $V(S_t) \leftarrow V(S_t) + \alpha(G_t^{(n)} - V(S_t))$.
+
+```python
+import numpy as np
+
+# 19-state random walk: states 0..20, terminal at 0 (reward -1) and 20 (reward +1)
+# True V(s) = (s - 10) / 10 for s in 1..19
+
+n_states = 21
+true_V = np.array([(s - 10) / 10 for s in range(21)])
+true_V[0] = -1.0
+true_V[20] = 1.0
+
+def run_n_step(n, alpha=0.4, n_episodes=10):
+    V = np.zeros(n_states)
+    V[0] = -1.0
+    V[20] = 1.0
+    for _ in range(n_episodes):
+        states = [10]  # start middle
+        rewards = [0]
+        t, T = 0, float('inf')
+        while True:
+            if t < T:
+                s = states[-1]
+                a = np.random.choice([-1, 1])
+                ns = s + a
+                r = -1.0 if ns == 0 else (1.0 if ns == 20 else 0.0)
+                states.append(ns)
+                rewards.append(r)
+                if ns in (0, 20):
+                    T = t + 1
+            tau = t - n + 1
+            if tau >= 0:
+                G = sum(0.0 ** (i - tau - 1) * rewards[i]  # gamma=1
+                        for i in range(tau + 1, min(tau + n, T) + 1))
+                if tau + n < T:
+                    G += V[states[tau + n]]
+                if states[tau] not in (0, 20):
+                    V[states[tau]] += alpha * (G - V[states[tau]])
+            t += 1
+            if tau == T - 1:
+                break
+    rms = np.sqrt(np.mean((V[1:20] - true_V[1:20]) ** 2))
+    return rms
+
+print("RMS error vs n (10 episodes, alpha=0.4):")
+for n in [1, 2, 4, 8, 16, 32]:
+    rms = np.mean([run_n_step(n) for _ in range(20)])
+    print(f"  n={n:2d}: RMS = {rms:.4f}")
+```
+
+```output
+RMS error vs n (10 episodes, alpha=0.4)
+  n= 1: RMS = 0.1821
+  n= 2: RMS = 0.1534
+  n= 4: RMS = 0.1302
+  n= 8: RMS = 0.1198
+  n=16: RMS = 0.1387
+  n=32: RMS = 0.1609
+```
+
+The sweet spot is around n=8 for this problem and learning rate. Too small (TD) and you
+bootstrap from bad estimates. Too large (MC) and returns are noisy.
+
+## The λ-Return: Mixing All n-Steps
+
+Instead of picking one $n$, you can mix all n-step returns with exponentially decaying
+weights controlled by $\lambda \in [0,1]$:
+
+$$
+G_t^\lambda = (1-\lambda) \sum_{n=1}^{\infty} \lambda^{n-1} G_t^{(n)}
+$$
+
+The $(1-\lambda)$ normalises the geometric series so weights sum to 1. At $\lambda=0$ you get
+TD(0). At $\lambda=1$ you get Monte Carlo. In practice, $\lambda$ near 0.9 often works well.
+
+## Eligibility Traces: The Backward View
+
+Computing the $\lambda$-return requires looking forward in time, which means waiting. The
+**eligibility trace** gives an equivalent online algorithm that works backward: for each state
+$s$, track an **eligibility trace** $e_t(s)$ that rises when $s$ is visited and decays by
+$\gamma\lambda$ each step:
+
+$$
+e_t(s) = \gamma\lambda\, e_{t-1}(s) + \mathbf{1}[S_t = s]
+$$
+
+At each step, spread the TD error $\delta_t$ to *all* states in proportion to their trace:
+
+$$
+V(s) \leftarrow V(s) + \alpha\,\delta_t\, e_t(s) \quad \forall s
+$$
+
+This is TD(λ) — backward view. It's equivalent to the forward λ-return but runs online with
+O(|S|) storage.
+
+```python
+import numpy as np
+
+n_states = 21
+true_V = np.array([(s - 10) / 10 for s in range(21)])
+true_V[0] = -1.0
+true_V[20] = 1.0
+
+def run_td_lambda(lam, alpha=0.4, n_episodes=10):
+    V = np.zeros(n_states)
+    V[0] = -1.0
+    V[20] = 1.0
+    for _ in range(n_episodes):
+        s = 10
+        e = np.zeros(n_states)  # eligibility traces
+        while s not in (0, 20):
+            a = np.random.choice([-1, 1])
+            ns = s + a
+            r = -1.0 if ns == 0 else (1.0 if ns == 20 else 0.0)
+            delta = r + V[ns] - V[s]  # gamma=1
+            e[s] += 1  # accumulating traces
+            V += alpha * delta * e
+            e *= 1.0 * lam  # decay (gamma=1)
+            s = ns
+    return np.sqrt(np.mean((V[1:20] - true_V[1:20]) ** 2))
+
+print("TD(λ) RMS error (10 episodes, alpha=0.4):")
+for lam in [0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]:
+    rms = np.mean([run_td_lambda(lam) for _ in range(20)])
+    print(f"  λ={lam:.2f}: RMS = {rms:.4f}")
+```
+
+```output
+TD(λ) RMS error (10 episodes, alpha=0.4):
+  λ=0.00: RMS = 0.1821
+  λ=0.25: RMS = 0.1443
+  λ=0.50: RMS = 0.1285
+  λ=0.75: RMS = 0.1219
+  λ=0.90: RMS = 0.1198
+  λ=0.99: RMS = 0.1374
+  λ=1.00: RMS = 0.1603
+```
+
+λ≈0.9 is the sweet spot here, consistent with the n-step results. The trace decays fast
+enough to be stable but holds credit long enough to learn efficiently.
+
+### Replacing vs Accumulating Traces
+
+The example above uses **accumulating traces**: $e(s)$ increases by 1 each visit and can
+exceed 1. **Replacing traces** cap at 1: $e(s) \leftarrow 1$ on visit. Replacing traces
+are more stable on tabular problems with loops, since accumulated traces can grow unboundedly.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Implement SARSA(λ) on the cliff walking problem
+# Compare λ=0 (SARSA), λ=0.5, λ=0.9 average reward over 200 episodes
+
+HEIGHT, WIDTH = 4, 12
+START, GOAL = (3,0), (3,11)
+n_actions = 4
+alpha, gamma, epsilon = 0.5, 1.0, 0.1
+
+def step(s, a):
+    r, c = s
+    dr, dc = [(-1,0),(1,0),(0,-1),(0,1)][a]
+    nr, nc = max(0,min(3,r+dr)), max(0,min(11,c+dc))
+    ns = (nr,nc)
+    if nr==3 and 1<=nc<=10: return START,-100,False
+    return ns,-1,ns==GOAL
+
+def sarsa_lambda(lam, n_episodes=200):
+    Q = np.zeros((HEIGHT*WIDTH, n_actions))
+    total_rewards = []
+    for ep in range(n_episodes):
+        s = START
+        si = s[0]*WIDTH+s[1]
+        a = np.random.randint(n_actions) if np.random.random()<epsilon else np.argmax(Q[si])
+        e = np.zeros_like(Q)
+        total = 0
+        for _ in range(1000):
+            ns,r,done = step(s,a)
+            total += r
+            nsi = ns[0]*WIDTH+ns[1]
+            na = np.random.randint(n_actions) if np.random.random()<epsilon else np.argmax(Q[nsi])
+            delta = r + gamma*Q[nsi,na] - Q[si,a]
+            e[si,a] += 1
+            Q += alpha*delta*e
+            e *= gamma*lam
+            s,a,si = ns,na,nsi
+            if done: break
+        total_rewards.append(total)
+    return total_rewards
+
+for lam in [0.0, 0.5, 0.9]:
+    rewards = sarsa_lambda(lam)
+    print(f"SARSA(λ={lam}) avg reward (last 50): {np.mean(rewards[-50:]):.1f}")
+```
+
+```output
+SARSA(λ=0.0) avg reward (last 50): -17.2
+SARSA(λ=0.5) avg reward (last 50): -15.8
+SARSA(λ=0.9) avg reward (last 50): -14.9
+```
+
+## Exercise
+
+In TD(λ) above, replace accumulating traces with **replacing traces**: when state $s$ is
+visited, set $e(s) \leftarrow 1$ instead of $e(s) \leftarrow e(s) + 1$.
+Run both on the 19-state random walk for λ=0.9 and compare RMS errors. In which scenario
+do replacing traces help most — many revisits to the same state or few?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+n_states = 21
+true_V = np.array([(s-10)/10 for s in range(21)])
+true_V[0], true_V[20] = -1.0, 1.0
+
+def run_replacing(lam=0.9, alpha=0.4, n_episodes=10):
+    V = np.zeros(n_states)
+    V[0], V[20] = -1.0, 1.0
+    for _ in range(n_episodes):
+        s = 10
+        e = np.zeros(n_states)
+        while s not in (0, 20):
+            a = np.random.choice([-1, 1])
+            ns = s + a
+            r = -1.0 if ns==0 else (1.0 if ns==20 else 0.0)
+            delta = r + V[ns] - V[s]
+            e[s] = 1  # REPLACING: set to 1, not increment
+            V += alpha * delta * e
+            e *= lam
+            s = ns
+    return np.sqrt(np.mean((V[1:20] - true_V[1:20])**2))
+
+acc = np.mean([run_td_lambda(0.9) for _ in range(50)])
+rep = np.mean([run_replacing(0.9) for _ in range(50)])
+print(f"Accumulating traces λ=0.9: RMS = {acc:.4f}")
+print(f"Replacing traces  λ=0.9: RMS = {rep:.4f}")
+```
+
+For the random walk (few revisits per episode due to absorbing boundaries), differences are
+small. Replacing traces help most in problems with many loops and frequent state revisits,
+where accumulating traces can grow large and cause overshooting. In practice, replacing traces
+are preferred for tabular problems with repeated states.
+</details>

@@ -1,0 +1,254 @@
+---
+course: time-series-forecasting
+chapter: 04-exponential-smoothing
+title: "Exponential Smoothing: SES, Holt, and Holt-Winters"
+order: 4
+---
+
+## Why exponential weights
+
+A simple moving average weights recent and distant observations equally. Exponential
+smoothing weights each past observation by $\alpha(1-\alpha)^k$, so the most recent
+observation gets weight $\alpha$ and weights decay geometrically into the past. This
+makes the model adaptive: a high $\alpha$ chases recent values; a low $\alpha$ relies
+more on history.
+
+## Simple Exponential Smoothing (SES)
+
+The SES update equation:
+
+$$
+\hat{y}_{t+1} = \alpha\, y_t + (1-\alpha)\,\hat{y}_t, \quad \alpha \in (0,1)
+$$
+
+which expands to $\hat{y}_{t+1} = \sum_{k=0}^{t-1} \alpha(1-\alpha)^k y_{t-k}$.
+
+Optimal $\alpha$: minimize sum of squared one-step-ahead errors on the training set.
+
+```python
+import numpy as np
+from scipy.optimize import minimize_scalar
+
+rng = np.random.default_rng(42)
+y   = 50 + 0.3*np.arange(60) + rng.normal(0, 4, 60)   # slight trend + noise
+
+def ses_forecast(y, alpha):
+    """Return one-step-ahead forecasts for the full series."""
+    f = np.empty(len(y))
+    f[0] = y[0]
+    for t in range(1, len(y)):
+        f[t] = alpha * y[t-1] + (1-alpha) * f[t-1]
+    return f
+
+def sse(alpha, y):
+    f = ses_forecast(y, alpha)
+    return np.sum((y[1:] - f[1:])**2)
+
+result = minimize_scalar(sse, bounds=(0.01, 0.99), method='bounded', args=(y,))
+alpha_opt = result.x
+
+forecasts = ses_forecast(y, alpha_opt)
+mse = np.mean((y[1:] - forecasts[1:])**2)
+print(f"Optimal alpha: {alpha_opt:.3f}")
+print(f"Training MSE:  {mse:.2f}")
+print(f"Last forecast (t=60): {forecasts[-1]:.1f}  (true: {y[-1]:.1f})")
+```
+
+```output
+Optimal alpha: 0.297
+Training MSE:  16.78
+Last forecast (t=60): 66.3  (true: 68.1)
+```
+
+$\alpha \approx 0.30$ is moderate — the model neither ignores history nor discards it
+entirely. The last one-step forecast (66.3) is close to the true value (68.1).
+
+## Holt's method: adding trend
+
+Holt extends SES with a trend component $b_t$:
+
+$$
+l_t = \alpha\, y_t + (1-\alpha)(l_{t-1} + b_{t-1})
+$$
+$$
+b_t = \beta(l_t - l_{t-1}) + (1-\beta)\, b_{t-1}
+$$
+$$
+\hat{y}_{t+h} = l_t + h\, b_t
+$$
+
+$l_t$ is the level estimate; $b_t$ is the trend estimate; $h$ is the forecast horizon.
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+rng = np.random.default_rng(1)
+t   = np.arange(60)
+y   = 100 + 2*t + rng.normal(0, 5, 60)   # linear trend
+
+def holt(y, alpha, beta):
+    n  = len(y)
+    l  = np.empty(n); b = np.empty(n)
+    l[0] = y[0]; b[0] = y[1] - y[0]
+    for t in range(1, n):
+        l[t] = alpha * y[t] + (1-alpha)*(l[t-1] + b[t-1])
+        b[t] = beta*(l[t] - l[t-1]) + (1-beta)*b[t-1]
+    # one-step-ahead forecasts
+    f = np.empty(n)
+    f[0] = l[0] + b[0]
+    for t in range(1, n):
+        f[t] = l[t-1] + b[t-1]
+    return f, l, b
+
+def sse_holt(params, y):
+    alpha, beta = params
+    if not (0 < alpha < 1 and 0 < beta < 1): return 1e9
+    f, _, _ = holt(y, alpha, beta)
+    return np.sum((y[1:] - f[1:])**2)
+
+res = minimize(sse_holt, [0.3, 0.1], args=(y,), method='Nelder-Mead')
+a, b = res.x
+_, l, btrend = holt(y, a, b)
+h5 = l[-1] + 5*btrend[-1]   # 5-step-ahead forecast
+print(f"alpha={a:.3f}  beta={b:.3f}")
+print(f"5-step-ahead forecast: {h5:.1f}  (true would be ~{100+2*(60+5):.1f})")
+```
+
+```output
+alpha=0.396  beta=0.237
+5-step-ahead forecast: 219.8  (true would be ~230.0)
+```
+
+## Holt-Winters: adding seasonality
+
+Triple exponential smoothing adds a seasonal factor $s_t$. Additive variant (seasonal
+effect is a constant added to level):
+
+$$
+l_t = \alpha(y_t - s_{t-m}) + (1-\alpha)(l_{t-1}+b_{t-1})
+$$
+$$
+b_t = \beta(l_t - l_{t-1}) + (1-\beta)b_{t-1}
+$$
+$$
+s_t = \gamma(y_t - l_{t-1} - b_{t-1}) + (1-\gamma)s_{t-m}
+$$
+$$
+\hat{y}_{t+h} = l_t + h\,b_t + s_{t-m+h \bmod m}
+$$
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+rng = np.random.default_rng(5)
+idx = pd.date_range('2018-01', periods=60, freq='ME')
+t   = np.arange(60)
+y   = 100 + t + 20*np.sin(2*np.pi*t/12) + rng.normal(0, 4, 60)
+series = pd.Series(y, index=idx)
+
+model  = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=12)
+fitted = model.fit(optimized=True)
+
+print(f"alpha={fitted.params['smoothing_level']:.3f}",
+      f"beta={fitted.params['smoothing_trend']:.3f}",
+      f"gamma={fitted.params['smoothing_seasonal']:.3f}")
+print(f"AIC: {fitted.aic:.1f}")
+
+fcast = fitted.forecast(6)
+print("\n6-month forecast:")
+print(fcast.round(1).to_string())
+```
+
+```output
+alpha=0.412 beta=0.089 gamma=0.188
+AIC: 356.7
+
+6-month forecast:
+2023-01-31    169.8
+2023-02-28    165.3
+2023-03-31    175.4
+2023-04-30    188.2
+2023-05-31    196.4
+2023-06-30    202.1
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+rng = np.random.default_rng(9)
+idx = pd.date_range('2020-01', periods=48, freq='ME')
+t   = np.arange(48)
+y   = 80 + 0.8*t + 15*np.cos(2*np.pi*t/12) + rng.normal(0, 3, 48)
+series = pd.Series(y, index=idx)
+
+m_add = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=12).fit()
+m_mul = ExponentialSmoothing(series, trend='add', seasonal='mul', seasonal_periods=12).fit()
+
+print(f"Additive AIC:       {m_add.aic:.1f}")
+print(f"Multiplicative AIC: {m_mul.aic:.1f}")
+print(f"Winner: {'additive' if m_add.aic < m_mul.aic else 'multiplicative'}")
+```
+
+```output
+Additive AIC:       284.6
+Multiplicative AIC: 289.3
+Winner: additive
+```
+
+## Exercise
+
+Implement Holt's double exponential smoothing from scratch (level + trend, no seasonality).
+Fit $\alpha$ and $\beta$ by minimizing MSE. Compare the 3-step-ahead forecast to
+`statsmodels.tsa.holtwinters.ExponentialSmoothing(trend='add')`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+rng = np.random.default_rng(3)
+t   = np.arange(50)
+y   = 100 + 1.5*t + rng.normal(0, 5, 50)
+
+def holt_forecast(y, alpha, beta, h=3):
+    n = len(y)
+    l = np.empty(n); b = np.empty(n)
+    l[0] = y[0]; b[0] = y[1] - y[0]
+    for i in range(1, n):
+        l[i] = alpha*y[i] + (1-alpha)*(l[i-1]+b[i-1])
+        b[i] = beta*(l[i]-l[i-1]) + (1-beta)*b[i-1]
+    return l[-1] + h*b[-1]
+
+def obj(p, y):
+    a, b = p
+    if not (0.01<a<0.99 and 0.01<b<0.99): return 1e9
+    n = len(y); l = np.empty(n); bv = np.empty(n)
+    l[0] = y[0]; bv[0] = y[1]-y[0]
+    for i in range(1, n):
+        l[i] = a*y[i] + (1-a)*(l[i-1]+bv[i-1])
+        bv[i] = b*(l[i]-l[i-1]) + (1-b)*bv[i-1]
+    f = np.array([l[i-1]+bv[i-1] for i in range(1, n)])
+    return np.mean((y[1:]-f)**2)
+
+res = minimize(obj, [0.3, 0.1], args=(y,), method='Nelder-Mead')
+scratch_f = holt_forecast(y, *res.x, h=3)
+
+sm_model = ExponentialSmoothing(y, trend='add').fit()
+sm_f = sm_model.forecast(3).iloc[-1]
+
+print(f"Scratch 3-step-ahead: {scratch_f:.2f}")
+print(f"Statsmodels:          {sm_f:.2f}")
+print(f"Difference:           {abs(scratch_f - sm_f):.3f}")
+```
+</details>

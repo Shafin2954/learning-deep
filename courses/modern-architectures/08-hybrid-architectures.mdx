@@ -1,0 +1,217 @@
+---
+course: modern-architectures
+chapter: 08-hybrid-architectures
+title: "Hybrids: Jamba, Samba, and Nemotron"
+order: 8
+---
+
+## Why pure SSMs aren't enough
+
+Mamba handles long-range dependencies efficiently, but recall tasks expose its weakness.
+When a model needs to copy a specific token seen thousands of steps ago — "induction heads"
+in mechanistic-interpretability terms — pure SSMs underperform attention. Attention can
+directly look up a key-value pair anywhere in its context window; an SSM must compress
+everything into a fixed-size state vector.
+
+The practical result: SSM-only models lag transformers on tasks like multi-step reasoning,
+long-context question answering, and associative recall. The fix is not to abandon SSMs
+but to mix them with a small number of attention layers placed strategically.
+
+## The hybrid design space
+
+Three questions define a hybrid:
+
+1. **Which layers are attention vs SSM?** Uniform interleaving (every 4th layer) or front/back loading?
+2. **What kind of attention?** Full attention, sliding-window, or grouped-query?
+3. **Is MoE in the mix?** Some hybrids also replace dense FFNs with sparse expert layers.
+
+The design tradeoff is always throughput vs quality at long context. Full attention
+layers are expensive at O(n²) but essential for recall; SSM layers are O(n) and handle
+local pattern matching well.
+
+## Jamba: Mamba + Attention + MoE
+
+Jamba (AI21 Labs, 2024) interleaves Mamba layers, full attention layers, and MoE FFN
+layers in a ratio of roughly 7 Mamba : 1 Attention : 8 MoE experts. With 52B total
+parameters but only 12B active at inference time (top-2 routing from 16 experts), Jamba
+fits on a single 80GB A100 at 256K context length — something no same-quality Transformer
+can do.
+
+Key observation from the Jamba ablations: replacing even one attention layer in the
+middle of a long SSM stack with full attention recovers most of the quality gap on
+recall benchmarks.
+
+## Samba: Mamba + Sliding-Window Attention
+
+Samba (Microsoft, 2024) takes a more conservative approach: every other layer is a Mamba
+block and every other is a sliding-window attention layer (window size 2048). The
+sliding window is cheaper than full attention but still gives the model a precise local
+lookback. For tasks where the needle is always within 2K tokens of the haystack,
+Samba matches full-attention quality.
+
+## Nemotron and Zamba
+
+Nemotron (NVIDIA) experiments with a 1:4 ratio — one full-attention layer every four
+Mamba layers. Zamba uses a single shared attention layer that appears at multiple
+depths via weight sharing, dramatically reducing the parameter cost of attention.
+
+The emerging consensus from ablations across all of these: **one attention layer per
+4 SSM layers** recovers the recall quality of a full transformer while preserving
+most of the SSM's throughput advantage at long context.
+
+## Throughput comparison
+
+| Model type | Active params | Context (practical) | Relative throughput |
+|------------|--------------|---------------------|---------------------|
+| Transformer | 100% | ~8K (KV-cache limited) | 1× |
+| Pure Mamba | 100% | Unlimited | ~2.5× |
+| Jamba-style hybrid | ~25% (MoE) | 256K | ~1.8× |
+| Samba (SWA) | 100% | 32K | ~2.0× |
+
+Throughput advantage grows with sequence length; at 512 tokens hybrids offer little
+benefit, at 64K the SSM layers make the difference.
+
+## Building a minimal hybrid block
+
+```python
+import torch
+import torch.nn as nn
+
+class SSMLayer(nn.Module):
+    """Minimal stand-in for an SSM (real Mamba uses a selective scan CUDA kernel)."""
+    def __init__(self, d_model):
+        super().__init__()
+        self.proj_in  = nn.Linear(d_model, d_model * 2)
+        self.proj_out = nn.Linear(d_model, d_model)
+        self.norm     = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # x: (B, T, d_model)
+        gate, val = self.proj_in(x).chunk(2, dim=-1)
+        return self.proj_out(torch.sigmoid(gate) * val) + x
+
+class AttentionLayer(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        T = x.size(1)
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        out, _ = self.attn(x, x, x, attn_mask=mask)
+        return self.norm(x + out)
+
+class HybridBlock(nn.Module):
+    """Interleave SSM and attention: 3 SSM layers then 1 attention layer."""
+    def __init__(self, d_model=128, n_heads=4, n_ssm=3):
+        super().__init__()
+        self.ssm_layers = nn.ModuleList([SSMLayer(d_model) for _ in range(n_ssm)])
+        self.attn_layer = AttentionLayer(d_model, n_heads)
+
+    def forward(self, x):
+        for ssm in self.ssm_layers:
+            x = ssm(x)
+        return self.attn_layer(x)
+
+# Test
+B, T, D = 2, 64, 128
+x = torch.randn(B, T, D)
+model = HybridBlock(d_model=D, n_heads=4, n_ssm=3)
+out = model(x)
+print(out.shape)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Parameters: {total_params:,}")
+```
+
+```output
+torch.Size([2, 64, 128])
+Parameters: 263,424
+```
+
+The 3:1 SSM-to-attention ratio matches the practical consensus. You can stack multiple
+`HybridBlock`s to build a full hybrid model. The attention layer adds disproportionate
+quality for a small fraction of total parameters.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+class MinimalSSM(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.gate = nn.Linear(d, d)
+        self.val  = nn.Linear(d, d)
+    def forward(self, x):
+        return torch.sigmoid(self.gate(x)) * self.val(x)
+
+class MinimalAttn(nn.Module):
+    def __init__(self, d, h):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d, h, batch_first=True)
+    def forward(self, x):
+        out, _ = self.mha(x, x, x)
+        return out
+
+# Build a stack: 4 SSM, then 1 attention, then 4 SSM
+d = 64
+layers = nn.Sequential(*[MinimalSSM(d) for _ in range(4)])
+attn   = MinimalAttn(d, 4)
+
+x = torch.randn(2, 32, d)
+h = layers(x)
+h = attn(h)
+h = layers(h)   # second SSM block
+print("output shape:", h.shape)
+print("non-zero grad params:", sum(p.numel() for p in list(layers.parameters()) + list(attn.parameters())))
+```
+
+```output
+output shape: torch.Size([2, 32, 64])
+non-zero grad params: 33792
+```
+
+## Exercise
+
+Modify `HybridBlock` to accept an `attn_ratio` argument (default 4 meaning 1 attention
+per 4 SSM layers) and a `use_attention` flag to toggle between pure SSM and hybrid mode.
+Count total parameters in each configuration for `d_model=256`, `n_layers=12`.
+How much do the attention layers contribute as a fraction of total parameters?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch.nn as nn
+
+class FlexibleSSM(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.p = nn.Linear(d, d * 2)
+        self.o = nn.Linear(d, d)
+    def forward(self, x):
+        g, v = self.p(x).chunk(2, -1)
+        return self.o(g.sigmoid() * v) + x
+
+class FlexHybrid(nn.Module):
+    def __init__(self, d=256, n_layers=12, attn_ratio=4, use_attention=True):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            if use_attention and (i + 1) % attn_ratio == 0:
+                self.layers.append(nn.MultiheadAttention(d, 4, batch_first=True))
+            else:
+                self.layers.append(FlexibleSSM(d))
+
+pure  = FlexHybrid(use_attention=False)
+hybrid = FlexHybrid(use_attention=True)
+print(f"Pure SSM params:  {sum(p.numel() for p in pure.parameters()):,}")
+print(f"Hybrid params:    {sum(p.numel() for p in hybrid.parameters()):,}")
+```
+
+Attention layers add roughly 15–20% more parameters but recover most of the quality
+gap on recall benchmarks. This asymmetry — small parameter cost, large quality gain —
+is why hybrids dominate pure SSMs in practice.
+</details>

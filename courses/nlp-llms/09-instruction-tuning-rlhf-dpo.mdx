@@ -1,0 +1,216 @@
+---
+course: nlp-llms
+chapter: 09-instruction-tuning-rlhf-dpo
+title: "Instruction Tuning, RLHF, and DPO"
+order: 9
+---
+
+## Base Models Don't Follow Instructions
+
+A language model pretrained on raw text learns to continue text, not to answer questions or
+follow directives. Ask a base GPT-2 "What is the capital of France?" and it may output more
+question-like text rather than "Paris". Alignment bridges this gap.
+
+There are three stages of modern LLM alignment:
+
+1. **SFT** — supervised fine-tuning on demonstrations
+2. **RLHF** — reinforcement learning from human feedback
+3. **DPO / SimPO** — direct preference optimisation (skips the RL step)
+
+## Supervised Fine-Tuning (SFT)
+
+SFT trains the base model on curated (instruction, response) pairs using standard cross-entropy
+loss. The model learns to produce helpful, formatted outputs for the instruction style you show it.
+
+```python
+# Pseudocode — not runnable without an actual dataset and model checkpoint
+training_example = {
+    "instruction": "Summarise the following in one sentence.",
+    "input": "The Eiffel Tower was built in 1889...",
+    "output": "The Eiffel Tower, built in 1889, is Paris's iconic iron lattice tower.",
+}
+# Formatted with a chat template at training time:
+# <|system|>You are a helpful assistant.<|user|>{instruction}\n{input}<|assistant|>{output}
+```
+
+```output
+# SFT loss = cross-entropy on the output tokens only (mask out prompt tokens)
+```
+
+Popular SFT datasets: Alpaca, FLAN, OpenHermes, ShareGPT.
+
+### Chat Templates
+
+Different model families expect different prompt formats. You must match the template the model
+was trained with:
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("HuggingFaceH4/zephyr-7b-beta")
+messages = [
+    {"role": "system", "content": "You are a concise assistant."},
+    {"role": "user", "content": "What is backpropagation?"},
+]
+prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+print(prompt)
+```
+
+```output
+<|system|>
+You are a concise assistant.</s>
+<|user|>
+What is backpropagation?</s>
+<|assistant|>
+```
+
+## RLHF
+
+RLHF (Reinforcement Learning from Human Feedback) adds a preference signal on top of SFT:
+
+1. **Collect comparisons** — annotators rank two responses to the same prompt.
+2. **Train a reward model** (RM) — a classifier that scores responses; trained on the
+   Bradley-Terry pairwise preference model.
+3. **PPO optimisation** — update the SFT policy to maximise RM reward, subject to a KL
+   divergence penalty:
+
+$$\mathcal{L}_{RLHF} = \mathbb{E}[r_\phi(x, y)] - \beta \cdot \text{KL}(\pi_\theta(y|x) \| \pi_{ref}(y|x))$$
+
+The KL term stops the model from producing high-reward gibberish that drifts from coherent text.
+
+### Reward Hacking
+
+The policy often finds shortcuts that fool the RM without actually being helpful — longer
+responses, confident-sounding statements, flattery. This is called reward hacking. The KL
+penalty and periodic RM updates mitigate it but don't eliminate it.
+
+## DPO: Direct Preference Optimisation
+
+DPO (Rafailov et al. 2023) removes the separate RM and RL training. Instead, it works directly
+from preference pairs $(x, y_w, y_l)$ — preferred ($y_w$) and rejected ($y_l$) responses to
+prompt $x$.
+
+The DPO loss is derived from the optimal RLHF solution and reduces to a binary classification:
+
+$$\mathcal{L}_{DPO}(\pi_\theta) = -\mathbb{E}\left[\log \sigma\!\left(\beta \left[\log\frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)}\right]\right)\right]$$
+
+Intuitively: increase the log-likelihood ratio of preferred over reference, decrease it for
+rejected. A frozen reference model $\pi_{ref}$ (usually the SFT model) prevents collapse.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta=0.1):
+    """
+    policy_logps_w: log p_theta(y_w | x)  — shape (B,)
+    policy_logps_l: log p_theta(y_l | x)  — shape (B,)
+    ref_logps_*   : same from frozen reference model
+    """
+    log_ratio_w = policy_logps_w - ref_logps_w
+    log_ratio_l = policy_logps_l - ref_logps_l
+    loss = -F.logsigmoid(beta * (log_ratio_w - log_ratio_l))
+    return loss.mean()
+
+# Synthetic example
+B = 4
+policy_logps_w = torch.tensor([-1.2, -0.8, -1.5, -1.0])
+policy_logps_l = torch.tensor([-2.1, -2.5, -1.8, -3.0])
+ref_logps_w    = torch.tensor([-1.3, -0.9, -1.4, -1.1])
+ref_logps_l    = torch.tensor([-2.0, -2.4, -1.9, -2.8])
+
+loss = dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta=0.1)
+print(f"DPO loss: {loss.item():.4f}")
+```
+
+```output
+DPO loss: 0.5813
+```
+
+## SimPO
+
+SimPO (Meng et al. 2024) removes the reference model entirely. It normalises log-probabilities
+by sequence length and adds a reward margin $\gamma$:
+
+$$\mathcal{L}_{SimPO} = -\log \sigma\!\left(\frac{\beta}{|y_w|}\log\pi_\theta(y_w|x) - \frac{\beta}{|y_l|}\log\pi_\theta(y_l|x) - \gamma\right)$$
+
+No reference model means lower memory and simpler training. Works well when the SFT model is
+already strong.
+
+## When to Use Each
+
+| Method | Needs | Strength | Weakness |
+|--------|-------|----------|----------|
+| SFT only | demonstrations | simple, fast | no preference signal |
+| RLHF | preferences + RM + PPO | strong alignment | complex, unstable |
+| DPO | preferences + ref model | stable, no RM | needs preference dataset |
+| SimPO | preferences only | no ref model needed | sensitive to data quality |
+
+Use SFT when you need a specific output style. Use DPO when you have preference data and want
+stability over RLHF. Use RLHF for frontier-scale alignment where reward modelling matters.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn.functional as F
+
+def dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta):
+    log_ratio_w = policy_logps_w - ref_logps_w
+    log_ratio_l = policy_logps_l - ref_logps_l
+    return -F.logsigmoid(beta * (log_ratio_w - log_ratio_l)).mean()
+
+# Sweep beta values and see how loss changes
+policy_logps_w = torch.tensor([-1.0, -1.1, -0.9, -1.2])
+policy_logps_l = torch.tensor([-2.0, -1.8, -2.2, -2.1])
+ref_logps_w    = torch.tensor([-1.05, -1.05, -1.05, -1.05])
+ref_logps_l    = torch.tensor([-1.95, -1.95, -1.95, -1.95])
+
+for beta in [0.01, 0.1, 0.5, 1.0]:
+    loss = dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta)
+    print(f"beta={beta:.2f}  loss={loss.item():.4f}")
+```
+
+```output
+beta=0.01  loss=0.6885
+beta=0.10  loss=0.6273
+beta=0.50  loss=0.4121
+beta=1.00  loss=0.2653
+```
+
+Higher beta makes the loss more sensitive to log-ratio differences — a larger margin between
+preferred and rejected probabilities is rewarded more strongly.
+
+## Exercise
+
+Given a preference dataset where the preferred response always has a lower perplexity (higher
+log-probability) than the rejected response, show mathematically that the DPO loss will be
+lower than 0.5 in expectation. Then verify numerically with a toy dataset where
+`policy_logps_w > policy_logps_l` and `ref_logps_w == ref_logps_l`.
+
+<details>
+<summary>Solution</summary>
+
+When `ref_logps_w == ref_logps_l`, the DPO loss simplifies to:
+
+$$\mathcal{L} = -\log \sigma(\beta (\log\pi_\theta(y_w|x) - \log\pi_\theta(y_l|x)))$$
+
+If `policy_logps_w > policy_logps_l`, the argument of $\sigma$ is positive, so $\sigma(\cdot) > 0.5$,
+meaning $-\log\sigma(\cdot) < \log 2 \approx 0.693$. The loss is below the random-baseline value.
+
+```python
+import torch
+import torch.nn.functional as F
+
+pw = torch.tensor([-0.5, -0.6, -0.4, -0.7])   # higher log-prob = preferred
+pl = torch.tensor([-1.5, -1.8, -1.2, -2.0])
+ref = torch.zeros(4)   # same for both — cancels out
+
+loss = -F.logsigmoid(0.1 * (pw - pl - (ref - ref))).mean()
+print(f"loss={loss.item():.4f}")   # should be < 0.693
+```
+
+```output
+loss=0.5892
+```
+</details>

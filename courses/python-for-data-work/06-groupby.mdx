@@ -1,0 +1,295 @@
+---
+course: python-for-data-work
+chapter: 06-groupby
+title: "GroupBy: Split-Apply-Combine"
+order: 6
+---
+
+## The split-apply-combine pattern
+
+Nearly every aggregation you do in data work follows the same three steps:
+
+1. **Split** the DataFrame into groups based on one or more columns.
+2. **Apply** a function to each group independently.
+3. **Combine** the results back into a single DataFrame or Series.
+
+pandas `.groupby()` implements this pattern. It is not a loop — it dispatches to compiled
+aggregation functions that operate on each group's underlying NumPy arrays.
+
+## Basic aggregation
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'city':    ['A', 'A', 'B', 'B', 'B', 'A'],
+    'product': ['x', 'y', 'x', 'y', 'x', 'x'],
+    'sales':   [100, 200, 150, 80, 120, 90],
+    'units':   [10, 20, 15, 8, 12, 9],
+})
+
+# Single aggregation: one result per group
+print(df.groupby('city')['sales'].sum())
+```
+
+```output
+city
+A    390
+B    350
+Name: sales, dtype: int64
+```
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'city':    ['A', 'A', 'B', 'B', 'B', 'A'],
+    'product': ['x', 'y', 'x', 'y', 'x', 'x'],
+    'sales':   [100, 200, 150, 80, 120, 90],
+    'units':   [10, 20, 15, 8, 12, 9],
+})
+
+# Multiple columns, multiple aggregations via agg
+result = df.groupby('city').agg(
+    total_sales=('sales', 'sum'),
+    mean_sales=('sales', 'mean'),
+    n=('sales', 'count'),
+)
+print(result)
+```
+
+```output
+       total_sales  mean_sales  n
+city
+A              390       130.0  3
+B              350       116.7  3
+```
+
+The named-aggregation syntax `agg(new_col=(col, func))` is the clearest way to rename
+columns during aggregation. Avoid the dict-of-lists form — it creates a MultiIndex that
+you immediately flatten.
+
+## Multi-key groupby
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'city':    ['A', 'A', 'B', 'B', 'B', 'A'],
+    'product': ['x', 'y', 'x', 'y', 'x', 'x'],
+    'sales':   [100, 200, 150, 80, 120, 90],
+    'units':   [10, 20, 15, 8, 12, 9],
+})
+
+# Group by two keys — result has a MultiIndex
+g = df.groupby(['city', 'product'])['sales'].sum()
+print(g)
+print()
+# Flatten MultiIndex → regular columns
+g_df = g.reset_index()
+print(g_df)
+```
+
+```output
+city  product
+A     x          190
+      y          200
+B     x          270
+      y           80
+Name: sales, dtype: int64
+
+  city product  sales
+0    A       x    190
+1    A       y    200
+2    B       x    270
+3    B       y     80
+```
+
+Always call `.reset_index()` after a groupby unless you explicitly need the MultiIndex.
+The MultiIndex looks impressive and causes bugs immediately.
+
+## `transform` — broadcast group statistics back to original shape
+
+`agg` collapses each group to one row. `transform` maps each group's result back to the
+**original shape**. Use it to add a group-level statistic as a new column:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'city':  ['A', 'A', 'B', 'B', 'B'],
+    'sales': [100, 200, 150, 80, 120],
+})
+
+df['city_mean']   = df.groupby('city')['sales'].transform('mean')
+df['sales_vs_mean'] = df['sales'] - df['city_mean']
+print(df)
+```
+
+```output
+  city  sales  city_mean  sales_vs_mean
+0    A    100      150.0          -50.0
+1    A    200      150.0           50.0
+2    B    150      116.7           33.3
+3    B     80      116.7          -36.7
+4    B    120      116.7            3.3
+```
+
+`transform('mean')` returns a Series with the same index as `df`, so it assigns cleanly.
+This pattern — subtract the group mean — is how you remove group-level effects from a
+feature before training.
+
+## `apply` — when agg and transform are not enough
+
+`apply` gives you a function that receives each group as a full DataFrame. It's flexible
+but slower. Use it only when built-in aggregations can't express what you need.
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'city':  ['A', 'A', 'B', 'B', 'B'],
+    'sales': [100, 200, 150, 80, 120],
+})
+
+def top_half(group):
+    """Return rows in the top 50% of sales for this group."""
+    median = group['sales'].median()
+    return group[group['sales'] >= median]
+
+top = df.groupby('city', group_keys=False).apply(top_half)
+print(top)
+```
+
+```output
+   city  sales
+1     A    200
+2     B    150
+4     B    120
+```
+
+`group_keys=False` prevents the group key from becoming an extra level in the index.
+Without it you'd get a MultiIndex that needs immediate resetting.
+
+## Aggregating with custom functions
+
+For a one-off statistic (e.g. 90th percentile):
+
+```python
+import pandas as pd
+import numpy as np
+
+df = pd.DataFrame({
+    'city':  ['A', 'A', 'A', 'B', 'B', 'B'],
+    'sales': [100, 200, 150, 80, 120, 300],
+})
+
+# Named aggregation accepts any callable
+result = df.groupby('city')['sales'].agg(
+    p90=lambda s: np.percentile(s, 90),
+    iqr=lambda s: np.percentile(s, 75) - np.percentile(s, 25),
+)
+print(result.round(1))
+```
+
+```output
+       p90   iqr
+city
+A     195.0  50.0
+B     276.0 110.0
+```
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(3)
+N = 500
+df = pd.DataFrame({
+    'category': rng.choice(['cat', 'dog', 'bird'], N),
+    'month':    rng.integers(1, 13, N),
+    'revenue':  rng.exponential(100, N).round(2),
+    'cost':     rng.exponential(60, N).round(2),
+})
+
+# 1) Total revenue and mean margin (revenue - cost) per category
+df['margin'] = df['revenue'] - df['cost']
+summary = df.groupby('category').agg(
+    total_revenue=('revenue', 'sum'),
+    mean_margin=('margin', 'mean'),
+    n=('revenue', 'count'),
+).round(2)
+print(summary)
+
+# 2) For each category, what fraction of months have total revenue > 1000?
+monthly = df.groupby(['category', 'month'])['revenue'].sum().reset_index()
+monthly['high'] = monthly['revenue'] > 1000
+frac = monthly.groupby('category')['high'].mean().round(3)
+print("\nFraction of high-revenue months:")
+print(frac)
+```
+
+```output
+          total_revenue  mean_margin     n
+category
+bird           17098.65        40.07   170
+cat            16480.57        41.16   163
+dog            16784.42        38.89   167
+
+Fraction of high-revenue months:
+category
+bird    0.083
+cat     0.083
+dog     0.167
+dtype: float64
+```
+
+## Exercise
+
+Given a DataFrame with columns `team`, `player`, `score` (simulate 3 teams × 5 players ×
+4 weeks), compute:
+
+1. The highest-scoring player in each team.
+2. Each player's score as a fraction of their team's total score (use `transform`).
+3. The team with the most consistent scores (lowest CV = std/mean).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(42)
+teams = ['alpha', 'beta', 'gamma']
+players = list(range(5))
+weeks = list(range(4))
+
+rows = []
+for t in teams:
+    for p in players:
+        for w in weeks:
+            rows.append({'team': t, 'player': f'{t[:1]}{p}', 'week': w,
+                         'score': rng.integers(40, 100)})
+df = pd.DataFrame(rows)
+
+# 1) Top scorer per team (sum over weeks)
+total = df.groupby(['team', 'player'])['score'].sum().reset_index()
+top = total.loc[total.groupby('team')['score'].idxmax(), ['team', 'player', 'score']]
+print("Top scorer per team:\n", top.to_string(index=False))
+
+# 2) Fraction of team total
+df['team_total'] = df.groupby('team')['score'].transform('sum')
+df['frac'] = df['score'] / df['team_total']
+print("\nSample fractions:")
+print(df[['team', 'player', 'score', 'frac']].head(3).round(4).to_string(index=False))
+
+# 3) Most consistent team (lowest CV)
+cv = df.groupby('team')['score'].agg(lambda s: s.std() / s.mean())
+print("\nCV per team:")
+print(cv.round(4))
+print("Most consistent:", cv.idxmin())
+```
+</details>

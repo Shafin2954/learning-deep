@@ -1,0 +1,331 @@
+---
+course: graph-ml
+chapter: 03-node-embeddings-deepwalk
+title: "Node Embeddings: DeepWalk and node2vec"
+order: 3
+---
+
+## The distributional hypothesis on graphs
+
+In NLP, words that appear in similar contexts have similar meanings. Graphs have an analog:
+nodes that appear in similar neighborhoods should have similar embeddings. DeepWalk formalizes
+this by generating random walks on the graph and treating each walk as a sentence, then
+running Word2Vec on those sentences to learn node vectors.
+
+The goal is a mapping $f: V \rightarrow \mathbb{R}^d$ that places structurally similar nodes
+close together in $\mathbb{R}^d$.
+
+## DeepWalk: random walks as sentences
+
+A random walk of length $L$ starting at node $v_0$: at each step, move to a uniformly random
+neighbor. Repeat $r$ walks per node. Collect all walks; treat each as a sentence where nodes
+are words. Train Skip-gram with negative sampling: for a center node $v$, predict its context
+nodes within window $w$.
+
+```python
+import networkx as nx
+import numpy as np
+import random
+from collections import defaultdict
+
+def random_walk(G, start, length):
+    walk = [start]
+    for _ in range(length - 1):
+        neighbors = list(G.neighbors(walk[-1]))
+        if not neighbors:
+            break
+        walk.append(random.choice(neighbors))
+    return walk
+
+G = nx.karate_club_graph()
+walks = []
+for node in G.nodes():
+    for _ in range(10):          # 10 walks per node
+        walks.append(random_walk(G, node, length=20))
+
+print(f"Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
+print(f"Total walks: {len(walks)}")
+print(f"Example walk: {walks[0][:8]}...")
+```
+
+```output
+Nodes: 34, Edges: 78
+Total walks: 340
+Example walk: [0, 1, 30, 33, 32, 15, 33, 9]...
+```
+
+### Skip-gram training on walks
+
+The Skip-gram objective: for each node $u$ in a walk, maximize the probability of observing
+its context nodes $v$ within window $w$:
+
+$$
+\max_f \sum_{u \in V} \left[ -\log Z_u + \sum_{v \in N_S(u)} f(v) \cdot f(u) \right]
+$$
+
+With negative sampling, this becomes a binary classification problem per (center, context) pair.
+
+```python
+from gensim.models import Word2Vec
+
+# Convert node IDs to strings (gensim expects strings)
+str_walks = [[str(n) for n in walk] for walk in walks]
+
+model = Word2Vec(
+    sentences=str_walks,
+    vector_size=64,
+    window=5,
+    min_count=0,
+    sg=1,           # Skip-gram
+    negative=5,
+    epochs=10,
+    workers=1,
+    seed=42,
+)
+
+embeddings = {int(node): model.wv[str(node)] for node in G.nodes()}
+print(f"Embedding shape per node: {embeddings[0].shape}")
+
+# Cosine similarity between node 0 and its neighbors
+from numpy.linalg import norm
+
+def cosine(a, b):
+    return np.dot(a, b) / (norm(a) * norm(b))
+
+sim_to_neighbor = cosine(embeddings[0], embeddings[1])
+sim_to_far = cosine(embeddings[0], embeddings[33])
+print(f"Similarity 0↔1 (connected):    {sim_to_neighbor:.3f}")
+print(f"Similarity 0↔33 (far/rival):   {sim_to_far:.3f}")
+```
+
+```output
+Embedding shape per node: (64,)
+Similarity 0↔1 (connected):    0.847
+Similarity 0↔33 (far/rival):   0.312
+```
+
+## node2vec: biased walks
+
+DeepWalk's uniform random walks capture a mix of local and global structure. node2vec lets you
+control this with two parameters:
+
+- **$p$ (return parameter)**: probability of returning to the previous node. High $p$ → less
+  backtracking → more exploration.
+- **$q$ (in-out parameter)**: controls BFS vs DFS bias. Low $q$ → walk prefers distant nodes
+  (DFS, captures structural roles). High $q$ → walk prefers nearby nodes (BFS, captures
+  community/homophily).
+
+### The biased transition probability
+
+If the walk just came from $t$ to $v$, the transition probability to neighbor $x$ of $v$ is:
+
+$$
+\pi_{vx} \propto \alpha_{pq}(t, x) \cdot w_{vx}
+$$
+
+where:
+
+$$
+\alpha_{pq}(t, x) = \begin{cases}
+1/p & \text{if } d_{tx} = 0 \quad (\text{return to } t) \\
+1   & \text{if } d_{tx} = 1 \quad (\text{common neighbor}) \\
+1/q & \text{if } d_{tx} = 2 \quad (\text{move further out})
+\end{cases}
+$$
+
+```python
+def node2vec_walk(G, start, length, p=1.0, q=1.0):
+    walk = [start]
+    prev = None
+    for _ in range(length - 1):
+        cur = walk[-1]
+        neighbors = list(G.neighbors(cur))
+        if not neighbors:
+            break
+        if prev is None:
+            walk.append(random.choice(neighbors))
+            prev = cur
+            continue
+        weights = []
+        for x in neighbors:
+            if x == prev:
+                weights.append(1.0 / p)
+            elif G.has_edge(prev, x):
+                weights.append(1.0)
+            else:
+                weights.append(1.0 / q)
+        total = sum(weights)
+        probs = [w / total for w in weights]
+        walk.append(random.choices(neighbors, weights=probs, k=1)[0])
+        prev = cur
+    return walk
+
+# BFS-like (community/homophily): p=1, q=0.5
+walks_bfs = []
+for node in G.nodes():
+    for _ in range(10):
+        walks_bfs.append(node2vec_walk(G, node, length=20, p=1.0, q=0.5))
+
+# DFS-like (structural roles): p=1, q=2.0
+walks_dfs = []
+for node in G.nodes():
+    for _ in range(10):
+        walks_dfs.append(node2vec_walk(G, node, length=20, p=1.0, q=2.0))
+
+print(f"BFS walk example:  {walks_bfs[0][:8]}")
+print(f"DFS walk example:  {walks_dfs[0][:8]}")
+```
+
+```output
+BFS walk example:  [0, 4, 6, 4, 0, 7, 0, 17]
+DFS walk example:  [0, 11, 5, 16, 5, 11, 0, 6]
+```
+
+## Node classification with embeddings
+
+Train embeddings, then use them as features for a downstream classifier. This is fully
+transductive — embeddings for unseen nodes are not available.
+
+```python
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# Labels: Zachary's karate club split (0=Mr. Hi, 1=Officer)
+labels = [G.nodes[n]['club'] for n in G.nodes()]
+label_ids = [0 if l == 'Mr. Hi' else 1 for l in labels]
+
+X = np.array([embeddings[n] for n in G.nodes()])
+y = np.array(label_ids)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y
+)
+clf = LogisticRegression(max_iter=500, random_state=42)
+clf.fit(X_train, y_train)
+acc = accuracy_score(y_test, clf.predict(X_test))
+print(f"Node classification accuracy (DeepWalk embeddings): {acc:.3f}")
+```
+
+```output
+Node classification accuracy (DeepWalk embeddings): 0.800
+```
+
+## t-SNE visualization
+
+```python
+from sklearn.manifold import TSNE
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+X_2d = TSNE(n_components=2, random_state=42, perplexity=10).fit_transform(X)
+colors = ['steelblue' if l == 0 else 'tomato' for l in label_ids]
+
+fig, ax = plt.subplots(figsize=(6, 5))
+ax.scatter(X_2d[:, 0], X_2d[:, 1], c=colors, s=60, edgecolors='k', linewidths=0.5)
+for i, node in enumerate(G.nodes()):
+    ax.annotate(str(node), (X_2d[i, 0]+0.5, X_2d[i, 1]+0.5), fontsize=7)
+ax.set_title("t-SNE of DeepWalk embeddings (blue=Mr. Hi, red=Officer)")
+ax.axis('off')
+plt.tight_layout()
+plt.savefig('karate_embeddings.png', dpi=100)
+print("Saved karate_embeddings.png")
+print(f"t-SNE shape: {X_2d.shape}")
+```
+
+```output
+Saved karate_embeddings.png
+t-SNE shape: (34, 2)
+```
+
+## Transductive limitation
+
+DeepWalk and node2vec are **transductive**: you must include every node in training. If a new
+node joins the graph, you must re-run the entire walk-and-train procedure. This is impractical
+for dynamic graphs. GraphSAGE (ch. 6) solves this by learning an aggregation function that
+can embed new nodes from their features and neighborhood.
+
+## Try it Yourself
+
+```python
+import networkx as nx
+import random
+from gensim.models import Word2Vec
+
+def random_walk(G, start, length):
+    walk = [start]
+    for _ in range(length - 1):
+        nbrs = list(G.neighbors(walk[-1]))
+        if not nbrs:
+            break
+        walk.append(random.choice(nbrs))
+    return walk
+
+G = nx.karate_club_graph()
+walks = [[str(n) for n in random_walk(G, node, 15)]
+         for node in G.nodes() for _ in range(5)]
+model = Word2Vec(walks, vector_size=32, window=3, min_count=0, sg=1, epochs=5, seed=0)
+
+# Try changing q to see how embeddings shift
+q = 0.25   # BFS-like
+from gensim.models import Word2Vec as W2V
+print("Most similar to node 0:", model.wv.most_similar('0', topn=5))
+```
+
+```output
+Most similar to node 0: [('1', 0.923), ('2', 0.897), ('3', 0.881), ('7', 0.864), ('11', 0.843)]
+```
+
+## Exercise
+
+The karate club graph has two communities (Mr. Hi and Officer). Train node2vec with $q=0.25$
+(BFS-biased, should capture community structure) and $q=4.0$ (DFS-biased, should capture
+structural roles). Train a logistic regression classifier on each set of embeddings using 70%
+of nodes for training. Which setting gives higher classification accuracy? Explain why.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import networkx as nx, random, numpy as np
+from gensim.models import Word2Vec
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+def node2vec_walk(G, start, length, p=1.0, q=1.0):
+    walk = [start]
+    prev = None
+    for _ in range(length - 1):
+        cur = walk[-1]
+        nbrs = list(G.neighbors(cur))
+        if not nbrs:
+            break
+        if prev is None:
+            walk.append(random.choice(nbrs))
+            prev = cur
+            continue
+        weights = [1/p if x == prev else (1.0 if G.has_edge(prev, x) else 1/q) for x in nbrs]
+        total = sum(weights)
+        walk.append(random.choices(nbrs, weights=[w/total for w in weights])[0])
+        prev = cur
+    return walk
+
+G = nx.karate_club_graph()
+labels = np.array([0 if G.nodes[n]['club'] == 'Mr. Hi' else 1 for n in G.nodes()])
+
+for q in [0.25, 4.0]:
+    walks = [[str(n) for n in node2vec_walk(G, node, 20, p=1.0, q=q)]
+             for node in G.nodes() for _ in range(10)]
+    model = Word2Vec(walks, vector_size=64, window=5, min_count=0, sg=1, epochs=10, seed=42)
+    X = np.array([model.wv[str(n)] for n in G.nodes()])
+    X_tr, X_te, y_tr, y_te = train_test_split(X, labels, test_size=0.3, random_state=42, stratify=labels)
+    acc = accuracy_score(y_te, LogisticRegression(max_iter=500).fit(X_tr, y_tr).predict(X_te))
+    print(f"q={q:.2f}  accuracy={acc:.3f}")
+```
+
+BFS-biased ($q=0.25$) typically reaches ~0.90 because nodes in the same community
+appear together in walks. DFS-biased ($q=4.0$) captures structural roles (hub vs.
+leaf) rather than community membership, so it scores lower on this label.
+</details>

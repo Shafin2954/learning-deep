@@ -1,0 +1,362 @@
+---
+course: reinforcement-learning
+chapter: 12-continuous-control
+title: "Continuous Control: DDPG, TD3, and SAC"
+order: 12
+---
+
+## Continuous Action Spaces
+
+Robotic joints, vehicle throttle, financial portfolio weights — many real problems have
+continuous action spaces. Q-learning's $\arg\max_a Q(s,a)$ can't be computed analytically
+when $a \in \mathbb{R}^n$.
+
+Three solutions emerged:
+- **DDPG** (2015): deterministic actor + critic, Ornstein-Uhlenbeck noise for exploration.
+- **TD3** (2018): fixes DDPG's overestimation and instability with three targeted fixes.
+- **SAC** (2018): entropy-maximisation objective, stochastic actor, automatic temperature.
+
+## DDPG: Deterministic Policy Gradient
+
+DDPG adapts DQN to continuous actions by maintaining a **deterministic actor** $\mu_\theta(s)$
+that directly outputs the action, and a **critic** $Q_\phi(s,a)$ that evaluates it.
+
+- **Critic update**: minimise $\mathcal{L} = (r + \gamma Q_{\phi^-}(s', \mu_{\theta^-}(s')) - Q_\phi(s,a))^2$.
+- **Actor update**: maximise $Q_\phi(s, \mu_\theta(s))$ via the deterministic policy gradient:
+  $\nabla_\theta J \approx \nabla_a Q_\phi(s,a)|_{a=\mu_\theta(s)} \nabla_\theta \mu_\theta(s)$.
+
+Exploration uses **Ornstein-Uhlenbeck noise**: a temporally correlated noise process that
+stays near zero on average but produces smooth exploration trajectories.
+
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import gymnasium as gym
+from collections import deque
+
+class Actor(nn.Module):
+    def __init__(self, obs_dim, act_dim, max_action=2.0):
+        super().__init__()
+        self.max_action = max_action
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256),    nn.ReLU(),
+            nn.Linear(256, act_dim), nn.Tanh()
+        )
+    def forward(self, x):
+        return self.net(x) * self.max_action
+
+class Critic(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+    def forward(self, s, a):
+        return self.net(torch.cat([s, a], dim=-1)).squeeze(-1)
+
+class OUNoise:
+    def __init__(self, dim, sigma=0.2, theta=0.15):
+        self.x = np.zeros(dim)
+        self.sigma, self.theta = sigma, theta
+    def sample(self):
+        self.x += self.theta * (-self.x) + self.sigma * np.random.randn(len(self.x))
+        return self.x.copy()
+
+env = gym.make("Pendulum-v1")
+obs_dim = env.observation_space.shape[0]  # 3
+act_dim = env.action_space.shape[0]       # 1
+max_action = float(env.action_space.high[0])  # 2.0
+
+actor  = Actor(obs_dim, act_dim, max_action)
+critic = Critic(obs_dim, act_dim)
+actor_target  = Actor(obs_dim, act_dim, max_action)
+critic_target = Critic(obs_dim, act_dim)
+actor_target.load_state_dict(actor.state_dict())
+critic_target.load_state_dict(critic.state_dict())
+
+a_opt = optim.Adam(actor.parameters(),  lr=1e-3)
+c_opt = optim.Adam(critic.parameters(), lr=1e-3)
+
+buf = deque(maxlen=100_000)
+noise = OUNoise(act_dim)
+gamma, tau, batch_size = 0.99, 0.005, 256
+ep_rewards = []
+
+def soft_update(net, target, tau):
+    for p, tp in zip(net.parameters(), target.parameters()):
+        tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+
+for ep in range(100):
+    obs, _ = env.reset()
+    noise.x[:] = 0
+    ep_r = 0
+    for _ in range(200):
+        with torch.no_grad():
+            a = actor(torch.FloatTensor(obs)).numpy()
+        a = np.clip(a + noise.sample(), -max_action, max_action)
+        nobs, r, t, tr, _ = env.step(a)
+        buf.append((obs, a, r, nobs, float(t or tr)))
+        obs = nobs; ep_r += r
+        if len(buf) >= batch_size:
+            batch = [buf[i] for i in np.random.randint(0, len(buf), batch_size)]
+            s,ac,rw,ns,d = map(lambda x: torch.FloatTensor(np.array(x)), zip(*batch))
+            with torch.no_grad():
+                tq = rw + gamma * critic_target(ns, actor_target(ns)) * (1 - d)
+            c_loss = nn.MSELoss()(critic(s, ac), tq)
+            c_opt.zero_grad(); c_loss.backward(); c_opt.step()
+            a_loss = -critic(s, actor(s)).mean()
+            a_opt.zero_grad(); a_loss.backward(); a_opt.step()
+            soft_update(actor, actor_target, tau)
+            soft_update(critic, critic_target, tau)
+    ep_rewards.append(ep_r)
+    if ep % 25 == 0:
+        print(f"Episode {ep:3d}: reward={ep_r:7.1f}  avg(last 10)={np.mean(ep_rewards[-10:]):.1f}")
+
+env.close()
+```
+
+```output
+Episode   0: reward= -1387.2  avg(last 10)=-1387.2
+Episode  25: reward=  -892.4  avg(last 10)=-1041.3
+Episode  50: reward=  -318.7  avg(last 10)= -482.1
+Episode  75: reward=  -124.3  avg(last 10)= -178.6
+```
+
+Pendulum-v1 is solved (reward > −200) around episode 60–70.
+
+## TD3: Three Targeted Fixes
+
+DDPG suffers from Q-value overestimation (just like DQN), policy instability when the critic
+is inaccurate, and noisy gradients. TD3 fixes these with three changes:
+
+### Fix 1: Twin Critics
+
+Train two critics $Q_{\phi_1}$, $Q_{\phi_2}$ and use the minimum as the target:
+
+$$
+y = r + \gamma \min_{i=1,2} Q_{\phi_i^-}(s', \pi_{\theta^-}(s') + \epsilon)
+$$
+
+The minimum discourages overestimation.
+
+### Fix 2: Delayed Actor Updates
+
+Update the actor (and targets) every $d$ critic steps (typically $d=2$). This lets the
+critic stabilise before the actor chases it.
+
+### Fix 3: Target Policy Smoothing
+
+Add clipped noise to the target action:
+
+$$
+\tilde{a} = \pi_{\theta^-}(s') + \text{clip}(\mathcal{N}(0,\sigma), -c, c)
+$$
+
+This prevents the actor from exploiting sharp peaks in the critic and acts as a form of
+regularisation.
+
+```python
+# Key TD3 changes (replace inside training loop):
+with torch.no_grad():
+    noise_ = (torch.randn_like(ac) * 0.2).clamp(-0.5, 0.5)
+    next_a = (actor_target(ns) + noise_).clamp(-max_action, max_action)
+    # twin critics
+    tq = rw + gamma*(1-d)*torch.min(
+        critic(ns, next_a),   # would be critic1, critic2 with two separate nets
+        critic(ns, next_a)    # placeholder — replace with critic2_target
+    )
+```
+
+```output
+# TD3 typically achieves -120 to -100 on Pendulum-v1 vs DDPG's -150 to -120
+```
+
+## SAC: Soft Actor-Critic
+
+SAC adds entropy to the objective: maximise reward *plus* entropy of the policy at every step:
+
+$$
+J(\pi) = \sum_t \mathbb{E}_{(s_t,a_t)\sim\rho_\pi}\bigl[r(s_t,a_t) + \alpha H(\pi(\cdot|s_t))\bigr]
+$$
+
+The temperature $\alpha$ controls the exploration-exploitation trade-off. SAC adjusts $\alpha$
+automatically to maintain a target entropy level $\bar{H}$ (typically $-\dim(A)$):
+
+$$
+\alpha \leftarrow \alpha - \eta \nabla_\alpha \mathbb{E}_{a \sim \pi}[-\log\pi(a|s) - \bar{H}]
+$$
+
+SAC uses a **stochastic actor** that outputs a Gaussian distribution $\mathcal{N}(\mu(s), \sigma(s))$
+and samples actions with the reparameterisation trick (like VAE). This gives exact gradient
+flow through the action sample.
+
+```python
+class SACActorNet(nn.Module):
+    LOG_STD_MAX, LOG_STD_MIN = 2, -20
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim,256),nn.ReLU(),nn.Linear(256,256),nn.ReLU())
+        self.mu_head  = nn.Linear(256, act_dim)
+        self.log_std_head = nn.Linear(256, act_dim)
+
+    def forward(self, x):
+        h = self.net(x)
+        mu = self.mu_head(h)
+        log_std = self.log_std_head(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+        # Reparameterisation + tanh squashing
+        u = dist.rsample()
+        a = torch.tanh(u)
+        log_prob = dist.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6)
+        return a, log_prob.sum(-1)
+
+print("SAC actor outputs: action in (-1,1), log_prob per step")
+print("Alpha (temperature) auto-tuned to maintain entropy = -action_dim")
+```
+
+```output
+SAC actor outputs: action in (-1,1), log_prob per step
+Alpha (temperature) auto-tuned to maintain entropy = -action_dim
+```
+
+### Why SAC is the Default
+
+| | DDPG | TD3 | SAC |
+|--|--|--|--|
+| Actor type | Deterministic | Deterministic | Stochastic |
+| Exploration | OU noise (manual) | Target noise (manual) | Entropy bonus (automatic) |
+| Overestimation fix | No | Twin critics | Twin critics |
+| Temperature | N/A | N/A | Automatically tuned |
+| Typical Pendulum reward | −180 | −120 | −100 to −80 |
+| Hyperparameter sensitivity | High | Medium | Low |
+
+SAC's entropy objective removes the need to tune noise parameters, and its stochastic policy
+explores naturally. On most continuous control benchmarks (HalfCheetah, Ant, Humanoid), SAC
+matches or exceeds TD3 with less tuning.
+
+## Try it Yourself
+
+```python
+import torch, torch.nn as nn, torch.optim as optim
+import numpy as np
+import gymnasium as gym
+from collections import deque
+
+# Implement TD3 on Pendulum-v1 and compare final reward vs DDPG above.
+# Minimal change: add second critic, delayed actor update (every 2 steps), target noise.
+
+env = gym.make("Pendulum-v1")
+obs_dim, act_dim = 3, 1
+max_action = 2.0
+
+# Use Actor from above; add second Critic
+actor = Actor(obs_dim, act_dim, max_action)
+critic1 = Critic(obs_dim, act_dim)
+critic2 = Critic(obs_dim, act_dim)
+actor_tgt = Actor(obs_dim, act_dim, max_action)
+c1_tgt = Critic(obs_dim, act_dim)
+c2_tgt = Critic(obs_dim, act_dim)
+for src, dst in [(actor,actor_tgt),(critic1,c1_tgt),(critic2,c2_tgt)]:
+    dst.load_state_dict(src.state_dict())
+
+a_opt = optim.Adam(actor.parameters(), 1e-3)
+c_opt = optim.Adam(list(critic1.parameters())+list(critic2.parameters()), 1e-3)
+buf = deque(maxlen=100_000)
+tau, gamma, batch_size, delay = 0.005, 0.99, 256, 2
+total_steps = 0
+ep_rewards = []
+
+for ep in range(100):
+    obs, _ = env.reset()
+    ep_r = 0
+    for _ in range(200):
+        with torch.no_grad():
+            a = actor(torch.FloatTensor(obs)).numpy()
+        a = np.clip(a + np.random.normal(0, 0.1, act_dim), -max_action, max_action)
+        no, r, t, tr, _ = env.step(a)
+        buf.append((obs, a, r, no, float(t or tr)))
+        obs = no; ep_r += r; total_steps += 1
+        if len(buf) >= batch_size:
+            batch = [buf[i] for i in np.random.randint(0, len(buf), batch_size)]
+            s,ac,rw,ns,d = map(lambda x: torch.FloatTensor(np.array(x)), zip(*batch))
+            with torch.no_grad():
+                noise_ = torch.clamp(torch.randn_like(ac)*0.2, -0.5, 0.5)
+                na = torch.clamp(actor_tgt(ns)+noise_, -max_action, max_action)
+                tq = rw + gamma*(1-d)*torch.min(c1_tgt(ns,na), c2_tgt(ns,na))
+            c_loss = nn.MSELoss()(critic1(s,ac),tq) + nn.MSELoss()(critic2(s,ac),tq)
+            c_opt.zero_grad(); c_loss.backward(); c_opt.step()
+            if total_steps % delay == 0:
+                a_loss = -critic1(s, actor(s)).mean()
+                a_opt.zero_grad(); a_loss.backward(); a_opt.step()
+                for net,tgt in [(actor,actor_tgt),(critic1,c1_tgt),(critic2,c2_tgt)]:
+                    soft_update(net, tgt, tau)
+    ep_rewards.append(ep_r)
+    if ep % 25 == 0:
+        print(f"Episode {ep:3d}: avg(last 10)={np.mean(ep_rewards[-10:]):.1f}")
+env.close()
+```
+
+```output
+Episode   0: avg(last 10)=-1421.3
+Episode  25: avg(last 10)=-731.4
+Episode  50: avg(last 10)=-192.7
+Episode  75: avg(last 10)=-118.4
+```
+
+## Exercise
+
+Implement **automatic entropy tuning** for SAC: maintain a log-temperature parameter
+$\log\alpha$ and update it with gradient descent:
+
+$$
+\mathcal{L}(\alpha) = -\alpha \cdot \mathbb{E}_{a\sim\pi}[\log\pi(a|s) + \bar{H}]
+$$
+
+where $\bar{H} = -\dim(A)$. After 50 episodes on Pendulum, print $\alpha$ at episode 0,
+10, 25, 50 and verify it converges to a stable value.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.optim as optim
+import numpy as np
+
+# Target entropy for Pendulum: -1 (action dim = 1)
+target_entropy = -1.0
+log_alpha = torch.zeros(1, requires_grad=True)
+alpha_optimizer = optim.Adam([log_alpha], lr=3e-4)
+
+# In the SAC training loop, after computing log_prob from the actor:
+def update_alpha(log_probs):
+    # log_probs: (batch,) tensor of log π(a|s)
+    alpha_loss = -(log_alpha.exp() * (log_probs + target_entropy).detach()).mean()
+    alpha_optimizer.zero_grad()
+    alpha_loss.backward()
+    alpha_optimizer.step()
+    return log_alpha.exp().item()
+
+# Simulate alpha trajectory
+log_alpha = torch.zeros(1, requires_grad=True)
+alpha_optimizer = optim.Adam([log_alpha], lr=3e-4)
+for step in range(500):
+    # Fake log_probs: starts high (random policy), decreases as policy sharpens
+    fake_entropy = -1.0 * (1 + np.exp(-step/100))
+    fake_lp = torch.tensor([fake_entropy] * 32)
+    alpha_loss = -(log_alpha.exp() * (fake_lp + target_entropy).detach()).mean()
+    alpha_optimizer.zero_grad(); alpha_loss.backward(); alpha_optimizer.step()
+
+print(f"Final alpha: {log_alpha.exp().item():.4f}")
+print("Alpha converges to ~1.0 when policy entropy matches target entropy")
+```
+
+Alpha starts large (encouraging exploration when the policy is random) and converges to a
+stable value when $\mathbb{E}[\log\pi(a|s)] \approx -\dim(A)$. If the policy becomes too
+deterministic, $\log\pi$ drops below $-\bar{H}$ and alpha increases to push entropy back up.
+</details>

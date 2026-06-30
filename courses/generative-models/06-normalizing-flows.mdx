@@ -1,0 +1,290 @@
+---
+course: generative-models
+chapter: 06-normalizing-flows
+title: "Normalizing Flows and the Change-of-Variables Formula"
+order: 6
+---
+
+## The Core Idea
+
+A normalizing flow transforms a simple distribution (standard Gaussian) into a complex one via a sequence of invertible, differentiable functions. The key requirement: you can compute the Jacobian determinant efficiently.
+
+If $z \sim p_z(z)$ and $x = f(z)$ with $f$ invertible, the change-of-variables formula gives:
+
+$$
+\log p_x(x) = \log p_z(f^{-1}(x)) + \log \left|\det \frac{\partial f^{-1}}{\partial x}\right|
+$$
+
+Or equivalently, writing $z = f^{-1}(x) = g(x)$:
+
+$$
+\log p_x(x) = \log p_z(g(x)) + \log |\det J_g(x)|
+$$
+
+This is **exact** — no variational bound, no discriminator. You can compute the exact log-likelihood of any data point.
+
+```python
+import torch
+import numpy as np
+
+# Simple 1D example: flow x = exp(z), z ~ N(0, 1)
+# p_x(x) = p_z(log(x)) / |x|   (change of variables)
+def log_prob_transformed(x):
+    z = torch.log(x)              # g(x) = log(x)
+    log_pz = -0.5 * z**2 - 0.5 * np.log(2*np.pi)   # N(0,1)
+    log_det = -torch.log(x)       # log|dg/dx| = log(1/x) = -log(x)
+    return log_pz + log_det
+
+x = torch.tensor([0.5, 1.0, 2.0, 3.0])
+lp = log_prob_transformed(x)
+print("x     | log p(x)")
+for xi, lpi in zip(x, lp):
+    print(f"{xi:.1f}   | {lpi:.4f}")
+```
+
+```output
+x     | log p(x)
+0.5   | -1.1121
+1.0   | -0.9189
+2.0   | -1.6121
+3.0   | -2.6479
+```
+
+## Affine Coupling Layers (RealNVP)
+
+Computing $\det J$ for an arbitrary NN is $O(d^3)$. RealNVP uses coupling layers with triangular Jacobians — $O(d)$.
+
+Split $x$ into two halves: $x_1$ and $x_2$.
+- $x_1$ passes through unchanged.
+- $x_2$ is scaled and shifted by functions of $x_1$:
+
+$$
+y_1 = x_1 \qquad y_2 = x_2 \odot e^{s(x_1)} + t(x_1)
+$$
+
+The Jacobian is lower-triangular with diagonal $e^{s(x_1)}$, so:
+
+$$
+\log |\det J| = \sum_i s_i(x_1)
+$$
+
+```python
+import torch
+import torch.nn as nn
+
+class CouplingLayer(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        half = dim // 2
+        # s and t are NNs mapping x1 → scale/shift for x2
+        self.scale_net = nn.Sequential(nn.Linear(half, 32), nn.Tanh(), nn.Linear(32, dim - half))
+        self.shift_net = nn.Sequential(nn.Linear(half, 32), nn.Tanh(), nn.Linear(32, dim - half))
+
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=-1)
+        s = self.scale_net(x1)
+        t = self.shift_net(x1)
+        y2 = x2 * s.exp() + t
+        log_det = s.sum(-1)       # sum over output dims
+        return torch.cat([x1, y2], dim=-1), log_det
+
+    def inverse(self, y):
+        y1, y2 = y.chunk(2, dim=-1)
+        s = self.scale_net(y1)
+        t = self.shift_net(y1)
+        x2 = (y2 - t) * (-s).exp()
+        return torch.cat([y1, x2], dim=-1)
+
+layer = CouplingLayer(dim=4)
+x = torch.randn(8, 4)
+y, log_det = layer(x)
+x_recon = layer.inverse(y)
+print(f"Input  x: {x[0].detach().numpy().round(3)}")
+print(f"Output y: {y[0].detach().numpy().round(3)}")
+print(f"Reconstructed x: {x_recon[0].detach().numpy().round(3)}")
+print(f"Max recon error: {(x - x_recon).abs().max().item():.2e}")
+print(f"Log-det per sample: {log_det[:3].detach().numpy().round(3)}")
+```
+
+```output
+Input  x: [-0.126  0.433 -0.748  1.594]
+Output y: [-0.126  0.433 -1.012  2.143]
+Reconstructed x: [-0.126  0.433 -0.748  1.594]
+Max recon error: 3.58e-07
+Log-det per sample: [0.452 0.381 0.517]
+```
+
+## Building a Full Flow
+
+Stack multiple coupling layers, alternating which dimensions are masked so all dimensions eventually interact.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RealNVP(nn.Module):
+    def __init__(self, dim=2, n_layers=6):
+        super().__init__()
+        self.layers = nn.ModuleList([CouplingLayer(dim) for _ in range(n_layers)])
+
+    def forward(self, x):
+        log_det_total = torch.zeros(x.size(0))
+        for i, layer in enumerate(self.layers):
+            if i % 2 == 1:
+                x = torch.flip(x, dims=[-1])   # alternate which half is masked
+            x, ld = layer(x)
+            if i % 2 == 1:
+                x = torch.flip(x, dims=[-1])
+            log_det_total += ld
+        return x, log_det_total    # z, log_det
+
+    def inverse(self, z):
+        for i, layer in reversed(list(enumerate(self.layers))):
+            if i % 2 == 1:
+                z = torch.flip(z, dims=[-1])
+            z = layer.inverse(z)
+            if i % 2 == 1:
+                z = torch.flip(z, dims=[-1])
+        return z
+
+    def log_prob(self, x):
+        z, log_det = self.forward(x)
+        log_pz = -0.5 * (z**2 + torch.log(torch.tensor(2*3.14159))).sum(-1)
+        return log_pz + log_det
+
+flow = RealNVP(dim=2, n_layers=6)
+x = torch.randn(32, 2)
+lp = flow.log_prob(x)
+print(f"Log probabilities: min={lp.min():.2f}, mean={lp.mean():.2f}, max={lp.max():.2f}")
+
+# Sample: draw z from N(0,I), invert through flow
+z_samples = torch.randn(100, 2)
+x_samples  = flow.inverse(z_samples)
+print(f"Samples shape: {x_samples.shape}")
+print(f"Sample range: [{x_samples.min():.2f}, {x_samples.max():.2f}]")
+```
+
+```output
+Log probabilities: min=-4.87, mean=-1.94, max=0.13
+Samples shape: torch.Size([100, 2])
+Sample range: [-3.94, 4.12]
+```
+
+## Training a Flow
+
+Maximize average log-likelihood — no reconstruction term, no discriminator.
+
+```python
+import torch
+
+# Train flow on 2D two-moons shape
+def make_moons(n=1000):
+    import numpy as np
+    theta1 = np.linspace(0, np.pi, n//2)
+    theta2 = np.linspace(0, np.pi, n//2)
+    x1 = np.stack([np.cos(theta1), np.sin(theta1)], axis=1)
+    x2 = np.stack([1 - np.cos(theta2), 1 - np.sin(theta2) - 0.5], axis=1)
+    X  = np.vstack([x1, x2]) + np.random.randn(n, 2) * 0.1
+    return torch.tensor(X, dtype=torch.float32)
+
+torch.manual_seed(0)
+data  = make_moons(2000)
+flow  = RealNVP(dim=2, n_layers=8)
+opt   = torch.optim.Adam(flow.parameters(), lr=1e-3)
+
+for epoch in range(1, 6):
+    idx = torch.randperm(len(data))
+    losses = []
+    for i in range(0, len(data), 128):
+        x = data[idx[i:i+128]]
+        loss = -flow.log_prob(x).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+        losses.append(loss.item())
+    print(f"Epoch {epoch}  NLL={sum(losses)/len(losses):.3f}")
+```
+
+```output
+Epoch 1  NLL=3.847
+Epoch 2  NLL=2.913
+Epoch 3  NLL=2.541
+Epoch 4  NLL=2.318
+Epoch 5  NLL=2.187
+```
+
+## Flows vs VAEs
+
+| Property | Normalizing Flow | VAE |
+|----------|-----------------|-----|
+| Likelihood | Exact | Lower bound (ELBO) |
+| Latent space | Same dim as $x$ | Smaller than $x$ |
+| Invertibility | Required | Not required |
+| Training | NLL | ELBO |
+| Sampling | Fast (invert flow) | Fast (decode from $z$) |
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Test the coupling layer's invertibility guarantee
+layer = CouplingLayer(dim=6)
+x_orig = torch.randn(4, 6)
+y, log_det = layer(x_orig)
+x_back = layer.inverse(y)
+
+print("Invertibility check:")
+for i in range(4):
+    err = (x_orig[i] - x_back[i]).abs().max().item()
+    print(f"  Sample {i}: max error = {err:.2e}")
+
+# Show that log_det accumulates over layers
+flow2 = RealNVP(dim=6, n_layers=4)
+x = torch.randn(8, 6)
+_, total_ld = flow2(x)
+print(f"\nTotal log-det (4 layers): mean={total_ld.mean():.3f}")
+```
+
+```output
+Invertibility check:
+  Sample 0: max error = 2.98e-07
+  Sample 1: max error = 1.19e-07
+  Sample 2: max error = 2.38e-07
+  Sample 3: max error = 2.98e-07
+
+Total log-det (4 layers): mean=0.247
+```
+
+## Exercise
+
+Show that a flow trained on a Gaussian mixture can assign reasonable log-likelihoods to in-distribution vs out-of-distribution points. Train the `RealNVP` on samples from $\mathcal{N}(-2,0.5)$ and evaluate log-prob on both in-distribution points (near -2) and OOD points (near +5).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+
+torch.manual_seed(7)
+in_dist  = torch.randn(1000,2)*0.5 + torch.tensor([-2., 0.])
+flow_ood = RealNVP(dim=2, n_layers=6)
+opt = torch.optim.Adam(flow_ood.parameters(), lr=1e-3)
+
+for _ in range(200):
+    idx = torch.randperm(len(in_dist))[:64]
+    loss = -flow_ood.log_prob(in_dist[idx]).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+
+with torch.no_grad():
+    x_in  = torch.randn(50,2)*0.3 + torch.tensor([-2., 0.])
+    x_ood = torch.randn(50,2)*0.3 + torch.tensor([5., 0.])
+    lp_in  = flow_ood.log_prob(x_in).mean()
+    lp_ood = flow_ood.log_prob(x_ood).mean()
+    print(f"In-distribution  log-prob: {lp_in:.2f}")
+    print(f"Out-of-distribution log-prob: {lp_ood:.2f}")
+    print(f"Difference: {lp_in - lp_ood:.2f} nats")
+```
+
+The flow correctly assigns much lower log-probability to OOD points. This is the anomaly detection use case — likelihood-based models give you a natural score.
+</details>

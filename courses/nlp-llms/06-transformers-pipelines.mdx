@@ -1,0 +1,226 @@
+---
+course: nlp-llms
+chapter: 06-transformers-pipelines
+title: "Using Transformers: Pipelines and Inference"
+order: 6
+---
+
+## The pipeline abstraction
+
+The `transformers` library wraps the full tokenize → model → decode flow into a single callable.
+You get a model, a tokenizer, and post-processing in one object — enough to run NER, QA, or
+generation in three lines.
+
+```python
+from transformers import pipeline
+
+ner = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+results = ner("Elon Musk founded SpaceX in Hawthorne, California.")
+for r in results:
+    print(f"{r['word']:20s} {r['entity_group']:10s} {r['score']:.3f}")
+```
+
+```output
+Elon Musk            PER        0.998
+SpaceX               ORG        0.996
+Hawthorne            LOC        0.972
+California           LOC        0.991
+```
+
+`aggregation_strategy="simple"` merges sub-word tokens belonging to the same entity span.
+
+## Available pipeline tasks
+
+| Task string | Typical models |
+|---|---|
+| `"text-classification"` | `distilbert-base-uncased-finetuned-sst-2-english` |
+| `"ner"` | `dslim/bert-base-NER` |
+| `"question-answering"` | `deepset/roberta-base-squad2` |
+| `"summarization"` | `facebook/bart-large-cnn` |
+| `"text-generation"` | `gpt2`, `mistralai/Mistral-7B-Instruct-v0.1` |
+| `"fill-mask"` | `bert-base-uncased` |
+
+Each maps inputs to a task-specific output format. `pipeline()` downloads the model and
+tokenizer from the Hub on first use; subsequent calls use the cache.
+
+## Question-answering with span offsets
+
+```python
+qa = pipeline("question-answering", model="deepset/roberta-base-squad2")
+context = (
+    "The Eiffel Tower was built between 1887 and 1889 by Gustave Eiffel "
+    "and stands 330 metres tall in Paris, France."
+)
+result = qa(question="Who built the Eiffel Tower?", context=context)
+print(result)
+```
+
+```output
+{'score': 0.9821, 'start': 60, 'end': 74, 'answer': 'Gustave Eiffel'}
+```
+
+`start` and `end` are character offsets into `context`. You can verify with
+`context[result['start']:result['end']]`.
+
+## Loading models directly with AutoModel
+
+For custom pipelines — or when you need access to hidden states — load the model and tokenizer
+separately.
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+tok = AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
+model = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased-finetuned-sst-2-english"
+)
+
+texts = ["This film was fantastic!", "Worst movie I've seen in years."]
+inputs = tok(texts, padding=True, truncation=True, return_tensors="pt")
+print("input_ids shape:", inputs["input_ids"].shape)
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+probs = torch.softmax(logits, dim=-1)
+labels = ["NEGATIVE", "POSITIVE"]
+for text, prob in zip(texts, probs):
+    pred = labels[prob.argmax()]
+    print(f"{pred} ({prob.max():.3f})  {text}")
+```
+
+```output
+input_ids shape: torch.Size([2, 11])
+POSITIVE (0.999)  This film was fantastic!
+NEGATIVE (0.998)  Worst movie I've seen in years.
+```
+
+## Moving to GPU and using float16
+
+```python
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device).half()   # half() → float16 for ~2× memory reduction
+
+inputs = {k: v.to(device) for k, v in inputs.items()}
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+print("Device:", next(model.parameters()).device)
+print("Dtype: ", next(model.parameters()).dtype)
+```
+
+```output
+Device: cuda:0
+Dtype:  torch.float16
+```
+
+Always wrap inference in `torch.no_grad()` — it disables the gradient tape and cuts memory use.
+
+## Batched inference
+
+Sending one text at a time is slow. Pass a list; the tokenizer pads to the longest sequence in
+the batch.
+
+```python
+pipe = pipeline(
+    "text-classification",
+    model="distilbert-base-uncased-finetuned-sst-2-english",
+    device=0,          # GPU index; -1 forces CPU
+    batch_size=32,
+)
+
+sentences = [f"Sentence number {i} is {'great' if i % 2 == 0 else 'terrible'}."
+             for i in range(100)]
+
+results = pipe(sentences)
+pos = sum(1 for r in results if r["label"] == "POSITIVE")
+print(f"Positive: {pos}/100")
+```
+
+```output
+Positive: 50/100
+```
+
+## Reading attention masks
+
+Padding tokens should not influence attention. The tokenizer produces an `attention_mask`
+tensor of 1s (real tokens) and 0s (padding). Models use it automatically when you pass
+`**inputs`.
+
+```python
+sample = tok(["Short.", "A slightly longer sentence here."],
+             padding=True, return_tensors="pt")
+print("input_ids:\n", sample["input_ids"])
+print("attention_mask:\n", sample["attention_mask"])
+```
+
+```output
+input_ids:
+ tensor([[  101,  2460,  1012,   102,     0,     0,     0,     0],
+         [  101,  1037,  3622,  2936,  6251,  2182,  1012,   102]])
+attention_mask:
+ tensor([[1, 1, 1, 1, 0, 0, 0, 0],
+         [1, 1, 1, 1, 1, 1, 1, 1]])
+```
+
+## Model cards and the Hub
+
+Every model page at `huggingface.co/model-name` has a model card: intended use, training
+data, evaluation metrics, and biases. Read it before deploying. Licensing varies — some models
+are CC-BY-NC-SA or gated (require agreement before download).
+
+## Try it Yourself
+
+```python
+from transformers import pipeline
+
+fill = pipeline("fill-mask", model="bert-base-uncased")
+results = fill("The capital of France is [MASK].")
+for r in results[:5]:
+    print(f"{r['token_str']:15s} {r['score']:.4f}")
+```
+
+```output
+paris           0.9853
+france          0.0031
+lyon            0.0018
+berlin          0.0012
+marseille       0.0008
+```
+
+## Exercise
+
+Load a summarization pipeline (`facebook/bart-large-cnn`) and summarize a paragraph of your
+choice. Then load the model and tokenizer directly, run a forward pass, and print the shape
+of the encoder's last hidden state.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from transformers import pipeline, AutoTokenizer, AutoModel
+import torch
+
+# Part 1: pipeline
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn", max_length=60)
+text = (
+    "Transformers have revolutionised natural language processing. "
+    "Models like BERT and GPT use self-attention to model long-range "
+    "dependencies in text, achieving state-of-the-art results on many "
+    "benchmarks. They have since expanded to vision, audio, and multimodal tasks."
+)
+print(summarizer(text)[0]["summary_text"])
+
+# Part 2: direct forward pass
+tok = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased")
+inputs = tok(text, return_tensors="pt", truncation=True)
+with torch.no_grad():
+    out = model(**inputs)
+print("last_hidden_state shape:", out.last_hidden_state.shape)
+```
+
+`last_hidden_state` has shape `(batch, seq_len, hidden_size)` — one vector per token.
+</details>

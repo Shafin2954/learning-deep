@@ -1,0 +1,362 @@
+---
+course: data-wrangling-eda
+chapter: 06-eda-workflow
+title: "EDA Workflow: Distributions, Relationships, Contingency"
+order: 6
+---
+
+## EDA is hypothesis generation
+
+Exploratory Data Analysis is not about making charts — it's about building a mental model of
+the data that informs every modelling decision. Work through these five steps in order, and
+document what you find at each step. Undocumented EDA is wasted EDA.
+
+1. **Shape and dtypes** — how many rows, columns, and what types?
+2. **Missing values** — which columns, how much, any pattern?
+3. **Univariate distributions** — shape, skew, outliers, cardinality.
+4. **Bivariate relationships** — numeric×numeric, numeric×categorical, categorical×categorical.
+5. **Multivariate** — pairplot, heatmap, conditional patterns.
+
+## Step 1: Shape and dtypes
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 500
+
+df = pd.DataFrame({
+    'age':       rng.integers(18, 75, n).astype(np.int32),
+    'income':    rng.exponential(40_000, n).astype(np.float64),
+    'score':     np.clip(rng.normal(700, 80, n), 300, 850).astype(np.float64),
+    'region':    rng.choice(['North', 'South', 'East', 'West'], n),
+    'product':   rng.choice(['Basic', 'Pro', 'Enterprise'], n, p=[0.5, 0.35, 0.15]),
+    'churned':   rng.integers(0, 2, n).astype(np.int8),
+})
+# Plant some missing values
+df.loc[rng.random(n) < 0.05, 'income'] = np.nan
+df.loc[rng.random(n) < 0.08, 'score']  = np.nan
+
+print(df.shape)
+print(df.dtypes)
+print(f"\nMemory: {df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+```
+
+```output
+(500, 6)
+age         int32
+income    float64
+score     float64
+region     object
+product    object
+churned      int8
+dtype: object
+
+Memory: 98.8 KB
+```
+
+## Step 2: Missing values
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 500
+df = pd.DataFrame({
+    'age':    rng.integers(18, 75, n).astype(np.int32),
+    'income': np.where(rng.random(n) < 0.05, np.nan, rng.exponential(40_000, n)),
+    'score':  np.where(rng.random(n) < 0.08, np.nan, np.clip(rng.normal(700, 80, n), 300, 850)),
+    'region': rng.choice(['North', 'South', 'East', 'West'], n),
+    'churned': rng.integers(0, 2, n).astype(np.int8),
+})
+
+miss = df.isnull().sum()
+miss_pct = (miss / len(df) * 100).round(1)
+summary = pd.DataFrame({'missing': miss, 'pct': miss_pct})
+print(summary[summary['missing'] > 0])
+```
+
+```output
+        missing  pct
+income       25  5.0
+score        35  7.0
+```
+
+## Step 3: Univariate distributions
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(1)
+n = 500
+income = rng.exponential(40_000, n).astype(np.float64)
+product = rng.choice(['Basic', 'Pro', 'Enterprise'], n, p=[0.5, 0.35, 0.15])
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 3))
+
+# Numeric: histogram with KDE
+axes[0].hist(income, bins=30, color='steelblue', alpha=0.7, edgecolor='white')
+axes[0].set_title('income (right-skewed)')
+axes[0].set_xlabel('income')
+
+# Numeric: box plot
+axes[1].boxplot(income, vert=False)
+axes[1].set_title('income box plot')
+axes[1].set_xlabel('income')
+
+# Categorical: count plot
+cats, counts = np.unique(product, return_counts=True)
+axes[2].barh(cats, counts, color=['steelblue', 'tomato', 'seagreen'])
+axes[2].set_title('product distribution')
+axes[2].set_xlabel('count')
+
+fig.tight_layout()
+plt.show()
+
+print(f"income skew: {pd.Series(income).skew():.2f}")
+print(f"product counts:\n{pd.Series(product).value_counts()}")
+```
+
+```output
+income skew: 2.04
+product counts:
+Basic         253
+Pro           176
+Enterprise     71
+dtype: int64
+[Figure: histogram, box plot, and bar chart for income and product columns]
+```
+
+Right-skewed income ($\text{skew} > 1$) is a signal to consider log-transforming before
+feeding to linear models. Enterprise customers are rare (14%) — flag for class-imbalance
+consideration.
+
+## Step 4: Bivariate relationships
+
+### Numeric × numeric
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(2)
+n = 500
+age    = rng.integers(18, 70, n).astype(np.float64)
+income = 20_000 + 800 * age + rng.normal(0, 10_000, n)
+score  = np.clip(600 + 0.5 * age - 0.0001 * income + rng.normal(0, 40, n), 300, 850)
+
+df = pd.DataFrame({'age': age, 'income': income, 'score': score})
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+axes[0].scatter(df['age'], df['income'], alpha=0.3, s=15)
+axes[0].set_xlabel('age'); axes[0].set_ylabel('income')
+axes[0].set_title('age vs income (positive trend)')
+
+axes[1].scatter(df['income'], df['score'], alpha=0.3, s=15, color='tomato')
+axes[1].set_xlabel('income'); axes[1].set_ylabel('score')
+axes[1].set_title('income vs score (weak negative)')
+
+fig.tight_layout()
+plt.show()
+print(df.corr().round(2))
+```
+
+```output
+           age  income  score
+age       1.00    0.93  -0.03
+income    0.93    1.00  -0.26
+score    -0.03   -0.26   1.00
+[Figure: two scatter plots showing age-income and income-score relationships]
+```
+
+### Numeric × categorical
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(3)
+n = 500
+product = rng.choice(['Basic', 'Pro', 'Enterprise'], n, p=[0.5, 0.35, 0.15])
+income  = np.where(
+    product == 'Enterprise', rng.normal(90_000, 20_000, n),
+    np.where(product == 'Pro', rng.normal(55_000, 15_000, n),
+             rng.normal(35_000, 10_000, n))
+)
+df = pd.DataFrame({'product': product, 'income': income})
+
+fig, ax = plt.subplots(figsize=(6, 4))
+groups = [df[df['product'] == p]['income'].dropna().values for p in ['Basic', 'Pro', 'Enterprise']]
+ax.boxplot(groups, labels=['Basic', 'Pro', 'Enterprise'])
+ax.set_ylabel('income')
+ax.set_title('Income by product tier')
+plt.show()
+
+print(df.groupby('product')['income'].agg(['mean', 'median', 'std']).round(0))
+```
+
+```output
+            mean  median    std
+product
+Basic      35052   35104  10074
+Enterprise 89863   89752  19791
+Pro        55072   55228  15249
+[Figure: box plot showing income distributions across Basic, Pro, Enterprise tiers]
+```
+
+## Step 5: Contingency tables for categorical × categorical
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(4)
+n = 500
+region  = rng.choice(['North', 'South', 'East', 'West'], n)
+product = rng.choice(['Basic', 'Pro', 'Enterprise'], n, p=[0.5, 0.35, 0.15])
+df = pd.DataFrame({'region': region, 'product': product})
+
+# Contingency table: raw counts
+ct = pd.crosstab(df['region'], df['product'])
+print("Raw counts:")
+print(ct)
+
+# Normalised by row: proportion within each region
+ct_norm = pd.crosstab(df['region'], df['product'], normalize='index').round(3)
+print("\nRow-normalised (proportion within region):")
+print(ct_norm)
+```
+
+```output
+Raw counts:
+product    Basic  Enterprise  Pro
+region
+East          67          18   44
+North         72          13   40
+South         60          18   46
+West          52          17   53
+
+Row-normalised (proportion within region):
+product    Basic  Enterprise   Pro
+region
+East       0.518       0.140  0.341
+North      0.587       0.106  0.326
+South      0.484       0.145  0.371
+West       0.402       0.131  0.467
+```
+
+Row-normalised tables reveal differences in distribution across groups. West has notably more
+Pro customers (46.7%) and fewer Basic customers (40.2%) than North (32.6% Pro, 58.7% Basic).
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(7)
+n = 400
+tenure  = rng.integers(1, 120, n).astype(np.float64)
+spend   = 20 + 0.5 * tenure + rng.exponential(30, n)
+segment = rng.choice(['A', 'B', 'C'], n, p=[0.4, 0.4, 0.2])
+churned = (spend < 40).astype(np.int8)
+
+df = pd.DataFrame({'tenure': tenure, 'spend': spend,
+                   'segment': segment, 'churned': churned})
+
+# Step 1-2: shape and missing
+print("Shape:", df.shape)
+print("Missing:\n", df.isnull().sum())
+
+# Step 3: numeric distributions
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+axes[0].hist(df['tenure'], bins=20, color='steelblue', edgecolor='white')
+axes[0].set_title('Tenure distribution')
+axes[1].hist(df['spend'], bins=30, color='tomato', edgecolor='white')
+axes[1].set_title('Spend distribution (right-skew?)')
+plt.tight_layout(); plt.show()
+
+# Step 4: bivariate scatter
+print("\nCorrelation spend vs tenure:", df['spend'].corr(df['tenure']).round(3))
+
+# Step 5: contingency
+print("\nChurn by segment:")
+print(pd.crosstab(df['segment'], df['churned'], normalize='index').round(3))
+```
+
+```output
+Shape: (400, 4)
+Missing:
+ tenure     0
+spend      0
+segment    0
+churned    0
+dtype: int64
+Correlation spend vs tenure: 0.474
+Churn by segment:
+         churned    0    1
+segment
+A               0.806  0.194
+B               0.788  0.212
+C               0.848  0.152
+[Figure: histograms of tenure and spend]
+```
+
+## Exercise
+
+Simulate a DataFrame: 600 rows, columns `temperature` (Normal 20, 5), `humidity` (Beta(2,5)×100),
+`city` (choice of 4 cities), `demand` (positive linear function of temperature + noise).
+Produce: (1) a printed missing-value summary, (2) a histogram of `demand`, (3) a box plot of
+`demand` by `city`, (4) a correlation table for the numeric columns.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+n = 600
+cities = ['Oslo', 'Cairo', 'Berlin', 'Tokyo']
+temp   = rng.normal(20, 5, n).astype(np.float64)
+df = pd.DataFrame({
+    'temperature': temp,
+    'humidity':    (rng.beta(2, 5, n) * 100).astype(np.float64),
+    'city':        rng.choice(cities, n),
+    'demand':      (200 + 8 * temp + rng.normal(0, 20, n)).astype(np.float64),
+})
+
+# 1) Missing summary
+print("Missing:\n", df.isnull().sum())
+
+# 2) Demand histogram
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+axes[0].hist(df['demand'], bins=25, color='steelblue', edgecolor='white')
+axes[0].set_title('Demand distribution')
+
+# 3) Box plot by city
+city_groups = [df[df['city'] == c]['demand'].values for c in cities]
+axes[1].boxplot(city_groups, labels=cities)
+axes[1].set_title('Demand by city')
+
+plt.tight_layout()
+plt.show()
+
+# 4) Correlation table
+print("\nCorrelation matrix:")
+print(df[['temperature', 'humidity', 'demand']].corr().round(3))
+```
+
+Temperature and demand should show strong positive correlation (~0.89); humidity and demand
+near zero. City box plots should show similar medians (city was random here) — a real dataset
+would show geographic differences.
+</details>

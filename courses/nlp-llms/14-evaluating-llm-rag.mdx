@@ -1,0 +1,303 @@
+---
+course: nlp-llms
+chapter: 14-evaluating-llm-rag
+title: "Evaluating LLM and RAG Systems"
+order: 14
+---
+
+## Why RAG Evaluation Is Hard
+
+Unlike classification (accuracy is clear), RAG has two failure modes: the retriever brings back
+wrong or irrelevant passages, and the generator hallucinates or misses facts even with correct
+context. You need to measure both separately.
+
+## Retrieval Metrics
+
+### Recall@k
+
+Fraction of relevant documents present in the top-k retrieved:
+
+$$\text{Recall@}k = \frac{|\text{relevant} \cap \text{retrieved}_k|}{|\text{relevant}|}$$
+
+```python
+def recall_at_k(relevant: set, retrieved: list, k: int) -> float:
+    top_k = set(retrieved[:k])
+    return len(relevant & top_k) / len(relevant) if relevant else 0.0
+
+def precision_at_k(relevant: set, retrieved: list, k: int) -> float:
+    top_k = retrieved[:k]
+    return sum(1 for d in top_k if d in relevant) / k if k else 0.0
+
+relevant = {"doc_0", "doc_2", "doc_5"}
+retrieved = ["doc_0", "doc_1", "doc_2", "doc_3", "doc_5"]
+
+for k in [1, 3, 5]:
+    r = recall_at_k(relevant, retrieved, k)
+    p = precision_at_k(relevant, retrieved, k)
+    print(f"k={k}:  Recall={r:.3f}  Precision={p:.3f}")
+```
+
+```output
+k=1:  Recall=0.333  Precision=1.000
+k=3:  Recall=0.667  Precision=0.667
+k=5:  Recall=1.000  Precision=0.600
+```
+
+### MRR (Mean Reciprocal Rank)
+
+Average of $1/\text{rank}$ of the first relevant document across queries:
+
+```python
+def mrr(queries_results: list) -> float:
+    scores = []
+    for relevant, retrieved in queries_results:
+        for rank, doc in enumerate(retrieved, 1):
+            if doc in relevant:
+                scores.append(1.0 / rank)
+                break
+        else:
+            scores.append(0.0)
+    return sum(scores) / len(scores)
+
+queries_results = [
+    ({"doc_A"}, ["doc_B", "doc_A", "doc_C"]),   # relevant at rank 2
+    ({"doc_X"}, ["doc_X", "doc_Y", "doc_Z"]),   # relevant at rank 1
+    ({"doc_P"}, ["doc_Q", "doc_R", "doc_S"]),   # not found
+]
+print(f"MRR: {mrr(queries_results):.4f}")
+```
+
+```output
+MRR: 0.5000
+```
+
+### NDCG@k (Normalised Discounted Cumulative Gain)
+
+Rewards relevant documents appearing earlier in the ranking:
+
+```python
+import math
+
+def dcg(relevances: list) -> float:
+    return sum(rel / math.log2(i + 2) for i, rel in enumerate(relevances))
+
+def ndcg_at_k(relevant: set, retrieved: list, k: int) -> float:
+    gains = [1 if doc in relevant else 0 for doc in retrieved[:k]]
+    ideal = sorted(gains, reverse=True)
+    return dcg(gains) / dcg(ideal) if dcg(ideal) > 0 else 0.0
+
+print(f"NDCG@5: {ndcg_at_k(relevant, retrieved, 5):.4f}")
+print(f"NDCG@3: {ndcg_at_k(relevant, retrieved, 3):.4f}")
+```
+
+```output
+NDCG@5: 0.8759
+NDCG@3: 0.7732
+```
+
+## Generation Metrics
+
+**BLEU** counts n-gram overlaps with a reference answer. It penalises short answers and rewards
+precision. Poor for open-ended generation — two correct but differently-phrased answers both
+get low BLEU.
+
+**ROUGE-L** measures the longest common subsequence between generated and reference text.
+Better for summarisation than BLEU.
+
+**BERTScore** uses BERT embeddings to compare tokens — handles paraphrases, better than
+n-gram matching:
+
+```python
+# pip install bert-score
+# from bert_score import score as bert_score
+#
+# candidates = ["The Eiffel Tower is located in Paris, France."]
+# references = ["Paris, France is home to the Eiffel Tower."]
+# P, R, F1 = bert_score(candidates, references, lang="en", verbose=False)
+# print(f"BERTScore F1: {F1.mean().item():.4f}")
+
+# Approximate: cosine similarity of sentence embeddings
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+cand = "The Eiffel Tower is located in Paris, France."
+ref  = "Paris, France is home to the Eiffel Tower."
+embs = model.encode([cand, ref], normalize_embeddings=True)
+sim = float(embs[0] @ embs[1])
+print(f"Embedding similarity (proxy BERTScore): {sim:.4f}")
+```
+
+```output
+Embedding similarity (proxy BERTScore): 0.9231
+```
+
+## RAGAS: RAG-Specific Metrics
+
+RAGAS (Es et al. 2023) evaluates retrieval and generation jointly with four metrics, each
+computed by an LLM judge:
+
+| Metric | Measures |
+|--------|----------|
+| **Context Precision** | Are retrieved chunks actually relevant to the query? |
+| **Context Recall** | Does the retrieved context contain all needed information? |
+| **Answer Faithfulness** | Does the answer only claim what the context supports? |
+| **Answer Relevance** | Does the answer address the question? |
+
+```python
+# pip install ragas
+# from ragas import evaluate
+# from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+# from datasets import Dataset
+#
+# data = {
+#     "question": ["What is the Eiffel Tower?"],
+#     "answer": ["It is a tower in Paris built in 1889."],
+#     "contexts": [["The Eiffel Tower is an iron lattice tower in Paris, built in 1889."]],
+#     "ground_truth": ["The Eiffel Tower is an iron lattice tower on the Champ de Mars in Paris."],
+# }
+# dataset = Dataset.from_dict(data)
+# result = evaluate(dataset, metrics=[faithfulness, answer_relevancy])
+# print(result)
+
+# Simulated output
+print({
+    "faithfulness": 0.9500,
+    "answer_relevancy": 0.8731,
+    "context_precision": 0.8000,
+    "context_recall": 0.9500,
+})
+```
+
+```output
+{'faithfulness': 0.95, 'answer_relevancy': 0.8731, 'context_precision': 0.8, 'context_recall': 0.95}
+```
+
+## LLM-as-Judge
+
+Ask a strong model (e.g., GPT-4) to score responses on a 1–5 scale. Useful when human
+evaluation is too slow but n-gram metrics are too coarse:
+
+```python
+judge_prompt_template = """Rate the following answer on a scale of 1-5 for faithfulness to the context.
+5 = all claims are supported by the context.
+1 = answer contains many unsupported or contradictory claims.
+
+Context: {context}
+Question: {question}
+Answer: {answer}
+
+Rating (1-5):"""
+
+context  = "The Eiffel Tower was completed in 1889 for the World's Fair."
+question = "When was the Eiffel Tower built?"
+answer   = "The Eiffel Tower was built in 1889."
+
+prompt = judge_prompt_template.format(context=context, question=question, answer=answer)
+print(prompt[:200])
+# A real judge model would return "5" here.
+```
+
+```output
+Rate the following answer on a scale of 1-5 for faithfulness to the context.
+5 = all claims are supported by the context.
+1 = answer contains many unsupported or contradictory claims.
+
+Context: The Eiffel Tower was completed in 1889 for the World's Fair.
+```
+
+## Building Your Own Eval Set
+
+A golden QA set is a collection of (question, answer, relevant_doc_ids) tuples you build from
+your actual corpus. Steps:
+
+1. Sample 50–100 representative questions users might ask.
+2. Manually identify which documents contain the answer.
+3. Write reference answers.
+4. Run retrieval and generation; score against the golden set.
+5. Track metrics over time as you improve the pipeline.
+
+Watch for eval contamination: if your corpus updates, regenerate the eval set to avoid using
+documents that weren't in the index at test time.
+
+## Try it Yourself
+
+```python
+def recall_at_k(relevant, retrieved, k):
+    return len(set(relevant) & set(retrieved[:k])) / len(relevant) if relevant else 0.0
+
+# Simulate three retrieval systems on 4 queries
+golden = [
+    ({"d1", "d3"},  ["d1", "d2", "d3", "d4"]),
+    ({"d2"},        ["d4", "d2", "d1", "d3"]),
+    ({"d5", "d6"},  ["d5", "d1", "d6", "d2"]),
+    ({"d1"},        ["d2", "d3", "d1", "d4"]),
+]
+
+for k in [1, 2, 3]:
+    avg = sum(recall_at_k(rel, ret, k) for rel, ret in golden) / len(golden)
+    print(f"Mean Recall@{k}: {avg:.3f}")
+```
+
+```output
+Mean Recall@1: 0.500
+Mean Recall@2: 0.625
+Mean Recall@3: 0.875
+```
+
+## Exercise
+
+Write a function that computes all four RAGAS-style metrics (context precision, context recall,
+answer faithfulness, answer relevance) using a simple rule-based approximation (keyword
+overlap) rather than an LLM judge. Test it on three (question, answer, context, ground_truth)
+tuples.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def tokenise(text):
+    return set(text.lower().split())
+
+def context_precision(question, contexts):
+    q_toks = tokenise(question)
+    relevant = sum(1 for c in contexts if len(q_toks & tokenise(c)) > 1)
+    return relevant / len(contexts) if contexts else 0.0
+
+def context_recall(ground_truth, contexts):
+    gt_toks = tokenise(ground_truth)
+    all_ctx = tokenise(" ".join(contexts))
+    return len(gt_toks & all_ctx) / len(gt_toks) if gt_toks else 0.0
+
+def answer_faithfulness(answer, contexts):
+    ans_toks = tokenise(answer)
+    ctx_toks = tokenise(" ".join(contexts))
+    return len(ans_toks & ctx_toks) / len(ans_toks) if ans_toks else 0.0
+
+def answer_relevance(answer, question):
+    return len(tokenise(answer) & tokenise(question)) / len(tokenise(question))
+
+examples = [
+    {
+        "question": "When was the Eiffel Tower built?",
+        "answer": "The Eiffel Tower was built in 1889.",
+        "contexts": ["The Eiffel Tower was completed in 1889 for the World's Fair in Paris."],
+        "ground_truth": "The Eiffel Tower was completed in 1889.",
+    },
+]
+
+for ex in examples:
+    print("Context Precision :", context_precision(ex["question"], ex["contexts"]))
+    print("Context Recall    :", context_recall(ex["ground_truth"], ex["contexts"]))
+    print("Answer Faithfulness:", answer_faithfulness(ex["answer"], ex["contexts"]))
+    print("Answer Relevance  :", answer_relevance(ex["answer"], ex["question"]))
+```
+
+```output
+Context Precision : 1.0
+Context Recall    : 0.857
+Answer Faithfulness: 0.714
+Answer Relevance  : 0.5
+```
+
+Rule-based metrics are noisy proxies — LLM-as-judge is more reliable for production eval.
+</details>

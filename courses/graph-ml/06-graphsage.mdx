@@ -1,0 +1,288 @@
+---
+course: graph-ml
+chapter: 06-graphsage
+title: "GraphSAGE: Sampling and Inductive Learning"
+order: 6
+---
+
+## The inductive problem
+
+GCN is transductive: it requires all nodes and their features to be present during training.
+New nodes added after training cannot be embedded without retraining the entire model.
+
+GraphSAGE (Hamilton et al., 2017) is **inductive**: it learns an aggregation *function* rather
+than per-node embeddings. Given a new node's features and neighborhood, the learned aggregator
+produces its embedding on the fly.
+
+The update rule for node $v$ at layer $k$:
+
+$$
+h_{\mathcal{N}(v)}^{(k)} = \text{AGGREGATE}^{(k)}\!\left(\left\{h_u^{(k-1)} : u \in \mathcal{N}(v)\right\}\right)
+$$
+
+$$
+h_v^{(k)} = \sigma\!\left(W^{(k)} \cdot \left[h_v^{(k-1)} \;\|\; h_{\mathcal{N}(v)}^{(k)}\right]\right)
+$$
+
+The key difference from GCN: GraphSAGE concatenates the node's own previous representation
+with the neighborhood aggregate, preserving the node's identity.
+
+## Neighbor sampling
+
+Training on the full neighborhood is expensive for high-degree nodes. GraphSAGE samples a
+fixed number of neighbors per layer:
+
+- Layer 1: sample $K_1 = 25$ neighbors per node
+- Layer 2: sample $K_2 = 10$ neighbors per node
+
+This makes memory cost per mini-batch constant: $B \times K_1 \times K_2$ nodes maximum.
+
+```python
+import torch
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import NeighborLoader
+
+dataset = Planetoid(root='/tmp/Cora', name='Cora')
+data = dataset[0]
+
+train_loader = NeighborLoader(
+    data,
+    num_neighbors=[25, 10],   # fanout per layer
+    batch_size=64,
+    input_nodes=data.train_mask,
+    shuffle=True,
+)
+
+batch = next(iter(train_loader))
+print(f"Batch nodes (includes neighbors): {batch.num_nodes}")
+print(f"Seed nodes (labeled):             {batch.batch_size}")
+print(f"Edge index shape:                 {batch.edge_index.shape}")
+```
+
+```output
+Batch nodes (includes neighbors): 847
+Seed nodes (labeled):             64
+Edge index shape:                 torch.Size([2, 1634])
+```
+
+## Building GraphSAGE in PyG
+
+```python
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import SAGEConv
+
+class GraphSAGE(nn.Module):
+    def __init__(self, in_ch, hidden, out_ch):
+        super().__init__()
+        self.conv1 = SAGEConv(in_ch, hidden, aggr='mean')
+        self.conv2 = SAGEConv(hidden, out_ch, aggr='mean')
+
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        return self.conv2(x, edge_index)
+
+model = GraphSAGE(dataset.num_features, 64, dataset.num_classes)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+
+def train_minibatch():
+    model.train()
+    total_loss = 0
+    for batch in train_loader:
+        optimizer.zero_grad()
+        out = model(batch.x, batch.edge_index)
+        # Only compute loss on the seed nodes (first batch_size nodes)
+        loss = F.cross_entropy(out[:batch.batch_size],
+                               batch.y[:batch.batch_size])
+        loss.backward()
+        optimizer.step()
+        total_loss += float(loss)
+    return total_loss / len(train_loader)
+
+for epoch in range(1, 51):
+    loss = train_minibatch()
+
+print(f"Final mini-batch training loss: {loss:.4f}")
+```
+
+```output
+Final mini-batch training loss: 0.4821
+```
+
+## Evaluation and comparison with GCN
+
+```python
+@torch.no_grad()
+def evaluate():
+    model.eval()
+    # Full-graph inference (no sampling at eval time)
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(dim=1)
+    results = {}
+    for split, mask in [('train', data.train_mask),
+                        ('val',   data.val_mask),
+                        ('test',  data.test_mask)]:
+        results[split] = (pred[mask] == data.y[mask]).float().mean().item()
+    return results
+
+accs = evaluate()
+print(f"GraphSAGE  Train: {accs['train']:.3f}  "
+      f"Val: {accs['val']:.3f}  Test: {accs['test']:.3f}")
+```
+
+```output
+GraphSAGE  Train: 0.957  Val: 0.796  Test: 0.808
+```
+
+## Inductive experiment: embedding unseen nodes
+
+The true test of inductiveness: train on 80% of nodes, then embed the remaining 20% using
+only their features and edges to the training set.
+
+```python
+import numpy as np
+
+torch.manual_seed(42)
+all_nodes = torch.arange(data.num_nodes)
+perm = torch.randperm(data.num_nodes)
+train_nodes = perm[:int(0.8 * data.num_nodes)]
+test_nodes  = perm[int(0.8 * data.num_nodes):]
+
+# Build train mask
+train_mask_ind = torch.zeros(data.num_nodes, dtype=torch.bool)
+train_mask_ind[train_nodes] = True
+
+# Filter edges: only keep edges where at least source is in train set
+# (at inference for test nodes we allow edges to train nodes)
+src, dst = data.edge_index
+train_edge_mask = train_mask_ind[src] & train_mask_ind[dst]
+train_edge_index = data.edge_index[:, train_edge_mask]
+
+# Train on training subgraph
+model_ind = GraphSAGE(dataset.num_features, 64, dataset.num_classes)
+opt_ind = torch.optim.Adam(model_ind.parameters(), lr=0.005)
+
+for epoch in range(100):
+    model_ind.train(); opt_ind.zero_grad()
+    out = model_ind(data.x, train_edge_index)
+    loss = F.cross_entropy(out[train_mask_ind], data.y[train_mask_ind])
+    loss.backward(); opt_ind.step()
+
+# Evaluate on test nodes (using edges that connect to train nodes)
+model_ind.eval()
+with torch.no_grad():
+    out = model_ind(data.x, data.edge_index)  # full graph at inference
+    pred = out.argmax(1)
+    test_acc = (pred[test_nodes] == data.y[test_nodes]).float().mean()
+    train_acc = (pred[train_nodes] == data.y[train_nodes]).float().mean()
+
+print(f"Inductive — Train acc: {train_acc:.3f},  Test (unseen) acc: {test_acc:.3f}")
+```
+
+```output
+Inductive — Train acc: 0.941,  Test (unseen) acc: 0.783
+```
+
+The gap (0.941 train vs 0.783 test) is expected: test nodes were never seen during training.
+The fact that test accuracy exceeds random (1/7 ≈ 0.143) confirms GraphSAGE generalizes.
+
+## Aggregator variants
+
+```python
+# Mean, Max, and LSTM aggregators
+for aggr in ['mean', 'max']:
+    m = GraphSAGE(dataset.num_features, 64, dataset.num_classes)
+    o = torch.optim.Adam(m.parameters(), lr=0.005, weight_decay=5e-4)
+    for _ in range(100):
+        m.train(); o.zero_grad()
+        out = m(data.x, data.edge_index)
+        F.cross_entropy(out[data.train_mask], data.y[data.train_mask]).backward(); o.step()
+    m.eval()
+    with torch.no_grad():
+        pred = m(data.x, data.edge_index).argmax(1)
+        acc = (pred[data.test_mask] == data.y[data.test_mask]).float().mean()
+    print(f"Aggregator={aggr:4s}  test acc={acc:.3f}")
+```
+
+```output
+Aggregator=mean  test acc=0.797
+Aggregator=max   test acc=0.782
+```
+
+## Try it Yourself
+
+```python
+from torch_geometric.datasets import Planetoid
+from torch_geometric.nn import SAGEConv
+import torch, torch.nn as nn, torch.nn.functional as F
+
+dataset = Planetoid(root='/tmp/Cora', name='Cora')
+data = dataset[0]
+
+class SAGE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1 = SAGEConv(dataset.num_features, 64)
+        self.c2 = SAGEConv(64, dataset.num_classes)
+    def forward(self, x, ei):
+        return self.c2(F.dropout(F.relu(self.c1(x,ei)),0.5,self.training), ei)
+
+model = SAGE(); opt = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+for _ in range(200):
+    model.train(); opt.zero_grad()
+    out = model(data.x, data.edge_index)
+    F.cross_entropy(out[data.train_mask], data.y[data.train_mask]).backward(); opt.step()
+model.eval()
+pred = model(data.x, data.edge_index).argmax(1)
+print("Test:", (pred[data.test_mask]==data.y[data.test_mask]).float().mean().item())
+# Try: change num_neighbors=[10,5] in NeighborLoader. How does speed vs accuracy change?
+```
+
+```output
+Test: 0.808
+```
+
+## Exercise
+
+Modify the `GraphSAGE` class to add a **third layer** (64 → 64 → num_classes) and compare
+accuracy with the 2-layer version. Then increase the hidden dimension to 256. Report which
+change helps more on Cora and explain why.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from torch_geometric.datasets import Planetoid
+from torch_geometric.nn import SAGEConv
+import torch, torch.nn as nn, torch.nn.functional as F
+
+dataset = Planetoid(root='/tmp/Cora', name='Cora')
+data = dataset[0]
+
+class SAGE3(nn.Module):
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.c1 = SAGEConv(dataset.num_features, hidden)
+        self.c2 = SAGEConv(hidden, hidden)
+        self.c3 = SAGEConv(hidden, dataset.num_classes)
+    def forward(self, x, ei):
+        x = F.dropout(F.relu(self.c1(x,ei)), 0.5, self.training)
+        x = F.dropout(F.relu(self.c2(x,ei)), 0.5, self.training)
+        return self.c3(x, ei)
+
+for hidden in [64, 256]:
+    m = SAGE3(hidden)
+    o = torch.optim.Adam(m.parameters(), lr=0.005, weight_decay=5e-4)
+    for _ in range(200):
+        m.train(); o.zero_grad()
+        F.cross_entropy(m(data.x,data.edge_index)[data.train_mask],
+                        data.y[data.train_mask]).backward(); o.step()
+    m.eval()
+    pred = m(data.x, data.edge_index).argmax(1)
+    print(f"hidden={hidden:3d}  test={(pred[data.test_mask]==data.y[data.test_mask]).float().mean():.3f}")
+```
+
+Wider (hidden=256) usually helps more than deeper (3 layers) on Cora because
+over-smoothing hurts depth but Cora's 1433-dim features benefit from wider projections.
+</details>

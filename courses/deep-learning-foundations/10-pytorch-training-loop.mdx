@@ -1,0 +1,303 @@
+---
+course: deep-learning-foundations
+chapter: 10-pytorch-training-loop
+title: "PyTorch: Tensors, Modules, and the Training Loop"
+order: 10
+---
+
+## Tensors
+
+A PyTorch tensor is an n-dimensional array that lives on a device (CPU or CUDA) and tracks gradient computations.
+
+```python
+import torch
+import torch.nn as nn
+
+# Creation
+a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+b = torch.zeros(3, 4)
+c = torch.randn(2, 5)
+
+print(f"a shape={a.shape}, dtype={a.dtype}, device={a.device}")
+print(f"b shape={b.shape}")
+print(f"c mean={c.mean():.4f}, std={c.std():.4f}")
+```
+
+```output
+a shape=torch.Size([2, 2]), dtype=torch.float32, device=cpu
+b shape=torch.Size([3, 4])
+c mean=0.0821, std=0.9934
+```
+
+Key tensor ops: `.view()` / `.reshape()` for shape changes, `.permute()` for axis reordering, `.squeeze()` / `.unsqueeze()` for singleton dims, `.to(device)` / `.cuda()` for device transfer.
+
+```python
+x = torch.randn(4, 3, 32, 32)  # batch of 4 RGB 32×32 images
+flat = x.view(4, -1)            # flatten spatial + channel
+print(f"Before: {x.shape}  →  After: {flat.shape}")
+
+# In-place ops use trailing underscore
+t = torch.ones(3)
+t.add_(5)
+print(f"In-place add: {t}")
+```
+
+```output
+Before: torch.Size([4, 3, 32, 32])  →  After: torch.Size([4, 3072])
+In-place add: tensor([6., 6., 6.])
+```
+
+## Autograd
+
+PyTorch builds a computation graph on the fly. Every tensor with `requires_grad=True` records which operations produced it; calling `.backward()` walks the graph in reverse to compute gradients.
+
+```python
+x = torch.tensor([2.0, 3.0], requires_grad=True)
+y = (x**2).sum()   # y = x0^2 + x1^2
+y.backward()
+print(f"dy/dx = {x.grad}")  # should be [2*x0, 2*x1] = [4, 6]
+```
+
+```output
+dy/dx = tensor([4., 6.])
+```
+
+`torch.no_grad()` disables gradient tracking — use it for validation and inference to save memory and compute:
+
+```python
+with torch.no_grad():
+    out = (x**3).sum()
+    print(f"Computed without tracking: {out.item():.1f}")
+    print(f"x.grad unchanged: {x.grad}")
+```
+
+```output
+Computed without tracking: 35.0
+x.grad unchanged: tensor([4., 6.])
+```
+
+## nn.Module
+
+Every neural network component subclasses `nn.Module`. Define `__init__` (layers) and `forward` (computation). PyTorch calls your `forward` automatically when you call the module like a function.
+
+```python
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim, dropout_p=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = MLP(16, 64, 2)
+print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+print(f"Trainable:  {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+```
+
+```output
+Parameters: 5,506
+Trainable:  5,506
+```
+
+`model.parameters()` yields all leaf tensors with `requires_grad=True`. `model.state_dict()` returns an ordered dict of all parameter tensors — used for saving/loading.
+
+## The canonical training loop
+
+```python
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+# Synthetic binary classification: 2D XOR-ish
+torch.manual_seed(42)
+N = 1000
+X = torch.randn(N, 16)
+y = ((X[:, 0] + X[:, 1]) > 0).long()
+
+dataset = TensorDataset(X, y)
+train_ds, val_ds = torch.utils.data.random_split(dataset, [800, 200])
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False)
+
+model = MLP(16, 64, 2, dropout_p=0.3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+criterion = nn.CrossEntropyLoss()
+
+for epoch in range(1, 6):
+    # --- Train ---
+    model.train()
+    total_loss = 0.0
+    for xb, yb in train_loader:
+        optimizer.zero_grad()          # 1. clear stale gradients
+        logits = model(xb)             # 2. forward pass
+        loss = criterion(logits, yb)   # 3. compute loss
+        loss.backward()                # 4. backward (populate .grad)
+        optimizer.step()               # 5. update weights
+        total_loss += loss.item() * len(xb)
+
+    # --- Validate ---
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            preds = model(xb).argmax(dim=1)
+            correct += (preds == yb).sum().item()
+
+    print(f"Epoch {epoch}: loss={total_loss/800:.4f}  val_acc={correct/200:.2%}")
+```
+
+```output
+Epoch 1: loss=0.6847  val_acc=61.50%
+Epoch 2: loss=0.6312  val_acc=68.00%
+Epoch 3: loss=0.5891  val_acc=72.50%
+Epoch 4: loss=0.5534  val_acc=74.00%
+Epoch 5: loss=0.5201  val_acc=76.00%
+```
+
+The five-step loop (`zero_grad → forward → loss → backward → step`) is universal — everything else (schedulers, mixed precision, gradient clipping) wraps around it.
+
+## Moving to GPU
+
+```python
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+model = MLP(16, 64, 2).to(device)
+xb = torch.randn(32, 16).to(device)
+with torch.no_grad():
+    out = model(xb)
+print(f"Output shape: {out.shape}, device: {out.device}")
+```
+
+```output
+Using device: cpu
+Output shape: torch.Size([32, 2]), device: cpu
+```
+
+The pattern is always: move model to device once, then move each batch to device inside the loop with `xb = xb.to(device)`.
+
+## Saving and loading checkpoints
+
+```python
+import os, tempfile
+
+# Save
+ckpt_path = os.path.join(tempfile.gettempdir(), "mlp_checkpoint.pt")
+torch.save({
+    "epoch": 5,
+    "model_state_dict": model.state_dict(),
+    "optimizer_state_dict": optimizer.state_dict(),
+    "loss": 0.5201,
+}, ckpt_path)
+
+# Load
+checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+model2 = MLP(16, 64, 2).to(device)
+model2.load_state_dict(checkpoint["model_state_dict"])
+print(f"Loaded from epoch {checkpoint['epoch']}, loss={checkpoint['loss']}")
+```
+
+```output
+Loaded from epoch 5, loss=0.5201
+```
+
+Always save both model state and optimizer state — optimizer contains momentum buffers and the adaptive learning rates, and resuming without them changes the training trajectory.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+
+# Build a 3-layer MLP for regression and train it
+N, D = 500, 8
+X = torch.randn(N, D)
+y = (X[:, :3].sum(dim=1, keepdim=True) + 0.1*torch.randn(N, 1))  # linear target + noise
+
+model = nn.Sequential(
+    nn.Linear(D, 32), nn.ReLU(),
+    nn.Linear(32, 32), nn.ReLU(),
+    nn.Linear(32, 1),
+)
+opt = torch.optim.Adam(model.parameters(), lr=5e-3)
+mse = nn.MSELoss()
+
+loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(X, y), batch_size=64, shuffle=True
+)
+
+for epoch in range(1, 11):
+    model.train()
+    total = 0.0
+    for xb, yb in loader:
+        opt.zero_grad()
+        loss = mse(model(xb), yb)
+        loss.backward()
+        opt.step()
+        total += loss.item()*len(xb)
+    if epoch % 2 == 0:
+        print(f"Epoch {epoch}: MSE={total/N:.4f}")
+```
+
+```output
+Epoch 2: MSE=3.4821
+Epoch 4: MSE=1.2341
+Epoch 6: MSE=0.5612
+Epoch 8: MSE=0.2134
+Epoch 10: MSE=0.1023
+```
+
+Try replacing `nn.ReLU()` with `nn.Tanh()` or adding `nn.BatchNorm1d(32)` between linear and activation.
+
+## Exercise
+
+Modify the training loop above to add: (1) gradient clipping at norm 1.0, (2) a cosine annealing LR schedule over 20 epochs, (3) save the best checkpoint (lowest val loss) and reload it at the end. Use the MLP from earlier with 20% of the data as validation.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn, os, tempfile
+
+torch.manual_seed(42)
+N, D = 800, 8
+X = torch.randn(N, D); y = X[:, :3].sum(1, keepdim=True) + 0.1*torch.randn(N, 1)
+
+tr_ds = torch.utils.data.TensorDataset(X[:640], y[:640])
+va_ds = torch.utils.data.TensorDataset(X[640:], y[640:])
+tr_ld = torch.utils.data.DataLoader(tr_ds, 64, shuffle=True)
+va_ld = torch.utils.data.DataLoader(va_ds, 64)
+
+model = nn.Sequential(nn.Linear(D,32), nn.ReLU(), nn.Linear(32,32), nn.ReLU(), nn.Linear(32,1))
+opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20, eta_min=1e-4)
+mse = nn.MSELoss()
+best, ckpt = float("inf"), os.path.join(tempfile.gettempdir(), "best.pt")
+
+for epoch in range(1, 21):
+    model.train()
+    for xb, yb in tr_ld:
+        opt.zero_grad(); loss = mse(model(xb), yb); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+    sched.step()
+
+    model.eval()
+    with torch.no_grad():
+        val_loss = sum(mse(model(xb),yb).item()*len(xb) for xb,yb in va_ld) / 160
+    if val_loss < best:
+        best = val_loss; torch.save(model.state_dict(), ckpt)
+
+model.load_state_dict(torch.load(ckpt, weights_only=True))
+print(f"Best val MSE: {best:.4f}")
+```
+</details>

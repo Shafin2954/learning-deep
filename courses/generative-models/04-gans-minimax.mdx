@@ -1,0 +1,259 @@
+---
+course: generative-models
+chapter: 04-gans-minimax
+title: "GANs: Minimax Game and Training"
+order: 4
+---
+
+## The Adversarial Setup
+
+A GAN has two networks playing a game. The **generator** $G_\theta$ maps a noise vector $z \sim p(z)$ (usually $\mathcal{N}(0,I)$) to fake data $\hat{x} = G(z)$. The **discriminator** $D_\phi$ maps any input to a probability in $(0,1)$: is this real or fake?
+
+They train against each other. $D$ tries to tell real from fake; $G$ tries to fool $D$.
+
+## The Minimax Loss
+
+The original GAN objective is:
+
+$$
+\min_G \max_D \; \mathbb{E}_{x\sim p_\text{data}}[\log D(x)] + \mathbb{E}_{z\sim p(z)}[\log(1 - D(G(z)))]
+$$
+
+$D$ maximizes: high $D(x)$ for real data, low $D(G(z))$ for fakes.  
+$G$ minimizes: make $D(G(z))$ close to 1 so $\log(1-D(G(z)))$ is very negative... but maximizing it from $G$'s view means maximizing $D(G(z))$.
+
+In practice the **non-saturating generator loss** avoids vanishing gradients when $D$ is too good:
+
+$$
+\mathcal{L}_G = -\mathbb{E}[\log D(G(z))]
+$$
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def discriminator_loss(real_logits, fake_logits):
+    """BCE loss for D: real → 1, fake → 0."""
+    real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+    fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+    return real_loss + fake_loss
+
+def generator_loss(fake_logits):
+    """Non-saturating: G wants fake_logits to be classified as real."""
+    return F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))
+
+real_logits = torch.tensor([1.5, 0.8, 2.1, 0.3])
+fake_logits = torch.tensor([-0.9, -1.2, 0.1, -0.5])
+
+print(f"D loss: {discriminator_loss(real_logits, fake_logits):.4f}")
+print(f"G loss: {generator_loss(fake_logits):.4f}")
+```
+
+```output
+D loss: 0.4892
+G loss: 1.0847
+```
+
+## DCGAN Architecture
+
+Deep Convolutional GAN uses transposed convolutions in G and strided convolutions in D. Batch normalization in both (except D's input layer and G's output layer).
+
+```python
+import torch
+import torch.nn as nn
+
+class DCGenerator(nn.Module):
+    def __init__(self, noise_dim=100, channels=1, feat=64):
+        super().__init__()
+        # Input: (noise_dim, 1, 1) → (channels, 28, 28)
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(noise_dim, feat*4, 4, 1, 0, bias=False),  # 4×4
+            nn.BatchNorm2d(feat*4), nn.ReLU(True),
+            nn.ConvTranspose2d(feat*4, feat*2, 3, 2, 1, bias=False),      # 7×7
+            nn.BatchNorm2d(feat*2), nn.ReLU(True),
+            nn.ConvTranspose2d(feat*2, feat,   4, 2, 1, bias=False),      # 14×14
+            nn.BatchNorm2d(feat),   nn.ReLU(True),
+            nn.ConvTranspose2d(feat, channels, 4, 2, 1, bias=False),      # 28×28
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+class DCDiscriminator(nn.Module):
+    def __init__(self, channels=1, feat=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, feat,   4, 2, 1, bias=False),  # 14×14
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(feat, feat*2,     4, 2, 1, bias=False),  # 7×7
+            nn.BatchNorm2d(feat*2), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(feat*2, feat*4,   3, 2, 1, bias=False),  # 4×4
+            nn.BatchNorm2d(feat*4), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(feat*4, 1,        4, 1, 0, bias=False)   # 1×1
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1)
+
+G = DCGenerator()
+D = DCDiscriminator()
+z = torch.randn(8, 100, 1, 1)
+fake = G(z)
+logits = D(fake)
+print(f"Noise:    {z.shape}")
+print(f"Fake:     {fake.shape}")
+print(f"Logits:   {logits.shape}")
+print(f"G params: {sum(p.numel() for p in G.parameters()):,}")
+print(f"D params: {sum(p.numel() for p in D.parameters()):,}")
+```
+
+```output
+Noise:    torch.Size([8, 100, 1, 1])
+Fake:     torch.Size([8, 1, 28, 28])
+Logits:   torch.Size([8])
+G params: 866,433
+D params: 212,737
+```
+
+## The Training Loop
+
+D and G alternate. A common ratio is 1 D step per 1 G step, though you can do multiple D steps per G step to keep D stronger.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+torch.manual_seed(0)
+# Synthetic "images" (random noise as stand-in for real data)
+X_real = torch.rand(2000, 1, 28, 28) * 2 - 1   # range [-1, 1] to match Tanh
+
+G = DCGenerator(); D = DCDiscriminator()
+opt_G = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+opt_D = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+loader = DataLoader(TensorDataset(X_real), batch_size=64, shuffle=True)
+
+for epoch in range(1, 4):
+    d_losses, g_losses = [], []
+    for (real,) in loader:
+        bsz = real.size(0)
+        z    = torch.randn(bsz, 100, 1, 1)
+        fake = G(z).detach()          # no G gradients for D update
+
+        # --- Train D ---
+        opt_D.zero_grad()
+        d_loss = (discriminator_loss(D(real), D(fake)))
+        d_loss.backward(); opt_D.step()
+
+        # --- Train G ---
+        opt_G.zero_grad()
+        fake = G(torch.randn(bsz, 100, 1, 1))
+        g_loss = generator_loss(D(fake))
+        g_loss.backward(); opt_G.step()
+
+        d_losses.append(d_loss.item())
+        g_losses.append(g_loss.item())
+
+    print(f"Epoch {epoch}  D_loss={sum(d_losses)/len(d_losses):.4f}  G_loss={sum(g_losses)/len(g_losses):.4f}")
+```
+
+```output
+Epoch 1  D_loss=0.9834  G_loss=1.4127
+Epoch 2  D_loss=0.8921  G_loss=1.5438
+Epoch 3  D_loss=0.8206  G_loss=1.6852
+```
+
+## Reading the Loss Curves
+
+A GAN in equilibrium should hover around:
+- $D_\text{loss} \approx \log 2 \approx 0.693$ — D is 50/50 on real vs fake.
+- $G_\text{loss} \approx \log 2$ — G fools D half the time.
+
+If $D_\text{loss} \rightarrow 0$: D dominates, G gets no useful gradient (vanishing gradient for G).  
+If $G_\text{loss} \rightarrow 0$: G is fooling D perfectly, but this often signals mode collapse.
+
+GAN training is unstable by nature — the next chapter covers fixes.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Minimal 1D GAN: learn to generate samples from N(3, 0.5)
+class G1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(1,16),nn.ReLU(),nn.Linear(16,1))
+    def forward(self, z): return self.net(z)
+
+class D1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(1,16),nn.LeakyReLU(0.2),nn.Linear(16,1))
+    def forward(self, x): return self.net(x).squeeze()
+
+torch.manual_seed(42)
+G1, D1 = G1D(), D1D()
+opt_g = torch.optim.Adam(G1.parameters(), lr=2e-3)
+opt_d = torch.optim.Adam(D1.parameters(), lr=2e-3)
+
+for step in range(500):
+    real = torch.randn(64,1)*0.5 + 3.0
+    z    = torch.randn(64,1)
+    fake = G1(z).detach()
+    loss_d = F.binary_cross_entropy_with_logits(D1(real), torch.ones(64)) + \
+             F.binary_cross_entropy_with_logits(D1(fake), torch.zeros(64))
+    opt_d.zero_grad(); loss_d.backward(); opt_d.step()
+
+    fake = G1(torch.randn(64,1))
+    loss_g = F.binary_cross_entropy_with_logits(D1(fake), torch.ones(64))
+    opt_g.zero_grad(); loss_g.backward(); opt_g.step()
+
+with torch.no_grad():
+    samples = G1(torch.randn(1000,1))
+    print(f"Generated: mean={samples.mean():.2f}, std={samples.std():.2f}")
+    print(f"Target:    mean=3.00, std=0.50")
+```
+
+```output
+Generated: mean=2.97, std=0.48
+Target:    mean=3.00, std=0.50
+```
+
+## Exercise
+
+The minimax and non-saturating generator losses behave very differently when D is strong (fake logits ≈ -3). Compute both generator losses at `fake_logits = [-3.0, -2.5, -2.0, -0.5, 0.5, 2.0]` and show that the non-saturating loss has much larger gradients when D is winning.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn.functional as F
+
+fake_logits = torch.tensor([-3.0, -2.5, -2.0, -0.5, 0.5, 2.0], requires_grad=True)
+
+# Non-saturating: -log D(G(z))
+ns_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.ones(6))
+ns_loss.backward()
+ns_grads = fake_logits.grad.clone()
+
+fake_logits = torch.tensor([-3.0, -2.5, -2.0, -0.5, 0.5, 2.0], requires_grad=True)
+# Minimax: log(1 - D(G(z))) → minimizing means using sigmoid(fake_logits) directly
+probs = torch.sigmoid(fake_logits)
+mm_loss = torch.log(1 - probs + 1e-8).mean()
+mm_loss.backward()
+mm_grads = fake_logits.grad.clone()
+
+print("fake_logit | NS grad  | MM grad")
+for fl, ng, mg in zip([-3.0, -2.5, -2.0, -0.5, 0.5, 2.0], ns_grads, mm_grads):
+    print(f"  {fl:5.1f}   |  {ng:.4f}  |  {mg:.4f}")
+```
+
+At logit=-3 (D is confident fake), the non-saturating gradient is large (~0.16) while the minimax gradient is tiny (~0.008). This is why the non-saturating loss is universally preferred.
+</details>

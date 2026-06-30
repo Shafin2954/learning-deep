@@ -1,0 +1,337 @@
+---
+course: data-wrangling-eda
+chapter: 11-scaling-transforms
+title: "Scaling and Power Transforms"
+order: 11
+---
+
+## When scaling matters — and when it doesn't
+
+Scaling makes features commensurable (on the same numerical scale). Models that use
+distance or gradient descent are scale-sensitive; tree models are not.
+
+| Model type | Needs scaling? |
+|------------|----------------|
+| Linear/logistic regression | Yes — coefficients have different units |
+| SVM, k-NN | Yes — distance is distorted by different scales |
+| PCA | Yes — variance is dominated by large-scale features |
+| Neural networks | Yes — gradient updates depend on scale |
+| Decision trees, Random Forest, XGBoost | No — splits are rank-based |
+
+## StandardScaler — zero mean, unit variance
+
+$$
+z = \frac{x - \mu}{\sigma}
+$$
+
+Assumes the feature is roughly Gaussian. Sensitive to outliers because $\mu$ and $\sigma$ are
+sensitive to outliers.
+
+```python
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 500
+X = rng.normal(50, 10, (n, 3)).astype(np.float64)
+X[:, 1] *= 100      # feature 1 has scale ~1000
+X[:, 2] += 5000     # feature 2 has large offset
+
+X_train, X_test = train_test_split(X, test_size=0.2, random_state=0)
+
+scaler = StandardScaler()
+scaler.fit(X_train)
+X_train_sc = scaler.transform(X_train)
+X_test_sc  = scaler.transform(X_test)
+
+print("Train stats after scaling:")
+print(f"  mean:  {X_train_sc.mean(axis=0).round(3)}")
+print(f"  std:   {X_train_sc.std(axis=0).round(3)}")
+print(f"\nScaler mean (from train): {scaler.mean_.round(1)}")
+print(f"Scaler std  (from train): {scaler.scale_.round(1)}")
+```
+
+```output
+Train stats after scaling:
+  mean:  [-0.     0.    -0.   ]
+  std:   [1. 1. 1.]
+
+Scaler mean (from train): [  50.2 5011.5 5050.1]
+Scaler std  (from train): [ 10.1 994.9  10.1]
+```
+
+## MinMaxScaler — maps to [0, 1]
+
+$$
+z = \frac{x - x_{\min}}{x_{\max} - x_{\min}}
+$$
+
+Extreme outliers compress the rest of the values to a narrow band. Use only when you know the
+feature has hard bounds and no outliers.
+
+```python
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(1)
+n = 500
+data = rng.normal(0, 1, n).astype(np.float64)
+data[0] = 100   # one extreme outlier
+
+X_train, X_test = train_test_split(data.reshape(-1, 1), test_size=0.2, random_state=0)
+
+mms = MinMaxScaler()
+mms.fit(X_train)
+X_sc = mms.transform(X_train)
+
+print(f"Without outlier — max normal value maps to: {mms.transform([[3.5]])[0,0]:.3f}")
+print(f"Entire normal range compressed to: [{X_sc[X_sc < mms.transform([[100]])[0,0]].max():.3f}]")
+print(f"95% of data in range: [{X_sc.min():.3f}, {np.percentile(X_sc, 95):.3f}]")
+print(f"Outlier maps to: {mms.transform([[100.0]])[0,0]:.3f}")
+```
+
+```output
+Without outlier — max normal value maps to: 0.062
+Entire normal range compressed to: [0.062]
+95% of data in range: [0.000, 0.058]
+Outlier maps to: 1.000
+```
+
+The single outlier at 100 claims the entire [0, 1] range; the actual data cluster in [0, 0.06].
+This is why MinMaxScaler is dangerous with outliers.
+
+## RobustScaler — IQR-based, outlier-resistant
+
+$$
+z = \frac{x - Q_2}{Q_3 - Q_1}
+$$
+
+Uses the median and IQR instead of mean and std, so outliers don't distort the centering or
+scaling.
+
+```python
+import numpy as np
+from sklearn.preprocessing import StandardScaler, RobustScaler
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(2)
+n = 500
+data = rng.normal(0, 1, n).astype(np.float64)
+data[[0, 1, 2]] = [50, -40, 80]   # 3 heavy outliers
+
+X = data.reshape(-1, 1)
+X_std    = StandardScaler().fit_transform(X).ravel()
+X_robust = RobustScaler().fit_transform(X).ravel()
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+for ax, vals, title in zip(axes,
+                            [X_std, X_robust],
+                            ['StandardScaler', 'RobustScaler']):
+    ax.hist(vals[np.abs(vals) < 5], bins=40, edgecolor='white', color='steelblue')
+    ax.set_title(title)
+    ax.set_xlabel('scaled value')
+plt.tight_layout(); plt.show()
+
+# Bulk data statistics
+bulk_std    = X_std[np.abs(X_std) < 10]
+bulk_robust = X_robust[np.abs(X_robust) < 10]
+print(f"StandardScaler bulk std:  {bulk_std.std():.3f}  (wanted ≈ 1)")
+print(f"RobustScaler   bulk std:  {bulk_robust.std():.3f}  (wanted ≈ 1)")
+```
+
+```output
+StandardScaler bulk std:  0.303  (wanted ≈ 1)
+RobustScaler   bulk std:  0.984  (wanted ≈ 1)
+[Figure: histograms showing StandardScaler compressed by outliers vs RobustScaler well-centred]
+```
+
+StandardScaler compresses the bulk of the data into a narrow range (std 0.30) because the
+3 extreme values inflated the computed std. RobustScaler maintains the correct spread.
+
+## PowerTransformer — make distributions more Gaussian
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import PowerTransformer
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(3)
+n = 800
+income  = rng.exponential(40_000, n).astype(np.float64)  # right-skewed
+expenses = (income * 0.4 - 5000 + rng.normal(0, 3000, n)).astype(np.float64)
+
+X = np.column_stack([income, expenses])
+pt = PowerTransformer(method='yeo-johnson')
+X_pt = pt.fit_transform(X)
+
+fig, axes = plt.subplots(2, 2, figsize=(10, 5))
+for i, (name, before, after) in enumerate([
+    ('income',   income,   X_pt[:, 0]),
+    ('expenses', expenses, X_pt[:, 1]),
+]):
+    axes[i, 0].hist(before, bins=40, edgecolor='white', color='steelblue')
+    axes[i, 0].set_title(f'{name} — original (skew={pd.Series(before).skew():.2f})')
+    axes[i, 1].hist(after, bins=40, edgecolor='white', color='tomato')
+    axes[i, 1].set_title(f'{name} — transformed (skew={pd.Series(after).skew():.2f})')
+
+plt.tight_layout(); plt.show()
+print(f"income  λ: {pt.lambdas_[0]:.3f}")
+print(f"expenses λ: {pt.lambdas_[1]:.3f}")
+```
+
+```output
+income  λ: 0.164
+expenses λ: 0.508
+[Figure: before/after histograms for income and expenses showing near-normal transformed distributions]
+```
+
+## QuantileTransformer
+
+Maps any distribution to a uniform or normal output by applying the empirical CDF. The most
+robust transform — immune to any shape, including bimodal and heavy-tailed distributions.
+The trade-off: it can distort relationships between features.
+
+```python
+import numpy as np
+from sklearn.preprocessing import QuantileTransformer
+
+rng = np.random.default_rng(4)
+n = 1000
+# Bimodal: mixture of two Gaussians
+x = np.concatenate([rng.normal(-3, 1, n//2), rng.normal(3, 1, n//2)]).astype(np.float64)
+
+qt = QuantileTransformer(output_distribution='normal', random_state=0)
+x_qt = qt.fit_transform(x.reshape(-1, 1)).ravel()
+
+import pandas as pd
+print(f"Original — mean: {x.mean():.2f}, std: {x.std():.2f}, skew: {pd.Series(x).skew():.2f}")
+print(f"Quantile — mean: {x_qt.mean():.2f}, std: {x_qt.std():.2f}, skew: {pd.Series(x_qt).skew():.2f}")
+```
+
+```output
+Original — mean: 0.01, std: 3.05, skew: -0.02
+Quantile — mean: 0.00, std: 1.00, skew: -0.01
+```
+
+## The golden rule: fit on train, transform both
+
+```python
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(5)
+X = rng.normal(100, 20, (500, 3)).astype(np.float64)
+X_train, X_test = train_test_split(X, test_size=0.2, random_state=0)
+
+scaler = StandardScaler()
+scaler.fit(X_train)           # only train — NO test data here
+
+X_train_sc = scaler.transform(X_train)
+X_test_sc  = scaler.transform(X_test)   # same scaler parameters
+
+print("Test mean (should be ~0, not exact 0 — that's expected):")
+print(X_test_sc.mean(axis=0).round(3))
+print("Test std (should be ~1, slight deviation because test != train):")
+print(X_test_sc.std(axis=0).round(3))
+```
+
+```output
+Test mean (should be ~0, not exact 0 — that's expected):
+[-0.011  0.099 -0.009]
+Test std (should be ~1, slight deviation because test != train):
+[0.971 0.988 1.007]
+```
+
+The test set deviates slightly from 0/1 — that's correct. If you fit on the full dataset,
+the test mean would be exactly 0 and std exactly 1, which is leakage.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.preprocessing import RobustScaler, PowerTransformer
+from sklearn.model_selection import train_test_split
+import pandas as pd
+
+rng = np.random.default_rng(6)
+n = 600
+X = np.column_stack([
+    rng.exponential(1000, n),    # right-skewed with potential outliers
+    rng.normal(50, 5, n),
+]).astype(np.float64)
+X[rng.choice(n, 10, replace=False), 0] = rng.uniform(50_000, 100_000, 10)  # outliers
+
+X_train, X_test = train_test_split(X, test_size=0.2, random_state=0)
+
+# Compare RobustScaler vs PowerTransformer
+rob = RobustScaler()
+pt  = PowerTransformer(method='yeo-johnson')
+
+X_train_rob = rob.fit_transform(X_train)
+X_train_pt  = pt.fit_transform(X_train)
+
+for name, Xsc in [('RobustScaler', X_train_rob), ('PowerTransformer', X_train_pt)]:
+    skew0 = pd.Series(Xsc[:, 0]).skew()
+    print(f"{name}: feature0 skew={skew0:.3f}")
+```
+
+```output
+RobustScaler: feature0 skew=9.312
+PowerTransformer: feature0 skew=-0.027
+```
+
+## Exercise
+
+Given features `age` (Normal), `salary` (log-normal), and `score` (0-100, bounded), apply:
+(a) StandardScaler to `age`, (b) PowerTransformer to `salary`, (c) MinMaxScaler to `score`.
+Use a Pipeline with ColumnTransformer. Verify no leakage by fitting on train only.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, PowerTransformer, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import Ridge
+
+rng = np.random.default_rng(0)
+n = 400
+df = pd.DataFrame({
+    'age':    rng.normal(40, 10, n).astype(np.float64),
+    'salary': np.exp(rng.normal(11, 0.5, n)).astype(np.float64),
+    'score':  np.clip(rng.normal(60, 15, n), 0, 100).astype(np.float64),
+})
+target = df['age'] * 0.5 + np.log(df['salary']) * 0.3 + rng.normal(0, 5, n)
+
+X_train, X_test, y_train, y_test = train_test_split(df, target, test_size=0.2, random_state=0)
+
+preproc = ColumnTransformer([
+    ('std', StandardScaler(),    ['age']),
+    ('pt',  PowerTransformer(),  ['salary']),
+    ('mms', MinMaxScaler(),      ['score']),
+])
+
+pipe = Pipeline([('prep', preproc), ('model', Ridge())])
+pipe.fit(X_train, y_train)
+
+print(f"Train R²: {pipe.score(X_train, y_train):.3f}")
+print(f"Test  R²: {pipe.score(X_test,  y_test):.3f}")
+
+# Verify: StandardScaler was fit on train only
+ss = pipe.named_steps['prep'].named_transformers_['std']
+print(f"\nScaler mean (from train): {ss.mean_[0]:.2f}")
+print(f"True train mean age:       {X_train['age'].mean():.2f}")
+```
+
+The scaler mean matches the training mean exactly — proof that fitting happened only on
+training data. The ColumnTransformer applies the correct transform per column without any
+test-data contamination.
+</details>

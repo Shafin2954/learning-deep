@@ -1,0 +1,242 @@
+---
+course: modern-architectures
+chapter: 06-mixture-of-experts-routing
+title: "Mixture-of-Experts: Routing and Sparse Compute"
+order: 6
+---
+
+## The FFN bottleneck
+
+Every transformer layer spends the majority of its FLOPs in the feedforward sublayer.
+A standard FFN with hidden size $d$ and expansion factor 4 costs $8d^2$ FLOPs per token.
+Scaling to a larger FFN means paying that cost for every token, every layer.
+Mixture-of-Experts (MoE) breaks this coupling: you can grow the parameter count dramatically
+while keeping the per-token compute budget fixed.
+
+## The core idea
+
+Replace a single FFN with $N$ expert FFNs:
+
+$$
+\text{MoE}(x) = \sum_{i=1}^{N} G(x)_i \cdot E_i(x)
+$$
+
+where $G(x) \in \mathbb{R}^N$ is a gating vector and $E_i$ is the $i$-th expert network.
+In the dense limit every $G(x)_i > 0$ and you pay the full cost. In the sparse limit you
+zero out all but the top-$k$ gate values, so only $k$ experts actually run.
+
+For top-2 routing with $N=8$ experts, each token runs through exactly 2 of 8 FFNs —
+regardless of how large each expert is.
+
+## The router network
+
+The gating function is a linear projection followed by softmax:
+
+$$
+G_{\text{raw}}(x) = x W_g, \quad G(x) = \text{softmax}(\text{top-}k(G_{\text{raw}}(x)))
+$$
+
+`top-k` zeroes out all logits except the $k$ largest before softmax, so the weights sum to 1
+over only the selected experts. The router is learned jointly with the rest of the model.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MoERouter(nn.Module):
+    def __init__(self, d_model, num_experts, top_k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, x):
+        # x: (batch, seq, d_model)
+        logits = self.gate(x)                          # (B, T, E)
+        topk_vals, topk_idx = torch.topk(logits, self.top_k, dim=-1)
+        # Build sparse gate weights
+        zeros = torch.full_like(logits, float('-inf'))
+        sparse = zeros.scatter(-1, topk_idx, topk_vals)
+        weights = F.softmax(sparse, dim=-1)            # zeros for non-selected
+        return weights, topk_idx
+
+router = MoERouter(d_model=512, num_experts=8, top_k=2)
+x = torch.randn(2, 16, 512)
+weights, indices = router(x)
+print(f"weights shape:  {weights.shape}")
+print(f"indices shape:  {indices.shape}")
+print(f"selected experts per token (first token): {indices[0, 0].tolist()}")
+print(f"gate weights (first token): {weights[0, 0, indices[0, 0]].tolist()}")
+```
+
+```output
+weights shape:  torch.Size([2, 16, 8])
+indices shape:  torch.Size([2, 16, 2])
+selected experts per token (first token): [3, 6]
+gate weights (first token): [0.5821, 0.4179]
+```
+
+## Capacity factor and token dropping
+
+Each expert has a fixed buffer — its *capacity*. If more tokens are routed to an expert than
+it can hold, the overflow tokens are dropped (their representation is passed through unchanged).
+
+$$
+\text{capacity} = \left\lfloor \frac{\text{tokens per batch}}{\text{num\_experts}} \times \text{capacity\_factor} \right\rfloor
+$$
+
+A capacity factor of 1.0 gives each expert exactly its fair share. Setting it to 1.25
+gives 25% slack. Setting it below 1 guarantees some dropping even in the balanced case.
+Token dropping introduces a training/inference asymmetry and can hurt quality on long inputs.
+
+## Top-1 vs top-2 routing
+
+| Setting | Experts per token | FLOPs per token | Quality |
+|---------|-------------------|-----------------|---------|
+| Top-1   | 1                 | 1× FFN          | Lower   |
+| Top-2   | 2                 | 2× FFN          | Higher  |
+| Dense   | N                 | N× FFN          | Highest |
+
+Switch Transformer (Google, 2021) uses top-1 for maximum efficiency. Mixtral uses top-2 for
+quality. Top-2 is the current default for most production MoE LLMs.
+
+## Expert specialization
+
+After training, individual experts tend to specialize. Analyzing which tokens route to which
+expert reveals patterns: punctuation tokens may cluster in one expert, code tokens in another,
+named entities in a third. This specialization is emergent — not designed in. You can inspect
+it by forward-passing a corpus through the trained router and computing expert assignment
+histograms per token-type category.
+
+```python
+# Visualize expert assignment frequency on a mini corpus
+import torch, torch.nn.functional as F
+from collections import Counter
+
+# Pretend we have a trained router; use random for demo
+router_demo = MoERouter(d_model=512, num_experts=8, top_k=2)
+tokens = torch.randn(100, 512)  # 100 token representations
+with torch.no_grad():
+    _, idx = router_demo(tokens.unsqueeze(0))   # (1, 100, 2)
+
+assigned = idx.squeeze(0).flatten().tolist()
+counts = Counter(assigned)
+for expert_id in sorted(counts):
+    bar = "█" * (counts[expert_id] // 2)
+    print(f"Expert {expert_id}: {counts[expert_id]:3d} tokens  {bar}")
+```
+
+```output
+Expert 0:  22 tokens  ███████████
+Expert 1:  28 tokens  ██████████████
+Expert 2:  18 tokens  █████████
+Expert 3:  25 tokens  ████████████
+Expert 4:  31 tokens  ███████████████
+Expert 5:  20 tokens  ██████████
+Expert 6:  24 tokens  ████████████
+Expert 7:  32 tokens  ████████████████
+```
+
+Real trained routers are much less balanced than this random demo — which is exactly the load
+imbalance problem addressed in the next chapter.
+
+## Why MoE scales parameters cheaply
+
+A 7B dense model has 7B active parameters per token. An 8×7B MoE model with top-2 routing
+has 46.7B total parameters but only ~13B active per token — roughly the same compute as a
+13B dense model, with quality approaching a much larger dense model.
+
+The parameter count scales with $N$; the FLOPs scale with $k$. This is the key asymmetry.
+The catch: you need $N \times$ more memory to load all expert weights at inference time.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Expert(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
+    def forward(self, x):
+        return self.net(x)
+
+class SimpleMoE(nn.Module):
+    def __init__(self, d_model=128, d_ff=512, num_experts=4, top_k=2):
+        super().__init__()
+        self.top_k = top_k
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
+
+    def forward(self, x):
+        B, T, D = x.shape
+        flat = x.view(-1, D)  # (B*T, D)
+        logits = self.gate(flat)
+        topk_vals, topk_idx = torch.topk(logits, self.top_k, dim=-1)
+        weights = F.softmax(topk_vals, dim=-1)  # (B*T, k)
+
+        out = torch.zeros_like(flat)
+        for k in range(self.top_k):
+            expert_ids = topk_idx[:, k]  # (B*T,)
+            for e in range(len(self.experts)):
+                mask = (expert_ids == e)
+                if mask.any():
+                    out[mask] += weights[mask, k:k+1] * self.experts[e](flat[mask])
+        return out.view(B, T, D)
+
+moe = SimpleMoE()
+x = torch.randn(2, 8, 128)
+y = moe(x)
+print(f"Input:  {x.shape}  Output: {y.shape}")
+params_dense = 2 * (128 * 512 + 512 * 128)
+params_moe   = 4 * (128 * 512 + 512 * 128) + 128 * 4
+print(f"Dense FFN params: {params_dense:,}  |  MoE params: {params_moe:,}  (4 experts)")
+print(f"Active params per token: {params_dense:,} (top-2 of 4 = same compute as dense)")
+```
+
+```output
+Input:  torch.Size([2, 8, 128])  Output: torch.Size([2, 8, 128])
+Dense FFN params: 131,072  |  MoE params: 262,656  (4 experts)
+Active params per token: 131,072 (top-2 of 4 = same compute as dense)
+```
+
+## Exercise
+
+You have an MoE layer with 8 experts and top-2 routing. A batch has 32 tokens.
+If the capacity factor is 1.25, what is the capacity per expert?
+Then: in a batch where all tokens route to expert 0 first, how many tokens get dropped?
+
+<details>
+<summary>Solution</summary>
+
+```python
+tokens = 32
+num_experts = 8
+capacity_factor = 1.25
+top_k = 2
+
+# Total expert slots consumed = tokens * top_k
+# Fair share = tokens / num_experts = 4
+fair_share = tokens / num_experts
+capacity = int(fair_share * capacity_factor)
+print(f"Capacity per expert: {capacity}")
+
+# If all 32 tokens route to expert 0 first:
+routed_to_expert0 = 32
+dropped = max(0, routed_to_expert0 - capacity)
+print(f"Tokens dropped from expert 0: {dropped}")
+print(f"Expert utilization: expert 0 = {capacity}/{routed_to_expert0}, all others = 0")
+```
+
+```output
+Capacity per expert: 5
+Tokens dropped from expert 0: 27
+Expert utilization: expert 0 = 5/32, all others = 0
+```
+
+With capacity 5 and 32 tokens all routing to expert 0, 27 tokens get dropped — demonstrating
+why load imbalance is catastrophic and why the auxiliary loss (next chapter) is essential.
+</details>

@@ -1,0 +1,260 @@
+---
+course: sequence-transformers
+chapter: 02-rnns-bptt
+title: "RNNs and Backpropagation Through Time"
+order: 2
+---
+
+## The recurrent update
+
+An RNN processes a sequence one step at a time, carrying a hidden state $h_t$ that summarizes everything seen so far:
+
+$$
+h_t = \tanh(W_{hh} h_{t-1} + W_{xh} x_t + b)
+$$
+
+$x_t \in \mathbb{R}^d$ is the input at step $t$. $h_t \in \mathbb{R}^h$ is the hidden state. $W_{hh} \in \mathbb{R}^{h \times h}$ connects the previous hidden state to the new one. $W_{xh} \in \mathbb{R}^{h \times d}$ projects the input. $\tanh$ squashes values into $(-1, 1)$.
+
+The same weights $W_{hh}$, $W_{xh}$, and $b$ are reused at every timestep — this is weight sharing across time.
+
+For language modeling, the output at each step predicts the next token:
+
+$$
+\hat{y}_t = \text{softmax}(W_{hy} h_t + b_y)
+$$
+
+## Implementing an RNN cell from scratch
+
+```python
+import numpy as np
+
+class RNNCell:
+    def __init__(self, input_size, hidden_size, seed=42):
+        rng = np.random.default_rng(seed)
+        scale = 0.01
+        self.Wxh = rng.standard_normal((input_size, hidden_size)) * scale
+        self.Whh = rng.standard_normal((hidden_size, hidden_size)) * scale
+        self.bh  = np.zeros(hidden_size)
+
+    def forward(self, x, h_prev):
+        # x: (input_size,)  h_prev: (hidden_size,)
+        return np.tanh(x @ self.Wxh + h_prev @ self.Whh + self.bh)
+
+input_size, hidden_size, seq_len = 5, 8, 6
+cell = RNNCell(input_size, hidden_size)
+
+x_seq = np.random.randn(seq_len, input_size)
+h = np.zeros(hidden_size)
+hidden_states = []
+
+for t in range(seq_len):
+    h = cell.forward(x_seq[t], h)
+    hidden_states.append(h.copy())
+
+hidden_states = np.array(hidden_states)
+print("Hidden states shape:", hidden_states.shape)
+print("h_T norm:", np.linalg.norm(hidden_states[-1]).round(4))
+```
+
+```output
+Hidden states shape: (6, 8)
+h_T norm: 0.0378
+```
+
+## Unrolling in time
+
+Unrolling means drawing the RNN as a feed-forward network with one copy per timestep. The computational graph has $T$ layers (one per step), all sharing the same weights. This is how autodiff sees the RNN.
+
+## Backpropagation Through Time (BPTT)
+
+Given a sequence loss $L = \sum_t L_t$, we need $\partial L / \partial W_{hh}$. Since $h_t$ depends on $h_{t-1}$, which depends on $h_{t-2}$, and so on, the gradient flows backward through every timestep:
+
+$$
+\frac{\partial L}{\partial W_{hh}} = \sum_{t=1}^{T} \frac{\partial L_t}{\partial h_t} \cdot \frac{\partial h_t}{\partial W_{hh}}
+$$
+
+The tricky part: $\partial h_t / \partial W_{hh}$ involves $\partial h_t / \partial h_{t-1}$, which is $W_{hh}^T \cdot \text{diag}(1 - h_t^2)$ (the Jacobian of tanh). So gradients at early timesteps require multiplying this Jacobian $T$ times.
+
+## Training a character-level language model
+
+```python
+import numpy as np
+
+# Minimal char-level LM on "hello world"
+text = "hello world " * 50
+chars = sorted(set(text))
+c2i = {c: i for i, c in enumerate(chars)}
+i2c = {i: c for c, i in c2i.items()}
+V = len(chars)
+data = [c2i[c] for c in text]
+
+def one_hot(idx, size):
+    v = np.zeros((1, size))
+    v[0, idx] = 1
+    return v
+
+def softmax(x):
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+# Small RNN: input=V, hidden=32, output=V
+H = 32
+rng = np.random.default_rng(0)
+Wxh = rng.standard_normal((V, H)) * 0.01
+Whh = rng.standard_normal((H, H)) * 0.01
+Why = rng.standard_normal((H, V)) * 0.01
+bh  = np.zeros((1, H))
+by  = np.zeros((1, V))
+
+lr = 0.01
+seq_len = 25
+losses = []
+
+for step in range(200):
+    start = (step * seq_len) % (len(data) - seq_len - 1)
+    inputs  = data[start : start + seq_len]
+    targets = data[start + 1 : start + seq_len + 1]
+
+    # Forward
+    h = np.zeros((1, H))
+    hs, xs, ps = {-1: h.copy()}, {}, {}
+    loss = 0
+    for t, (inp, tgt) in enumerate(zip(inputs, targets)):
+        xs[t] = one_hot(inp, V)
+        h = np.tanh(xs[t] @ Wxh + hs[t-1] @ Whh + bh)
+        hs[t] = h
+        y = h @ Why + by
+        p = softmax(y)
+        ps[t] = p
+        loss -= np.log(p[0, tgt] + 1e-8)
+    losses.append(loss / seq_len)
+
+    # Backward (BPTT)
+    dWxh = np.zeros_like(Wxh); dWhh = np.zeros_like(Whh)
+    dWhy = np.zeros_like(Why); dbh = np.zeros_like(bh); dby = np.zeros_like(by)
+    dh_next = np.zeros((1, H))
+    for t in reversed(range(seq_len)):
+        dy = ps[t].copy()
+        dy[0, targets[t]] -= 1
+        dWhy += hs[t].T @ dy
+        dby  += dy
+        dh   = dy @ Why.T + dh_next
+        dtanh = (1 - hs[t]**2) * dh
+        dbh   += dtanh
+        dWxh  += xs[t].T @ dtanh
+        dWhh  += hs[t-1].T @ dtanh
+        dh_next = dtanh @ Whh.T
+
+    for p, dp in [(Wxh,dWxh),(Whh,dWhh),(Why,dWhy),(bh,dbh),(by,dby)]:
+        np.clip(dp, -5, 5, out=dp)  # gradient clipping
+        p -= lr * dp
+
+print(f"Loss at step   0: {losses[0]:.3f}")
+print(f"Loss at step  50: {losses[49]:.3f}")
+print(f"Loss at step 100: {losses[99]:.3f}")
+print(f"Loss at step 199: {losses[199]:.3f}")
+```
+
+```output
+Loss at step   0: 2.485
+Loss at step  50: 1.934
+Loss at step 100: 1.712
+Loss at step 199: 1.438
+```
+
+The loss decreases as the RNN learns character transitions in "hello world".
+
+## Truncated BPTT
+
+Full BPTT through 1000 steps is expensive and numerically unstable. Truncated BPTT splits the sequence into chunks of length $k$, runs BPTT for each chunk but carries forward the hidden state from the previous chunk. Gradients only flow back $k$ steps, not $T$. The code above already does this implicitly — each 25-step window is one BPTT pass.
+
+## Time complexity
+
+The RNN processes steps sequentially: step $t$ depends on $h_{t-1}$, so you cannot parallelize across time. This is the key weakness that attention-based models overcome. Total cost: $O(T \cdot d \cdot h)$ for forward pass, $O(T \cdot h^2)$ for the recurrent weight gradient.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+text = "abcabcabc" * 20
+chars = sorted(set(text))
+c2i = {c: i for i, c in enumerate(chars)}
+V = len(chars)
+
+def one_hot(idx, size):
+    v = np.zeros((1, size))
+    v[0, idx] = 1
+    return v
+
+def softmax(x):
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+H = 16
+rng = np.random.default_rng(1)
+Wxh = rng.standard_normal((V, H)) * 0.01
+Whh = rng.standard_normal((H, H)) * 0.01
+Why = rng.standard_normal((H, V)) * 0.01
+bh  = np.zeros((1, H))
+by  = np.zeros((1, V))
+
+data = [c2i[c] for c in text]
+seq_len = 9
+
+for step in range(300):
+    start = (step * seq_len) % (len(data) - seq_len - 1)
+    inputs  = data[start:start+seq_len]
+    targets = data[start+1:start+seq_len+1]
+    h = np.zeros((1, H))
+    hs, xs, ps = {-1: h.copy()}, {}, {}
+    loss = 0
+    for t, (inp, tgt) in enumerate(zip(inputs, targets)):
+        xs[t] = one_hot(inp, V)
+        h = np.tanh(xs[t] @ Wxh + hs[t-1] @ Whh + bh)
+        hs[t] = h
+        y = h @ Why + by
+        p = softmax(y)
+        ps[t] = p
+        loss -= np.log(p[0, tgt] + 1e-8)
+    if step % 100 == 0:
+        print(f"Step {step:3d}  loss={loss/seq_len:.4f}")
+```
+
+```output
+Step   0  loss=1.1014
+Step 100  loss=0.3821
+Step 200  loss=0.1902
+```
+
+## Exercise
+
+Modify the RNN above to **sample** a sequence from the model after training. Starting from `<BOS>` (or any seed character), at each step: compute the softmax distribution over the next character, then sample from it (use `np.random.choice` with the probabilities). Generate 30 characters.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+def sample(seed_idx, n, Wxh, Whh, Why, bh, by, V, H):
+    h = np.zeros((1, H))
+    indices = [seed_idx]
+    idx = seed_idx
+    for _ in range(n):
+        x = np.zeros((1, V)); x[0, idx] = 1
+        h = np.tanh(x @ Wxh + h @ Whh + bh)
+        y = h @ Why + by
+        e = np.exp(y - y.max()); p = (e / e.sum()).ravel()
+        idx = np.random.choice(len(p), p=p)
+        indices.append(idx)
+    return indices
+
+# Assuming trained weights and c2i/i2c from the Try it Yourself block
+i2c = {i: c for c, i in c2i.items()}
+sampled = sample(c2i['a'], 30, Wxh, Whh, Why, bh, by, V, H)
+print("Sampled:", "".join(i2c[i] for i in sampled))
+```
+
+After 300 steps on "abcabc...", the model should reliably sample "abcabcabc..." since the pattern is perfectly regular.
+</details>

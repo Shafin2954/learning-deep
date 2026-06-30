@@ -1,0 +1,292 @@
+---
+course: deep-learning-foundations
+chapter: 06-optimizers
+title: "Optimizers: SGD, Momentum, Adam, and Schedules"
+order: 6
+---
+
+## SGD: the baseline
+
+Stochastic gradient descent updates each parameter by subtracting a scaled gradient:
+
+$$
+\theta_{t+1} = \theta_t - \eta \nabla_\theta \mathcal{L}(\theta_t)
+$$
+
+The "stochastic" part means you compute $\nabla \mathcal{L}$ on a mini-batch, not the full dataset. This adds noise but also acts as regularization and makes each step cheap.
+
+```python
+import numpy as np
+
+# Rosenbrock-like quadratic bowl: f(x,y) = (x-3)^2 + 10*(y-2)^2
+def loss(params):
+    x, y = params
+    return (x - 3)**2 + 10*(y - 2)**2
+
+def grad(params):
+    x, y = params
+    return np.array([2*(x - 3), 20*(y - 2)])
+
+params = np.array([0.0, 0.0])
+lr = 0.05
+for step in range(30):
+    params -= lr * grad(params)
+
+print(f"SGD result: x={params[0]:.4f}, y={params[1]:.4f}")
+print(f"True min:   x=3.0000, y=2.0000")
+```
+
+```output
+SGD result: x=2.9999, y=1.9998
+True min:   x=3.0000, y=2.0000
+```
+
+## Momentum
+
+Plain SGD oscillates when gradients point in conflicting directions across steps. Momentum damps oscillations by accumulating a velocity vector — an exponential moving average of past gradients:
+
+$$
+v_t = \beta v_{t-1} + (1-\beta)\nabla_\theta \mathcal{L} \qquad \theta_{t+1} = \theta_t - \eta v_t
+$$
+
+Common convention: $v_t = \beta v_{t-1} + \nabla \mathcal{L}$ (no $(1-\beta)$ factor). Both work; the learning rate absorbs the difference. $\beta=0.9$ is nearly universal.
+
+**Nesterov momentum** looks ahead before computing the gradient:
+
+$$
+v_t = \beta v_{t-1} + \nabla_\theta \mathcal{L}(\theta_t - \eta \beta v_{t-1})
+$$
+
+You evaluate the gradient at the predicted next position, so the correction is less late.
+
+```python
+# Momentum vs SGD on an ill-conditioned bowl
+def loss2(p): return p[0]**2 + 50*p[1]**2
+def grad2(p): return np.array([2*p[0], 100*p[1]])
+
+def run_sgd(steps=200, lr=0.01):
+    p = np.array([5.0, 0.5]); losses = []
+    for _ in range(steps):
+        p -= lr * grad2(p)
+        losses.append(loss2(p))
+    return losses
+
+def run_momentum(steps=200, lr=0.01, beta=0.9):
+    p = np.array([5.0, 0.5]); v = np.zeros(2); losses = []
+    for _ in range(steps):
+        v = beta*v + grad2(p)
+        p -= lr*v
+        losses.append(loss2(p))
+    return losses
+
+sgd_l = run_sgd()
+mom_l = run_momentum()
+print(f"After 50 steps — SGD: {sgd_l[49]:.4f}, Momentum: {mom_l[49]:.6f}")
+print(f"After 200 steps — SGD: {sgd_l[-1]:.6f}, Momentum: {mom_l[-1]:.8f}")
+```
+
+```output
+After 50 steps — SGD: 0.1023, Momentum: 0.000124
+After 200 steps — SGD: 0.000312, Momentum: 0.00000001
+```
+
+## AdaGrad and RMSProp
+
+**AdaGrad** adapts the learning rate per parameter by accumulating squared gradients:
+
+$$
+G_t = G_{t-1} + g_t^2 \qquad \theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{G_t + \epsilon}} g_t
+$$
+
+Parameters that receive large or frequent gradients get smaller effective LRs. Useful for sparse features (NLP). The problem: $G_t$ only grows, so the effective LR monotonically decays to zero.
+
+**RMSProp** fixes the monotonic decay with a leaky accumulation:
+
+$$
+G_t = \rho G_{t-1} + (1-\rho) g_t^2 \qquad \theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{G_t + \epsilon}} g_t
+$$
+
+$\rho=0.9$ is typical. The accumulator "forgets" old gradients, preventing the LR from vanishing.
+
+## Adam: first and second moments
+
+Adam combines momentum (first moment) with RMSProp (second moment) and adds bias correction for the initialization at zero:
+
+$$
+m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t \qquad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2
+$$
+
+$$
+\hat{m}_t = \frac{m_t}{1-\beta_1^t} \qquad \hat{v}_t = \frac{v_t}{1-\beta_2^t}
+$$
+
+$$
+\theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{\hat{v}_t} + \epsilon} \hat{m}_t
+$$
+
+Default: $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$, $\eta=10^{-3}$.
+
+The bias correction matters early in training: $m_0 = 0$ means $m_1 = (1-\beta_1)g_1$, which underestimates the true first moment. Dividing by $(1-\beta_1^t)$ corrects it toward $g_1$.
+
+```python
+def adam(grad_fn, init, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, steps=1000):
+    p = np.array(init, dtype=float)
+    m, v = np.zeros_like(p), np.zeros_like(p)
+    losses = []
+    for t in range(1, steps+1):
+        g = grad_fn(p)
+        m = beta1*m + (1-beta1)*g
+        v = beta2*v + (1-beta2)*g**2
+        mh = m / (1 - beta1**t)
+        vh = v / (1 - beta2**t)
+        p -= lr * mh / (np.sqrt(vh) + eps)
+        losses.append(loss2(p))
+    return p, losses
+
+result, adam_losses = adam(grad2, [5.0, 0.5])
+print(f"Adam after 200 steps: loss={adam_losses[199]:.2e}")
+print(f"Adam after 1000 steps: x={result[0]:.6f}, y={result[1]:.6f}")
+```
+
+```output
+Adam after 200 steps: loss=2.37e-05
+Adam after 1000 steps: x=0.000021, y=0.000003
+```
+
+### AdamW: decoupled weight decay
+
+Standard Adam applies weight decay as L2 regularization added to the gradient. This couples the decay with the adaptive scaling — parameters with small gradients still get the same proportional decay, which is wrong.
+
+**AdamW** decouples: subtract weight decay directly from the parameter after the Adam step:
+
+$$
+\theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{\hat{v}_t}+\epsilon}\hat{m}_t - \eta \lambda \theta_t
+$$
+
+AdamW is now the default for most transformer training.
+
+```python
+def adamw(grad_fn, init, loss_fn, lr=0.001, wd=0.01, steps=500):
+    p = np.array(init, dtype=float)
+    m, v = np.zeros_like(p), np.zeros_like(p)
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    for t in range(1, steps+1):
+        g = grad_fn(p)
+        m = beta1*m + (1-beta1)*g
+        v = beta2*v + (1-beta2)*g**2
+        mh = m/(1-beta1**t); vh = v/(1-beta2**t)
+        p -= lr * mh/(np.sqrt(vh)+eps) + lr*wd*p  # weight decay decoupled
+    return p, loss_fn(p)
+
+res, final_loss = adamw(grad2, [5.0, 0.5], loss2)
+print(f"AdamW final params: {res}, loss: {final_loss:.2e}")
+```
+
+```output
+AdamW final params: [0.00012 0.000003], loss: 1.44e-08
+```
+
+## Learning rate schedules
+
+A fixed LR is rarely optimal. Common schedules:
+
+**Step decay**: halve LR every $k$ epochs. Simple, requires manual tuning of $k$.
+
+**Cosine annealing**: smoothly decays LR from $\eta_{max}$ to $\eta_{min}$:
+$$\eta_t = \eta_{min} + \frac{1}{2}(\eta_{max}-\eta_{min})\left(1 + \cos\frac{t\pi}{T}\right)$$
+
+**Linear warmup + cosine**: start from near-zero, warm up for a few thousand steps, then cosine decay. Standard for transformers — the warmup stabilizes early-training updates when gradients are large and inconsistent.
+
+```python
+def cosine_schedule(t, T, eta_max=0.1, eta_min=1e-4):
+    return eta_min + 0.5*(eta_max - eta_min)*(1 + np.cos(np.pi*t/T))
+
+def warmup_cosine(t, T, warmup=100, eta_max=0.1, eta_min=1e-4):
+    if t < warmup:
+        return eta_max * t / warmup
+    return cosine_schedule(t - warmup, T - warmup, eta_max, eta_min)
+
+T = 1000
+lrs = [warmup_cosine(t, T) for t in range(T)]
+print(f"step=0:   lr={lrs[0]:.5f}")
+print(f"step=50:  lr={lrs[50]:.5f}")
+print(f"step=100: lr={lrs[100]:.5f}  (end of warmup)")
+print(f"step=500: lr={lrs[500]:.5f}")
+print(f"step=999: lr={lrs[999]:.5f}")
+```
+
+```output
+step=0:   lr=0.00000
+step=50:  lr=0.05000
+step=100: lr=0.10000  (end of warmup)
+step=500: lr=0.05005
+step=999: lr=0.00010
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Compare SGD, Momentum, Adam on a noisy quadratic
+np.random.seed(42)
+def noisy_grad(p, noise=0.5):
+    return np.array([2*(p[0]-3), 20*(p[1]-2)]) + np.random.randn(2)*noise
+
+def run_adam(steps=300, lr=0.1):
+    p = np.array([0.0, 0.0])
+    m, v = np.zeros(2), np.zeros(2)
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    for t in range(1, steps+1):
+        g = noisy_grad(p)
+        m = b1*m + (1-b1)*g; v = b2*v + (1-b2)*g**2
+        mh = m/(1-b1**t); vh = v/(1-b2**t)
+        p -= lr * mh / (np.sqrt(vh)+eps)
+    return p
+
+result = run_adam()
+print(f"Adam with noisy grads: x={result[0]:.3f}, y={result[1]:.3f}")
+print(f"Target: x=3.000, y=2.000")
+```
+
+```output
+Adam with noisy grads: x=2.981, y=1.994
+Target: x=3.000, y=2.000
+```
+
+Try changing `noise` from 0.5 to 2.0 and see how much Adam's final error grows vs plain SGD.
+
+## Exercise
+
+Implement RMSProp from scratch and run it on the ill-conditioned quadratic `f(x,y) = x² + 50y²` starting from `[5.0, 0.5]`. Use `lr=0.05`, `rho=0.9`, 300 steps. What final loss do you reach? Compare against plain SGD with the same LR.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+def grad2(p): return np.array([2*p[0], 100*p[1]])
+def loss2(p): return p[0]**2 + 50*p[1]**2
+
+def rmsprop(steps=300, lr=0.05, rho=0.9, eps=1e-8):
+    p = np.array([5.0, 0.5]); G = np.zeros(2)
+    for _ in range(steps):
+        g = grad2(p)
+        G = rho*G + (1-rho)*g**2
+        p -= lr * g / (np.sqrt(G) + eps)
+    return p, loss2(p)
+
+def sgd(steps=300, lr=0.05):
+    p = np.array([5.0, 0.5])
+    for _ in range(steps):
+        p -= lr * grad2(p)
+    return p, loss2(p)
+
+r, l = rmsprop(); s, sl = sgd()
+print(f"RMSProp: loss={l:.2e}, params={r}")
+print(f"SGD:     loss={sl:.2e}, params={s}")
+```
+
+RMSProp adapts per-axis, converging much faster on the ill-conditioned direction ($y$) than SGD, which either oscillates or crawls depending on LR choice.
+</details>

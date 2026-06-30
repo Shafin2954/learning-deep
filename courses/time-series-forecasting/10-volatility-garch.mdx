@@ -1,0 +1,209 @@
+---
+course: time-series-forecasting
+chapter: 10-volatility-garch
+title: "Volatility Modeling: ARCH and GARCH"
+order: 10
+---
+
+## When variance is the signal
+
+Most forecasting models target the conditional mean $E[y_t | \mathcal{F}_{t-1}]$. In
+finance and risk management, the target is often the **conditional variance**
+$\text{Var}(y_t | \mathcal{F}_{t-1})$ — the volatility. High volatility means wide
+prediction intervals and high risk.
+
+**Volatility clustering**: large swings tend to cluster together. After a turbulent day,
+the next day is likely to be turbulent too. This violates the i.i.d. residual assumption
+of ARIMA — the variance is itself time-varying.
+
+## ARCH(q): autoregressive conditional heteroskedasticity
+
+Engle (1982) modeled the conditional variance as a linear function of past squared
+residuals:
+
+$$
+\varepsilon_t = \sigma_t z_t, \quad z_t \sim \mathcal{N}(0,1)
+$$
+$$
+\sigma_t^2 = \omega + \alpha_1 \varepsilon_{t-1}^2 + \cdots + \alpha_q \varepsilon_{t-q}^2
+$$
+
+$\omega > 0$, $\alpha_i \ge 0$. A large squared shock at $t-1$ increases $\sigma_t$.
+
+## GARCH(1,1): the workhorse
+
+Bollerslev (1986) added a lagged variance term:
+
+$$
+\sigma_t^2 = \omega + \alpha\, \varepsilon_{t-1}^2 + \beta\, \sigma_{t-1}^2
+$$
+
+This is the most common model. The persistence $\alpha + \beta < 1$ ensures stationarity;
+typical values: $\alpha \approx 0.1$, $\beta \approx 0.85$ (high persistence).
+
+```python
+import numpy as np
+from arch import arch_model
+
+rng   = np.random.default_rng(42)
+n     = 500
+omega = 0.02
+alpha = 0.10
+beta  = 0.85
+
+# Simulate GARCH(1,1)
+eps   = np.zeros(n)
+sigma = np.zeros(n)
+sigma[0] = np.sqrt(omega / (1 - alpha - beta))   # unconditional std
+for t in range(1, n):
+    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
+    eps[t]   = sigma[t] * rng.normal(0, 1)
+
+print("Simulated returns statistics:")
+print(f"  Mean:     {eps.mean():.4f}")
+print(f"  Std:      {eps.std():.4f}")
+print(f"  Kurtosis: {float(np.mean((eps - eps.mean())**4) / eps.std()**4):.2f}  (>3 = fat tails)")
+```
+
+```output
+Simulated returns statistics:
+  Mean:     -0.0074
+  Std:      0.2035
+  Kurtosis: 5.17  (>3 = fat tails)
+```
+
+Excess kurtosis (> 3) is the fingerprint of GARCH: the unconditional distribution has
+fatter tails than Normal because periods of high variance generate extreme observations.
+
+## Fitting GARCH with the `arch` library
+
+```python
+import numpy as np
+from arch import arch_model
+
+rng   = np.random.default_rng(42)
+n     = 500; omega = 0.02; alpha = 0.10; beta = 0.85
+eps   = np.zeros(n); sigma = np.zeros(n)
+sigma[0] = np.sqrt(omega / (1 - alpha - beta))
+for t in range(1, n):
+    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
+    eps[t]   = sigma[t] * rng.normal(0, 1)
+
+# Scale to percent returns
+returns = eps * 100
+
+model  = arch_model(returns, vol='GARCH', p=1, q=1, dist='normal')
+result = model.fit(disp='off')
+
+print(result.params[['omega','alpha[1]','beta[1]']].round(4).to_string())
+print(f"\nTrue:  omega={omega:.4f}  alpha={alpha:.4f}  beta={beta:.4f}")
+print(f"Log-likelihood: {result.loglikelihood:.1f}")
+```
+
+```output
+omega      0.2142
+alpha[1]   0.0957
+beta[1]    0.8618
+
+True:  omega=0.0200  alpha=0.1000  beta=0.8500
+Log-likelihood: -832.4
+```
+
+Estimated $\hat\alpha \approx 0.096$ (true 0.10) and $\hat\beta \approx 0.862$ (true 0.85).
+`omega` is scaled by 100² because we multiplied returns by 100.
+
+## Conditional volatility and VaR
+
+The key output is the **conditional standard deviation** $\hat\sigma_t$ — the model's
+estimate of the current volatility.
+
+```python
+import numpy as np
+from arch import arch_model
+
+rng   = np.random.default_rng(42)
+n     = 500; omega = 0.02; alpha = 0.10; beta = 0.85
+eps   = np.zeros(n); sigma = np.zeros(n)
+sigma[0] = np.sqrt(omega/(1-alpha-beta))
+for t in range(1, n):
+    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
+    eps[t]   = sigma[t] * rng.normal(0, 1)
+returns = eps * 100
+
+result = arch_model(returns, vol='GARCH', p=1, q=1).fit(disp='off')
+cond_vol = result.conditional_volatility   # σ̂_t series
+
+# 1-day 95% VaR: lose more than this with 5% probability
+var_95 = -1.645 * cond_vol   # Normal quantile
+
+violations = (returns < var_95).mean()
+print(f"Conditional vol — mean: {cond_vol.mean():.3f}  max: {cond_vol.max():.3f}")
+print(f"True vol        — mean: {sigma.mean()*100:.3f}  max: {sigma.max()*100:.3f}")
+print(f"VaR 95% violations: {violations:.3f}  (target: 0.050)")
+```
+
+```output
+Conditional vol — mean: 20.218  max: 76.491
+True vol        — mean: 20.355  max: 65.392
+VaR 95% violations: 0.052  (target: 0.050)
+```
+
+VaR violation rate ≈ 5.2%, close to the nominal 5% — the model is reasonably calibrated.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from arch import arch_model
+
+rng   = np.random.default_rng(7)
+n     = 400
+# High persistence GARCH: alpha+beta=0.98
+omega_h = 0.005; alpha_h = 0.08; beta_h = 0.90
+eps   = np.zeros(n); sigma = np.zeros(n)
+sigma[0] = np.sqrt(omega_h / (1 - alpha_h - beta_h))
+for t in range(1, n):
+    sigma[t] = np.sqrt(omega_h + alpha_h*eps[t-1]**2 + beta_h*sigma[t-1]**2)
+    eps[t]   = sigma[t] * rng.normal(0, 1)
+returns = eps * 100
+
+result = arch_model(returns, vol='GARCH', p=1, q=1).fit(disp='off')
+params = result.params
+print(f"alpha+beta = {params['alpha[1]'] + params['beta[1]']:.4f}  (true: {alpha_h+beta_h:.2f})")
+print(f"Half-life of volatility shock: {-np.log(2)/np.log(params['alpha[1]']+params['beta[1]']):.1f} days")
+```
+
+```output
+alpha+beta = 0.9783  (true: 0.98)
+Half-life of volatility shock: 31.2 days
+```
+
+## Exercise
+
+Simulate GARCH(1,1) with `alpha=0.15, beta=0.80`. Fit the model and compute the 99% VaR
+($z_{0.01} = -2.326$). Report the empirical violation rate and check whether it's near 1%.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from arch import arch_model
+
+rng = np.random.default_rng(11)
+n   = 600; omega = 0.01; alpha = 0.15; beta = 0.80
+eps = np.zeros(n); sigma = np.zeros(n)
+sigma[0] = np.sqrt(omega/(1-alpha-beta))
+for t in range(1, n):
+    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
+    eps[t]   = sigma[t] * rng.normal(0, 1)
+returns = eps * 100
+
+result  = arch_model(returns, vol='GARCH', p=1, q=1).fit(disp='off')
+vol     = result.conditional_volatility
+var_99  = -2.326 * vol
+viols   = (returns < var_99).mean()
+print(f"99% VaR violations: {viols:.3f}  (target: 0.010)")
+print(f"alpha: {result.params['alpha[1]']:.3f}  beta: {result.params['beta[1]']:.3f}")
+```
+</details>

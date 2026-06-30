@@ -1,0 +1,313 @@
+---
+course: generative-models
+chapter: 10-autoregressive-generation
+title: "Autoregressive Generation: PixelCNN and Token Models"
+order: 10
+---
+
+## The autoregressive factorization
+
+Every generative model must define $p(x)$. Autoregressive models do it by the chain rule —
+no approximation needed:
+
+$$
+p(x) = \prod_{i=1}^{D} p(x_i \mid x_1, x_2, \ldots, x_{i-1})
+$$
+
+Each pixel (or token) is predicted from all previous ones. Training is fast because all
+conditional distributions can be computed in parallel (you have the ground-truth $x_{<i}$
+at training time). Sampling is slow because you must generate one element at a time.
+
+This is the same factorization used by GPT — the "image" is just a sequence of pixels
+or discrete image tokens instead of text tokens.
+
+## PixelCNN: masked convolutions for images
+
+A naive CNN sees the whole image at once. PixelCNN (van den Oord et al., 2016) enforces
+the causal constraint by zeroing out the parts of the convolutional kernel that would
+see future pixels.
+
+Two mask types:
+- **Mask A**: used in the first layer. Blocks the current pixel and all future pixels.
+- **Mask B**: used in subsequent layers. Allows the current pixel's own channel but still
+  blocks future pixels.
+
+### Implementing a masked convolution
+
+```python
+import torch
+import torch.nn as nn
+
+class MaskedConv2d(nn.Conv2d):
+    def __init__(self, mask_type, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert mask_type in ("A", "B")
+        # Register a buffer so the mask moves with the module to GPU
+        self.register_buffer("mask", self.weight.data.clone())
+        _, _, kH, kW = self.weight.size()
+        self.mask.fill_(1)
+        # Zero out the center row from the center column onward
+        self.mask[:, :, kH // 2, kW // 2 + (mask_type == "B"):] = 0
+        # Zero out all rows below the center
+        self.mask[:, :, kH // 2 + 1:] = 0
+
+    def forward(self, x):
+        self.weight.data *= self.mask
+        return super().forward(x)
+
+# Verify: build a 3x3 Mask A conv and inspect the mask
+conv_a = MaskedConv2d("A", in_channels=1, out_channels=1, kernel_size=3, padding=1)
+print("Mask A (first layer):")
+print(conv_a.mask[0, 0])
+
+conv_b = MaskedConv2d("B", in_channels=1, out_channels=1, kernel_size=3, padding=1)
+print("\nMask B (subsequent layers):")
+print(conv_b.mask[0, 0])
+```
+
+```output
+Mask A (first layer):
+tensor([[1., 1., 1.],
+        [1., 0., 0.],
+        [0., 0., 0.]])
+
+Mask B (subsequent layers):
+tensor([[1., 1., 1.],
+        [1., 1., 0.],
+        [0., 0., 0.]])
+```
+
+Mask A sees only the top-left context and excludes the current pixel. Mask B adds the
+current pixel back (the "B" stands for "including self"). Stacking several Mask B layers
+after the first Mask A layer grows the effective receptive field over past pixels without
+leaking future information.
+
+### Verifying no future leakage
+
+```python
+import torch
+
+# Run a forward pass and check that changing a future pixel has zero effect
+# on the current pixel's output
+model = nn.Sequential(
+    MaskedConv2d("A", 1, 64, 7, padding=3),
+    nn.ReLU(),
+    MaskedConv2d("B", 64, 64, 7, padding=3),
+    nn.ReLU(),
+    MaskedConv2d("B", 64, 1, 7, padding=3),
+)
+
+x = torch.zeros(1, 1, 8, 8)
+out_before = model(x).clone()
+
+# Perturb pixel at position (5, 5) — a "future" pixel relative to (2, 2)
+x[0, 0, 5, 5] = 1.0
+out_after = model(x)
+
+diff = (out_after - out_before).abs()
+# The output at (2,2) should be unchanged
+print(f"Max change at pixel (2,2): {diff[0,0,2,2].item():.6f}")
+print(f"Max change at pixel (7,7): {diff[0,0,7,7].item():.6f}")
+```
+
+```output
+Max change at pixel (2,2): 0.000000
+Max change at pixel (7,7): 0.183421
+```
+
+Pixel (2, 2) is unaffected by the perturbation at (5, 5). Pixel (7, 7) — which comes after
+(5, 5) in raster order — does change. The causal constraint holds.
+
+## PixelCNN++
+
+The original PixelCNN models each pixel as a 256-way softmax, which is wasteful for
+continuous intensities. PixelCNN++ replaces it with a mixture of discretized logistics:
+
+$$
+p(x_i \mid x_{<i}) = \sum_k \pi_k \, \sigma\!\left(\frac{x_i + 0.5 - \mu_k}{s_k}\right)
+- \sigma\!\left(\frac{x_i - 0.5 - \mu_k}{s_k}\right)
+$$
+
+This requires only a small number of mixture components (typically 5–10) instead of 256
+softmax logits, and produces smoother probability distributions.
+
+## VQ-VAE: discrete image tokens
+
+Autoregressive sampling over raw pixels is slow because images are large ($28\times28 = 784$
+pixels for MNIST, $256\times256\times3 = 196\,608$ for a photo). VQ-VAE solves this by
+first compressing the image to a small grid of discrete tokens, then training an
+autoregressive model on those tokens.
+
+### The VQ-VAE components
+
+**Encoder** $E$: maps image $x$ to a continuous latent $z_e \in \mathbb{R}^{H' \times W' \times d}$.
+
+**Codebook** $\{e_k\}_{k=1}^K$: a learned dictionary of $K$ $d$-dimensional vectors (typically $K = 512$).
+
+**Quantization**: each spatial position in $z_e$ is replaced by its nearest codebook entry:
+$$
+z_q(h, w) = e_k, \quad k = \arg\min_j \|z_e(h,w) - e_j\|_2
+$$
+
+**Decoder** $D$: reconstructs $\hat{x}$ from $z_q$.
+
+**Loss**:
+$$
+\mathcal{L} = \underbrace{\|x - \hat{x}\|^2}_{\text{recon}} + \underbrace{\|\text{sg}[z_e] - z_q\|^2}_{\text{codebook}} + \underbrace{\beta\|z_e - \text{sg}[z_q]\|^2}_{\text{commitment}}
+$$
+
+where $\text{sg}[\cdot]$ is the stop-gradient operator. The straight-through estimator
+passes gradients through the quantization step during backprop.
+
+```python
+import torch
+import torch.nn.functional as F
+
+class VectorQuantizer(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.commitment_cost = commitment_cost
+        nn.init.uniform_(self.embedding.weight, -1/num_embeddings, 1/num_embeddings)
+
+    def forward(self, z_e):
+        # z_e: (B, D, H, W) → flatten spatial
+        B, D, H, W = z_e.shape
+        flat = z_e.permute(0, 2, 3, 1).reshape(-1, D)  # (B*H*W, D)
+
+        # Distances to codebook entries
+        dist = (flat**2).sum(1, keepdim=True) \
+             - 2 * flat @ self.embedding.weight.T \
+             + (self.embedding.weight**2).sum(1)
+        indices = dist.argmin(1)
+        z_q = self.embedding(indices).reshape(B, H, W, D).permute(0, 3, 1, 2)
+
+        # Losses
+        codebook_loss = F.mse_loss(z_q.detach(), z_e)
+        commitment_loss = F.mse_loss(z_q, z_e.detach())
+        loss = codebook_loss + self.commitment_cost * commitment_loss
+
+        # Straight-through: copy gradients from z_q to z_e
+        z_q = z_e + (z_q - z_e).detach()
+        return z_q, loss, indices.reshape(B, H, W)
+
+vq = VectorQuantizer(num_embeddings=512, embedding_dim=64)
+z = torch.randn(2, 64, 8, 8)   # batch of 2, latent 8x8
+z_q, vq_loss, token_ids = vq(z)
+print(f"z_q shape:   {z_q.shape}")
+print(f"token_ids:   {token_ids.shape}  (unique tokens: {token_ids.unique().numel()})")
+print(f"VQ loss:     {vq_loss.item():.4f}")
+```
+
+```output
+z_q shape:   torch.Size([2, 64, 8, 8])
+token_ids:   torch.Size([2, 8, 8])  (unique tokens: 97)
+VQ loss:     0.9823
+```
+
+After training the VQ-VAE, you have a $8 \times 8 = 64$-token sequence per image (instead
+of $256^2 = 65\,536$ pixels). You can then train a PixelCNN or GPT-style Transformer on
+these integer token sequences — orders of magnitude faster than pixel-level autoregression.
+
+## VQGAN: sharper images with adversarial loss
+
+VQ-VAE minimizes MSE reconstruction, which yields blurry images (MSE averages over modes).
+VQGAN adds a **patch discriminator** (from pix2pix) and a **perceptual loss** (VGG features)
+on top of the VQ-VAE objective:
+
+$$
+\mathcal{L}_{\text{VQGAN}} = \mathcal{L}_{\text{VQ}} + \lambda_1 \mathcal{L}_{\text{perceptual}} + \lambda_2 \mathcal{L}_{\text{GAN}}
+$$
+
+The result is much sharper reconstructions. VQGAN's codebook is used as the image tokenizer
+for many modern image generation systems (Stable Diffusion's VAE, DALL-E).
+
+## Connection to language models
+
+Once images are tokenized to short integer sequences, image generation becomes
+indistinguishable from text generation. You can:
+
+- Train a GPT on image token sequences → unconditional image generation.
+- Prepend class or text tokens → conditional generation.
+- Interleave text and image tokens → multimodal models (GPT-4V style).
+
+This is why "vision language models" share so much architecture with pure text models —
+the pipeline is: pixels → VQGAN tokens → autoregressive Transformer.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+class MaskedConv2d(nn.Conv2d):
+    def __init__(self, mask_type, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("mask", self.weight.data.clone())
+        _, _, kH, kW = self.weight.size()
+        self.mask.fill_(1)
+        self.mask[:, :, kH // 2, kW // 2 + (mask_type == "B"):] = 0
+        self.mask[:, :, kH // 2 + 1:] = 0
+    def forward(self, x):
+        self.weight.data *= self.mask
+        return super().forward(x)
+
+# Build a tiny PixelCNN for 1-channel 16x16 images
+pixel_cnn = nn.Sequential(
+    MaskedConv2d("A", 1, 64, kernel_size=7, padding=3),
+    nn.ReLU(),
+    *[layer for _ in range(4) for layer in (
+        MaskedConv2d("B", 64, 64, kernel_size=7, padding=3),
+        nn.ReLU()
+    )],
+    nn.Conv2d(64, 256, 1),  # 256-way softmax per pixel
+)
+
+x = torch.zeros(1, 1, 16, 16)
+logits = pixel_cnn(x)
+print(f"Input: {x.shape}  →  Logits: {logits.shape}")
+print("Each pixel predicts one of 256 intensity values.")
+```
+
+```output
+Input: torch.Size([1, 1, 16, 16])  →  Logits: torch.Size([1, 256, 16, 16])
+Each pixel predicts one of 256 intensity values.
+```
+
+Try changing `kernel_size` to 3 and see how the receptive field shrinks. Try adding
+more Mask B layers and observe how quality improves (at the cost of more compute).
+
+## Exercise
+
+You have a trained PixelCNN that outputs 256-class logits for each pixel.  
+Write a `sample()` function that generates a $16 \times 16$ image by scanning
+pixels in raster order (row by row, left to right), sampling each pixel from
+the predicted distribution, and feeding it back for the next step.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn.functional as F
+
+def sample(model, n_images=1, height=16, width=16, device="cpu"):
+    model.eval()
+    canvas = torch.zeros(n_images, 1, height, width, device=device)
+    with torch.no_grad():
+        for row in range(height):
+            for col in range(width):
+                logits = model(canvas)          # (N, 256, H, W)
+                probs = F.softmax(logits[:, :, row, col], dim=1)  # (N, 256)
+                pixel = torch.multinomial(probs, 1).float() / 255.0  # (N, 1)
+                canvas[:, 0, row, col] = pixel[:, 0]
+    return canvas  # (N, 1, H, W), values in [0, 1]
+
+# Usage: imgs = sample(pixel_cnn, n_images=4)
+```
+
+The key insight: you pass the entire canvas each time but only read the logit at
+position `(row, col)`. The mask ensures only past pixels influence this prediction.
+Raster-order scanning respects the causal ordering the model was trained on.
+
+</details>

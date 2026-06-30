@@ -1,0 +1,260 @@
+---
+course: probability-statistics
+chapter: 10-confidence-intervals-bootstrap
+title: "Confidence Intervals and the Bootstrap"
+order: 10
+---
+
+## What a confidence interval is
+
+A **95% confidence interval** is a procedure, not a statement about a fixed interval. The correct interpretation: if you repeat the experiment and CI construction many times, 95% of the resulting intervals will contain the true parameter.
+
+The interval $[\bar{x} - 1.96\,\text{SE},\; \bar{x}+1.96\,\text{SE}]$ is random (it changes each sample). The parameter $\mu$ is fixed. After you observe the data, either the interval contains $\mu$ or it doesn't — there's no probability attached to that specific interval.
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(0)
+mu_true, sigma = 10.0, 3.0
+n, N_trials = 30, 1000
+alpha = 0.05
+
+# Build 1000 CIs; count how many capture mu
+contains = 0
+for _ in range(N_trials):
+    x = rng.normal(mu_true, sigma, n)
+    se = sigma / np.sqrt(n)          # known sigma → z-interval
+    lo = x.mean() - stats.norm.ppf(1 - alpha/2) * se
+    hi = x.mean() + stats.norm.ppf(1 - alpha/2) * se
+    if lo <= mu_true <= hi:
+        contains += 1
+
+print(f"Coverage (sigma known, z-interval): {contains/N_trials:.3f}  (target: {1-alpha:.3f})")
+```
+
+```output
+Coverage (sigma known, z-interval): 0.952  (target: 0.950)
+```
+
+## t-interval when sigma is unknown
+
+Replace $\sigma$ with $S$ and $z_{\alpha/2}$ with $t_{\alpha/2,\,n-1}$:
+
+$$
+\bar{x} \;\pm\; t_{\alpha/2,\,n-1} \cdot \frac{S}{\sqrt{n}}
+$$
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(1)
+mu_true, sigma = 10.0, 3.0
+n, N_trials = 12, 2000  # small n makes sigma unknown important
+alpha = 0.05
+
+z_cover = 0; t_cover = 0
+for _ in range(N_trials):
+    x = rng.normal(mu_true, sigma, n)
+    xbar, s = x.mean(), x.std(ddof=1)
+    se = s / np.sqrt(n)
+
+    # z-interval (wrong: uses z, not t)
+    lo_z = xbar - stats.norm.ppf(1-alpha/2) * se
+    hi_z = xbar + stats.norm.ppf(1-alpha/2) * se
+
+    # t-interval (correct)
+    lo_t = xbar - stats.t.ppf(1-alpha/2, df=n-1) * se
+    hi_t = xbar + stats.t.ppf(1-alpha/2, df=n-1) * se
+
+    z_cover += lo_z <= mu_true <= hi_z
+    t_cover += lo_t <= mu_true <= hi_t
+
+print(f"n={n}, sigma unknown")
+print(f"z-interval coverage: {z_cover/N_trials:.3f}  (under-covers!)")
+print(f"t-interval coverage: {t_cover/N_trials:.3f}  (correct)")
+```
+
+```output
+n=12, sigma unknown
+z-interval coverage: 0.924  (under-covers!)
+t-interval coverage: 0.949  (correct)
+```
+
+## The bootstrap
+
+When the data isn't Normal or the statistic is complex (median, ratio, correlation), use the **bootstrap**: resample with replacement $B$ times, compute the statistic each time, and use the resulting distribution.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(2)
+# Non-normal data: Exponential(1) — median is log(2) ≈ 0.693
+x = rng.exponential(1.0, 50)
+true_median = np.log(2)
+
+B = 10_000
+boot_medians = np.array([
+    np.median(rng.choice(x, size=len(x), replace=True))
+    for _ in range(B)
+])
+
+# Percentile CI
+lo, hi = np.percentile(boot_medians, [2.5, 97.5])
+print(f"Sample median:    {np.median(x):.4f}  (true: {true_median:.4f})")
+print(f"Bootstrap 95% CI: [{lo:.4f}, {hi:.4f}]")
+print(f"Contains true?    {lo <= true_median <= hi}")
+print(f"Bootstrap SE:     {boot_medians.std():.4f}")
+```
+
+```output
+Sample median:    0.6789  (true: 0.6931)
+Bootstrap 95% CI: [0.5060, 0.8547]
+Contains true?    True
+Bootstrap SE:     0.0907
+```
+
+### BCa confidence intervals
+
+The **bias-corrected and accelerated (BCa)** bootstrap corrects for bias and skewness in the bootstrap distribution. It shifts the percentiles used to form the interval.
+
+```python
+import numpy as np
+from scipy import stats
+
+def bca_ci(data, stat_fn, B=5000, alpha=0.05, seed=3):
+    rng = np.random.default_rng(seed)
+    n = len(data)
+    theta_hat = stat_fn(data)
+
+    # Bootstrap distribution
+    boot_stats = np.array([
+        stat_fn(rng.choice(data, size=n, replace=True))
+        for _ in range(B)
+    ])
+
+    # Bias-correction: z0
+    z0 = stats.norm.ppf((boot_stats < theta_hat).mean())
+
+    # Acceleration: jackknife
+    jack_stats = np.array([stat_fn(np.delete(data, i)) for i in range(n)])
+    jack_mean  = jack_stats.mean()
+    num   = np.sum((jack_mean - jack_stats)**3)
+    denom = 6 * (np.sum((jack_mean - jack_stats)**2))**1.5
+    a = num / denom if denom != 0 else 0.0
+
+    # Adjusted percentiles
+    z_alpha   = stats.norm.ppf(alpha / 2)
+    z_1alpha  = stats.norm.ppf(1 - alpha / 2)
+    pct_lo = 100 * stats.norm.cdf(z0 + (z0 + z_alpha) / (1 - a*(z0 + z_alpha)))
+    pct_hi = 100 * stats.norm.cdf(z0 + (z0 + z_1alpha) / (1 - a*(z0 + z_1alpha)))
+
+    return np.percentile(boot_stats, [pct_lo, pct_hi])
+
+rng = np.random.default_rng(4)
+x = rng.exponential(1.0, 40)
+lo, hi = bca_ci(x, np.median, B=8000)
+print(f"BCa 95% CI for median: [{lo:.4f}, {hi:.4f}]  (true: {np.log(2):.4f})")
+```
+
+```output
+BCa 95% CI for median: [0.5217, 0.9441]  (true: 0.6931)
+```
+
+## Coverage simulation
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(5)
+true_median = np.log(2)   # Exp(1) median
+n, B, N_trials = 30, 2000, 500
+
+perc_cover = 0; t_cover = 0
+for _ in range(N_trials):
+    x = rng.exponential(1.0, n)
+
+    # Percentile bootstrap CI for median
+    boot = np.array([np.median(rng.choice(x, n, replace=True)) for _ in range(B)])
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    perc_cover += lo <= true_median <= hi
+
+    # t-CI for mean (for comparison — mean ≠ median here)
+    se = x.std(ddof=1) / np.sqrt(n)
+    lo_t = x.mean() - stats.t.ppf(0.975, df=n-1) * se
+    hi_t = x.mean() + stats.t.ppf(0.975, df=n-1) * se
+    t_cover += lo_t <= 1.0 <= hi_t  # true mean = 1 for Exp(1)
+
+print(f"Bootstrap percentile CI for median: {perc_cover/N_trials:.3f}  (target: 0.95)")
+print(f"t-CI for mean:                      {t_cover/N_trials:.3f}  (target: 0.95)")
+```
+
+```output
+Bootstrap percentile CI for median: 0.938  (target: 0.95)
+t-CI for mean:                      0.944  (target: 0.95)
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(99)
+# Skewed data: income-like distribution (log-normal)
+x = rng.lognormal(mean=2.0, sigma=1.0, size=80)
+
+# Bootstrap CI for the mean (not the log-mean)
+B = 5000
+boot_means = np.array([rng.choice(x, size=len(x), replace=True).mean() for _ in range(B)])
+
+lo, hi = np.percentile(boot_means, [2.5, 97.5])
+print(f"Sample mean:     {x.mean():.4f}")
+print(f"Bootstrap 95% CI: [{lo:.4f}, {hi:.4f}]")
+print(f"Bootstrap SE:    {boot_means.std():.4f}")
+print(f"True mean (lognormal): {np.exp(2.0 + 0.5*1.0**2):.4f}")
+```
+
+```output
+Sample mean:     7.8493
+Bootstrap 95% CI: [6.1177, 9.9327]
+Bootstrap SE:    0.9878
+True mean (lognormal): 7.3891
+```
+
+## Exercise
+
+You observe 60 measurements from an unknown distribution. The sample correlation between $X$ and $Y$ is 0.45. Build a 95% bootstrap percentile CI for the correlation. How wide is it?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(7)
+n = 60
+# Simulate data with true correlation 0.45
+rho = 0.45
+cov = [[1, rho], [rho, 1]]
+data = rng.multivariate_normal([0, 0], cov, size=n)
+
+sample_corr = np.corrcoef(data[:,0], data[:,1])[0,1]
+print(f"Sample correlation: {sample_corr:.4f}  (true: {rho})")
+
+B = 8000
+boot_corrs = np.zeros(B)
+for b in range(B):
+    idx = rng.choice(n, size=n, replace=True)
+    d = data[idx]
+    boot_corrs[b] = np.corrcoef(d[:,0], d[:,1])[0,1]
+
+lo, hi = np.percentile(boot_corrs, [2.5, 97.5])
+print(f"95% bootstrap CI: [{lo:.4f}, {hi:.4f}]")
+print(f"Width: {hi-lo:.4f}")
+print(f"Contains true rho? {lo <= rho <= hi}")
+```
+
+The CI width (~0.4) reflects the sampling uncertainty in correlations at $n=60$. You'd need several hundred observations to get a tight correlation estimate.
+</details>

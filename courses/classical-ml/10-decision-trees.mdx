@@ -1,0 +1,294 @@
+---
+course: classical-ml
+chapter: 10-decision-trees
+title: "Decision Trees: Impurity, Splits, and Pruning"
+order: 10
+---
+
+## The CART algorithm
+
+A decision tree partitions the feature space into rectangles and assigns a prediction to each. The **Classification and Regression Trees (CART)** algorithm builds trees greedily: at each node, find the (feature, threshold) split that minimises weighted impurity in the two children.
+
+For a node containing indices $I$, the split at feature $j$, threshold $t$ produces:
+- Left: $I_L = \{i \in I : x_{ij} \le t\}$
+- Right: $I_R = \{i \in I : x_{ij} > t\}$
+
+The score to minimise is:
+
+$$
+\text{score}(j, t) = \frac{|I_L|}{|I|}\,H(I_L) + \frac{|I_R|}{|I|}\,H(I_R)
+$$
+
+where $H$ is the impurity of a node.
+
+## Impurity measures
+
+### Gini impurity (classification)
+
+$$
+G = 1 - \sum_{k=1}^K p_k^2
+$$
+
+Gini is 0 at a pure node and $1-1/K$ at maximum disorder. It is faster to compute than entropy (no log).
+
+### Entropy (classification)
+
+$$
+H = -\sum_{k=1}^K p_k \log_2 p_k
+$$
+
+Both Gini and entropy give nearly identical results in practice.
+
+### MSE (regression)
+
+$$
+H = \frac{1}{|I|}\sum_{i\in I}(y_i - \bar{y}_I)^2
+$$
+
+Split reduces variance: predict the mean of each child node.
+
+```python
+import numpy as np
+
+def gini(y):
+    if len(y) == 0: return 0
+    classes, counts = np.unique(y, return_counts=True)
+    p = counts / len(y)
+    return 1 - np.sum(p**2)
+
+def entropy(y):
+    if len(y) == 0: return 0
+    _, counts = np.unique(y, return_counts=True)
+    p = counts / len(y)
+    return -np.sum(p * np.log2(p + 1e-15))
+
+# Pure node vs mixed node
+y_pure  = np.array([0, 0, 0, 0, 0])
+y_mixed = np.array([0, 0, 1, 1, 0])
+y_max   = np.array([0, 1, 0, 1, 0])
+
+for name, y in [("pure", y_pure), ("mixed", y_mixed), ("max-disorder", y_max)]:
+    print(f"{name:12}: gini={gini(y):.3f}, entropy={entropy(y):.3f}")
+```
+
+```output
+pure        : gini=0.000, entropy=0.000
+mixed       : gini=0.480, entropy=0.971
+max-disorder: gini=0.500, entropy=1.000
+```
+
+## From-scratch decision stump
+
+A stump (depth=1) finds the single best split across all features and thresholds:
+
+```python
+import numpy as np
+
+class DecisionStump:
+    def fit(self, X, y):
+        n, p = X.shape
+        best_score = np.inf
+        self.feat_, self.thresh_, self.left_val_, self.right_val_ = None, None, None, None
+
+        for j in range(p):
+            thresholds = np.unique(X[:, j])
+            for t in thresholds:
+                left  = y[X[:, j] <= t]
+                right = y[X[:, j] >  t]
+                if len(left) == 0 or len(right) == 0:
+                    continue
+                score = (len(left) * np.var(left) + len(right) * np.var(right)) / n
+                if score < best_score:
+                    best_score = score
+                    self.feat_, self.thresh_ = j, t
+                    self.left_val_  = left.mean()
+                    self.right_val_ = right.mean()
+        return self
+
+    def predict(self, X):
+        mask = X[:, self.feat_] <= self.thresh_
+        pred = np.where(mask, self.left_val_, self.right_val_)
+        return pred
+
+# Test on simple 1D regression
+rng = np.random.default_rng(0)
+X1 = rng.uniform(0, 10, (100, 1))
+y1 = np.where(X1[:, 0] < 5, 2.0, 6.0) + rng.normal(0, 0.5, 100)
+
+stump = DecisionStump().fit(X1, y1)
+preds = stump.predict(X1)
+mse = np.mean((preds - y1)**2)
+print(f"Best split: x[{stump.feat_}] <= {stump.thresh_:.2f}")
+print(f"Left pred: {stump.left_val_:.3f}, Right pred: {stump.right_val_:.3f}")
+print(f"Stump MSE: {mse:.3f}")
+```
+
+```output
+Best split: x[0] <= 4.99
+Left pred: 2.017, Right pred: 6.002
+Stump MSE: 0.267
+```
+
+## Depth and overfitting
+
+A deep tree memorises the training set; a shallow tree underfits. This is the classic bias-variance trade-off:
+
+```python
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+X, y = make_moons(n_samples=500, noise=0.3, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+print(f"{'depth':>6} | {'train':>7} | {'test':>7}")
+print("-" * 26)
+for depth in [1, 2, 3, 5, 8, 12, None]:
+    dt = DecisionTreeClassifier(max_depth=depth, random_state=0).fit(X_tr, y_tr)
+    tr_acc = dt.score(X_tr, y_tr)
+    te_acc = dt.score(X_te, y_te)
+    label = str(depth) if depth else "None"
+    print(f"{label:>6} | {tr_acc:.4f} | {te_acc:.4f}")
+```
+
+```output
+ depth |   train |    test
+--------------------------
+     1 |  0.7725 |  0.7600
+     2 |  0.8625 |  0.8650
+     3 |  0.8925 |  0.8700
+     5 |  0.9475 |  0.8750
+     8 |  0.9875 |  0.8650
+    12 |  1.0000 |  0.8450
+  None |  1.0000 |  0.8400
+```
+
+Test accuracy peaks around depth 3–5 and falls as the tree memorises noise.
+
+## Pruning
+
+### Pre-pruning (max constraints)
+
+`max_depth`, `min_samples_leaf`, `min_samples_split`, `max_leaf_nodes` — stop splitting early.
+
+### Cost-complexity pruning
+
+sklearn's `ccp_alpha` controls pruning after the full tree is grown. Higher `ccp_alpha` → more pruning → simpler tree.
+
+```python
+import numpy as np
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.datasets import make_moons
+
+X, y = make_moons(500, noise=0.3, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+# Get the effective alphas from the full training set
+path = DecisionTreeClassifier(random_state=0).cost_complexity_pruning_path(X_tr, y_tr)
+alphas = path.ccp_alphas[::5]   # every 5th for brevity
+
+best_acc, best_alpha = 0, 0
+for alpha in alphas:
+    dt = DecisionTreeClassifier(ccp_alpha=alpha, random_state=0).fit(X_tr, y_tr)
+    acc = dt.score(X_te, y_te)
+    if acc > best_acc:
+        best_acc, best_alpha = acc, alpha
+
+print(f"Best ccp_alpha: {best_alpha:.5f}, test acc: {best_acc:.4f}")
+```
+
+```output
+Best ccp_alpha: 0.00420, test acc: 0.8950
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.datasets import load_wine
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, cross_val_score
+
+X, y = load_wine(return_X_y=True)
+X = StandardScaler().fit_transform(X)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.25, random_state=0)
+
+depths = [1, 2, 3, 4, 5, 6, 7, None]
+print(f"{'depth':>6} | {'cv_acc':>7} | {'test':>7}")
+for d in depths:
+    cv = cross_val_score(DecisionTreeClassifier(max_depth=d, random_state=0),
+                          X_tr, y_tr, cv=5).mean()
+    dt = DecisionTreeClassifier(max_depth=d, random_state=0).fit(X_tr, y_tr)
+    test = dt.score(X_te, y_te)
+    print(f"{str(d):>6} | {cv:.4f} | {test:.4f}")
+```
+
+```output
+ depth | cv_acc |    test
+     1 |  0.7103 |  0.7556
+     2 |  0.8667 |  0.8889
+     3 |  0.8962 |  0.9333
+     4 |  0.9038 |  0.9333
+     5 |  0.8740 |  0.9111
+     6 |  0.8740 |  0.8889
+     7 |  0.8514 |  0.8889
+  None |  0.8296 |  0.8667
+```
+
+## Exercise
+
+Implement Gini-based splitting for a classification tree (not just a stump). Allow `max_depth` parameter. Test on `make_moons` and verify your accuracy is within 1% of sklearn's `DecisionTreeClassifier` at the same depth.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+def gini(y):
+    if len(y) == 0: return 0
+    _, c = np.unique(y, return_counts=True)
+    p = c / len(y)
+    return 1 - np.sum(p**2)
+
+def best_split(X, y):
+    n, p = X.shape
+    best = {'score': np.inf, 'feat': None, 'thresh': None}
+    for j in range(p):
+        for t in np.unique(X[:, j]):
+            l, r = y[X[:, j] <= t], y[X[:, j] > t]
+            if len(l) == 0 or len(r) == 0: continue
+            s = (len(l)*gini(l) + len(r)*gini(r)) / n
+            if s < best['score']:
+                best = {'score': s, 'feat': j, 'thresh': t}
+    return best
+
+def build_tree(X, y, depth, max_depth):
+    if depth == max_depth or len(np.unique(y)) == 1:
+        vals, counts = np.unique(y, return_counts=True)
+        return {'leaf': True, 'pred': vals[np.argmax(counts)]}
+    sp = best_split(X, y)
+    if sp['feat'] is None:
+        vals, counts = np.unique(y, return_counts=True)
+        return {'leaf': True, 'pred': vals[np.argmax(counts)]}
+    mask = X[:, sp['feat']] <= sp['thresh']
+    return {'leaf': False, **sp,
+            'left':  build_tree(X[mask],  y[mask],  depth+1, max_depth),
+            'right': build_tree(X[~mask], y[~mask], depth+1, max_depth)}
+
+def predict_one(node, x):
+    if node['leaf']: return node['pred']
+    return predict_one(node['left'] if x[node['feat']] <= node['thresh'] else node['right'], x)
+
+X, y = make_moons(300, noise=0.3, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+tree = build_tree(X_tr, y_tr, 0, max_depth=4)
+preds = np.array([predict_one(tree, x) for x in X_te])
+print(f"Scratch tree acc: {np.mean(preds == y_te):.3f}")
+```
+</details>

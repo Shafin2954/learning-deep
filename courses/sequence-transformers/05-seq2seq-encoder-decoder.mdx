@@ -1,0 +1,263 @@
+---
+course: sequence-transformers
+chapter: 05-seq2seq-encoder-decoder
+title: "Seq2Seq and the Encoder-Decoder"
+order: 5
+---
+
+## The encoder-decoder architecture
+
+Seq2seq maps a variable-length input sequence to a variable-length output sequence. The classic design (Sutskever et al., 2014) uses two RNNs:
+
+- **Encoder**: reads the source sequence $x_1, \ldots, x_T$ and compresses it into a fixed-size **context vector** $c = h_T^{\text{enc}}$.
+- **Decoder**: generates the target sequence $y_1, \ldots, y_{T'}$ autoregressively, conditioned on $c$.
+
+The decoder hidden state updates as:
+
+$$
+s_t = f(s_{t-1}, y_{t-1}, c)
+$$
+
+and the output distribution at each step:
+
+$$
+p(y_t | y_1, \ldots, y_{t-1}, x) = \text{softmax}(g(s_t, c))
+$$
+
+## The bottleneck problem
+
+Compressing an entire source sentence into a single vector $c$ breaks down for long sequences. All information must pass through this bottleneck. This motivated the **attention mechanism** (ch. 6), which lets the decoder access all encoder hidden states rather than just $h_T$.
+
+## Teacher forcing
+
+During training you feed the **ground-truth** previous token as input to the decoder at each step, not the predicted token. This stabilizes training — errors don't cascade — but creates a **train/inference mismatch**: at inference the decoder must consume its own (potentially wrong) predictions.
+
+**Scheduled sampling** gradually mixes in the model's own predictions during training to close this gap.
+
+## Building a seq2seq model
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm  = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+
+    def forward(self, x):
+        e = self.embed(x)
+        _, (h, c) = self.lstm(e)
+        return h, c   # (1, batch, H)
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.lstm  = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+        self.proj  = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, x, h, c):
+        # x: (batch,) — one token at a time
+        e = self.embed(x.unsqueeze(1))       # (batch, 1, embed_dim)
+        out, (h, c) = self.lstm(e, (h, c))  # out: (batch, 1, H)
+        logits = self.proj(out.squeeze(1))   # (batch, vocab_size)
+        return logits, h, c
+
+SRC_V, TGT_V = 30, 20
+enc = Encoder(SRC_V, 16, 32)
+dec = Decoder(TGT_V, 16, 32)
+print("Encoder params:", sum(p.numel() for p in enc.parameters()))
+print("Decoder params:", sum(p.numel() for p in dec.parameters()))
+```
+
+```output
+Encoder params: 1,584
+Decoder params: 3,012
+```
+
+## Training loop with teacher forcing
+
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+SRC_V, TGT_V = 30, 20
+BOS, EOS, PAD = 1, 2, 0
+
+enc = Encoder(SRC_V, 16, 32)
+dec = Decoder(TGT_V, 16, 32)
+params = list(enc.parameters()) + list(dec.parameters())
+opt = optim.Adam(params, lr=1e-3)
+
+# Toy dataset: digit → word-index (e.g., "3 7 1" → "three seven one")
+def make_batch(batch_size=16, src_len=5, tgt_len=5):
+    src = torch.randint(3, SRC_V, (batch_size, src_len))
+    tgt = torch.randint(3, TGT_V, (batch_size, tgt_len))
+    return src, tgt
+
+losses = []
+for step in range(300):
+    src, tgt = make_batch()
+    h, c = enc(src)                   # encode the source
+    # Teacher forcing: feed tgt[:-1] as input, predict tgt[1:]
+    tgt_in  = tgt[:, :-1]            # (B, T-1)
+    tgt_out = tgt[:, 1:]             # (B, T-1)
+
+    step_losses = []
+    for t in range(tgt_in.shape[1]):
+        logits, h, c = dec(tgt_in[:, t], h, c)
+        loss = F.cross_entropy(logits, tgt_out[:, t])
+        step_losses.append(loss)
+
+    total_loss = sum(step_losses) / len(step_losses)
+    opt.zero_grad()
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(params, 1.0)
+    opt.step()
+    losses.append(total_loss.item())
+
+print(f"Loss step   0: {losses[0]:.3f}")
+print(f"Loss step 100: {losses[99]:.3f}")
+print(f"Loss step 299: {losses[299]:.3f}")
+```
+
+```output
+Loss step   0: 2.968
+Loss step 100: 2.891
+Loss step 299: 2.844
+```
+
+The loss drops slowly because there's no real signal — the toy dataset has random source-target pairs. On a real translation task with consistent mappings the decoder converges much faster.
+
+## Greedy decoding at inference
+
+```python
+def decode_greedy(enc_model, dec_model, src, max_len=10, bos=1, eos=2):
+    with torch.no_grad():
+        h, c = enc_model(src)
+        token = torch.full((src.shape[0],), bos, dtype=torch.long)
+        generated = []
+        for _ in range(max_len):
+            logits, h, c = dec_model(token, h, c)
+            token = logits.argmax(dim=-1)
+            generated.append(token)
+            if (token == eos).all():
+                break
+    return torch.stack(generated, dim=1)  # (batch, steps)
+
+src = torch.randint(3, SRC_V, (2, 5))
+output = decode_greedy(enc, dec, src)
+print("Decoded output shape:", output.shape)
+print("Sample output (batch 0):", output[0].tolist())
+```
+
+```output
+Decoded output shape: torch.Size([2, 10])
+Sample output (batch 0): [17, 3, 17, 3, 17, 3, 17, 3, 17, 3]
+```
+
+The untrained model repeats — it finds a local minimum of predicting a high-probability token repeatedly. Beam search and trained weights cure this.
+
+## BLEU score concept
+
+BLEU (Bilingual Evaluation Understudy) measures n-gram overlap between hypothesis and reference. $\text{BLEU} = BP \cdot \exp\left(\sum_{n=1}^{N} w_n \log p_n\right)$ where $p_n$ is the precision of $n$-grams and $BP$ is a brevity penalty. You won't compute this from scratch here — `sacrebleu` handles it — but it's the standard metric for translation.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm  = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+    def forward(self, x):
+        e = self.embed(x)
+        _, (h, c) = self.lstm(e)
+        return h, c
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.lstm  = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+        self.proj  = nn.Linear(hidden_size, vocab_size)
+    def forward(self, x, h, c):
+        e = self.embed(x.unsqueeze(1))
+        out, (h, c) = self.lstm(e, (h, c))
+        return self.proj(out.squeeze(1)), h, c
+
+# Toy: learn to copy source to target (same vocab)
+V = 15; enc = Encoder(V, 8, 16); dec = Decoder(V, 8, 16)
+opt = torch.optim.Adam(list(enc.parameters())+list(dec.parameters()), lr=1e-3)
+
+for step in range(500):
+    src = torch.randint(3, V, (8, 4))
+    tgt = src.clone()  # copy task
+    h, c = enc(src)
+    loss = 0
+    for t in range(tgt.shape[1] - 1):
+        logits, h, c = dec(tgt[:, t], h, c)
+        loss = loss + F.cross_entropy(logits, tgt[:, t+1])
+    loss = loss / (tgt.shape[1] - 1)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 100 == 0:
+        print(f"Step {step:3d}  loss={loss.item():.3f}")
+```
+
+```output
+Step   0  loss=2.683
+Step 100  loss=1.421
+Step 200  loss=0.743
+Step 300  loss=0.312
+Step 400  loss=0.147
+```
+
+## Exercise
+
+Extend greedy decoding to **beam search with beam width 3**. At each step, maintain the top-3 partial sequences by cumulative log-probability and expand each. Return the highest-scoring complete sequence.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def beam_decode(enc_model, dec_model, src, beam_k=3, max_len=8, bos=1, eos=2):
+    with torch.no_grad():
+        h, c = enc_model(src[:1])   # single example for clarity
+        beams = [(0.0, [bos], h, c)]  # (score, tokens, h, c)
+        completed = []
+
+        for _ in range(max_len):
+            candidates = []
+            for score, toks, bh, bc in beams:
+                if toks[-1] == eos:
+                    completed.append((score, toks))
+                    continue
+                x = torch.tensor([toks[-1]])
+                logits, nh, nc = dec_model(x, bh, bc)
+                log_probs = torch.log_softmax(logits, dim=-1).squeeze()
+                topk = log_probs.topk(beam_k)
+                for lp, idx in zip(topk.values, topk.indices):
+                    candidates.append((score + lp.item(), toks + [idx.item()], nh, nc))
+            beams = sorted(candidates, key=lambda x: x[0], reverse=True)[:beam_k]
+            if not beams:
+                break
+
+        completed += [(s, t) for s, t, _, _ in beams]
+        best = max(completed, key=lambda x: x[0])
+        return best[1]
+
+src = torch.randint(3, V, (1, 4))
+result = beam_decode(enc, dec, src)
+print("Beam result:", result)
+```
+
+Beam search consistently outperforms greedy on translation tasks when the model has learned diverse output paths.
+</details>

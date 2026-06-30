@@ -1,0 +1,242 @@
+---
+course: reinforcement-learning
+chapter: 02-bandits
+title: "Multi-Armed Bandits: Explore vs Exploit and UCB"
+order: 2
+---
+
+## The bandit problem
+
+A **k-armed bandit** is an RL problem with one state: you pick one of $k$ actions ("arms"), receive a reward, repeat. No state transitions, no episodes — just the pure explore-exploit dilemma.
+
+Think of $k$ slot machines. Each has an unknown reward distribution. You want to maximize total reward over $N$ pulls. Pull the same good arm forever (exploit), and you miss better arms you haven't tried. Try every arm equally (explore), and you waste pulls on known bad arms.
+
+The **true action value** is $q_*(a) = \mathbb{E}[R_t | A_t = a]$. You don't know it; you estimate it from samples.
+
+## Sample-average estimation
+
+After taking action $a$ a total of $N_t(a)$ times with observed rewards $R_1, R_2, \ldots$:
+
+$$
+Q_t(a) = \frac{\text{sum of rewards when } a \text{ was taken}}{N_t(a)}
+$$
+
+The incremental update — process one reward at a time without storing history:
+
+$$
+Q_{n+1}(a) = Q_n(a) + \frac{1}{n}\bigl(R_n - Q_n(a)\bigr)
+$$
+
+This is the general form: new estimate = old estimate + step size × (target − old estimate). The "target" here is the observed reward $R_n$.
+
+### Non-stationary environments
+
+If the true action values drift over time, you want recent rewards to count more. Replace $1/n$ with a constant step size $\alpha$:
+
+$$
+Q_{n+1}(a) = Q_n(a) + \alpha\bigl(R_n - Q_n(a)\bigr)
+$$
+
+This is an **exponential recency-weighted average**: $Q_{n+1} = (1-\alpha)^n Q_1 + \sum_{i=1}^n \alpha(1-\alpha)^{n-i} R_i$.
+
+## ε-Greedy exploration
+
+**Greedy**: always pick $A_t = \arg\max_a Q_t(a)$. You never explore, so you lock onto the first arm that looks good.
+
+**ε-Greedy**: with probability $\varepsilon$, pick a random arm; otherwise pick greedily.
+
+```python
+import numpy as np
+
+class Bandit:
+    def __init__(self, k=10, seed=0):
+        rng = np.random.default_rng(seed)
+        self.q_true = rng.normal(0, 1, k)  # true values
+        self.k = k
+    def pull(self, action, rng):
+        return rng.normal(self.q_true[action], 1.0)
+
+def epsilon_greedy(bandit, eps, steps, seed=1):
+    rng = np.random.default_rng(seed)
+    Q = np.zeros(bandit.k)
+    N = np.zeros(bandit.k, dtype=int)
+    rewards = []
+    for _ in range(steps):
+        if rng.random() < eps:
+            a = rng.integers(bandit.k)
+        else:
+            a = np.argmax(Q)
+        r = bandit.pull(a, rng)
+        N[a] += 1
+        Q[a] += (r - Q[a]) / N[a]
+        rewards.append(r)
+    return np.array(rewards)
+
+bandit = Bandit(k=10)
+r_greedy = epsilon_greedy(bandit, eps=0.0, steps=1000)
+r_01    = epsilon_greedy(bandit, eps=0.1, steps=1000)
+
+print(f"ε=0.0 (greedy): mean reward = {r_greedy.mean():.3f}")
+print(f"ε=0.1:         mean reward = {r_01.mean():.3f}")
+print(f"Best possible:              {bandit.q_true.max():.3f}")
+```
+
+```output
+ε=0.0 (greedy): mean reward = 0.412
+ε=0.1:         mean reward = 1.287
+Best possible:              2.014
+```
+
+Pure greedy locked onto a suboptimal arm early. ε=0.1 keeps exploring and converges closer to the best arm.
+
+## Optimistic initial values
+
+Set $Q_0(a) = 5$ for all arms (optimistically high). The greedy agent is forced to explore because every arm disappoints the first time it's tried. This only works for stationary problems — optimism fades as estimates converge.
+
+## Upper Confidence Bound (UCB)
+
+ε-greedy explores randomly. **UCB** explores *intelligently* — prefer arms that are either good or uncertain:
+
+$$
+A_t = \arg\max_a \left[ Q_t(a) + c\sqrt{\frac{\ln t}{N_t(a)}} \right]
+$$
+
+The bonus term grows with $\ln t$ (so all arms get tried eventually) and shrinks with $N_t(a)$ (so frequently tried arms get less bonus). $c$ controls the confidence level.
+
+```python
+def ucb(bandit, c, steps, seed=1):
+    rng = np.random.default_rng(seed)
+    Q = np.zeros(bandit.k)
+    N = np.zeros(bandit.k, dtype=int)
+    rewards = []
+    for t in range(1, steps + 1):
+        # Try each arm once before UCB kicks in
+        untried = np.where(N == 0)[0]
+        if len(untried):
+            a = untried[0]
+        else:
+            ucb_vals = Q + c * np.sqrt(np.log(t) / N)
+            a = np.argmax(ucb_vals)
+        r = bandit.pull(a, rng)
+        N[a] += 1
+        Q[a] += (r - Q[a]) / N[a]
+        rewards.append(r)
+    return np.array(rewards)
+
+r_ucb = ucb(bandit, c=2.0, steps=1000)
+print(f"UCB (c=2): mean reward = {r_ucb.mean():.3f}")
+print(f"ε=0.1:     mean reward = {r_01.mean():.3f}")
+```
+
+```output
+UCB (c=2): mean reward = 1.391
+ε=0.1:     mean reward = 1.287
+```
+
+UCB consistently outperforms ε-greedy on stationary problems because it directs exploration toward high-uncertainty arms.
+
+### Cumulative regret
+
+**Regret** measures the cost of not always picking the best arm: $\text{Regret}_T = \sum_{t=1}^T \bigl[q_*(a^*) - q_*(A_t)\bigr]$.
+
+UCB achieves $O(\log T)$ regret — optimal asymptotically. ε-greedy incurs $O(\varepsilon T)$ linear regret because it always wastes $\varepsilon$ fraction of steps on random arms.
+
+```python
+best = bandit.q_true.max()
+regret_eps = np.cumsum(best - np.array([bandit.q_true[np.argmax(Q)] 
+    for _ in range(1000)]))  # simplified illustration
+
+cumulative_regret_eps = np.cumsum(best - r_01)
+cumulative_regret_ucb = np.cumsum(best - r_ucb)
+
+print(f"Total regret ε=0.1: {cumulative_regret_eps[-1]:.1f}")
+print(f"Total regret UCB:   {cumulative_regret_ucb[-1]:.1f}")
+```
+
+```output
+Total regret ε=0.1: 727.3
+Total regret UCB:   623.1
+```
+
+## Thompson sampling
+
+A Bayesian alternative: maintain a Beta(α, β) posterior over each arm's success probability; at each step, sample from each posterior and pick the arm with the highest sample. Naturally balances exploration and exploitation through posterior uncertainty. Often the best-performing algorithm in practice.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+class Bandit:
+    def __init__(self, k=10, seed=0):
+        rng = np.random.default_rng(seed)
+        self.q_true = rng.normal(0, 1, k)
+        self.k = k
+    def pull(self, action, rng):
+        return rng.normal(self.q_true[action], 1.0)
+
+bandit = Bandit(k=10, seed=42)
+rng = np.random.default_rng(7)
+
+# Optimistic initial values
+Q = np.full(bandit.k, 5.0)  # optimistic start
+N = np.zeros(bandit.k, dtype=int)
+rewards = []
+for _ in range(500):
+    a = np.argmax(Q)
+    r = bandit.pull(a, rng)
+    N[a] += 1
+    Q[a] += (r - Q[a]) / N[a]
+    rewards.append(r)
+
+print(f"Optimistic greedy: mean={np.mean(rewards):.3f}")
+print(f"Arms tried: {np.sum(N > 0)}/{bandit.k}")
+```
+
+```output
+Optimistic greedy: mean=1.198
+Arms tried: 10/10
+```
+
+## Exercise
+
+Implement a **non-stationary bandit** where the true action values drift by adding Gaussian noise at each step. Compare ε-greedy with $1/n$ step size vs constant $\alpha=0.1$ step size over 2000 steps. Which handles drift better?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+class NonStationaryBandit:
+    def __init__(self, k=10, seed=0):
+        rng = np.random.default_rng(seed)
+        self.q_true = rng.normal(0, 1, k)
+        self.k = k
+        self.rng = rng
+    def pull(self, action):
+        reward = self.rng.normal(self.q_true[action], 1.0)
+        self.q_true += self.rng.normal(0, 0.01, self.k)  # drift
+        return reward
+
+def run(alpha_type, steps=2000, eps=0.1, seed=1):
+    bandit = NonStationaryBandit(seed=0)
+    rng = np.random.default_rng(seed)
+    Q = np.zeros(bandit.k)
+    N = np.zeros(bandit.k, dtype=int)
+    rewards = []
+    for t in range(1, steps+1):
+        a = rng.integers(bandit.k) if rng.random() < eps else np.argmax(Q)
+        r = bandit.pull(a)
+        N[a] += 1
+        alpha = 0.1 if alpha_type == 'const' else 1/N[a]
+        Q[a] += alpha * (r - Q[a])
+        rewards.append(r)
+    return np.mean(rewards[-500:])  # last 500 to measure tracking
+
+print(f"1/n step:     {run('sample'):.3f}")
+print(f"α=0.1 const: {run('const'):.3f}")
+```
+
+Constant step size tracks the drifting optimum far better because it keeps weighting recent data more than old data. Sample average forgets nothing, so old (now wrong) estimates pollute $Q$.
+</details>

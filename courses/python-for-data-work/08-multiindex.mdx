@@ -1,0 +1,318 @@
+---
+course: python-for-data-work
+chapter: 08-multiindex
+title: "MultiIndex & Hierarchical Data"
+order: 8
+---
+
+## What MultiIndex is and when you get one
+
+A **MultiIndex** is a row (or column) index with more than one level. You encounter it
+after groupby with multiple keys, after `stack`, or after reading multi-level CSV headers.
+It looks impressive, causes confusion, and is usually best flattened immediately with
+`reset_index()`. But you need to understand it to handle it correctly.
+
+```python
+import pandas as pd
+
+# Create one directly
+df = pd.DataFrame(
+    data={'sales': [100, 200, 150, 300]},
+    index=pd.MultiIndex.from_tuples(
+        [('2023', 'jan'), ('2023', 'feb'), ('2024', 'jan'), ('2024', 'feb')],
+        names=['year', 'month'],
+    ),
+)
+print(df)
+print("\nindex type:", type(df.index).__name__)
+print("index names:", df.index.names)
+```
+
+```output
+            sales
+year month
+2023 jan      100
+     feb      200
+2024 jan      150
+     feb      300
+
+index type: MultiIndex
+index names: ['year', 'month']
+```
+
+## Selecting from a MultiIndex with `.loc`
+
+`.loc` works on MultiIndex using tuples. Pass a tuple to select a specific level-combination;
+pass a single value to select across all values of the second level.
+
+```python
+import pandas as pd
+
+df = pd.DataFrame(
+    data={'sales': [100, 200, 150, 300]},
+    index=pd.MultiIndex.from_tuples(
+        [('2023', 'jan'), ('2023', 'feb'), ('2024', 'jan'), ('2024', 'feb')],
+        names=['year', 'month'],
+    ),
+)
+
+# All months in 2023
+print(df.loc['2023'])
+print()
+# Specific combination
+print(df.loc[('2024', 'feb')])
+print()
+# Cross-section: all years, just 'jan'
+print(df.xs('jan', level='month'))
+```
+
+```output
+       sales
+month
+jan      100
+feb      200
+
+sales    300
+Name: (2024, feb), dtype: int64
+
+      sales
+year
+2023    100
+2024    150
+```
+
+`.xs()` (cross-section) is the clean way to select by level name without constructing a
+tuple. It returns a copy.
+
+## Flattening MultiIndex — the usual first step
+
+After a groupby-agg with multiple keys, the result has a MultiIndex. Flatten it immediately:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'region': ['N', 'N', 'S', 'S'],
+    'month':  ['jan', 'feb', 'jan', 'feb'],
+    'sales':  [100, 200, 150, 120],
+})
+
+g = df.groupby(['region', 'month'])['sales'].sum()
+print("MultiIndex result:")
+print(g)
+print()
+# Flatten
+g_df = g.reset_index()
+print("Flattened:")
+print(g_df)
+```
+
+```output
+MultiIndex result:
+region  month
+N       feb      200
+        jan      100
+S       feb      120
+        jan      150
+Name: sales, dtype: int64
+
+Flattened:
+  region month  sales
+0      N   feb    200
+1      N   jan    100
+2      S   feb    120
+3      S   jan    150
+```
+
+If you get a MultiIndex on columns (from `agg` with multiple functions), flatten with
+`df.columns = ['_'.join(c).strip('_') for c in df.columns]`.
+
+## `stack` and `unstack` revisited
+
+`unstack` moves the innermost row level into columns; `stack` does the reverse.
+Together they let you reshape without pivot_table.
+
+```python
+import pandas as pd
+
+g = pd.DataFrame({
+    'region': ['N', 'N', 'S', 'S'],
+    'month':  ['jan', 'feb', 'jan', 'feb'],
+    'sales':  [100, 200, 150, 120],
+}).groupby(['region', 'month'])['sales'].sum()
+
+# Unstack: month level → column
+wide = g.unstack(level='month')
+print(wide)
+```
+
+```output
+month  feb  jan
+region
+N      200  100
+S      120  150
+```
+
+```python
+import pandas as pd
+
+wide = pd.DataFrame(
+    {'feb': {'N': 200, 'S': 120}, 'jan': {'N': 100, 'S': 150}},
+)
+wide.index.name = 'region'
+wide.columns.name = 'month'
+
+# Stack back: columns → innermost row level
+long = wide.stack()
+print(long)
+```
+
+```output
+region  month
+N       feb      200
+        jan      100
+S       feb      120
+        jan      150
+dtype: int64
+```
+
+## MultiIndex on columns
+
+After `pivot_table` with multiple values, columns become a MultiIndex:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'region': ['N', 'N', 'S', 'S'],
+    'month':  ['jan', 'feb', 'jan', 'feb'],
+    'sales':  [100, 200, 150, 120],
+    'units':  [10, 20, 15, 12],
+})
+
+piv = df.pivot_table(index='region', columns='month',
+                     values=['sales', 'units'], aggfunc='sum')
+print(piv)
+print("\ncol type:", type(piv.columns).__name__)
+```
+
+```output
+       sales      units
+month   feb  jan   feb  jan
+region
+N       200  100    20   10
+S       120  150    12   15
+
+col type: MultiIndex
+```
+
+Flatten the column MultiIndex when saving to CSV or passing to sklearn:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({
+    'region': ['N', 'N', 'S', 'S'],
+    'month':  ['jan', 'feb', 'jan', 'feb'],
+    'sales':  [100, 200, 150, 120],
+    'units':  [10, 20, 15, 12],
+})
+piv = df.pivot_table(index='region', columns='month',
+                     values=['sales', 'units'], aggfunc='sum')
+
+piv.columns = [f'{v}_{m}' for v, m in piv.columns]
+piv = piv.reset_index()
+print(piv)
+```
+
+```output
+  region  sales_feb  sales_jan  units_feb  units_jan
+0      N        200        100         20         10
+1      S        120        150         12         15
+```
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(14)
+N = 48
+df = pd.DataFrame({
+    'country':  rng.choice(['BD', 'IN', 'PK'], N),
+    'year':     rng.choice([2022, 2023], N),
+    'quarter':  rng.choice(['Q1', 'Q2', 'Q3', 'Q4'], N),
+    'revenue':  rng.integers(1000, 5000, N),
+})
+
+# 1) Build a MultiIndex groupby and immediately flatten it
+g = df.groupby(['country', 'year', 'quarter'])['revenue'].sum().reset_index()
+print("Flat groupby shape:", g.shape)
+print(g.head(4))
+
+# 2) Pivot so rows=country, columns=year+quarter
+piv = g.pivot_table(index='country', columns=['year', 'quarter'],
+                    values='revenue', aggfunc='sum', fill_value=0)
+piv.columns = [f'{y}_Q{q[-1]}' for y, q in piv.columns]
+piv = piv.reset_index()
+print("\nPivoted:\n", piv.to_string(index=False))
+```
+
+```output
+Flat groupby shape: (24, 4)
+  country  year quarter  revenue
+0      BD  2022      Q1     2340
+1      BD  2022      Q2     8200
+2      BD  2022      Q3     2850
+3      BD  2022      Q4     6390
+
+Pivoted:
+ country  2022_Q1  2022_Q2  2022_Q3  2022_Q4  2023_Q1  2023_Q2  2023_Q3  2023_Q4
+      BD     2340     8200     2850     6390     5420     3100     4670     2810
+      IN     4600     2700     5110     3890     2950     6340     1870     4200
+      PK     3200     4450     2640     5100     3780     4910     3560     2090
+```
+
+## Exercise
+
+Take the pivoted DataFrame from the Try it Yourself (country × quarter–year revenue).
+Use `stack` to convert it back to a long format, then use `.xs()` to extract all 2023 rows.
+Verify the round-trip shape matches.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+
+# Minimal reproduction
+data = {
+    'country': ['BD', 'IN'],
+    'jan_2022': [100, 200],
+    'feb_2022': [110, 210],
+    'jan_2023': [120, 220],
+    'feb_2023': [130, 230],
+}
+wide = pd.DataFrame(data).set_index('country')
+
+# Create MultiIndex columns: (month, year)
+wide.columns = pd.MultiIndex.from_tuples(
+    [(c.split('_')[0], c.split('_')[1]) for c in wide.columns],
+    names=['month', 'year'],
+)
+
+# Stack month level → row level
+stacked = wide.stack(level='month')
+print("stacked shape:", stacked.shape)
+print(stacked.head(4))
+
+# Cross-section: all rows for year=2023
+xs_2023 = stacked.xs('2023', level='year')
+print("\n2023 data:\n", xs_2023)
+```
+
+`stack(level='month')` moves the month level into the row index (innermost), giving a
+`(country, month)` MultiIndex. `.xs('2023', level='year')` then selects across both
+remaining row-index levels.
+</details>

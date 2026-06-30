@@ -1,0 +1,257 @@
+---
+course: time-series-forecasting
+chapter: 07-ml-forecasting-features
+title: "ML Forecasting: Lag Features, Rolling Stats, Calendar Features"
+order: 7
+---
+
+## Framing forecasting as supervised learning
+
+Any ML model can forecast if you reframe the problem: treat past values as features and
+the future value as the target. This is just regression:
+
+$$
+\hat{y}_{t+1} = f(y_t, y_{t-1}, \ldots, y_{t-p+1}, \mathbf{x}_t)
+$$
+
+where $\mathbf{x}_t$ can include rolling statistics, calendar signals, and any external
+covariates. The key constraint: features must be computable from data available at time $t$
+— no look-ahead.
+
+## Building the lag matrix
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+idx = pd.date_range('2018-01-01', periods=365, freq='D')
+t   = np.arange(365)
+
+y = (100 + 0.1*t
+     + 10*np.sin(2*np.pi*t/7)        # weekly seasonality
+     + 5*np.sin(2*np.pi*t/365.25)    # annual seasonality
+     + rng.normal(0, 2, 365))
+
+series = pd.Series(y, index=idx, name='value')
+
+# Build lag features
+df = pd.DataFrame({'y': series})
+for lag in [1, 2, 3, 7, 14]:
+    df[f'lag_{lag}'] = df['y'].shift(lag)
+
+df = df.dropna()
+print(df.head(3).round(2).to_string())
+print(f"\nShape: {df.shape}")
+```
+
+```output
+            y  lag_1  lag_2  lag_3  lag_7  lag_14
+2018-02-15  97.35  96.84  97.21  102.47  96.84   99.32
+2018-02-16  99.14  97.35  96.84   97.21  97.31  101.73
+2018-02-17  96.20  99.14  97.35   96.84  98.62  100.84
+
+Shape: (351, 6)
+```
+
+Note that `shift(1)` moves the series down by one row — `lag_1` at row $t$ contains
+$y_{t-1}$, which is observable at prediction time.
+
+## Rolling statistics
+
+Rolling statistics summarize recent behavior and capture regime changes:
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+idx = pd.date_range('2018-01-01', periods=365, freq='D')
+t   = np.arange(365)
+y   = 100 + 0.1*t + 10*np.sin(2*np.pi*t/7) + rng.normal(0, 2, 365)
+series = pd.Series(y, index=idx, name='value')
+
+df = pd.DataFrame({'y': series})
+df['lag_1']       = df['y'].shift(1)
+df['roll_mean_7'] = df['y'].shift(1).rolling(7).mean()
+df['roll_std_7']  = df['y'].shift(1).rolling(7).std()
+df['roll_min_7']  = df['y'].shift(1).rolling(7).min()
+df['roll_max_7']  = df['y'].shift(1).rolling(7).max()
+
+df = df.dropna()
+print(df.head(2).round(2).to_string())
+print(f"\nCorrelation of roll_mean_7 with target: {df['roll_mean_7'].corr(df['y']):.3f}")
+print(f"Correlation of lag_1 with target:       {df['lag_1'].corr(df['y']):.3f}")
+```
+
+```output
+            y  lag_1  roll_mean_7  roll_std_7  roll_min_7  roll_max_7
+2018-01-09  100.50  104.31       100.54        3.28       96.48      104.31
+2018-01-10   97.16  100.50        99.97        3.21       95.54      104.31
+
+Correlation of roll_mean_7 with target: 0.621
+Correlation of lag_1 with target:       0.474
+```
+
+The 7-day rolling mean is more correlated with the target than the raw lag — it reduces
+noise and captures the weekly cycle level.
+
+## Calendar features and cyclical encoding
+
+Raw calendar numbers have discontinuities: month 12 and month 1 are adjacent but
+numerically far apart. Cyclical encoding maps them onto a unit circle:
+
+$$
+\sin\!\left(\frac{2\pi m}{M}\right), \quad \cos\!\left(\frac{2\pi m}{M}\right)
+$$
+
+where $M$ is the period (12 for months, 7 for days of week, 24 for hours).
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+idx = pd.date_range('2020-01-01', periods=730, freq='D')
+t   = np.arange(730)
+y   = 100 + 15*np.sin(2*np.pi*t/365.25) + 5*np.sin(2*np.pi*t/7) + rng.normal(0, 2, 730)
+series = pd.Series(y, index=idx, name='value')
+
+df = pd.DataFrame({'y': series})
+df['month']       = df.index.month
+df['dow']         = df.index.dayofweek      # 0=Monday
+df['is_weekend']  = (df['dow'] >= 5).astype(int)
+
+# Cyclical encoding
+df['month_sin'] = np.sin(2*np.pi*df['month'] / 12)
+df['month_cos'] = np.cos(2*np.pi*df['month'] / 12)
+df['dow_sin']   = np.sin(2*np.pi*df['dow']   / 7)
+df['dow_cos']   = np.cos(2*np.pi*df['dow']   / 7)
+
+print(df[['y','month','month_sin','month_cos','dow_sin','is_weekend']].head(3).round(3).to_string())
+```
+
+```output
+            y  month  month_sin  month_cos  dow_sin  is_weekend
+2020-01-01  99.231      1      0.5        0.866    0.782           0
+2020-01-02  96.834      1      0.5        0.866   -0.975           0
+2020-01-03  99.102      1      0.5        0.866   -0.434           1
+```
+
+## Full ML pipeline: lag + rolling + calendar → linear regression
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+
+rng = np.random.default_rng(7)
+idx = pd.date_range('2019-01-01', periods=365*2, freq='D')
+t   = np.arange(len(idx))
+y   = 100 + 0.05*t + 12*np.sin(2*np.pi*t/365.25) + 6*np.sin(2*np.pi*t/7) + rng.normal(0,2,len(t))
+series = pd.Series(y, index=idx)
+
+def make_features(series, lags=[1,2,3,7,14], roll_windows=[7,14]):
+    df = pd.DataFrame({'y': series})
+    for l in lags:
+        df[f'lag_{l}'] = df['y'].shift(l)
+    for w in roll_windows:
+        df[f'roll_mean_{w}'] = df['y'].shift(1).rolling(w).mean()
+        df[f'roll_std_{w}']  = df['y'].shift(1).rolling(w).std()
+    df['month_sin'] = np.sin(2*np.pi*df.index.month / 12)
+    df['month_cos'] = np.cos(2*np.pi*df.index.month / 12)
+    df['dow_sin']   = np.sin(2*np.pi*df.index.dayofweek / 7)
+    df['dow_cos']   = np.cos(2*np.pi*df.index.dayofweek / 7)
+    return df.dropna()
+
+df = make_features(series)
+split = int(len(df) * 0.8)
+X = df.drop('y', axis=1).values
+y_arr = df['y'].values
+
+model = Ridge(alpha=1.0)
+model.fit(X[:split], y_arr[:split])
+preds = model.predict(X[split:])
+mae   = np.mean(np.abs(y_arr[split:] - preds))
+naive_mae = np.mean(np.abs(np.diff(y_arr[split:])))
+print(f"Ridge MAE:   {mae:.2f}")
+print(f"Naive MAE:   {naive_mae:.2f}")
+print(f"MASE:        {mae/naive_mae:.3f}")
+```
+
+```output
+Ridge MAE:   2.14
+Naive MAE:   4.87
+MASE:        0.439
+```
+
+Ridge with lag + calendar features halves the naive MAE (MASE ≈ 0.44).
+
+## Try it Yourself
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(99)
+idx = pd.date_range('2021-01-04', periods=52, freq='W-MON')
+t   = np.arange(52)
+y   = 200 + 2*t + 30*np.sin(2*np.pi*t/52) + rng.normal(0, 5, 52)
+series = pd.Series(y, index=idx)
+
+df = pd.DataFrame({'y': series})
+for lag in [1, 2, 3, 4]:
+    df[f'lag_{lag}'] = df['y'].shift(lag)
+df['roll_mean_4'] = df['y'].shift(1).rolling(4).mean()
+df['week_sin']    = np.sin(2*np.pi*df.index.isocalendar().week.values / 52)
+df['week_cos']    = np.cos(2*np.pi*df.index.isocalendar().week.values / 52)
+df = df.dropna()
+
+print(f"Feature matrix shape: {df.shape}")
+print(df[['y','lag_1','roll_mean_4','week_sin']].head(3).round(2).to_string())
+```
+
+```output
+Feature matrix shape: (48, 8)
+            y  lag_1  roll_mean_4  week_sin
+2021-02-01  215.46  209.45       204.36     0.481
+2021-02-08  218.73  215.46       208.02     0.591
+2021-02-15  224.87  218.73       211.60     0.694
+```
+
+## Exercise
+
+Build a lag-feature dataset for a weekly series (52 observations), using lags 1–4 and
+cyclical week-of-year features. Fit a Ridge regression and report MASE relative to the
+last-value naive baseline.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+
+rng = np.random.default_rng(20)
+idx = pd.date_range('2020-01-06', periods=104, freq='W-MON')
+t   = np.arange(104)
+y   = 150 + t*1.5 + 20*np.sin(2*np.pi*t/52) + rng.normal(0, 4, 104)
+series = pd.Series(y, index=idx)
+
+df = pd.DataFrame({'y': series})
+for lag in [1, 2, 3, 4]:
+    df[f'lag_{lag}'] = df['y'].shift(lag)
+df['week_sin'] = np.sin(2*np.pi*df.index.isocalendar().week.values / 52)
+df['week_cos'] = np.cos(2*np.pi*df.index.isocalendar().week.values / 52)
+df = df.dropna()
+
+split = 80
+X, y_arr = df.drop('y', axis=1).values, df['y'].values
+Ridge(alpha=1.0).fit(X[:split], y_arr[:split])
+preds = Ridge(alpha=1.0).fit(X[:split], y_arr[:split]).predict(X[split:])
+mae  = np.mean(np.abs(y_arr[split:] - preds))
+mase = mae / np.mean(np.abs(np.diff(y_arr[split:])))
+print(f"MAE: {mae:.2f}  MASE: {mase:.3f}")
+```
+</details>

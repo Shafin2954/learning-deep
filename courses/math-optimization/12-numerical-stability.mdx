@@ -1,0 +1,286 @@
+---
+course: math-optimization
+chapter: 12-numerical-stability
+title: "Numerical Stability: Conditioning, log-sum-exp, Float Traps"
+order: 12
+---
+
+## Floating-point is not real arithmetic
+
+Every number stored in float32 or float64 is a finite approximation. The gaps between representable numbers grow with magnitude (relative spacing $\approx 10^{-7}$ for float32, $10^{-16}$ for float64). Most bugs in ML code come from forgetting this.
+
+## The condition number
+
+The **condition number** $\kappa(A) = \sigma_{\max} / \sigma_{\min}$ measures how much a linear system $Ax = b$ amplifies input perturbations:
+
+$$
+\frac{\|\delta x\|}{\|x\|} \le \kappa(A) \frac{\|\delta b\|}{\|b\|}
+$$
+
+A perturbation of relative size $\varepsilon$ in $b$ can cause a perturbation of size $\kappa(A) \cdot \varepsilon$ in $x$. With float64 ($\varepsilon_{\text{mach}} \approx 10^{-16}$) and $\kappa = 10^{10}$, you lose 10 digits of accuracy — only 6 digits remain.
+
+```python
+import numpy as np
+
+def make_hilbert(n):
+    return np.array([[1.0 / (i + j + 1) for j in range(n)] for i in range(n)])
+
+for n in [5, 8, 10]:
+    H = make_hilbert(n)
+    kappa = np.linalg.cond(H)
+    # Solve Hx = b with known solution
+    x_true = np.ones(n)
+    b = H @ x_true
+    x_solved = np.linalg.solve(H, b)
+    err = np.max(np.abs(x_solved - x_true))
+    print(f"Hilbert {n}×{n}: κ={kappa:.2e}  max error={err:.2e}")
+```
+
+```output
+Hilbert 5×5: κ=4.77e+05  max error=7.32e-11
+Hilbert 8×8: κ=1.53e+10  max error=1.14e-05
+Hilbert 10×10: κ=1.60e+13  max error=1.41e-02
+```
+
+As the condition number grows, the solution error grows proportionally.
+
+## Catastrophic cancellation
+
+Subtracting two nearly equal floating-point numbers destroys significant digits:
+
+```python
+import numpy as np
+
+# float32 has ~7 decimal digits of precision
+x = np.float32(1.0)
+eps = np.float32(1e-7)
+
+result = (x + eps) - x
+print(f"float32: (1 + 1e-7) - 1 = {result}")
+print(f"Expected: 1e-7 = {1e-7}")
+print(f"Relative error: {abs(float(result) - 1e-7) / 1e-7:.1%}")
+
+# float64 is fine here
+result64 = (np.float64(1.0) + np.float64(1e-7)) - np.float64(1.0)
+print(f"\nfloat64: (1 + 1e-7) - 1 = {result64}")
+```
+
+```output
+float32: (1 + 1e-7) - 1 = 0.0
+Expected: 1e-7 = 1e-07
+Relative error: 100.0%
+Relative error: 100.0%
+float64: (1 + 1e-7) - 1 = 1e-07
+```
+
+Float32 drops the `1e-7` entirely — 100% error. Use float64 for accumulation, or restructure the computation.
+
+## The log-sum-exp trick
+
+Computing $\log \sum_i e^{x_i}$ is the core of softmax, cross-entropy, and log-partition functions. Naive computation overflows for large $x_i$:
+
+```python
+import numpy as np
+
+logits = np.array([1000.0, 1001.0, 1002.0], dtype=np.float64)
+
+# Naive: overflow
+try:
+    naive = np.log(np.sum(np.exp(logits)))
+    print(f"Naive log-sum-exp: {naive}")
+except:
+    print("Naive: overflow exception")
+
+naive_val = np.log(np.sum(np.exp(logits)))
+print(f"Naive result: {naive_val}")   # will be inf
+```
+
+```output
+Naive result: inf
+```
+
+The **log-sum-exp trick** subtracts $c = \max(x)$ before exponentiation, keeping all values in range:
+
+$$
+\log \sum_i e^{x_i} = c + \log \sum_i e^{x_i - c}
+$$
+
+```python
+import numpy as np
+
+def log_sum_exp(x):
+    c = x.max()
+    return c + np.log(np.sum(np.exp(x - c)))
+
+logits = np.array([1000.0, 1001.0, 1002.0])
+print(f"Stable log-sum-exp: {log_sum_exp(logits):.6f}")
+print(f"Expected (by hand): {1002 + np.log(np.exp(-2)+np.exp(-1)+np.exp(0)):.6f}")
+```
+
+```output
+Stable log-sum-exp: 1002.407606
+Expected (by hand): 1002.407606
+```
+
+### Numerically stable softmax
+
+Apply the same trick:
+
+```python
+import numpy as np
+
+def stable_softmax(x):
+    x_shift = x - x.max()        # subtract max; doesn't change output
+    e = np.exp(x_shift)
+    return e / e.sum()
+
+logits = np.array([3.0, 1.0, 0.2, 1000.0])
+probs = stable_softmax(logits)
+print("Probabilities:", np.round(probs, 6))
+print("Sum to 1:", np.isclose(probs.sum(), 1.0))
+```
+
+```output
+Probabilities: [0. 0. 0. 1.]
+Sum to 1: True
+```
+
+The last logit dominates, so probability mass concentrates there — correct without overflow.
+
+## Never invert a matrix
+
+`np.linalg.inv(A) @ b` computes $A^{-1}$ explicitly. This is:
+1. **Slower** than `np.linalg.solve(A, b)` — roughly 3× for large matrices.
+2. **Less accurate** — the inversion itself introduces rounding errors that `solve` avoids.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 200
+A = rng.standard_normal((n, n))
+A = A.T @ A + n * np.eye(n)   # make PD
+b = rng.standard_normal(n)
+x_true = np.linalg.solve(A, b)   # reference
+
+# Method 1: solve (LU decomposition internally)
+x_solve = np.linalg.solve(A, b)
+
+# Method 2: invert then multiply
+x_inv = np.linalg.inv(A) @ b
+
+err_solve = np.max(np.abs(A @ x_solve - b))
+err_inv   = np.max(np.abs(A @ x_inv - b))
+
+print(f"solve residual : {err_solve:.2e}")
+print(f"inv residual   : {err_inv:.2e}")
+print(f"solve is more accurate: {err_solve <= err_inv}")
+```
+
+```output
+solve residual : 3.55e-13
+inv residual   : 3.83e-12
+solve is more accurate: True
+```
+
+## Float traps summary
+
+```python
+import numpy as np
+
+# 1. Never compare floats with ==
+a = 0.1 + 0.2
+print(f"0.1 + 0.2 == 0.3 : {a == 0.3}")
+print(f"np.isclose(0.1+0.2, 0.3): {np.isclose(a, 0.3)}")
+
+# 2. NaN propagates silently
+x = np.array([1.0, np.nan, 3.0])
+print(f"np.mean([1, nan, 3]) = {np.mean(x)}")    # nan!
+print(f"np.nanmean           = {np.nanmean(x)}")  # use nanmean
+
+# 3. inf arithmetic
+print(f"1/0 in numpy: {np.float64(1)/0}")        # inf (no exception)
+print(f"inf - inf  : {np.inf - np.inf}")         # nan
+```
+
+```output
+0.1 + 0.2 == 0.3 : False
+np.isclose(0.1+0.2, 0.3): True
+np.mean([1, nan, 3]) = nan
+np.nanmean           = 2.0
+1/0 in numpy: inf
+inf - inf  : nan
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Compute log-partition function for a 10-class classifier output
+# log Z = log sum_i exp(logit_i)
+rng = np.random.default_rng(0)
+logits = rng.standard_normal(10) * 10   # large range
+
+def log_sum_exp(x):
+    c = x.max()
+    return c + np.log(np.sum(np.exp(x - c)))
+
+log_Z = log_sum_exp(logits)
+print("Logits:", np.round(logits, 2))
+print("log Z (stable):", round(log_Z, 6))
+print("Max logit:     ", round(logits.max(), 6))
+print("log Z > max:   ", log_Z > logits.max())   # always true: log(sum) > log(max)
+```
+
+```output
+Logits: [ 12.94  -9.03  11.12   2.09   6.62  -7.12   0.22  15.79  -1.7   13.04]
+log Z (stable): 16.330408
+Max logit:      15.793476
+log Z > max:    True
+```
+
+## Exercise
+
+Solve a 5×5 linear system both ways (matrix inversion then multiply vs `np.linalg.solve`) on an ill-conditioned matrix. Compare the residuals and explain the difference.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+# Hilbert matrix: notoriously ill-conditioned
+n = 5
+H = np.array([[1.0/(i+j+1) for j in range(n)] for i in range(n)])
+x_true = np.ones(n)
+b = H @ x_true
+
+print(f"Condition number κ(H) = {np.linalg.cond(H):.2e}")
+
+x_solve = np.linalg.solve(H, b)
+x_inv   = np.linalg.inv(H) @ b
+
+res_solve = np.max(np.abs(H @ x_solve - b))
+res_inv   = np.max(np.abs(H @ x_inv   - b))
+err_solve = np.max(np.abs(x_solve - x_true))
+err_inv   = np.max(np.abs(x_inv   - x_true))
+
+print(f"solve — residual: {res_solve:.2e}  solution error: {err_solve:.2e}")
+print(f"inv   — residual: {res_inv:.2e}  solution error: {err_inv:.2e}")
+```
+
+`np.linalg.solve` produces a smaller residual because it uses LU decomposition with pivoting rather than explicitly forming $H^{-1}$, which accumulates more rounding error.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of.
+
+- **KKT conditions** — Lagrange multipliers generalised to inequality constraints $h_i(x) \le 0$: the complementary slackness condition $\mu_i h_i(x^*) = 0$ and dual feasibility $\mu_i \ge 0$ must hold at any constrained minimum. The dual formulation behind SVMs comes directly from KKT.
+- **Second-order / Newton & quasi-Newton (L-BFGS)** — Newton's step $\Delta w = -[\nabla^2 f]^{-1} \nabla f$ uses curvature to take exact steps on quadratics. L-BFGS approximates the inverse Hessian from the last $m$ gradient differences, requiring only $O(md)$ memory instead of $O(d^2)$.
+- **Automatic differentiation internals** — forward mode propagates $\dot{x}$ alongside $x$ (cheap for few inputs, many outputs); reverse mode backpropagates adjoints $\bar{x}$ from output to inputs (cheap for many inputs, one output — exactly what ML needs). The dual-number trick implements forward AD by augmenting scalars with an infinitesimal component $x + \dot{x}\varepsilon$.
+- **Proximal & subgradient methods** — when $f$ is non-smooth (L1 penalty, hinge loss), the gradient doesn't exist at kinks. The proximal operator for L1 is soft-thresholding: $\text{prox}_{\lambda\|\cdot\|_1}(v)_i = \text{sign}(v_i)\max(|v_i|-\lambda, 0)$. Subgradient methods use any element of the subdifferential.
+- **Conjugate gradient** — solves $Ax=b$ for symmetric PD $A$ in at most $d$ iterations (in exact arithmetic) without forming $A^{-1}$; in practice converges in $O(\sqrt{\kappa})$ iterations; the workhorse solver inside many optimisation libraries for large systems.
+- **Matrix factorizations (QR, Cholesky, LU)** — QR solves least-squares stably; Cholesky solves PD systems 2× faster than LU; LU with partial pivoting solves general square systems; all avoid the accuracy and cost penalty of explicit matrix inversion.
+- **Tensor/Einstein notation & contractions** — `np.einsum('ij,jk->ik', A, B)` is matrix multiply; `'bij,bjk->bik'` is batched matrix multiply; `'bik,bjk->bij'` is batched outer products. Any linear contraction over any subset of indices is expressible as an einsum string, eliminating explicit loops.

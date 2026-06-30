@@ -1,0 +1,364 @@
+---
+course: sequence-transformers
+chapter: 11-decoding-kv-cache
+title: "Decoding: Greedy, Beam Search, Sampling, and KV Cache"
+order: 11
+---
+
+## Decoding is generation
+
+Training a language model minimizes cross-entropy over every token in a sequence. At inference
+you only have the input prefix and you need to generate what comes next — one token at a time.
+The decoding strategy you choose shapes the output more than you might expect.
+
+## Greedy decoding
+
+The simplest rule: at each step take the token with the highest logit.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def greedy_decode(model, input_ids, max_new_tokens, eos_id=None):
+    ids = input_ids.clone()
+    for _ in range(max_new_tokens):
+        logits = model(ids)          # (1, seq_len, vocab_size)
+        next_id = logits[0, -1].argmax()
+        ids = torch.cat([ids, next_id.unsqueeze(0).unsqueeze(0)], dim=1)
+        if eos_id is not None and next_id.item() == eos_id:
+            break
+    return ids
+
+# Example with a toy vocabulary
+vocab = {0: "<bos>", 1: "the", 2: "cat", 3: "sat", 4: "on", 5: "mat", 6: "<eos>"}
+# Dummy fixed logit table (not a real model)
+logit_table = torch.zeros(7, 7)
+logit_table[0, 1] = 5.0   # after <bos> → "the"
+logit_table[1, 2] = 5.0   # after "the" → "cat"
+logit_table[2, 3] = 5.0   # after "cat" → "sat"
+logit_table[3, 4] = 5.0   # after "sat" → "on"
+logit_table[4, 5] = 5.0   # after "on"  → "mat"
+logit_table[5, 6] = 5.0   # after "mat" → <eos>
+
+class ToyModel(torch.nn.Module):
+    def forward(self, ids):
+        last = ids[0, -1].item()
+        return logit_table[last].unsqueeze(0).unsqueeze(0)
+
+input_ids = torch.tensor([[0]])
+out = greedy_decode(ToyModel(), input_ids, max_new_tokens=6, eos_id=6)
+print(" ".join(vocab[i.item()] for i in out[0]))
+```
+
+```output
+<bos> the cat sat on mat <eos>
+```
+
+Greedy decoding is deterministic and fast but tends to repeat itself on longer generations
+because the highest-probability continuation at each step can form loops.
+
+## Beam search
+
+Beam search keeps the top-$k$ hypotheses at each step rather than committing to the single
+best token.
+
+```python
+def beam_search(logit_fn, input_ids, beam_width=3, max_new_tokens=10, eos_id=None):
+    # beams: list of (score, token_list)
+    beams = [(0.0, input_ids[0].tolist())]
+    completed = []
+
+    for _ in range(max_new_tokens):
+        candidates = []
+        for score, seq in beams:
+            ids = torch.tensor([seq])
+            logits = logit_fn(ids)[0, -1]          # (vocab_size,)
+            log_probs = F.log_softmax(logits, dim=-1)
+            topk_lp, topk_ids = log_probs.topk(beam_width)
+            for lp, tok in zip(topk_lp.tolist(), topk_ids.tolist()):
+                candidates.append((score + lp, seq + [tok]))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        beams = []
+        for score, seq in candidates[:beam_width]:
+            if eos_id is not None and seq[-1] == eos_id:
+                completed.append((score / len(seq), seq))  # length penalty
+            else:
+                beams.append((score, seq))
+        if not beams:
+            break
+
+    completed += [(s / len(seq), seq) for s, seq in beams]
+    completed.sort(key=lambda x: x[0], reverse=True)
+    return completed[0][1]
+
+result = beam_search(ToyModel().forward, torch.tensor([[0]]), beam_width=2, eos_id=6)
+print(" ".join(vocab[i] for i in result))
+```
+
+```output
+<bos> the cat sat on mat <eos>
+```
+
+Length penalty (dividing score by sequence length) prevents beam search from always preferring
+short sequences. The beam width controls the quality-compute tradeoff: wider beams search more
+of the space but cost `beam_width` forward passes per step.
+
+## Temperature scaling and sampling
+
+Instead of taking the argmax, you can sample from the distribution. Temperature $T$ sharpens
+or flattens the logits before softmax:
+
+$$
+p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}
+$$
+
+$T < 1$ makes the distribution peakier (more deterministic). $T > 1$ makes it flatter (more
+random). $T = 1$ is the raw model distribution.
+
+```python
+def sample_decode(logit_fn, input_ids, max_new_tokens, temperature=1.0,
+                  top_k=None, top_p=None, eos_id=None):
+    ids = input_ids.clone()
+    generated = []
+    for _ in range(max_new_tokens):
+        logits = logit_fn(ids)[0, -1]  # (vocab_size,)
+        logits = logits / temperature
+
+        if top_k is not None:
+            # zero out everything below the top-k
+            values, _ = logits.topk(top_k)
+            logits[logits < values[-1]] = float('-inf')
+
+        if top_p is not None:
+            # nucleus sampling: keep smallest set with cumulative prob >= top_p
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            remove_mask = cumprobs - sorted_logits.softmax(dim=-1) > top_p
+            logits[sorted_idx[remove_mask]] = float('-inf')
+
+        probs = F.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, 1)
+        ids = torch.cat([ids, next_id.unsqueeze(0)], dim=1)
+        generated.append(next_id.item())
+        if eos_id is not None and next_id.item() == eos_id:
+            break
+    return ids
+
+torch.manual_seed(42)
+out = sample_decode(ToyModel().forward, torch.tensor([[0]]),
+                    max_new_tokens=6, temperature=0.8, eos_id=6)
+print(" ".join(vocab[i.item()] for i in out[0]))
+```
+
+```output
+<bos> the cat sat on mat <eos>
+```
+
+### Top-k sampling
+
+Keep only the $k$ most probable tokens and redistribute probability mass over them. Common
+values: $k = 50$ for creative text, $k = 10$ for more focused output.
+
+### Nucleus (top-p) sampling
+
+Keep the smallest set of tokens whose cumulative probability exceeds $p$. This adapts the
+cutoff to the model's confidence: when the model is sure, the nucleus is small; when it is
+uncertain, more tokens are included. $p = 0.9$ or $p = 0.95$ are typical defaults.
+
+### Repetition penalty
+
+Reduce the logit of any token that already appears in the generated context by dividing by a
+penalty factor $> 1$. This breaks loops without changing the distribution for new tokens.
+
+## The KV cache
+
+Without caching, generating the $t$-th token requires recomputing all key and value tensors
+for positions $1 \ldots t-1$ — even though you computed them on every previous step. This is
+$O(T^2)$ total work.
+
+The KV cache stores the key and value projections for every layer and every previously seen
+position. On step $t$ you only compute keys and values for position $t$, append them to the
+cache, and run attention over the full cached sequence.
+
+```python
+import torch
+import torch.nn as nn
+
+class CachedAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, kv_cache=None):
+        B, T, C = x.shape
+        H, D = self.n_heads, self.d_head
+        q = self.q(x).view(B, T, H, D).transpose(1, 2)   # (B, H, T, D)
+        k = self.k(x).view(B, T, H, D).transpose(1, 2)
+        v = self.v(x).view(B, T, H, D).transpose(1, 2)
+
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+
+        new_cache = (k, v)
+        scale = D ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale          # (B, H, T, T_full)
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, T, C)
+        return self.out(out), new_cache
+
+# Simulate two forward passes: one with full seq, one cached
+d_model, n_heads = 64, 4
+attn = CachedAttention(d_model, n_heads)
+attn.eval()
+
+prefix = torch.randn(1, 5, d_model)
+new_tok = torch.randn(1, 1, d_model)
+
+# Without cache: full sequence
+full_seq = torch.cat([prefix, new_tok], dim=1)
+out_full, _ = attn(full_seq)
+
+# With cache: run prefix first, then one token
+with torch.no_grad():
+    _, cache = attn(prefix)
+    out_cached, new_cache = attn(new_tok, kv_cache=cache)
+
+print("Output matches:", torch.allclose(out_full[:, -1:], out_cached, atol=1e-5))
+print("Cached K shape:", new_cache[0].shape)  # includes all 6 positions
+```
+
+```output
+Output matches: True
+Cached K shape: torch.Size([1, 4, 6, 16])
+```
+
+The key insight: the output for the new token is identical whether you recompute the full
+sequence or use the cache. You get the same result while only doing one attention query.
+
+### Cache memory cost
+
+For a model with $L$ layers, $H$ heads, head dimension $d$, and sequence length $T$:
+
+$$
+\text{KV cache size} = 2 \times L \times H \times T \times d \times \text{bytes per element}
+$$
+
+A 70B-parameter model with 80 layers, 8 KV heads, and head dim 128 at FP16:
+$2 \times 80 \times 8 \times T \times 128 \times 2 = 327{,}680 \times T$ bytes.
+At $T = 8{,}192$ tokens that is 2.56 GB per sequence — for a single batch element.
+
+This is why inference memory is dominated by the KV cache, not the model weights, at long
+context lengths. GQA/MQA reduce this by sharing K and V heads.
+
+### Batched generation and left-padding
+
+When you generate for a batch of prompts with different lengths, you left-pad shorter prompts
+so all sequences start at position 0 in the attention mask. Right-padding would corrupt
+positional encodings for all but the longest sequence.
+
+```python
+# Left-padding example
+prompts = [[1, 2, 3], [4, 5], [6]]
+max_len = max(len(p) for p in prompts)
+pad_id = 0
+padded = [[pad_id] * (max_len - len(p)) + p for p in prompts]
+print(padded)
+```
+
+```output
+[[1, 2, 3], [0, 4, 5], [0, 0, 6]]
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn.functional as F
+
+# Tiny vocabulary: 0=<bos>, 1=a, 2=b, 3=c, 4=<eos>
+logit_table = torch.tensor([
+    [0., 5., 1., 1., 0.],   # after <bos>: prefer 'a'
+    [0., 0., 5., 1., 0.],   # after 'a':   prefer 'b'
+    [0., 0., 0., 5., 0.],   # after 'b':   prefer 'c'
+    [0., 0., 0., 0., 5.],   # after 'c':   prefer <eos>
+    [0., 0., 0., 0., 0.],   # after <eos>: nothing
+], dtype=torch.float32)
+
+def logit_fn(ids):
+    last = ids[0, -1].item()
+    return logit_table[last].unsqueeze(0).unsqueeze(0)
+
+# Greedy
+ids = torch.tensor([[0]])
+for _ in range(4):
+    next_id = logit_fn(ids)[0, -1].argmax()
+    ids = torch.cat([ids, next_id.view(1, 1)], dim=1)
+    if next_id.item() == 4:
+        break
+
+vocab = {0: "<bos>", 1: "a", 2: "b", 3: "c", 4: "<eos>"}
+print("Greedy:", " ".join(vocab[i.item()] for i in ids[0]))
+
+# Now try temperature=2.0 and see how the output changes
+torch.manual_seed(0)
+ids2 = torch.tensor([[0]])
+for _ in range(4):
+    logits = logit_fn(ids2)[0, -1] / 2.0
+    probs = F.softmax(logits, dim=-1)
+    next_id = torch.multinomial(probs, 1)
+    ids2 = torch.cat([ids2, next_id.unsqueeze(0)], dim=1)
+    if next_id.item() == 4:
+        break
+print("Temp=2:", " ".join(vocab[i.item()] for i in ids2[0]))
+```
+
+```output
+Greedy: <bos> a b c <eos>
+Temp=2: <bos> a b c <eos>
+```
+
+Try changing `temperature` to 5.0 to see random deviations from the greedy path.
+
+## Exercise
+
+Implement a repetition penalty: before softmax, divide the logit of any token that already
+appears in `ids` by a penalty factor $\alpha > 1$. Show that with $\alpha = 10$ and the
+logit table above, the model avoids repeating 'a' even if forced to start with it twice.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def decode_with_rep_penalty(logit_fn, input_ids, max_new_tokens, alpha=2.0, eos_id=None):
+    ids = input_ids.clone()
+    for _ in range(max_new_tokens):
+        logits = logit_fn(ids)[0, -1].clone()
+        seen = set(ids[0].tolist())
+        for tok in seen:
+            if logits[tok] > 0:
+                logits[tok] /= alpha
+        next_id = logits.argmax()
+        ids = torch.cat([ids, next_id.view(1, 1)], dim=1)
+        if eos_id is not None and next_id.item() == eos_id:
+            break
+    return ids
+
+# Force 'a' at start then let penalty steer
+forced = torch.tensor([[0, 1]])  # <bos>, a
+result = decode_with_rep_penalty(logit_fn, forced, max_new_tokens=5, alpha=10.0, eos_id=4)
+print(" ".join(vocab[i.item()] for i in result[0]))
+```
+
+The penalty divides positive logits for seen tokens, pushing the model toward tokens it has
+not yet generated. The key insight is that you only penalize positive logits — negative logits
+would become less negative (increase probability) if divided by $\alpha$.
+
+</details>

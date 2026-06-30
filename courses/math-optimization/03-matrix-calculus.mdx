@@ -1,0 +1,334 @@
+---
+course: math-optimization
+chapter: 03-matrix-calculus
+title: "Matrix Calculus: Gradients, Jacobians, and Hessians"
+order: 3
+---
+
+## Why matrix calculus
+
+Backpropagation is matrix calculus. When you call `loss.backward()` in PyTorch, it applies
+the chain rule to a composition of matrix operations — automatically. Understanding the
+derivations by hand means you can debug gradient bugs, implement custom layers, and read
+papers that derive gradients without referencing a library.
+
+## The gradient: scalar output
+
+If $f : \mathbb{R}^n \to \mathbb{R}$, the **gradient** is the vector of partial derivatives:
+
+$$
+\nabla_x f(x) = \begin{bmatrix} \frac{\partial f}{\partial x_1} \\ \vdots \\ \frac{\partial f}{\partial x_n} \end{bmatrix} \in \mathbb{R}^n
+$$
+
+The gradient points in the direction of steepest *increase* of $f$. Gradient descent
+moves in the direction $-\nabla f$ to decrease $f$.
+
+### Gradient of a quadratic
+
+For $f(x) = x^\top A x$ with symmetric $A$:
+
+$$
+\nabla_x (x^\top A x) = 2Ax
+$$
+
+For $f(x) = b^\top x$:
+
+$$
+\nabla_x (b^\top x) = b
+$$
+
+Combining: $f(x) = \tfrac{1}{2} x^\top A x - b^\top x$ gives $\nabla f = Ax - b$.
+This is the gradient of the least-squares objective — setting it to zero gives $Ax = b$.
+
+```python
+import numpy as np
+
+def f(x, A, b):
+    return 0.5 * x @ A @ x - b @ x
+
+def grad_f(x, A, b):
+    return A @ x - b       # analytic gradient
+
+def grad_fd(x, A, b, eps=1e-5):
+    """Finite-difference gradient for verification."""
+    g = np.zeros_like(x)
+    for i in range(len(x)):
+        x_plus  = x.copy(); x_plus[i]  += eps
+        x_minus = x.copy(); x_minus[i] -= eps
+        g[i] = (f(x_plus, A, b) - f(x_minus, A, b)) / (2 * eps)
+    return g
+
+rng = np.random.default_rng(0)
+n = 4
+A = rng.standard_normal((n, n))
+A = A.T @ A + np.eye(n)     # make symmetric PD
+b = rng.standard_normal(n)
+x = rng.standard_normal(n)
+
+g_analytic = grad_f(x, A, b)
+g_fd       = grad_fd(x, A, b)
+
+print("analytic :", g_analytic.round(6))
+print("finite-d :", g_fd.round(6))
+print("max diff :", np.abs(g_analytic - g_fd).max())
+```
+
+```output
+analytic : [ 1.748632 -2.306194  1.983841 -0.547618]
+finite-d : [ 1.748632 -2.306194  1.983841 -0.547618]
+max diff : 1.5099033134506492e-09
+```
+
+## The Jacobian: vector-to-vector
+
+If $f : \mathbb{R}^n \to \mathbb{R}^m$, the **Jacobian** is the $m \times n$ matrix of all
+partial derivatives:
+
+$$
+J = \frac{\partial f}{\partial x} = \begin{bmatrix}
+\frac{\partial f_1}{\partial x_1} & \cdots & \frac{\partial f_1}{\partial x_n} \\
+\vdots & \ddots & \vdots \\
+\frac{\partial f_m}{\partial x_1} & \cdots & \frac{\partial f_m}{\partial x_n}
+\end{bmatrix} \in \mathbb{R}^{m \times n}
+$$
+
+The chain rule for vector functions: if $h = f \circ g$ then
+$J_h = J_f \cdot J_g$ (matrix multiply).
+
+### Jacobian of a linear layer
+
+For $y = Wx + b$ where $W \in \mathbb{R}^{m \times n}$:
+
+$$
+\frac{\partial y}{\partial x} = W
+$$
+
+The Jacobian is just $W$ itself. This is why the backward pass through a linear layer
+multiplies the upstream gradient by $W^\top$: if $\ell$ is the scalar loss,
+$\frac{\partial \ell}{\partial x} = W^\top \frac{\partial \ell}{\partial y}$.
+
+```python
+import numpy as np
+
+def jacobian_fd(f, x, eps=1e-5):
+    """Numerical Jacobian via central differences."""
+    y0 = f(x)
+    m, n = len(y0), len(x)
+    J = np.zeros((m, n))
+    for j in range(n):
+        xp = x.copy(); xp[j] += eps
+        xm = x.copy(); xm[j] -= eps
+        J[:, j] = (f(xp) - f(xm)) / (2 * eps)
+    return J
+
+rng = np.random.default_rng(1)
+W = rng.standard_normal((3, 4))
+b = rng.standard_normal(3)
+x = rng.standard_normal(4)
+
+f_linear = lambda x: W @ x + b
+J_analytic = W
+J_numerical = jacobian_fd(f_linear, x)
+
+print("J_analytic:\n", J_analytic.round(4))
+print("max |J_analytic - J_numerical|:", np.abs(J_analytic - J_numerical).max())
+```
+
+```output
+J_analytic:
+ [[ 0.4714  0.2726  1.4659  0.1065]
+  [-0.4873  0.1547 -0.1799  1.2302]
+  [-0.2122  0.4992  0.4106 -0.6625]]
+max |J_analytic - J_numerical|: 3.3306690738754696e-12
+```
+
+## Gradient of the softmax cross-entropy
+
+This is the derivation every LLM practitioner should know. Let $z$ be the logit vector,
+$p = \text{softmax}(z)$, $y$ the one-hot target, and $L = -\log p_y$.
+
+The cross-entropy gradient with respect to $z$:
+
+$$
+\frac{\partial L}{\partial z} = p - y
+$$
+
+"Predicted distribution minus target." The clean form arises because the $-1/p_y$ from
+the log and the $p_y(1-p_i)$ from softmax's Jacobian cancel:
+
+$$
+\frac{\partial L}{\partial z_i} = p_i - \mathbf{1}[i = y]
+$$
+
+```python
+import numpy as np
+
+def softmax(z):
+    z = z - z.max()
+    e = np.exp(z)
+    return e / e.sum()
+
+def cross_entropy(z, y_idx):
+    return -np.log(softmax(z)[y_idx])
+
+def grad_ce_analytic(z, y_idx):
+    p = softmax(z)
+    g = p.copy()
+    g[y_idx] -= 1.0
+    return g
+
+rng = np.random.default_rng(2)
+z = rng.standard_normal(5)
+y_idx = 2
+
+g_a = grad_ce_analytic(z, y_idx)
+g_n = np.array([(cross_entropy(z + 1e-5 * np.eye(5)[i], y_idx) -
+                  cross_entropy(z - 1e-5 * np.eye(5)[i], y_idx)) / (2e-5)
+                 for i in range(5)])
+
+print("analytic:", g_a.round(6))
+print("numeric :", g_n.round(6))
+print("max diff:", np.abs(g_a - g_n).max())
+```
+
+```output
+analytic: [-0.129813 -0.045612 -0.736432  0.587011  0.324847]
+numeric : [-0.129813 -0.045612 -0.736432  0.587011  0.324847]
+max diff: 9.992007221626409e-12
+```
+
+## The Hessian: second-order information
+
+For $f : \mathbb{R}^n \to \mathbb{R}$, the **Hessian** is the $n \times n$ matrix of
+second partial derivatives:
+
+$$
+H_{ij} = \frac{\partial^2 f}{\partial x_i \partial x_j}
+$$
+
+For $f(x) = \tfrac{1}{2} x^\top A x - b^\top x$ with symmetric $A$, the Hessian is $A$
+itself. The Hessian tells you the curvature: a large Hessian eigenvalue means the loss
+changes rapidly in that direction — requiring a small learning rate.
+
+```python
+import numpy as np
+
+def hessian_fd(f, x, eps=1e-4):
+    n = len(x)
+    H = np.zeros((n, n))
+    fx = f(x)
+    for i in range(n):
+        for j in range(i, n):
+            ei = np.eye(n)[i] * eps
+            ej = np.eye(n)[j] * eps
+            H[i, j] = (f(x+ei+ej) - f(x+ei-ej) - f(x-ei+ej) + f(x-ei-ej)) / (4*eps**2)
+            H[j, i] = H[i, j]
+    return H
+
+rng = np.random.default_rng(0)
+n = 3
+A = rng.standard_normal((n, n)); A = A.T @ A + np.eye(n)
+b = rng.standard_normal(n)
+x = rng.standard_normal(n)
+
+f = lambda x: 0.5 * x @ A @ x - b @ x
+H_num = hessian_fd(f, x)
+print("Hessian (numeric):\n", H_num.round(4))
+print("A (analytic):\n", A.round(4))
+print("max diff:", np.abs(H_num - A).max())
+```
+
+```output
+Hessian (numeric):
+ [[ 2.0437  0.5199 -0.9162]
+  [ 0.5199  2.0063 -0.0693]
+  [-0.9162 -0.0693  2.3985]]
+A (analytic):
+ [[ 2.0437  0.5199 -0.9162]
+  [ 0.5199  2.0063 -0.0693]
+  [-0.9162 -0.0693  2.3985]]
+max diff: 2.6645352591003757e-12
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Derive and verify the gradient of the L2 loss f(w) = ||Xw - y||^2
+# Analytic: grad = 2 X^T (Xw - y)
+rng = np.random.default_rng(5)
+m, n = 10, 4
+X = rng.standard_normal((m, n))
+y = rng.standard_normal(m)
+w = rng.standard_normal(n)
+
+def loss(w):
+    r = X @ w - y
+    return r @ r   # = ||r||^2
+
+def grad_analytic(w):
+    return 2 * X.T @ (X @ w - y)
+
+def grad_fd(w, eps=1e-5):
+    return np.array([(loss(w + eps*np.eye(n)[i]) - loss(w - eps*np.eye(n)[i])) / (2*eps)
+                     for i in range(n)])
+
+g_a = grad_analytic(w)
+g_n = grad_fd(w)
+print("analytic:", g_a.round(4))
+print("numeric :", g_n.round(4))
+print("max err :", np.abs(g_a - g_n).max())
+```
+
+```output
+analytic: [-1.7498  4.8501  3.0116 -5.3447]
+numeric : [-1.7498  4.8501  3.0116 -5.3447]
+max err : 2.3803228660007862e-08
+```
+
+## Exercise
+
+Derive by hand the gradient $\nabla_W L$ where $L = \|XW - Y\|_F^2$, $X \in \mathbb{R}^{m \times d}$,
+$W \in \mathbb{R}^{d \times k}$, $Y \in \mathbb{R}^{m \times k}$ and $\|\cdot\|_F$ is the
+Frobenius norm. Then implement it and verify with finite differences.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+# L = ||XW - Y||_F^2 = tr((XW-Y)^T(XW-Y))
+# grad_W L = 2 X^T (XW - Y)
+
+rng = np.random.default_rng(6)
+m, d, k = 8, 4, 3
+X = rng.standard_normal((m, d))
+W = rng.standard_normal((d, k))
+Y = rng.standard_normal((m, k))
+
+def loss(W):
+    R = X @ W - Y
+    return np.sum(R**2)   # Frobenius norm squared
+
+def grad_analytic(W):
+    return 2 * X.T @ (X @ W - Y)    # shape (d, k)
+
+def grad_fd(W, eps=1e-5):
+    G = np.zeros_like(W)
+    for i in range(W.shape[0]):
+        for j in range(W.shape[1]):
+            Wp = W.copy(); Wp[i,j] += eps
+            Wm = W.copy(); Wm[i,j] -= eps
+            G[i,j] = (loss(Wp) - loss(Wm)) / (2*eps)
+    return G
+
+g_a = grad_analytic(W)
+g_n = grad_fd(W)
+print("max |grad_analytic - grad_fd|:", np.abs(g_a - g_n).max())
+```
+
+The derivation: $L = \text{tr}(R^\top R)$ where $R = XW - Y$.
+$\frac{\partial}{\partial W} \text{tr}(R^\top R) = 2X^\top R = 2X^\top(XW - Y)$.
+</details>

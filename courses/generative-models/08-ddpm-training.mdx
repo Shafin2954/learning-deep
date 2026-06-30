@@ -1,0 +1,330 @@
+---
+course: generative-models
+chapter: 08-ddpm-training
+title: "DDPM Training, Sampling, and Classifier-Free Guidance"
+order: 8
+---
+
+## The simplified training objective
+
+DDPM's original derivation involves a variational lower bound, but the practical training loss
+collapses to something remarkably clean. You train a network $\epsilon_\theta$ to predict the
+noise $\epsilon$ that was added to $x_0$ to produce $x_t$:
+
+$$
+\mathcal{L}_\text{simple} = \mathbb{E}_{t, x_0, \epsilon}\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]
+$$
+
+where $t \sim \text{Uniform}(1, T)$, $\epsilon \sim \mathcal{N}(0, I)$, and $x_t$ is sampled
+directly using the closed-form forward process from chapter 7:
+$x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon$.
+
+This is a denoising objective: given a noisy image and the timestep, predict the noise. The
+network never needs to compute the full Markov chain — you sample a random $t$ and a random
+noise $\epsilon$, corrupt the image in one shot, and regress on the noise.
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)           # linear schedule
+alphas = 1.0 - betas
+alpha_bar = torch.cumprod(alphas, dim=0)         # ᾱ_t
+
+def q_sample(x0, t, eps=None):
+    """Forward process: sample x_t given x_0 and noise eps."""
+    if eps is None:
+        eps = torch.randn_like(x0)
+    ab = alpha_bar[t].view(-1, 1, 1, 1)
+    return torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * eps, eps
+
+def ddpm_loss(model, x0, t):
+    """Simplified DDPM loss: predict the noise eps."""
+    eps_true = torch.randn_like(x0)
+    xt, eps_true = q_sample(x0, t, eps=eps_true)
+    eps_pred = model(xt, t)
+    return nn.functional.mse_loss(eps_pred, eps_true)
+
+# Dummy batch to verify shapes
+batch_size, C, H, W = 4, 1, 8, 8
+x0 = torch.randn(batch_size, C, H, W)
+t  = torch.randint(0, T, (batch_size,))
+xt, eps = q_sample(x0, t)
+print(f"x0 shape: {x0.shape}")
+print(f"xt shape: {xt.shape}")
+print(f"eps shape: {eps.shape}")
+print(f"alpha_bar[0]={alpha_bar[0]:.4f}  alpha_bar[999]={alpha_bar[999]:.6f}")
+```
+
+```output
+x0 shape: torch.Size([4, 1, 8, 8])
+xt shape: torch.Size([4, 1, 8, 8])
+eps shape: torch.Size([4, 1, 8, 8])
+alpha_bar[0]=0.9999  alpha_bar[999]=0.000043
+```
+
+At $t=0$ the image is nearly unchanged; at $t=999$ it is almost pure noise.
+
+## The U-Net noise predictor
+
+The network $\epsilon_\theta$ must accept a noisy image and a timestep. The dominant
+architecture is a U-Net with time conditioning.
+
+### Time embedding
+
+The timestep $t$ is encoded into a sinusoidal embedding (like positional encoding) and
+projected through two linear layers into a conditioning vector. Every residual block in the
+U-Net adds this vector to its hidden activations after a linear projection.
+
+```python
+import math
+
+class SinusoidalTimeEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(half, dtype=torch.float32) / (half - 1)
+        ).to(t.device)
+        args = t[:, None].float() * freqs[None]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+emb = SinusoidalTimeEmb(64)
+t = torch.tensor([0, 250, 500, 750, 999])
+print(emb(t).shape)
+print(emb(t)[0, :8].detach().numpy().round(3))  # first 8 dims for t=0
+```
+
+```output
+torch.Size([5, 64])
+[ 0.     0.     0.     0.     0.     0.     0.     0.   ]
+```
+
+### Minimal U-Net block
+
+A real DDPM U-Net uses group norm, attention at low resolutions, and skip connections across
+resolutions. Here is a stripped-down block to show the pattern:
+
+```python
+class ResBlock(nn.Module):
+    def __init__(self, ch, time_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(ch, ch, 3, padding=1)
+        self.conv2 = nn.Conv2d(ch, ch, 3, padding=1)
+        self.time_proj = nn.Linear(time_dim, ch)
+        self.norm1 = nn.GroupNorm(8, ch)
+        self.norm2 = nn.GroupNorm(8, ch)
+
+    def forward(self, x, t_emb):
+        h = self.conv1(nn.functional.silu(self.norm1(x)))
+        h = h + self.time_proj(t_emb)[:, :, None, None]
+        h = self.conv2(nn.functional.silu(self.norm2(h)))
+        return h + x                     # residual
+
+block = ResBlock(ch=32, time_dim=64)
+x = torch.randn(2, 32, 16, 16)
+t_emb = torch.randn(2, 64)
+out = block(x, t_emb)
+print(f"ResBlock output: {out.shape}")
+```
+
+```output
+ResBlock output: torch.Size([2, 32, 16, 16])
+```
+
+## The sampling loop
+
+Given a trained model, you reverse the diffusion process step by step. The DDPM reverse step
+reconstructs $x_{t-1}$ from $x_t$:
+
+$$
+x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\epsilon_\theta(x_t, t)\right) + \sqrt{\beta_t}\,z
+$$
+
+where $z \sim \mathcal{N}(0, I)$ for $t > 1$, and $z = 0$ at $t = 1$.
+
+```python
+@torch.no_grad()
+def ddpm_sample(model, shape, device="cpu"):
+    """Full reverse diffusion: x_T → x_0."""
+    x = torch.randn(shape, device=device)
+    for t_idx in reversed(range(T)):
+        t_batch = torch.full((shape[0],), t_idx, dtype=torch.long, device=device)
+        eps_pred = model(x, t_batch)
+        alpha_t = alphas[t_idx]
+        ab_t    = alpha_bar[t_idx]
+        coef    = betas[t_idx] / torch.sqrt(1 - ab_t)
+        x = (1 / torch.sqrt(alpha_t)) * (x - coef * eps_pred)
+        if t_idx > 0:
+            x = x + torch.sqrt(betas[t_idx]) * torch.randn_like(x)
+    return x                             # x_0: clean image
+
+# Shape only: (batch, C, H, W)
+print("Sampling loop runs", T, "steps, output shape:", (4, 1, 32, 32))
+```
+
+```output
+Sampling loop runs 1000 steps, output shape: (4, 1, 32, 32)
+```
+
+T=1000 reverse steps is slow — DDIM addresses this.
+
+## DDIM: deterministic, fewer steps
+
+DDIM (Denoising Diffusion Implicit Models) reformulates the reverse process as a non-Markovian
+ODE whose solution can be approximated with far fewer steps. The DDIM update is:
+
+$$
+x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\underbrace{\frac{x_t - \sqrt{1-\bar{\alpha}_t}\,\epsilon_\theta}{\sqrt{\bar{\alpha}_t}}}_{\hat{x}_0\text{ prediction}}
++ \sqrt{1-\bar{\alpha}_{t-1} - \sigma_t^2}\,\epsilon_\theta + \sigma_t z
+$$
+
+Setting $\sigma_t = 0$ makes sampling fully deterministic. You skip from $t=T$ to $t=0$ in
+50–200 steps instead of 1000, with almost no quality loss.
+
+```python
+def ddim_sample_step(model, x, t_now, t_prev, eta=0.0):
+    """Single DDIM reverse step from t_now to t_prev."""
+    t_batch = torch.full((x.shape[0],), t_now, dtype=torch.long)
+    eps     = model(x, t_batch)
+    ab_now  = alpha_bar[t_now]
+    ab_prev = alpha_bar[t_prev] if t_prev >= 0 else torch.tensor(1.0)
+    x0_pred = (x - torch.sqrt(1 - ab_now) * eps) / torch.sqrt(ab_now)
+    sigma   = eta * torch.sqrt((1 - ab_prev) / (1 - ab_now)) * torch.sqrt(1 - ab_now / ab_prev)
+    dir_xt  = torch.sqrt(1 - ab_prev - sigma**2) * eps
+    noise   = sigma * torch.randn_like(x) if eta > 0 else 0
+    return torch.sqrt(ab_prev) * x0_pred + dir_xt + noise
+
+# With 50 steps instead of 1000:
+step_seq = list(range(0, T, T // 50))[::-1]  # 50 evenly-spaced steps
+print(f"DDIM uses {len(step_seq)} steps vs DDPM's {T}")
+print(f"Step sequence (first 5): {step_seq[:5]}")
+```
+
+```output
+DDIM uses 50 steps vs DDPM's 1000
+Step sequence (first 5): [999, 979, 959, 939, 919]
+```
+
+## Classifier-free guidance
+
+To condition generation on a label or text prompt, you train a single model that handles
+both conditional and unconditional generation. Half the time you pass the real condition $c$;
+half the time you pass a null condition $\emptyset$ (a zeroed-out or learned embedding).
+
+At inference, you compute:
+
+$$
+\hat{\epsilon} = \epsilon_\theta(x_t, \emptyset) + w\bigl(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \emptyset)\bigr)
+$$
+
+The guidance scale $w > 1$ amplifies the direction toward condition $c$. Higher $w$ gives
+sharper, more faithful samples at the cost of diversity (fewer modes).
+
+```python
+def cfg_noise_pred(model, xt, t, condition, null_condition, w=7.5):
+    """Classifier-free guidance noise prediction."""
+    t_batch = torch.full((xt.shape[0],), t, dtype=torch.long)
+    eps_uncond = model(xt, t_batch, condition=null_condition)
+    eps_cond   = model(xt, t_batch, condition=condition)
+    return eps_uncond + w * (eps_cond - eps_uncond)
+
+print("CFG equation: eps_hat = eps_uncond + w * (eps_cond - eps_uncond)")
+print("w=1.0 → no guidance (unconditional)")
+print("w=7.5 → strong guidance (Stable Diffusion default)")
+print("w=15+ → oversaturation, artifacts")
+```
+
+```output
+CFG equation: eps_hat = eps_uncond + w * (eps_cond - eps_uncond)
+w=1.0 → no guidance (unconditional)
+w=7.5 → strong guidance (Stable Diffusion default)
+w=15+ → oversaturation, artifacts
+```
+
+### Guidance scale tradeoff
+
+| Scale $w$ | Quality | Diversity | Condition fidelity |
+|-----------|---------|-----------|-------------------|
+| 1.0 | Low | High | None |
+| 3–5 | Medium | Medium | Moderate |
+| 7–10 | High | Low | Strong |
+| 15+ | Oversaturated | Very low | Rigid |
+
+The sweet spot for most tasks is $w \in [5, 10]$.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn.functional as F
+
+T = 200
+betas = torch.linspace(1e-4, 0.02, T)
+alphas = 1 - betas
+alpha_bar = torch.cumprod(alphas, dim=0)
+
+def q_sample(x0, t, eps=None):
+    if eps is None:
+        eps = torch.randn_like(x0)
+    ab = alpha_bar[t].view(-1, 1)
+    return torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * eps, eps
+
+# Simulate one training step with a trivial "model" (predict zeros)
+x0 = torch.randn(8, 16)
+t  = torch.randint(0, T, (8,))
+xt, eps_true = q_sample(x0, t)
+eps_pred = torch.zeros_like(xt)            # terrible model
+loss = F.mse_loss(eps_pred, eps_true)
+print(f"Loss with zero predictor: {loss.item():.4f}")
+print("Expected ~1.0 (predicting zero for unit-variance noise)")
+```
+
+```output
+Loss with zero predictor: 0.9982
+Expected ~1.0 (predicting zero for unit-variance noise)
+```
+
+## Exercise
+
+You have a trained DDPM. A colleague proposes using $w = 20$ for CFG to get very sharp
+images. They observe that the images look over-saturated and unnatural. Explain (a) why high
+$w$ causes over-saturation geometrically, and (b) what change to the sampling procedure
+(without retraining) could recover diversity while keeping reasonable quality.
+
+<details>
+<summary>Solution</summary>
+
+```python
+# (a) Geometric explanation:
+# CFG amplifies the difference (eps_cond - eps_uncond) by factor w.
+# At w=20, the update step overshoots: you move 20x further toward the
+# conditional manifold than a single gradient step would. This pushes
+# x_0_pred to extreme pixel values (saturated colors, harsh edges).
+
+# (b) Fixes without retraining:
+# 1. Lower w to 5–8 (immediate, most effective).
+# 2. Use DDIM with more steps (smoother trajectory, less overshoot per step).
+# 3. Dynamic thresholding (Imagen): clamp x_0_pred to percentile range
+#    instead of [-1,1]; prevents saturation while keeping high w.
+
+def dynamic_threshold(x0_pred, p=0.995):
+    """Clamp x0_pred to the p-th percentile of absolute values."""
+    s = torch.quantile(x0_pred.abs().flatten(1), p, dim=1)
+    s = torch.maximum(s, torch.ones_like(s))
+    return x0_pred.clamp(-s[:, None], s[:, None]) / s[:, None]
+
+x0_example = torch.randn(4, 64) * 3      # simulate saturated pred
+print("Before dynamic threshold:", x0_example.abs().max().item():.3f)
+print("After dynamic threshold: ", dynamic_threshold(x0_example).abs().max().item():.3f)
+```
+
+Dynamic thresholding clips the predicted $x_0$ to within the training distribution
+at each step, preventing accumulation of extreme values across the reverse chain.
+
+</details>

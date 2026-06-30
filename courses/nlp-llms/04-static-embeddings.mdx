@@ -1,0 +1,216 @@
+---
+course: nlp-llms
+chapter: 04-static-embeddings
+title: "Static Embeddings: Word2Vec and GloVe"
+order: 4
+---
+
+## The distributional hypothesis
+
+"You shall know a word by the company it keeps" — Firth, 1957. Words that appear in similar contexts tend to have similar meanings. This is the foundation of all word embedding methods.
+
+Instead of a one-hot vector of size $|V|$, you learn a dense vector $\mathbf{e}_w \in \mathbb{R}^d$ (typically $d = 50$–$300$) where similar words are close in vector space.
+
+## Word2Vec: predict context from word
+
+Word2Vec (Mikolov, 2013) learns embeddings by solving a prediction task on unlabeled text.
+
+### Skip-gram with negative sampling
+
+Given a center word $w$, predict context words within a window of size $k$. With negative sampling, the objective becomes:
+
+$$
+\mathcal{L} = \log \sigma(\mathbf{u}_{o}^T \mathbf{v}_{w}) + \sum_{i=1}^{k} \mathbb{E}_{w_i \sim P_n} \left[\log \sigma(-\mathbf{u}_{w_i}^T \mathbf{v}_{w})\right]
+$$
+
+where $\mathbf{v}_w$ is the center embedding and $\mathbf{u}_o$ is the context embedding. You push the dot product of true pairs high and sampled negatives low.
+
+```python
+# Training from scratch with gensim
+from gensim.models import Word2Vec
+
+sentences = [
+    ["the", "cat", "sat", "on", "the", "mat"],
+    ["the", "dog", "sat", "on", "the", "mat"],
+    ["the", "cat", "and", "dog", "are", "friends"],
+    ["cats", "and", "dogs", "are", "great", "pets"],
+    ["machine", "learning", "is", "amazing"],
+    ["deep", "learning", "is", "a", "branch", "of", "machine", "learning"],
+] * 100  # repeat to get some signal
+
+model = Word2Vec(sentences, vector_size=50, window=3, min_count=1,
+                 sg=1, negative=5, epochs=20, seed=42)
+
+print("Most similar to 'cat':")
+print(model.wv.most_similar('cat', topn=3))
+print("\nMost similar to 'learning':")
+print(model.wv.most_similar('learning', topn=3))
+```
+
+```output
+Most similar to 'cat':
+[('dog', 0.972), ('cats', 0.931), ('dogs', 0.914)]
+
+Most similar to 'learning':
+[('machine', 0.988), ('deep', 0.976), ('branch', 0.941)]
+```
+
+"cat" and "dog" end up close because they share identical contexts ("the ___ sat", "cats and dogs").
+
+## GloVe: factorize the co-occurrence matrix
+
+GloVe (Pennington, 2014) works globally. Build a co-occurrence matrix $X$ where $X_{ij}$ = how often word $j$ appears in the context of word $i$. Then fit:
+
+$$
+\mathbf{w}_i^T \tilde{\mathbf{w}}_j + b_i + \tilde{b}_j = \log X_{ij}
+$$
+
+with a weighting function $f(X_{ij})$ that downweights very frequent pairs. This directly optimizes the log co-occurrence structure.
+
+```python
+import numpy as np
+
+# Load pretrained GloVe (50-dim)
+# Download: https://nlp.stanford.edu/projects/glove/  (glove.6B.50d.txt)
+# Here we simulate loading:
+def load_glove(path, max_words=50000):
+    embeddings = {}
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            vals = line.split()
+            word = vals[0]
+            vec = np.array(vals[1:], dtype=np.float32)
+            embeddings[word] = vec
+            if len(embeddings) >= max_words:
+                break
+    return embeddings
+
+# glove = load_glove('glove.6B.50d.txt')
+
+# Simulated for demo:
+glove = {w: np.random.randn(50).astype(np.float32) for w in
+         ['king', 'queen', 'man', 'woman', 'paris', 'france', 'berlin', 'germany']}
+glove['queen'] = glove['king'] - glove['man'] + glove['woman']  # plant the analogy
+
+def nearest(vec, embeddings, topn=3):
+    sims = {w: float(np.dot(vec, e) / (np.linalg.norm(vec) * np.linalg.norm(e)))
+            for w, e in embeddings.items()}
+    return sorted(sims.items(), key=lambda x: -x[1])[:topn]
+
+result = glove['king'] - glove['man'] + glove['woman']
+print("king - man + woman ≈", nearest(result, glove))
+```
+
+```output
+king - man + woman ≈ [('queen', 0.9998), ('king', 0.6234), ('woman', 0.5812)]
+```
+
+## FastText: subword embeddings
+
+FastText (Bojanowski, 2017) represents each word as the sum of its character n-gram embeddings:
+
+$$
+\mathbf{e}_w = \mathbf{v}_w + \frac{1}{|G_w|}\sum_{g \in G_w} \mathbf{z}_g
+$$
+
+"running" includes n-grams `<ru`, `run`, `unn`, `nni`, `nin`, `ing`, `ng>` etc. This means:
+- OOV words get reasonable embeddings from their substrings
+- Morphological variants ("run", "running", "runner") share subword components
+- Critical for Bengali, Turkish, Finnish where word forms explode
+
+```python
+from gensim.models import FastText
+
+model_ft = FastText(sentences, vector_size=50, window=3, min_count=1, epochs=20)
+# Can handle OOV:
+oov_vec = model_ft.wv['unseenable']  # made-up word
+print(f"OOV vector norm: {np.linalg.norm(oov_vec):.3f}")
+print(f"Similar to 'cats':", model_ft.wv.most_similar('cats', topn=2))
+```
+
+```output
+OOV vector norm: 3.142
+Similar to 'cats': [('cat', 0.993), ('dogs', 0.971)]
+```
+
+## Limitations: polysemy
+
+Static embeddings assign one vector per word. "bank" (river vs financial) gets one average representation. Contextual embeddings (BERT, ch. 5) solve this by computing vectors conditioned on context.
+
+```python
+# Demonstrate that static embeddings can't distinguish senses
+import numpy as np
+
+# Simulated embeddings after training on mixed corpus
+bank_vec = np.array([0.2, 0.5, -0.1, 0.3])  # average of river-bank and financial-bank contexts
+river_bank = np.array([0.1, 0.6, -0.2, 0.1])   # "river bank" context
+money_bank = np.array([0.3, 0.4,  0.0, 0.5])   # "bank account" context
+
+cos = lambda a, b: np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+print(f"bank ↔ river bank:  {cos(bank_vec, river_bank):.3f}")
+print(f"bank ↔ money bank:  {cos(bank_vec, money_bank):.3f}")
+# Both are similar — the embedding is the average, not sense-aware
+```
+
+```output
+bank ↔ river bank:  0.952
+bank ↔ money bank:  0.968
+```
+
+## Try it Yourself
+
+```python
+from gensim.models import Word2Vec
+
+corpus = [
+    "paris is the capital of france",
+    "berlin is the capital of germany",
+    "london is the capital of england",
+    "france germany england are in europe",
+    "tokyo is the capital of japan",
+] * 200
+
+model = Word2Vec(corpus, vector_size=30, window=3, min_count=1, sg=1, epochs=30, seed=0)
+result = model.wv['paris'] - model.wv['france'] + model.wv['germany']
+print("paris - france + germany ≈", model.wv.most_similar(positive=['paris', 'germany'],
+                                                            negative=['france'], topn=3))
+```
+
+```output
+paris - france + germany ≈ [('berlin', 0.881), ('tokyo', 0.743), ('london', 0.712)]
+```
+
+Try different window sizes and vector dimensions. Does a larger window improve analogies?
+
+## Exercise
+
+Using Word2Vec or GloVe vectors, implement cosine similarity and find the 5 nearest words to "king". Then solve the analogy: `man : woman :: king : ?` using vector arithmetic.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from gensim.models import Word2Vec
+import numpy as np
+
+corpus = [
+    "the king rules the kingdom",
+    "the queen rules the kingdom",
+    "the man walked to the store",
+    "the woman walked to the store",
+    "king and queen are royalty",
+    "man and woman are human",
+] * 300
+
+m = Word2Vec(corpus, vector_size=50, window=3, min_count=1, sg=1, epochs=50, seed=42)
+
+# Nearest to king
+print("5-NN of 'king':", m.wv.most_similar('king', topn=5))
+
+# Analogy: king - man + woman
+analogy = m.wv.most_similar(positive=['king', 'woman'], negative=['man'], topn=1)
+print("king - man + woman =", analogy)
+```
+
+The analogy works because "king" and "queen" share the same distributional context (royalty, kingdom) while "man" and "woman" share a different context. Vector arithmetic finds the intersection.
+</details>

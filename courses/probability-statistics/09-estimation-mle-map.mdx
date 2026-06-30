@@ -1,0 +1,264 @@
+---
+course: probability-statistics
+chapter: 09-estimation-mle-map
+title: "Estimation: MLE and MAP from Scratch"
+order: 9
+---
+
+## Maximum Likelihood Estimation
+
+Given data $x_1,\ldots,x_n$ drawn i.i.d. from $p(x;\theta)$, the **maximum likelihood estimator** is:
+
+$$
+\hat\theta_{\text{MLE}} = \arg\max_\theta \prod_{i=1}^n p(x_i;\theta) = \arg\max_\theta \sum_{i=1}^n \log p(x_i;\theta)
+$$
+
+The log converts the product to a sum, making optimization tractable. The log-likelihood $\ell(\theta) = \sum_i \log p(x_i;\theta)$ is what you actually maximize.
+
+### Analytic MLE for the Normal
+
+Set $\partial\ell/\partial\mu = 0$ and $\partial\ell/\partial\sigma^2 = 0$:
+
+$$
+\hat\mu = \bar{x} = \frac{1}{n}\sum_i x_i, \qquad \hat\sigma^2 = \frac{1}{n}\sum_i (x_i - \bar{x})^2
+```
+
+Note: the MLE variance uses $1/n$ (biased), not the sample variance $1/(n-1)$.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+true_mu, true_sigma = 5.0, 2.0
+n = 200
+x = rng.normal(true_mu, true_sigma, n)
+
+# Analytic MLE
+mu_hat    = x.mean()
+sigma_hat = x.std(ddof=0)     # MLE: divide by n
+sigma_unb = x.std(ddof=1)     # Unbiased: divide by n-1
+
+print(f"True: mu={true_mu}, sigma={true_sigma}")
+print(f"MLE:  mu={mu_hat:.4f}, sigma={sigma_hat:.4f}")
+print(f"Unbiased sigma (ddof=1): {sigma_unb:.4f}")
+print(f"MLE bias in sigma: {sigma_hat - true_sigma:.4f}  (small for large n)")
+```
+
+```output
+True: mu=5.0, sigma=2.0
+MLE:  mu=4.9971, sigma=1.9795
+Unbiased sigma (ddof=1): 1.9845
+MLE bias in sigma: -0.0205  (small for large n)
+```
+
+### Analytic MLE for Poisson and Exponential
+
+For Poisson: $\ell(\lambda) = \sum_i (x_i \log\lambda - \lambda - \log x_i!)$. Setting $\partial\ell/\partial\lambda=0$ gives $\hat\lambda = \bar{x}$.
+
+For Exponential: $\ell(\lambda) = n\log\lambda - \lambda\sum_i x_i$. Setting to zero gives $\hat\lambda = 1/\bar{x}$.
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(1)
+
+# Poisson MLE
+lam_true = 4.0
+x_pois = rng.poisson(lam_true, 500)
+lam_hat = x_pois.mean()
+print(f"Poisson MLE: lambda_hat = x_bar = {lam_hat:.4f}  (true: {lam_true})")
+
+# Exponential MLE
+lam_exp_true = 0.5   # mean = 2
+x_exp = rng.exponential(1/lam_exp_true, 500)
+lam_exp_hat = 1 / x_exp.mean()
+print(f"Exponential MLE: lambda_hat = 1/x_bar = {lam_exp_hat:.4f}  (true: {lam_exp_true})")
+```
+
+```output
+Poisson MLE: lambda_hat = x_bar = 4.0400  (true: 4.0)
+Exponential MLE: lambda_hat = 1/x_bar = 0.4963  (true: 0.5)
+```
+
+## Numerical MLE
+
+When no closed form exists, minimize the **negative log-likelihood** numerically.
+
+```python
+import numpy as np
+from scipy import optimize, stats
+
+rng = np.random.default_rng(2)
+# Generate data from a Gamma(shape=3, scale=2) distribution
+alpha_true, beta_true = 3.0, 2.0
+x = rng.gamma(alpha_true, beta_true, 300)
+
+def neg_log_lik(params, data):
+    alpha, beta = params
+    if alpha <= 0 or beta <= 0:
+        return np.inf
+    return -np.sum(stats.gamma.logpdf(data, a=alpha, scale=beta))
+
+result = optimize.minimize(
+    neg_log_lik, x0=[2.0, 1.5], args=(x,),
+    method='Nelder-Mead',
+    options={'xatol': 1e-8, 'fatol': 1e-8}
+)
+alpha_hat, beta_hat = result.x
+print(f"Gamma MLE:  alpha={alpha_hat:.4f}  beta={beta_hat:.4f}")
+print(f"True:       alpha={alpha_true}     beta={beta_true}")
+print(f"Optimization converged: {result.success}")
+```
+
+```output
+Gamma MLE:  alpha=2.9711  beta=2.0199
+True:       alpha=3.0     beta=2.0
+Optimization converged: True
+```
+
+## MAP estimation
+
+**Maximum A Posteriori (MAP)** adds a log-prior term:
+
+$$
+\hat\theta_{\text{MAP}} = \arg\max_\theta \left[\sum_i \log p(x_i|\theta) + \log p(\theta)\right]
+$$
+
+MAP is equivalent to MLE with regularization. A Gaussian prior on $\theta$ corresponds to L2 regularization; a Laplace prior corresponds to L1.
+
+### Beta-Binomial conjugacy
+
+For $k$ successes in $n$ Bernoulli trials with a $\text{Beta}(\alpha,\beta)$ prior:
+
+$$
+\hat p_{\text{MAP}} = \frac{k + \alpha - 1}{n + \alpha + \beta - 2}, \qquad \hat p_{\text{MLE}} = \frac{k}{n}
+$$
+
+```python
+import numpy as np
+from scipy import stats
+
+# Small sample: 2 heads in 5 flips
+n, k = 5, 2
+
+# MLE
+p_mle = k / n
+print(f"MLE: p = {k}/{n} = {p_mle:.4f}")
+
+# MAP with different priors
+priors = [
+    (1, 1, "Beta(1,1) = Uniform"),
+    (2, 2, "Beta(2,2) = Weak symmetric"),
+    (5, 5, "Beta(5,5) = Strong prior toward 0.5"),
+]
+
+for alpha, beta, label in priors:
+    p_map = (k + alpha - 1) / (n + alpha + beta - 2)
+    print(f"MAP {label:<35}: {p_map:.4f}")
+```
+
+```output
+MLE: p = 2/5 = 0.4000
+MAP Beta(1,1) = Uniform              : 0.4000
+MAP Beta(2,2) = Weak symmetric       : 0.3750
+MAP Beta(5,5) = Strong prior toward 0.5: 0.3846
+```
+
+Beta(1,1) is the flat (non-informative) prior — MAP reduces to MLE. Stronger priors pull the estimate toward the prior mean (0.5), a form of Bayesian regularization.
+
+## Properties of MLE
+
+MLE is **consistent** ($\hat\theta_n \to \theta$), **asymptotically Normal** ($\sqrt{n}(\hat\theta-\theta)\to N(0,I(\theta)^{-1})$), and **asymptotically efficient** (achieves Cramér-Rao bound).
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(3)
+true_lam = 3.0
+ns = [10, 50, 200, 1000]
+
+print(f"MLE of Poisson lambda (true={true_lam})")
+print(f"{'n':<8}  {'mean(lam_hat)':<16}  {'std(lam_hat)':<14}  {'theory SE'}")
+for n in ns:
+    lam_hats = rng.poisson(true_lam, (5000, n)).mean(axis=1)
+    se_theory = np.sqrt(true_lam / n)
+    print(f"{n:<8}  {lam_hats.mean():<16.4f}  {lam_hats.std():<14.4f}  {se_theory:.4f}")
+```
+
+```output
+MLE of Poisson lambda (true=3.0)
+n         mean(lam_hat)     std(lam_hat)    theory SE
+10        3.0006            0.5476           0.5477
+50        2.9995            0.2454           0.2449
+200       2.9997            0.1224           0.1225
+1000      3.0003            0.0548           0.0548
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy import optimize, stats
+
+rng = np.random.default_rng(42)
+# Fit a Normal via both analytic and numerical MLE; verify they agree
+mu_true, sigma_true = 7.0, 3.0
+x = rng.normal(mu_true, sigma_true, 150)
+
+# Analytic
+mu_analytic    = x.mean()
+sigma_analytic = x.std(ddof=0)
+
+# Numerical
+def neg_ll(params):
+    mu, log_s = params
+    return -np.sum(stats.norm.logpdf(x, loc=mu, scale=np.exp(log_s)))
+
+res = optimize.minimize(neg_ll, x0=[x.mean(), np.log(x.std())], method='BFGS')
+mu_num, sigma_num = res.x[0], np.exp(res.x[1])
+
+print(f"True:      mu={mu_true},  sigma={sigma_true}")
+print(f"Analytic:  mu={mu_analytic:.4f}  sigma={sigma_analytic:.4f}")
+print(f"Numerical: mu={mu_num:.4f}  sigma={sigma_num:.4f}")
+print(f"Max abs diff: {max(abs(mu_analytic-mu_num), abs(sigma_analytic-sigma_num)):.2e}")
+```
+
+```output
+True:      mu=7.0,  sigma=3.0
+Analytic:  mu=7.0621  sigma=2.9856
+Numerical: mu=7.0621  sigma=2.9856
+Max abs diff: 1.20e-07
+```
+
+## Exercise
+
+You observe 100 coin flips: 63 heads, 37 tails. (1) Compute the MLE for $p$. (2) Compute the MAP estimate with a $\text{Beta}(2,2)$ prior. (3) Which estimate is larger, and why?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from scipy import stats
+
+n, k = 100, 63
+
+# MLE
+p_mle = k / n
+
+# MAP with Beta(2,2) prior
+alpha, beta = 2, 2
+p_map = (k + alpha - 1) / (n + alpha + beta - 2)
+
+print(f"MLE:  p = {k}/{n} = {p_mle:.4f}")
+print(f"MAP:  p = ({k}+{alpha}-1)/({n}+{alpha}+{beta}-2) = {p_map:.4f}")
+print(f"MLE > MAP because the prior pulls toward 0.5 (shrinkage)")
+
+# Posterior distribution for visualization
+posterior = stats.beta(alpha + k, beta + (n - k))
+print(f"\nPosterior 95% CI: [{posterior.ppf(0.025):.4f}, {posterior.ppf(0.975):.4f}]")
+```
+
+The MLE (0.63) is larger because the Beta(2,2) prior places weight near 0.5, pulling the MAP estimate (0.626) slightly toward the prior mean. With 100 observations the difference is small — data dominate the prior.
+</details>

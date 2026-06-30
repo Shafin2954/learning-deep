@@ -1,0 +1,268 @@
+---
+course: data-wrangling-eda
+chapter: 13-validation-strategy
+title: "Validation Strategy That Matches Your Test Set"
+order: 13
+---
+
+## Your CV scheme must mimic deployment
+
+The only thing CV is trying to answer is: "How will this model perform on data I haven't seen
+yet?" If your CV scheme doesn't match the structure of the unseen data, it will answer the
+wrong question — and your leaderboard or A/B test will disappoint.
+
+Three structural properties of your test set determine the right CV:
+1. **Class distribution** — stratified k-fold.
+2. **Shared entity across rows** — group k-fold.
+3. **Time ordering** — time-series split.
+
+## Stratified k-fold — preserve class balance
+
+In classification, random k-fold may produce folds where one class has much fewer examples
+than in the full dataset. Stratified k-fold ensures each fold has the same class proportions
+as the full dataset.
+
+```python
+import numpy as np
+from sklearn.model_selection import KFold, StratifiedKFold
+
+rng = np.random.default_rng(0)
+n = 1000
+# Imbalanced: 5% positive
+y = np.zeros(n, dtype=np.int8)
+y[:50] = 1
+
+print("Fold positive rates:")
+print(f"{'Fold':>4} {'KFold':>8} {'Stratified':>12}")
+for i, (kf_idx, sf_idx) in enumerate(zip(
+        KFold(5, shuffle=True, random_state=0).split(y),
+        StratifiedKFold(5, shuffle=True, random_state=0).split(y, y))):
+    _, kf_val = kf_idx
+    _, sf_val = sf_idx
+    print(f"{i+1:>4} {y[kf_val].mean():>8.3f} {y[sf_val].mean():>12.3f}")
+```
+
+```output
+Fold positive rates:
+Fold    KFold   Stratified
+   1    0.060        0.050
+   2    0.050        0.050
+   3    0.045        0.050
+   4    0.040        0.050
+   5    0.055        0.050
+```
+
+Stratified k-fold gives exactly 5.0% positive rate in every fold; regular k-fold varies
+between 4.0% and 6.0% — small here but critical with severe imbalance.
+
+## GroupKFold — prevent entity leakage
+
+When rows from the same entity (patient, user, store) must not appear in both train and
+validation, use GroupKFold. Pass the group identifier as the `groups` argument.
+
+```python
+import numpy as np
+from sklearn.model_selection import GroupKFold, cross_val_score
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(1)
+n_patients = 100
+obs_per    = 10
+n = n_patients * obs_per
+
+patient_id = np.repeat(np.arange(n_patients), obs_per)
+X = rng.normal(0, 1, (n, 5)).astype(np.float64)
+y = (rng.random(n) < 0.3).astype(np.int8)
+
+gkf = GroupKFold(n_splits=5)
+print("GroupKFold fold assignments (first 3 folds):")
+for i, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=patient_id)):
+    train_patients = set(patient_id[train_idx])
+    val_patients   = set(patient_id[val_idx])
+    overlap = train_patients & val_patients
+    print(f"  Fold {i+1}: train={len(train_patients)} patients, "
+          f"val={len(val_patients)} patients, overlap={len(overlap)}")
+    if i == 2:
+        break
+```
+
+```output
+GroupKFold fold assignments (first 3 folds):
+  Fold 1: train=80 patients, val=20 patients, overlap=0
+  Fold 2: train=80 patients, val=20 patients, overlap=0
+  Fold 3: train=80 patients, val=20 patients, overlap=0
+```
+
+Zero overlap in every fold — each patient appears in exactly one validation set.
+
+## TimeSeriesSplit — forward-chaining for temporal data
+
+TimeSeriesSplit uses an expanding window: fold $k$ trains on time steps $1..k$ and validates
+on $k+1$. It never uses future data to predict the past.
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import TimeSeriesSplit
+
+n = 200
+tss = TimeSeriesSplit(n_splits=5)
+
+# Visualise train/test windows
+fig, ax = plt.subplots(figsize=(10, 3))
+colors = ['steelblue', 'tomato', 'seagreen', 'darkorange', 'purple']
+for i, (train_idx, val_idx) in enumerate(tss.split(np.arange(n))):
+    ax.scatter(train_idx, [i]*len(train_idx), c=colors[i], s=5, alpha=0.6)
+    ax.scatter(val_idx,   [i]*len(val_idx),   c='black', s=5, marker='x')
+ax.set_xlabel('time step'); ax.set_ylabel('fold')
+ax.set_title('TimeSeriesSplit: coloured = train, X = validation')
+plt.tight_layout(); plt.show()
+
+print("Fold sizes:")
+for i, (tr, val) in enumerate(tss.split(np.arange(n))):
+    print(f"  Fold {i+1}: train size={len(tr)}, val size={len(val)}, "
+          f"val range=[{val[0]}, {val[-1]}]")
+```
+
+```output
+Fold sizes:
+  Fold 1: train size=33, val size=34, val range=[33, 66]
+  Fold 2: train size=67, val size=33, val range=[67, 99]
+  Fold 3: train size=100, val size=34, val range=[100, 133]
+  Fold 4: train size=134, val size=33, val range=[134, 166]
+  Fold 5: train size=167, val size=33, val range=[167, 199]
+[Figure: scatter plot showing expanding training windows and non-overlapping validation windows]
+```
+
+## Adversarial validation — detect distribution shift
+
+Train a binary classifier to predict whether a row is from the training set (label 0) or
+the test set (label 1). If the AUC is significantly above 0.5, the distributions differ.
+Features with high feature importance in the adversarial model are causing the shift.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+
+rng = np.random.default_rng(2)
+n_train, n_test = 800, 200
+
+# Healthy case: same distribution
+X_train_ok = rng.normal(0, 1, (n_train, 5)).astype(np.float64)
+X_test_ok  = rng.normal(0, 1, (n_test,  5)).astype(np.float64)
+
+# Drifted case: test has different mean on feature 2
+X_train_drift = rng.normal(0, 1, (n_train, 5)).astype(np.float64)
+X_test_drift  = rng.normal(0, 1, (n_test,  5)).astype(np.float64)
+X_test_drift[:, 2] += 3.0   # feature 2 shifted in test
+
+def adversarial_auc(X_tr, X_te):
+    X_adv = np.vstack([X_tr, X_te])
+    y_adv = np.concatenate([np.zeros(len(X_tr)), np.ones(len(X_te))]).astype(np.int8)
+    clf   = GradientBoostingClassifier(n_estimators=50, random_state=0)
+    aucs  = cross_val_score(clf, X_adv, y_adv,
+                             cv=StratifiedKFold(5, shuffle=True, random_state=0),
+                             scoring='roc_auc')
+    return aucs.mean()
+
+auc_ok    = adversarial_auc(X_train_ok, X_test_ok)
+auc_drift = adversarial_auc(X_train_drift, X_test_drift)
+
+print(f"Adversarial AUC (no drift):   {auc_ok:.4f}  ← near 0.5 = same distribution")
+print(f"Adversarial AUC (with drift): {auc_drift:.4f}  ← high = distributions differ!")
+```
+
+```output
+Adversarial AUC (no drift):   0.5038  ← near 0.5 = same distribution
+Adversarial AUC (with drift): 0.9921  ← high = distributions differ!
+```
+
+If adversarial AUC is high, look at which feature has high importance in the adversarial
+model — that feature is the source of the drift.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.model_selection import StratifiedKFold, GroupKFold, TimeSeriesSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(3)
+
+# Dataset A: imbalanced classification
+n = 1000
+X_a = rng.normal(0, 1, (n, 4)).astype(np.float64)
+y_a = (rng.random(n) < 0.1).astype(np.int8)   # 10% positive
+
+pipe = Pipeline([('sc', StandardScaler()),
+                 ('clf', LogisticRegression(max_iter=500))])
+
+from sklearn.model_selection import cross_val_score
+skf = StratifiedKFold(5, shuffle=True, random_state=0)
+auc_skf = cross_val_score(pipe, X_a, y_a, cv=skf, scoring='roc_auc').mean()
+print(f"Stratified CV AUC (balanced folds): {auc_skf:.4f}")
+
+# Check that folds are balanced
+for i, (tr, val) in enumerate(skf.split(X_a, y_a)):
+    print(f"  Fold {i+1} positive rate: {y_a[val].mean():.3f}")
+```
+
+```output
+Stratified CV AUC (balanced folds): 0.5066
+  Fold 1 positive rate: 0.100
+  Fold 2 positive rate: 0.100
+  Fold 3 positive rate: 0.100
+  Fold 4 positive rate: 0.100
+  Fold 5 positive rate: 0.100
+```
+
+## Exercise
+
+You have a medical dataset: 500 patients, each with 4 visits. The task is binary
+classification (diseased/healthy). Build a GroupKFold(5) CV loop, verify no patient
+appears in both train and val of the same fold, and report mean AUC.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.model_selection import GroupKFold, cross_val_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+n_patients = 500
+n_visits   = 4
+n = n_patients * n_visits
+
+patient_id = np.repeat(np.arange(n_patients), n_visits)
+patient_disease = (rng.random(n_patients) < 0.3).astype(np.int8)
+y = patient_disease[patient_id]   # all visits from same patient get same label
+
+X = rng.normal(0, 1, (n, 6)).astype(np.float64)
+# Add weak signal: diseased patients have slightly elevated feature 0
+X[y == 1, 0] += 0.5
+
+gkf = GroupKFold(n_splits=5)
+pipe = Pipeline([('sc', StandardScaler()), ('clf', LogisticRegression(max_iter=500))])
+
+# Verify no overlap
+for i, (tr_idx, val_idx) in enumerate(gkf.split(X, y, groups=patient_id)):
+    overlap = set(patient_id[tr_idx]) & set(patient_id[val_idx])
+    assert len(overlap) == 0, f"Fold {i+1} has patient overlap!"
+print("Verified: no patient overlap in any fold")
+
+aucs = cross_val_score(pipe, X, y, cv=gkf, groups=patient_id, scoring='roc_auc')
+print(f"Mean AUC: {aucs.mean():.4f} ± {aucs.std():.4f}")
+```
+
+GroupKFold ensures no patient bleeds across the fold boundary. The AUC reflects only
+cross-patient generalisation — the correct quantity for a medical model that will
+be applied to new patients, not new visits from known patients.
+</details>

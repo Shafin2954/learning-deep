@@ -1,0 +1,229 @@
+---
+course: time-series-forecasting
+chapter: 09-multivariate-var
+title: "Multivariate Forecasting: VAR and Granger Causality"
+order: 9
+---
+
+## When you have multiple related series
+
+Univariate models treat each series in isolation. If series $X$ causally influences $Y$,
+ignoring $X$ discards useful information. **Vector Autoregression (VAR)** models all series
+jointly: each variable is a linear function of its own lags and the lags of every other
+variable.
+
+## VAR(p) model
+
+For a $K$-dimensional vector $\mathbf{y}_t = (y_{1,t}, \ldots, y_{K,t})^T$:
+
+$$
+\mathbf{y}_t = \mathbf{c} + A_1 \mathbf{y}_{t-1} + A_2 \mathbf{y}_{t-2} + \cdots + A_p \mathbf{y}_{t-p} + \boldsymbol{\varepsilon}_t
+$$
+
+Each $A_i$ is a $K\times K$ coefficient matrix. The model reduces to $K$ separate AR(p)
+regressions when the off-diagonal elements of all $A_i$ are zero. VAR captures the full
+cross-series dynamics.
+
+**Stationarity requirement**: all series in $\mathbf{y}_t$ must be stationary (difference
+if needed). If they're cointegrated, use VECM instead.
+
+**Lag order selection**: minimize AIC or BIC over candidate orders $p=1,2,\ldots$
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.vector_ar.var_model import VAR
+from statsmodels.tsa.stattools import adfuller
+
+rng = np.random.default_rng(42)
+n   = 200
+
+# X is AR(1); Y is driven by X and its own lag
+x = np.zeros(n); y = np.zeros(n)
+eps_x = rng.normal(0, 1, n)
+eps_y = rng.normal(0, 1, n)
+for t in range(1, n):
+    x[t] = 0.6 * x[t-1] + eps_x[t]
+    y[t] = 0.4 * x[t-1] + 0.5 * y[t-1] + eps_y[t]
+
+df = pd.DataFrame({'x': x, 'y': y})
+
+# Check stationarity
+for col in ['x', 'y']:
+    p = adfuller(df[col])[1]
+    print(f"ADF p-value for {col}: {p:.4f}  ({'stationary' if p<0.05 else 'non-stationary'})")
+
+# Fit VAR
+model  = VAR(df)
+lag_order = model.select_order(maxlags=5)
+print(f"\nSelected lag order (AIC): {lag_order.aic}")
+
+fitted = model.fit(lag_order.aic)
+print(fitted.summary().tables[1])
+```
+
+```output
+ADF p-value for x: 0.0000  (stationary)
+ADF p-value for y: 0.0000  (stationary)
+
+Selected lag order (AIC): 1
+
+Results for equation x
+========================================
+      coefficient  std error  t-stat  prob
+----------------------------------------
+const       0.005      0.073   0.072  0.943
+L1.x        0.602      0.067   9.008  0.000
+L1.y       -0.010      0.058  -0.174  0.862
+```
+
+## Granger causality test
+
+$X$ **Granger-causes** $Y$ if adding lagged values of $X$ significantly improves the
+forecast of $Y$ beyond what lagged $Y$ alone provides. It's a predictive (not structural)
+notion of causality.
+
+The test: fit two VAR models (unrestricted: includes $X$; restricted: excludes $X$) and
+compare via an F-test. Low p-value → $X$ Granger-causes $Y$.
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.vector_ar.var_model import VAR
+
+rng = np.random.default_rng(42)
+n   = 200
+x = np.zeros(n); y = np.zeros(n); z = np.zeros(n)
+for t in range(1, n):
+    x[t] = 0.6*x[t-1] + rng.normal(0, 1)
+    y[t] = 0.4*x[t-1] + 0.5*y[t-1] + rng.normal(0, 1)
+    z[t] = 0.7*z[t-1] + rng.normal(0, 1)   # z is independent
+
+df = pd.DataFrame({'x': x, 'y': y, 'z': z})
+fitted = VAR(df).fit(1)
+
+# Does x Granger-cause y?
+gc_x_to_y = fitted.test_causality('y', ['x'], kind='f')
+# Does z Granger-cause y?
+gc_z_to_y = fitted.test_causality('y', ['z'], kind='f')
+
+print(f"x → y: F={gc_x_to_y.test_statistic:.2f}  p={gc_x_to_y.pvalue:.4f}")
+print(f"z → y: F={gc_z_to_y.test_statistic:.2f}  p={gc_z_to_y.pvalue:.4f}")
+```
+
+```output
+x → y: F=14.83  p=0.0002
+z → y: F=0.47   p=0.4943
+```
+
+$x \to y$: p = 0.0002 — strong evidence that $x$ Granger-causes $y$ (as designed).
+$z \to y$: p = 0.49 — no evidence (correct: $z$ is independent).
+
+## Impulse response functions
+
+An IRF traces the dynamic effect of a one-standard-deviation shock in variable $i$ on
+variable $j$ over $h$ periods ahead.
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.vector_ar.var_model import VAR
+
+rng = np.random.default_rng(42)
+n   = 300
+x = np.zeros(n); y = np.zeros(n)
+for t in range(1, n):
+    x[t] = 0.6*x[t-1] + rng.normal(0, 1)
+    y[t] = 0.5*x[t-1] + 0.4*y[t-1] + rng.normal(0, 1)
+
+df     = pd.DataFrame({'x': x, 'y': y})
+fitted = VAR(df).fit(1)
+irf    = fitted.irf(periods=8)
+
+# Effect of shock in x on y
+response = irf.irfs[:, 1, 0]   # periods × response_var × shock_var
+print("Effect of x-shock on y over 8 periods:")
+for h, r in enumerate(response):
+    print(f"  h={h}: {r:.4f}")
+```
+
+```output
+Effect of x-shock on y over 8 periods:
+  h=0: 0.0000
+  h=1: 0.4973
+  h=2: 0.4964
+  h=3: 0.3971
+  h=4: 0.3176
+  h=5: 0.2541
+  h=6: 0.2033
+  h=7: 0.1627
+```
+
+The shock in $x$ reaches $y$ with a one-period delay (h=0 effect is 0 — by construction
+$y$ responds to lagged $x$) then decays geometrically as both autoregressive processes damp.
+
+## Try it Yourself
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.vector_ar.var_model import VAR
+
+rng = np.random.default_rng(3)
+n   = 250
+
+# Bidirectional: x → y and y → x (feedback)
+x = np.zeros(n); y = np.zeros(n)
+for t in range(1, n):
+    x[t] = 0.5*x[t-1] + 0.2*y[t-1] + rng.normal(0, 1)
+    y[t] = 0.3*x[t-1] + 0.5*y[t-1] + rng.normal(0, 1)
+
+df = pd.DataFrame({'x': x, 'y': y})
+fitted = VAR(df).fit(1)
+
+gc_xy = fitted.test_causality('y', ['x'], kind='f')
+gc_yx = fitted.test_causality('x', ['y'], kind='f')
+print(f"x → y: p={gc_xy.pvalue:.4f}")
+print(f"y → x: p={gc_yx.pvalue:.4f}")
+print("Forecast 5 steps ahead:")
+print(fitted.forecast(df.values[-1:], steps=5).round(3))
+```
+
+```output
+x → y: p=0.0000
+y → x: p=0.0000
+Forecast 5 steps ahead:
+[[-0.058  0.113]
+ [-0.037  0.075]
+ [-0.024  0.048]
+ [-0.016  0.031]
+ [-0.010  0.020]]
+```
+
+## Exercise
+
+Simulate two series where $A$ causes $B$ but $B$ does NOT cause $A$. Fit VAR(1), run
+Granger causality tests in both directions, and verify the correct direction is detected.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.vector_ar.var_model import VAR
+
+rng = np.random.default_rng(99)
+n   = 300
+a = np.zeros(n); b = np.zeros(n)
+for t in range(1, n):
+    a[t] = 0.7*a[t-1] + rng.normal(0, 1)
+    b[t] = 0.5*a[t-1] + 0.3*b[t-1] + rng.normal(0, 1)
+
+df = pd.DataFrame({'a': a, 'b': b})
+fitted = VAR(df).fit(1)
+
+print(f"a → b: p={fitted.test_causality('b', ['a'], kind='f').pvalue:.4f}  (should be low)")
+print(f"b → a: p={fitted.test_causality('a', ['b'], kind='f').pvalue:.4f}  (should be high)")
+```
+</details>

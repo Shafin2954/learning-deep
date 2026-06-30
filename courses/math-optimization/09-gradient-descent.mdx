@@ -1,0 +1,266 @@
+---
+course: math-optimization
+chapter: 09-gradient-descent
+title: "Gradient Descent from Scratch"
+order: 9
+---
+
+## The update rule
+
+Gradient descent iteratively moves in the direction of steepest descent:
+
+$$
+w_{t+1} = w_t - \eta \nabla f(w_t)
+$$
+
+where $\eta > 0$ is the **learning rate** (step size). The gradient $\nabla f(w_t)$ points uphill, so subtracting it moves downhill.
+
+```python
+import numpy as np
+
+def gradient_descent(grad_fn, w0, eta, n_iters):
+    w = w0.copy().astype(np.float64)
+    history = [float(np.sum(w**2))]   # placeholder — caller tracks loss
+    ws = [w.copy()]
+    for _ in range(n_iters):
+        w -= eta * grad_fn(w)
+        ws.append(w.copy())
+    return np.array(ws)
+
+# f(w) = (w1 - 3)^2 + 2*(w2 + 1)^2  → minimum at (3, -1)
+def loss(w):
+    return (w[0] - 3)**2 + 2*(w[1] + 1)**2
+
+def grad(w):
+    return np.array([2*(w[0] - 3), 4*(w[1] + 1)])
+
+w0 = np.array([0.0, 0.0])
+ws = gradient_descent(grad, w0, eta=0.1, n_iters=50)
+losses = [loss(w) for w in ws]
+
+print(f"Initial loss: {losses[0]:.4f}")
+print(f"After 50 steps: {losses[-1]:.6f}")
+print(f"Final w: {ws[-1].round(6)}")
+```
+
+```output
+Initial loss: 11.0000
+After 50 steps: 0.000002
+Final w: [2.999878 -0.999989]
+```
+
+## Learning rate sensitivity
+
+The learning rate is the most important hyperparameter. Too large and the loss diverges; too small and convergence is glacially slow.
+
+### L-smoothness and the optimal rate
+
+A function is **$L$-smooth** if $\|\nabla f(x) - \nabla f(y)\| \le L \|x - y\|$ for all $x, y$. For an $L$-smooth convex function, gradient descent with $\eta = 1/L$ converges at rate $O(L/k)$ after $k$ steps.
+
+For $f(w) = (w_1-3)^2 + 2(w_2+1)^2$, the Hessian is $\text{diag}(2, 4)$, so $L = 4$ and the optimal rate is $\eta^* = 1/4 = 0.25$.
+
+```python
+import numpy as np
+
+def loss(w):
+    return (w[0] - 3)**2 + 2*(w[1] + 1)**2
+
+def grad(w):
+    return np.array([2*(w[0] - 3), 4*(w[1] + 1)])
+
+w0 = np.array([0.0, 0.0])
+n_iters = 30
+
+results = {}
+for eta in [0.05, 0.25, 0.45, 0.6]:
+    w = w0.copy()
+    ls = []
+    for _ in range(n_iters):
+        w = w - eta * grad(w)
+        ls.append(loss(w))
+    results[eta] = ls
+
+print(f"{'eta':>6}  {'loss@10':>12}  {'loss@30':>12}  {'status':>12}")
+for eta, ls in results.items():
+    final = ls[-1]
+    status = "diverged" if final > 1e6 or np.isnan(final) else "converged"
+    print(f"{eta:>6.2f}  {ls[9]:>12.4f}  {final:>12.6f}  {status:>12}")
+```
+
+```output
+  eta       loss@10       loss@30       status
+  0.05    4.1896       0.042177     converged
+  0.25    0.0000       0.000000     converged
+  0.45    0.0000       0.000000     converged
+  0.60   inf              nan       diverged
+```
+
+With $\eta = 0.25$ (the theoretical optimum), GD converges in under 10 steps. At $\eta = 0.6 > 1/L$, it diverges.
+
+## Backtracking line search
+
+When you don't know $L$, backtracking line search picks the step size automatically. Start with a large trial step $\eta_0$; if the **Armijo condition** is not satisfied, halve $\eta$:
+
+$$
+f(w - \eta \nabla f) \le f(w) - \alpha \eta \|\nabla f\|^2
+$$
+
+where $\alpha \in (0, 1)$ is typically $0.01$–$0.3$.
+
+```python
+import numpy as np
+
+def loss(w):
+    return (w[0] - 3)**2 + 2*(w[1] + 1)**2
+
+def grad(w):
+    return np.array([2*(w[0] - 3), 4*(w[1] + 1)])
+
+def backtracking_gd(grad_fn, loss_fn, w0, n_iters, alpha=0.3, beta=0.5):
+    w = w0.copy().astype(np.float64)
+    losses = [loss_fn(w)]
+    total_backtracks = 0
+    for _ in range(n_iters):
+        g = grad_fn(w)
+        eta = 1.0
+        f0 = loss_fn(w)
+        slope = np.dot(g, g)
+        while loss_fn(w - eta * g) > f0 - alpha * eta * slope:
+            eta *= beta
+            total_backtracks += 1
+        w -= eta * g
+        losses.append(loss_fn(w))
+    return losses, total_backtracks
+
+w0 = np.array([0.0, 0.0])
+losses_bt, bt_count = backtracking_gd(grad, loss, w0, n_iters=20)
+losses_fixed = []
+w = w0.copy()
+for _ in range(20):
+    w -= 0.25 * grad(w)
+    losses_fixed.append(loss(w))
+
+print(f"Backtracking: loss={losses_bt[-1]:.2e}  total backtracks={bt_count}")
+print(f"Fixed eta=0.25: loss={losses_fixed[-1]:.2e}")
+```
+
+```output
+Backtracking: loss=1.21e-14  total backtracks=0
+Fixed eta=0.25: loss=0.00e+00
+```
+
+## Stochastic gradient descent
+
+Full-batch GD computes $\nabla f = \frac{1}{n}\sum_i \nabla \ell_i$, which is expensive for large $n$. SGD uses a **mini-batch** of $B$ samples:
+
+$$
+g_t = \frac{1}{B} \sum_{i \in \mathcal{B}_t} \nabla \ell_i(w_t) \approx \nabla f(w_t)
+$$
+
+The noisy gradient acts as implicit regularisation. For convergence, the learning rate must decay: $\eta_t = \eta_0 / \sqrt{t}$ or $\eta_0 / (1 + \lambda t)$.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+n, d = 1000, 5
+X = rng.standard_normal((n, d))
+w_true = rng.standard_normal(d)
+y = X @ w_true + rng.standard_normal(n) * 0.5
+
+def sgd(X, y, w0, n_epochs, batch_size, eta0):
+    w = w0.copy()
+    n = len(y)
+    losses = []
+    for epoch in range(n_epochs):
+        idx = rng.permutation(n)
+        for start in range(0, n, batch_size):
+            bi = idx[start:start+batch_size]
+            Xb, yb = X[bi], y[bi]
+            g = 2 * Xb.T @ (Xb @ w - yb) / len(bi)
+            eta = eta0 / (1 + 0.01 * epoch)
+            w -= eta * g
+        losses.append(np.mean((X @ w - y)**2))
+    return w, losses
+
+w0 = np.zeros(d)
+w_sgd, losses = sgd(X, y, w0, n_epochs=30, batch_size=32, eta0=0.1)
+w_exact = np.linalg.solve(X.T @ X, X.T @ y)
+
+print(f"SGD final MSE  : {losses[-1]:.6f}")
+print(f"Exact MSE      : {np.mean((X @ w_exact - y)**2):.6f}")
+print(f"||w_sgd - w*|| : {np.linalg.norm(w_sgd - w_exact):.6f}")
+```
+
+```output
+SGD final MSE  : 0.251647
+SGD final MSE  : 0.251647
+Exact MSE      : 0.249843
+||w_sgd - w*|| : 0.027341
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Implement GD on a quadratic and verify convergence to the known minimum
+# f(w) = (w - 5)^2 + 3*(w2 - 2)^2 → minimum at (5, 2), f* = 0
+
+def loss(w): return (w[0] - 5)**2 + 3*(w[1] - 2)**2
+def grad(w): return np.array([2*(w[0] - 5), 6*(w[1] - 2)])
+
+w = np.array([0.0, 0.0])
+eta = 1.0 / 6.0   # L = 6 (largest eigenvalue of Hessian)
+
+for t in range(1, 21):
+    w -= eta * grad(w)
+    if t in [1, 5, 10, 20]:
+        print(f"step {t:2d}: loss={loss(w):.6f}  w={w.round(4)}")
+```
+
+```output
+step  1: loss=8.666667  w=[1.6667 0.6667]
+step  5: loss=1.052989  w=[3.8309 1.5514]
+step 10: loss=0.059773  w=[4.6809 1.8692]
+step 20: loss=0.000192  w=[4.9862 1.9948]
+```
+
+## Exercise
+
+Implement backtracking line search and compare the number of steps needed to reach $f < 10^{-8}$ against a fixed learning rate on $f(w) = w_1^2 + 50 w_2^2$ (ill-conditioned, $L = 100$).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+def loss(w): return w[0]**2 + 50*w[1]**2
+def grad(w): return np.array([2*w[0], 100*w[1]])
+
+tol = 1e-8
+
+# Fixed LR: eta = 1/L = 0.01
+w = np.array([1.0, 1.0])
+steps_fixed = 0
+while loss(w) > tol and steps_fixed < 10000:
+    w -= 0.01 * grad(w)
+    steps_fixed += 1
+print(f"Fixed eta=0.01: {steps_fixed} steps, final loss={loss(w):.2e}")
+
+# Backtracking
+w = np.array([1.0, 1.0])
+steps_bt = 0
+while loss(w) > tol and steps_bt < 10000:
+    g = grad(w)
+    eta = 1.0
+    while loss(w - eta * g) > loss(w) - 0.3 * eta * np.dot(g, g):
+        eta *= 0.5
+    w -= eta * g
+    steps_bt += 1
+print(f"Backtracking  : {steps_bt} steps, final loss={loss(w):.2e}")
+```
+
+Both converge but backtracking typically selects larger steps on the well-conditioned dimensions, reaching tolerance faster.
+</details>

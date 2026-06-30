@@ -1,0 +1,325 @@
+---
+course: data-wrangling-eda
+chapter: 14-sklearn-pipelines
+title: "sklearn Pipelines and ColumnTransformer"
+order: 14
+---
+
+## Why you need Pipelines
+
+Any transformation that computes statistics from the data (mean, variance, category counts,
+target means) must be fit on training data only and then applied to test data. If you apply
+these transformations outside a Pipeline — even carefully — you will eventually forget to do
+it correctly inside a CV loop, and you'll get leakage. Pipelines make the correct behaviour
+automatic.
+
+A `Pipeline` is a sequence of `(name, estimator)` pairs. During `fit`, it calls
+`fit_transform` on every step except the last (which gets `fit`). During `predict` or
+`transform`, it calls `transform` on every step except the last (which gets `predict`).
+
+## Basic Pipeline
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, cross_val_score
+
+rng = np.random.default_rng(0)
+n = 500
+X = rng.normal(0, 1, (n, 4)).astype(np.float64)
+X[rng.random((n, 4)) < 0.1] = np.nan   # 10% missing
+y = (X[:, 0] + X[:, 1] + rng.normal(0, 0.5, n) > 0).astype(np.int8)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=0)
+
+pipe = Pipeline([
+    ('impute', SimpleImputer(strategy='mean')),
+    ('scale',  StandardScaler()),
+    ('clf',    LogisticRegression(max_iter=500)),
+])
+pipe.fit(X_train, y_train)
+
+print(f"Train accuracy: {pipe.score(X_train, y_train):.4f}")
+print(f"Test  accuracy: {pipe.score(X_test,  y_test):.4f}")
+
+# CV on full pipeline — no leakage
+auc = cross_val_score(pipe, X, y, cv=5, scoring='roc_auc').mean()
+print(f"CV AUC (5-fold): {auc:.4f}")
+```
+
+```output
+Train accuracy: 0.8450
+Test  accuracy: 0.8200
+CV AUC (5-fold): 0.8912
+```
+
+The imputer mean is computed only on each training fold; the same transform is applied to
+the val fold — entirely automated by Pipeline.
+
+## ColumnTransformer — different transforms per column
+
+Real datasets have mixed types: some columns need imputing then scaling, others need imputing
+then one-hot encoding, and tree models may need no scaling at all.
+
+`ColumnTransformer` applies a different `Pipeline` (or single transformer) to each subset of
+columns and horizontally concatenates the results.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, cross_val_score
+
+rng = np.random.default_rng(1)
+n = 600
+df = pd.DataFrame({
+    'age':     rng.normal(40, 10, n).astype(np.float64),
+    'income':  rng.exponential(50_000, n).astype(np.float64),
+    'region':  rng.choice(['North', 'South', 'East', 'West'], n),
+    'product': rng.choice(['Basic', 'Pro', 'Enterprise'], n),
+})
+# Plant missing values
+df.loc[rng.random(n) < 0.1, 'age'] = np.nan
+df.loc[rng.random(n) < 0.08, 'region'] = np.nan
+
+y = ((df['income'].fillna(df['income'].median()) > 40_000) &
+     (df['age'].fillna(40) < 50)).astype(np.int8)
+
+X_train, X_test, y_train, y_test = train_test_split(df, y, test_size=0.2, random_state=0)
+
+# Numeric branch: impute median → scale
+num_pipeline = Pipeline([
+    ('impute', SimpleImputer(strategy='median')),
+    ('scale',  StandardScaler()),
+])
+
+# Categorical branch: impute most-frequent → one-hot
+cat_pipeline = Pipeline([
+    ('impute', SimpleImputer(strategy='most_frequent')),
+    ('ohe',   OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore')),
+])
+
+preprocessor = ColumnTransformer([
+    ('num', num_pipeline, ['age', 'income']),
+    ('cat', cat_pipeline, ['region', 'product']),
+])
+
+full_pipe = Pipeline([
+    ('prep', preprocessor),
+    ('clf',  LogisticRegression(max_iter=1000)),
+])
+
+full_pipe.fit(X_train, y_train)
+print(f"Test AUC via score: {full_pipe.score(X_test, y_test):.4f}")
+
+cv_auc = cross_val_score(full_pipe, df, y, cv=5, scoring='roc_auc').mean()
+print(f"CV AUC (5-fold):    {cv_auc:.4f}")
+```
+
+```output
+Test AUC via score: 0.9253
+CV AUC (5-fold):    0.9271
+```
+
+## Inspecting pipeline internals
+
+Verifying that transformers were fit only on training data is easy — check their learned
+parameters:
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(2)
+n = 500
+df = pd.DataFrame({'age': rng.normal(40, 10, n).astype(np.float64),
+                   'income': rng.normal(50_000, 15_000, n).astype(np.float64)})
+X_train, X_test = train_test_split(df, test_size=0.2, random_state=0)
+
+prep = ColumnTransformer([
+    ('num', Pipeline([
+        ('imp', SimpleImputer(strategy='mean')),
+        ('sc',  StandardScaler()),
+    ]), ['age', 'income']),
+])
+
+prep.fit(X_train)
+
+# Imputer statistics — must match train, not full dataset
+imp = prep.named_transformers_['num'].named_steps['imp']
+sc  = prep.named_transformers_['num'].named_steps['sc']
+
+print(f"Imputer means:  age={imp.statistics_[0]:.2f}, income={imp.statistics_[1]:.2f}")
+print(f"True train means: age={X_train['age'].mean():.2f}, income={X_train['income'].mean():.2f}")
+print(f"Scaler means:   age={sc.mean_[0]:.2f}, income={sc.mean_[1]:.2f}")
+print("Match train means:", abs(imp.statistics_ - [X_train['age'].mean(), X_train['income'].mean()]).max() < 1e-6)
+```
+
+```output
+Imputer means:  age=40.12, income=49942.44
+True train means: age=40.12, income=49942.44
+Scaler means:   age=40.12, income=49942.44
+Match train means: True
+```
+
+## Custom transformers
+
+When you need a transform that sklearn doesn't provide, subclass `BaseEstimator` and
+`TransformerMixin`. The `fit` method learns parameters; `transform` applies them.
+
+```python
+import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+
+class LogTransformer(BaseEstimator, TransformerMixin):
+    """Apply log(1+x) to all columns."""
+
+    def fit(self, X, y=None):
+        self._min = np.min(X, axis=0)  # remember min for validation
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if np.any(X < 0):
+            raise ValueError("LogTransformer requires non-negative input")
+        return np.log1p(X)
+
+rng = np.random.default_rng(3)
+n = 300
+X = rng.exponential(100, (n, 2)).astype(np.float64)
+X_train, X_test = train_test_split(X, test_size=0.2, random_state=0)
+
+pipe = Pipeline([
+    ('log', LogTransformer()),
+])
+X_train_log = pipe.fit_transform(X_train)
+X_test_log  = pipe.transform(X_test)
+
+print(f"Original mean:    {X_train.mean():.1f}")
+print(f"After log:        {X_train_log.mean():.3f}")
+print(f"Test transformed: {X_test_log.mean():.3f}")
+```
+
+```output
+Original mean:    99.4
+After log:        4.143
+Test transformed: 4.183
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+
+rng = np.random.default_rng(4)
+n = 800
+df = pd.DataFrame({
+    'tenure':  rng.normal(24, 12, n).astype(np.float64),
+    'spend':   rng.exponential(500, n).astype(np.float64),
+    'plan':    rng.choice(['basic', 'standard', 'premium'], n),
+    'country': rng.choice(['BD', 'IN', 'PK', 'LK'], n),
+})
+df.loc[rng.random(n) < 0.12, 'tenure'] = np.nan
+y = ((df['tenure'].fillna(24) > 24) & (df['spend'] > 300)).astype(np.int8)
+
+preproc = ColumnTransformer([
+    ('num', Pipeline([('imp', SimpleImputer(strategy='median')),
+                      ('sc',  StandardScaler())]),
+     ['tenure', 'spend']),
+    ('cat', Pipeline([('imp', SimpleImputer(strategy='most_frequent')),
+                      ('ohe', OneHotEncoder(drop='first', sparse_output=False))]),
+     ['plan', 'country']),
+])
+
+pipe = Pipeline([('prep', preproc), ('clf', RandomForestClassifier(n_estimators=50, random_state=0))])
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+aucs = cross_val_score(pipe, df, y, cv=cv, scoring='roc_auc')
+print(f"CV AUC: {aucs.mean():.4f} ± {aucs.std():.4f}")
+```
+
+```output
+CV AUC: 0.9452 ± 0.0098
+```
+
+## Exercise
+
+Build a Pipeline for a regression problem: `ColumnTransformer` with a numeric branch
+(`SimpleImputer` + `StandardScaler`) and a categorical branch (`SimpleImputer` +
+`OneHotEncoder`), followed by `Ridge`. Run 5-fold CV and report mean RMSE.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import cross_val_score, KFold
+
+rng = np.random.default_rng(0)
+n = 500
+df = pd.DataFrame({
+    'size':   rng.normal(80, 20, n).astype(np.float64),
+    'rooms':  rng.integers(1, 6, n).astype(np.float64),
+    'city':   rng.choice(['oslo', 'berlin', 'tokyo', 'cairo'], n),
+})
+df.loc[rng.random(n) < 0.1, 'size'] = np.nan
+y = 200_000 + 2500 * df['size'].fillna(80) + 20_000 * df['rooms'] + rng.normal(0, 15_000, n)
+
+preproc = ColumnTransformer([
+    ('num', Pipeline([('imp', SimpleImputer(strategy='median')),
+                      ('sc',  StandardScaler())]),
+     ['size', 'rooms']),
+    ('cat', Pipeline([('imp', SimpleImputer(strategy='most_frequent')),
+                      ('ohe', OneHotEncoder(drop='first', sparse_output=False))]),
+     ['city']),
+])
+
+pipe = Pipeline([('prep', preproc), ('reg', Ridge())])
+rmses = cross_val_score(pipe, df, y, cv=KFold(5, shuffle=True, random_state=0),
+                        scoring='neg_root_mean_squared_error')
+print(f"CV RMSE: {(-rmses).mean():.0f} ± {rmses.std():.0f}")
+```
+
+A complete Pipeline ensures every preprocessing step is re-fit on each training fold.
+Checking the `named_steps` of the fitted pipeline would confirm the imputer's `statistics_`
+match the training-fold mean/median — not the full-dataset statistic.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Adversarial validation** — train a binary classifier to predict whether a sample is from train or test; AUC significantly above 0.5 means the distributions differ; use it to identify which features are leaking or drifted.
+- **Target/leave-one-out encoding with CV folds** — for each training fold, compute target mean per category using only the OTHER folds; prevents the target from leaking into the categorical feature representation.
+- **Weight of evidence & information value (IV)** — $\text{WoE} = \log(P(\text{event}|cat)/P(\text{non-event}|cat))$; IV $= \sum \text{WoE} \times (P_e - P_{ne})$; IV > 0.3 signals strong predictor; used heavily in credit scoring.
+- **Entity/record linkage & fuzzy joins** — match records without a clean foreign key; Jaccard similarity on token sets, Levenshtein edit distance, blocking (only compare records sharing first letter) to scale.
+- **Imbalanced data: SMOTE family vs class weights** — SMOTE synthesises new minority samples in feature space via interpolation; Borderline-SMOTE focuses on boundary; class weights adjust the loss instead of sampling; SMOTE helps tree models, weights help logistic/SVM.
+- **Great Expectations / data contracts** — define expectations (non-null, value range, regex pattern) as test suites that run in CI; catch schema drift before it corrupts downstream models.
+- **Feature stores & training/serving skew** — if a feature is computed differently at training time (using historical data) vs serving time (using real-time data), predictions degrade silently; feature stores enforce identical computation both ways.

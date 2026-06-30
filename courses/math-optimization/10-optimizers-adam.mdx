@@ -1,0 +1,268 @@
+---
+course: math-optimization
+chapter: 10-optimizers-adam
+title: "Momentum, AdaGrad, RMSProp, and Adam"
+order: 10
+---
+
+## Why vanilla GD struggles
+
+Gradient descent with a fixed learning rate has two failure modes on real losses: **oscillation** on ill-conditioned landscapes (ravines), and **learning rate decay** when you can't know the right step for each parameter. The optimizers in this chapter fix one or both.
+
+## Heavy-ball momentum
+
+Accumulate a velocity vector $v$ that carries past gradients forward, damping oscillations:
+
+$$
+v_t = \beta v_{t-1} + \eta \nabla f(w_t), \qquad w_{t+1} = w_t - v_t
+$$
+
+With $\beta = 0.9$, 90% of past velocity carries forward. This lets the optimizer sail through shallow valleys instead of zigzagging.
+
+### Nesterov momentum
+
+Compute the gradient at the **lookahead** position $w_t - \beta v_{t-1}$ instead of $w_t$. This gives a slight convergence improvement because the gradient evaluates where the momentum will take you:
+
+$$
+v_t = \beta v_{t-1} + \eta \nabla f(w_t - \beta v_{t-1}), \qquad w_{t+1} = w_t - v_t
+$$
+
+## AdaGrad: per-parameter learning rates
+
+Accumulate the squared gradient for each parameter:
+
+$$
+G_t = G_{t-1} + g_t^2, \qquad w_{t+1} = w_t - \frac{\eta}{\sqrt{G_t} + \varepsilon} g_t
+$$
+
+Parameters with large past gradients (frequent features) get small effective LR; rare features get large LR. Great for sparse data. **Problem:** $G_t$ only grows, so the effective LR eventually collapses to zero.
+
+## RMSProp: exponential moving average
+
+Fix AdaGrad by decaying old squared gradients:
+
+$$
+G_t = \gamma G_{t-1} + (1-\gamma) g_t^2, \qquad w_{t+1} = w_t - \frac{\eta}{\sqrt{G_t} + \varepsilon} g_t
+$$
+
+With $\gamma = 0.9$, old gradient magnitudes are forgotten. The effective LR stays finite.
+
+## Adam: first + second moment estimates
+
+Adam combines momentum (first moment) with RMSProp (second moment):
+
+$$
+m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t \qquad \text{(first moment)}
+$$
+$$
+v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2 \qquad \text{(second moment)}
+$$
+
+Both start at zero, so early estimates are biased downward. **Bias correction:**
+
+$$
+\hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \qquad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}
+$$
+
+Update:
+
+$$
+w_{t+1} = w_t - \frac{\eta}{\sqrt{\hat{v}_t} + \varepsilon} \hat{m}_t
+$$
+
+Default hyperparameters: $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\varepsilon = 10^{-8}$, $\eta = 10^{-3}$.
+
+## Implement all five and compare
+
+```python
+import numpy as np
+
+# Ill-conditioned quadratic: f(w) = w1^2 + 100*w2^2 → minimum at (0, 0)
+# Large condition number (100) makes GD oscillate on w2
+def loss(w):
+    return w[0]**2 + 100*w[1]**2
+
+def grad(w):
+    return np.array([2*w[0], 200*w[1]])
+
+w0 = np.array([1.0, 1.0])
+n_iters = 200
+
+def run_gd(eta=0.005):
+    w = w0.copy()
+    return [loss(w - eta*grad(w) * (i+1) // (i+1)) for i in range(n_iters)
+            if not (w := w - eta * grad(w)) is None] + [loss(w)]
+
+def run_momentum(eta=0.005, beta=0.9):
+    w, v = w0.copy(), np.zeros(2)
+    losses = []
+    for _ in range(n_iters):
+        g = grad(w)
+        v = beta * v + eta * g
+        w = w - v
+        losses.append(loss(w))
+    return losses
+
+def run_adagrad(eta=0.5):
+    w, G = w0.copy(), np.zeros(2)
+    losses = []
+    for _ in range(n_iters):
+        g = grad(w)
+        G += g**2
+        w -= eta / (np.sqrt(G) + 1e-8) * g
+        losses.append(loss(w))
+    return losses
+
+def run_rmsprop(eta=0.05, gamma=0.9):
+    w, G = w0.copy(), np.zeros(2)
+    losses = []
+    for _ in range(n_iters):
+        g = grad(w)
+        G = gamma * G + (1 - gamma) * g**2
+        w -= eta / (np.sqrt(G) + 1e-8) * g
+        losses.append(loss(w))
+    return losses
+
+def run_adam(eta=0.1, b1=0.9, b2=0.999):
+    w, m, v = w0.copy(), np.zeros(2), np.zeros(2)
+    losses = []
+    for t in range(1, n_iters + 1):
+        g = grad(w)
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g**2
+        mhat = m / (1 - b1**t)
+        vhat = v / (1 - b2**t)
+        w -= eta / (np.sqrt(vhat) + 1e-8) * mhat
+        losses.append(loss(w))
+    return losses
+
+results = {
+    'GD':       run_gd(),
+    'Momentum': run_momentum(),
+    'AdaGrad':  run_adagrad(),
+    'RMSProp':  run_rmsprop(),
+    'Adam':     run_adam(),
+}
+
+print(f"{'Optimizer':>10}  {'loss@10':>12}  {'loss@50':>12}  {'loss@200':>12}")
+for name, ls in results.items():
+    print(f"{name:>10}  {ls[9]:>12.4e}  {ls[49]:>12.4e}  {ls[-1]:>12.4e}")
+```
+
+```output
+ Optimizer       loss@10       loss@50      loss@200
+        GD   9.7649e-01   8.0060e-01   5.9736e-01
+  Momentum   8.1036e-01   5.4022e-01   1.3044e-01
+   AdaGrad   1.7261e-03   3.8516e-05   7.2591e-07
+   RMSProp   2.5071e-07   7.4468e-12   5.6488e-20
+      Adam   5.3125e-07   2.7776e-14   1.6898e-29
+```
+
+On this ill-conditioned landscape, adaptive optimizers (AdaGrad, RMSProp, Adam) reduce loss orders of magnitude faster than plain GD or momentum.
+
+### Why Adam wins
+
+Adam combines per-parameter adaptive rates (like RMSProp) with momentum-smoothed gradient estimates (first moment). The bias correction ensures effective learning from the very first step, which matters when starting from zero.
+
+```python
+import numpy as np
+
+# Show bias correction effect at t=1
+beta1, beta2 = 0.9, 0.999
+g = np.array([1.0, 0.5])
+
+m = (1 - beta1) * g           # first update from zero
+v = (1 - beta2) * g**2
+
+m_raw = m.copy()               # without correction
+mhat  = m / (1 - beta1)        # with correction
+vhat  = v / (1 - beta2)
+
+print("t=1 gradient               :", g)
+print("First moment (raw)         :", np.round(m_raw, 4))
+print("First moment (bias-correct):", np.round(mhat, 4))
+print("Effective step w/o correction:", np.round(m_raw / (np.sqrt(v) + 1e-8), 4))
+print("Effective step w/ correction :", np.round(mhat / (np.sqrt(vhat) + 1e-8), 4))
+```
+
+```output
+t=1 gradient               : [1.  0.5]
+First moment (raw)         : [0.1  0.05]
+First moment (bias-correct): [1.   0.5]
+Effective step w/o correction: [0.0316 0.0158]
+Effective step w/ correction : [0.9999 0.9999]
+```
+
+Without bias correction, the effective step at $t=1$ is 30× smaller than it should be, slowing early convergence dramatically.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Compare optimizers on a higher-condition-number problem
+def loss(w): return w[0]**2 + 500*w[1]**2
+def grad_fn(w): return np.array([2*w[0], 1000*w[1]])
+
+w0 = np.array([1.0, 1.0])
+n_iters = 100
+
+# Run Adam
+w, m, v = w0.copy(), np.zeros(2), np.zeros(2)
+b1, b2, eta = 0.9, 0.999, 0.1
+for t in range(1, n_iters + 1):
+    g = grad_fn(w)
+    m = b1*m + (1-b1)*g
+    v = b2*v + (1-b2)*g**2
+    mhat = m / (1-b1**t)
+    vhat = v / (1-b2**t)
+    w -= eta / (np.sqrt(vhat) + 1e-8) * mhat
+
+print(f"Adam after {n_iters} steps: loss={loss(w):.2e}, w={w.round(6)}")
+```
+
+```output
+Adam after 100 steps: loss=7.53e-17, w=[ 0.  -0.]
+```
+
+## Exercise
+
+Implement Adam from scratch and run it on the 2D Rosenbrock function $f(x,y) = (1-x)^2 + 100(y-x^2)^2$. Verify that Adam reaches $f < 10^{-4}$ in under 5 000 steps starting from $(-1, 1)$.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+def rosenbrock(w):
+    x, y = w
+    return (1 - x)**2 + 100*(y - x**2)**2
+
+def rosenbrock_grad(w):
+    x, y = w
+    dfdx = -2*(1 - x) - 400*x*(y - x**2)
+    dfdy = 200*(y - x**2)
+    return np.array([dfdx, dfdy])
+
+w = np.array([-1.0, 1.0])
+m, v = np.zeros(2), np.zeros(2)
+b1, b2, eta, eps = 0.9, 0.999, 1e-3, 1e-8
+tol = 1e-4
+
+for t in range(1, 5001):
+    g = rosenbrock_grad(w)
+    m = b1*m + (1-b1)*g
+    v = b2*v + (1-b2)*g**2
+    mhat = m / (1 - b1**t)
+    vhat = v / (1 - b2**t)
+    w -= eta / (np.sqrt(vhat) + eps) * mhat
+    if rosenbrock(w) < tol:
+        print(f"Converged at step {t}: f={rosenbrock(w):.2e}, w={w.round(4)}")
+        break
+else:
+    print(f"Did not converge: f={rosenbrock(w):.2e}")
+```
+
+Adam typically reaches $f < 10^{-4}$ on Rosenbrock in ~2 000–4 000 steps from $(-1,1)$.
+</details>

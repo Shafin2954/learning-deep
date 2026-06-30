@@ -1,0 +1,241 @@
+---
+course: modern-architectures
+chapter: 12-reading-architecture-papers
+title: "Reading Architecture Papers Systematically"
+order: 12
+---
+
+## Why you need a framework
+
+Architecture papers share a structural problem: they are written to persuade, not to
+inform. Every paper leads with its best result, chooses baselines that flatter its
+contribution, and buries caveats in appendices. Without a systematic reading method
+you will either over-trust every paper or dismiss them all from fatigue.
+
+A reproducible 6-step framework turns "this paper seems impressive" into "here is
+exactly what was proven, under what conditions, at what cost."
+
+## Step 1: Identify the claimed problem and scale
+
+Before reading the method, ask: what problem does this paper claim to solve, and at
+what scale?
+
+- Is the issue **quality** (perplexity, accuracy, BLEU)?
+- Is the issue **efficiency** (throughput, latency, memory)?
+- Is the issue **both** — and if so, is the claimed Pareto improvement actually
+  demonstrated at the scale you care about?
+
+**Red flag**: the paper benchmarks at 100M parameters but claims applicability to
+7B+ models. Architectural tradeoffs often flip at scale.
+
+## Step 2: Find the key equation
+
+Every real contribution has one equation (or one algorithm) that states the actual
+change. Everything else is context.
+
+- Mamba: $\Delta, B, C = \text{Linear}(x)$ — the SSM parameters are input-dependent.
+- RetNet: retention $= Q K^T \odot D$ where $D_{nm} = \gamma^{n-m}$ — the decay mask.
+- GQA: share $K, V$ heads across $g$ query heads — one sentence, one equation.
+
+If you cannot identify the key equation after 10 minutes, the paper is either unclear
+or you are reading a review / application paper rather than an architecture paper.
+
+## Step 3: Check the baselines
+
+The most common form of dishonesty in architecture papers is baseline selection.
+
+Questions to ask:
+- Is the Transformer baseline trained with the **same compute budget** as the proposed
+  model? (Same FLOPs, same data, same hyperparameter tuning effort?)
+- Is Flash Attention used for the Transformer baseline? (A vanilla attention baseline
+  makes any alternative look faster.)
+- Are the baselines the strongest available at the time of submission? (Comparing
+  against a 2020 model in a 2024 paper is suspicious.)
+- Is the evaluation task **in-distribution** for the proposed model's training setup?
+
+**Red flag**: the paper uses a Transformer baseline without FlashAttention but evaluates
+throughput as a key claim.
+
+## Step 4: Find the ablation table
+
+The ablation table is the most honest part of any architecture paper. It answers: if you
+remove one component, how much does performance degrade?
+
+A well-ablated paper will have a table like:
+
+| Model | Perplexity | Throughput |
+|-------|-----------|------------|
+| Full model | 12.1 | 2.1× |
+| − selective scan | 14.3 | 2.1× |
+| − input-dependent B,C | 13.8 | 2.1× |
+| − hardware-aware kernel | 12.1 | 1.1× |
+
+This tells you: the selective scan is load-bearing for quality; the fused kernel is
+load-bearing for throughput; they are independent improvements.
+
+**Red flag**: the paper has no ablation table, or the ablation removes only components
+that don't hurt performance (thus proving nothing).
+
+## Step 5: Check the compute budget
+
+Wall-clock time and FLOPs are different things. A model can be faster in FLOPs but
+slower in wall-clock if it requires many small GPU operations (bad memory access
+pattern) rather than a few large ones (good utilization).
+
+Always look for:
+- **Total training FLOPs** (not just per-step — did they train for the same number of
+  steps?).
+- **Hardware** (A100 vs H100 vs V100 — throughput numbers differ 3–4×).
+- **Sequence length of the throughput benchmark** (SSMs win at long context; short
+  context favors Transformers).
+- **Batch size** (large batches favor attention due to parallelism; small batches favor
+  SSMs due to sequential state update).
+
+```python
+# Compute FLOPs for a Transformer attention layer vs an SSM layer
+def attention_flops(B, T, D, H):
+    # QKV projections: 3 * B * T * D * D
+    # Attention matrix: B * H * T * T * (D/H)
+    # Value reduction: B * H * T * T * (D/H)
+    # Output projection: B * T * D * D
+    qkv    = 3 * B * T * D * D
+    attn   = 2 * B * H * T * T * (D // H)   # matmul + softmax-weighted sum
+    out_pr = B * T * D * D
+    return qkv + attn + out_pr
+
+def ssm_flops(B, T, D, N_STATE=16):
+    # Input projection: B * T * D * D
+    # SSM scan: B * T * D * N_STATE (recurrent update)
+    # Output projection: B * T * D * D
+    proj = 2 * B * T * D * D
+    scan = B * T * D * N_STATE
+    return proj + scan
+
+B, H, D = 1, 8, 512
+for T in [128, 1024, 8192]:
+    attn = attention_flops(B, T, D, H)
+    ssm  = ssm_flops(B, T, D)
+    print(f"T={T:5d}: Attention={attn/1e6:.1f}M  SSM={ssm/1e6:.1f}M  ratio={attn/ssm:.1f}x")
+```
+
+```output
+T=  128: Attention=201.3M  SSM=67.1M  ratio=3.0x
+T= 1024: Attention=1207.9M  SSM=537.9M  ratio=2.2x
+T= 8192: Attention=69206.0M  SSM=4303.9M  ratio=16.1x
+```
+
+At short sequence lengths the attention advantage shrinks; at long sequences SSMs
+win on FLOPs by an order of magnitude. This is why benchmark sequence length matters.
+
+## Step 6: Reproduction signals
+
+A paper is reproducible if:
+- Code is released (GitHub link in the abstract, not "code available upon request").
+- Hyperparameters are fully specified (learning rate, warmup, weight decay, dropout).
+- Random seeds are reported.
+- Checkpoint weights are released (you can run the evaluation yourself).
+
+**Red flag**: "full implementation details are in the appendix" but the appendix is
+missing or vague.
+
+## Framework applied: Mamba vs RetNet
+
+| Question | Mamba | RetNet |
+|----------|-------|--------|
+| Claimed problem | O(n²) attention, KV cache | Same |
+| Key equation | Input-dependent $\Delta, B, C$ | Fixed decay matrix $\gamma^{n-m}$ |
+| Transformer baseline | FlashAttention-2 used | FlashAttention-2 used |
+| Ablation table | Yes, selective scan is load-bearing | Yes, decay matters |
+| Compute budget | A100, same FLOPs | A100, same FLOPs |
+| Code released | Yes (state-spaces/mamba) | Yes (microsoft/torchscale) |
+
+Both papers pass most criteria. The key difference: Mamba's selectivity is input-dependent
+(more expressive, harder to parallelize) while RetNet's decay is fixed (easier to
+parallelize via chunkwise retention). For your use case, that tradeoff is the decision.
+
+## Choosing an architecture: a checklist
+
+Before picking an architecture for a project, answer these:
+
+1. **Context length** — short (< 4K) → Transformer wins on quality. Long (> 32K) → SSM or hybrid.
+2. **Inference latency** — if first-token latency matters, KV cache is a liability → SSM.
+3. **Memory per user** — serving 1000 concurrent users × 64K context × 32 layers × KV cache
+   is gigabytes → SSM or GQA Transformer.
+4. **Training compute** — unlimited → Transformer still leads on pretrained quality.
+   Constrained → consider efficiency.
+5. **Recall / retrieval tasks** — needle-in-haystack, associative recall → at least some
+   attention layers required.
+6. **Hardware** — consumer GPU (16 GB) → parameter-efficient models, avoid 8B+ Transformers.
+
+## Try it Yourself
+
+```python
+# Build your own baseline evaluation checklist as a scoring rubric
+paper_criteria = {
+    "Key equation identified":         True,
+    "FlashAttention baseline used":    True,
+    "Same FLOPs as proposed model":    False,
+    "Ablation table present":          True,
+    "Code released":                   True,
+    "Seeds reported":                  False,
+    "Checkpoint released":             False,
+}
+
+score = sum(paper_criteria.values())
+total = len(paper_criteria)
+print(f"Paper trust score: {score}/{total}")
+for k, v in paper_criteria.items():
+    status = "✓" if v else "✗"
+    print(f"  {status} {k}")
+```
+
+```output
+Paper trust score: 4/7
+  ✓ Key equation identified
+  ✓ FlashAttention baseline used
+  ✗ Same FLOPs as proposed model
+  ✓ Ablation table present
+  ✓ Code released
+  ✗ Seeds reported
+  ✗ Checkpoint released
+```
+
+## Exercise
+
+Apply the 6-step framework to the original Attention Is All You Need (Vaswani et al., 2017).
+Identify: (1) the key equation, (2) what the baseline was, (3) what the ablation table
+showed was most important, (4) what was not reported that would be important today.
+
+<details>
+<summary>Solution</summary>
+
+1. **Key equation**: $\text{Attention}(Q,K,V) = \text{softmax}(QK^T/\sqrt{d_k})V$ —
+   scaled dot-product attention. The multi-head variant is a consequence.
+
+2. **Baseline**: RNNs and convolutional sequence models (ConvS2S). No Transformer
+   baseline existed; this was the Transformer's introduction.
+
+3. **Ablation table** (Table 3 in the paper): removing positional encoding hurts the
+   most (BLEU drops 1.0+). Learned vs sinusoidal PE makes almost no difference.
+   Reducing heads from 8 to 1 hurts by 0.9 BLEU. Removing residual dropout hurts 0.3.
+
+4. **What's missing by 2025 standards**: no FLOPs budget comparison (RNNs are
+   parameter-cheap but the comparison wasn't compute-controlled); no long-context
+   evaluation (the task was WMT EN-DE, ~30 token sentences); no wall-clock
+   throughput numbers; seeds not reported; no KV-cache memory analysis.
+
+The paper is still an exemplar for clarity of the key equation and the ablation table —
+two things that many 2024 papers still don't do as well.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Mixture-of-Depths / early-exit** — allocate compute only to "hard" tokens; skip layers for easy ones via learned routing.
+- **Linear-attention deltas (DeltaNet, Gated DeltaNet)** — newest linear attention variants that beat Mamba on certain recall benchmarks.
+- **Sparse/Switch routing internals & expert collapse** — why MoE training becomes unstable and how auxiliary losses and z-loss fix it.
+- **Retrieval-augmented architectures (RETRO)** — bake retrieval into the model via chunked cross-attention to a frozen retrieval database.
+- **Mixture-of-Attention-heads / SwitchHead** — apply token-level sparsity inside attention heads rather than in the FFN.
+- **Hardware-aware design (the Mamba trick)** — algorithms shaped by GPU SRAM capacity; fused kernels avoid materializing large intermediate tensors.

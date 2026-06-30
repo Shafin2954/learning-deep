@@ -1,0 +1,252 @@
+---
+course: cnns-computer-vision
+chapter: 03-pooling-downsampling
+title: "Pooling and Downsampling"
+order: 3
+---
+
+## Why pooling exists
+
+After a conv layer your feature map is still nearly full-resolution. Pooling reduces spatial size so that later layers see a larger effective field without growing the parameter count, and it provides a degree of translation invariance: if a feature shifts by one pixel, the max in a 2×2 region stays the same.
+
+Two primary variants:
+
+- **Max pooling** — take the maximum value in each kernel window. Keeps the strongest activation; discards position.
+- **Average pooling** — take the mean. Smoother; used in classification heads and inception modules.
+
+```python
+import torch
+import torch.nn as nn
+
+x = torch.arange(1, 17, dtype=torch.float32).reshape(1, 1, 4, 4)
+print("Input:\n", x.squeeze())
+
+mp = nn.MaxPool2d(kernel_size=2, stride=2)
+ap = nn.AvgPool2d(kernel_size=2, stride=2)
+
+print("MaxPool2d(2,2):\n", mp(x).squeeze())
+print("AvgPool2d(2,2):\n", ap(x).squeeze())
+```
+
+```output
+Input:
+ tensor([[ 1.,  2.,  3.,  4.],
+        [ 5.,  6.,  7.,  8.],
+        [ 9., 10., 11., 12.],
+        [13., 14., 15., 16.]])
+MaxPool2d(2,2):
+ tensor([[ 6.,  8.],
+        [14., 16.]])
+AvgPool2d(2,2):
+ tensor([[ 3.5,  5.5],
+        [11.5, 13.5]])
+```
+
+A 2×2 pool with stride 2 halves both height and width.
+
+## Spatial resolution and receptive field
+
+Each pooling step doubles the receptive field of neurons in deeper layers without adding parameters. A feature at depth 3 after three 2×2 max pools sees a 8×8 region of the original image.
+
+```python
+import torch
+import torch.nn as nn
+
+# Track shape through a typical stem
+x = torch.zeros(1, 3, 224, 224)
+stem = nn.Sequential(
+    nn.Conv2d(3, 64, 3, padding=1),   # 224
+    nn.MaxPool2d(2, 2),                 # 112
+    nn.Conv2d(64, 128, 3, padding=1),  # 112
+    nn.MaxPool2d(2, 2),                 # 56
+    nn.Conv2d(128, 256, 3, padding=1), # 56
+    nn.MaxPool2d(2, 2),                 # 28
+)
+for layer in stem:
+    x = layer(x)
+    print(f"{layer.__class__.__name__:20s} → {tuple(x.shape)}")
+```
+
+```output
+Conv2d               → (1, 64, 224, 224)
+MaxPool2d            → (1, 64, 112, 112)
+Conv2d               → (1, 128, 112, 112)
+MaxPool2d            → (1, 128, 56, 56)
+Conv2d               → (1, 256, 56, 56)
+MaxPool2d            → (1, 256, 28, 28)
+```
+
+## Stride-based downsampling vs pooling
+
+Instead of a pooling layer you can use a conv with `stride=2`. This is learnable and increasingly preferred (no hard max, no information loss choice made by hand).
+
+```python
+x = torch.zeros(1, 64, 56, 56)
+pool_down   = nn.MaxPool2d(2, 2)
+stride_down = nn.Conv2d(64, 64, 3, stride=2, padding=1)
+
+print("MaxPool output:", pool_down(x).shape)
+print("Strided conv output:", stride_down(x).shape)
+```
+
+```output
+MaxPool output: torch.Size([1, 64, 28, 28])
+Strided conv output: torch.Size([1, 64, 28, 28])
+```
+
+ResNets use strided convolutions at the start of each residual block (the first conv in the block has `stride=2`). Strided convolution adds no extra layer, learns what to keep.
+
+## Global average pooling for classification heads
+
+After the convolutional backbone you need to go from a spatial feature map to a vector for the classifier. The classic approach: flatten the map. A better one: **global average pooling (GAP)** — reduce every spatial position to a single scalar per channel.
+
+GAP eliminates the dependency on input spatial size, so the same backbone can take variable-resolution images.
+
+```python
+backbone_out = torch.randn(4, 512, 7, 7)  # batch=4, 512 channels, 7×7
+
+gap  = nn.AdaptiveAvgPool2d(1)          # → (4, 512, 1, 1)
+flat = gap(backbone_out).flatten(1)     # → (4, 512)
+
+print("After GAP:", flat.shape)
+```
+
+```output
+After GAP: torch.Size([4, 512])
+```
+
+## Adaptive pooling
+
+`nn.AdaptiveAvgPool2d(output_size)` and `nn.AdaptiveMaxPool2d(output_size)` figure out the kernel and stride automatically to hit the target spatial size.
+
+```python
+x = torch.randn(1, 256, 13, 13)
+
+# Different target sizes from the same input
+for out_hw in [7, 3, 1]:
+    out = nn.AdaptiveAvgPool2d(out_hw)(x)
+    print(f"Target {out_hw}×{out_hw} → {tuple(out.shape)}")
+```
+
+```output
+Target 7×7 → (1, 256, 7, 7)
+Target 3×3 → (1, 256, 3, 3)
+Target 1×1 → (1, 256, 1, 1)
+```
+
+This is why torchvision's ResNet50 ends with `AdaptiveAvgPool2d(1)` — the backbone works for any input resolution ≥ 32.
+
+## Translation invariance via max pooling
+
+Max pooling is invariant to small translations within the pooling window. If the receptive field of a 3×3 max pool shifts by one pixel, the maximum is often unchanged.
+
+```python
+import torch
+
+# Simulate a feature map with a spike at position (1,1)
+feat = torch.zeros(1, 1, 4, 4)
+feat[0, 0, 1, 1] = 1.0
+
+feat_shifted = torch.zeros_like(feat)
+feat_shifted[0, 0, 1, 2] = 1.0  # shifted right by 1
+
+mp = nn.MaxPool2d(2, 2)
+print("Original pooled:\n", mp(feat).squeeze())
+print("Shifted pooled:\n", mp(feat_shifted).squeeze())
+```
+
+```output
+Original pooled:
+ tensor([[1., 0.],
+        [0., 0.]])
+Shifted pooled:
+ tensor([[1., 0.],
+        [0., 0.]])
+```
+
+Both produce the same output — the 1-pixel shift disappeared inside the 2×2 pool window.
+
+## Depthwise-separable convolutions preview
+
+Pooling isn't the only way to reduce cost. A standard 3×3 conv on 64 channels uses $3 \times 3 \times 64 \times 128 = 73728$ parameters per output map. A **depthwise-separable** conv splits this into:
+
+1. Depthwise conv: one 3×3 filter per input channel → 64 × 9 = 576 params.
+2. Pointwise conv: 1×1 across all channels → 64 × 128 = 8192 params.
+
+Total: 8768 — about 8× fewer than the full conv. Full treatment in chapter 5.
+
+```python
+C_in, C_out = 64, 128
+full_params = 3 * 3 * C_in * C_out
+dw_params   = 3 * 3 * C_in           # one filter per channel
+pw_params   = 1 * 1 * C_in * C_out
+print(f"Full conv params:      {full_params:,}")
+print(f"DepthwiseSep params:   {dw_params + pw_params:,}")
+print(f"Reduction factor:      {full_params / (dw_params + pw_params):.1f}×")
+```
+
+```output
+Full conv params:      73,728
+DepthwiseSep params:   8,768
+Reduction factor:      8.4×
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Build a tiny feature extractor and trace spatial dimensions
+x = torch.randn(1, 3, 128, 128)
+net = nn.Sequential(
+    nn.Conv2d(3,  32, 3, padding=1),
+    nn.ReLU(),
+    nn.MaxPool2d(2, 2),
+    nn.Conv2d(32, 64, 3, padding=1),
+    nn.ReLU(),
+    nn.AdaptiveAvgPool2d(4),
+)
+for layer in net:
+    x = layer(x)
+    print(f"{type(layer).__name__:25s} → {tuple(x.shape)}")
+```
+
+```output
+Conv2d                    → (1, 32, 128, 128)
+ReLU                      → (1, 32, 128, 128)
+MaxPool2d                 → (1, 32, 64, 64)
+Conv2d                    → (1, 64, 64, 64)
+ReLU                      → (1, 64, 64, 64)
+AdaptiveAvgPool2d         → (1, 64, 4, 4)
+```
+
+Try swapping `MaxPool2d` for a strided conv (`nn.Conv2d(32, 32, 3, stride=2, padding=1)`) and compare parameter counts. Then try `AdaptiveAvgPool2d(1)` at the end and flatten to get a 64-d vector for a classifier head.
+
+## Exercise
+
+Write a function `build_head(in_channels, num_classes)` that uses global average pooling followed by a linear layer to produce class logits from a spatial feature map of any H×W. Verify it works on inputs of size (2, 256, 7, 7) and (2, 256, 14, 14).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn as nn
+
+def build_head(in_channels: int, num_classes: int) -> nn.Module:
+    return nn.Sequential(
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+        nn.Linear(in_channels, num_classes),
+    )
+
+head = build_head(256, 10)
+for hw in [7, 14]:
+    x = torch.randn(2, 256, hw, hw)
+    logits = head(x)
+    print(f"Input (2,256,{hw},{hw}) → logits {tuple(logits.shape)}")
+```
+
+`AdaptiveAvgPool2d(1)` collapses any spatial size to 1×1, so the linear head always receives a 256-d vector regardless of the input resolution.
+</details>

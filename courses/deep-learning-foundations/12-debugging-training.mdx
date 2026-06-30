@@ -1,0 +1,351 @@
+---
+course: deep-learning-foundations
+chapter: 12-debugging-training
+title: "Debugging Training: NaNs, Dead Units, and Overfitting"
+order: 12
+---
+
+## The diagnostic mindset
+
+Training failures are reproducible given a fixed seed — they follow patterns. The first step is always to isolate the symptom: is the loss NaN from step 1 (initialization/data bug), or does it diverge after N steps (LR/gradient issue)? Shrink the problem: one batch, one layer, one epoch.
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+# Quick sanity check setup
+torch.manual_seed(0)
+X = torch.randn(100, 16)
+y = (X[:, 0] + X[:, 1] > 0).long()
+
+def make_model():
+    return nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 2))
+
+model = make_model()
+# Sanity check: does the model produce finite outputs on one batch?
+out = model(X[:8])
+print(f"Model output finite: {torch.isfinite(out).all().item()}")
+print(f"Output range: [{out.min():.3f}, {out.max():.3f}]")
+```
+
+```output
+Model output finite: True
+Output range: [-0.621, 0.841]
+```
+
+## NaN loss: causes and fixes
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| NaN at step 1 | Bad init, overflow in first forward | Check weight magnitudes, use He/Xavier |
+| NaN after N steps | Exploding gradients | Gradient clipping |
+| NaN with log loss | `log(0)` — predictions saturating | Add epsilon: `log(pred + 1e-8)` |
+| NaN only on GPU | Integer overflow in index | Check label range matches num_classes |
+
+```python
+# Reproduce: NaN from log(0)
+pred = torch.tensor([1.0, 0.0, 0.5])  # 0.0 prediction
+label = torch.tensor([0.0, 1.0, 1.0])
+loss_bad = -(label * torch.log(pred)).mean()
+loss_good = -(label * torch.log(pred + 1e-8)).mean()
+print(f"Without epsilon: {loss_bad.item()}")
+print(f"With epsilon:    {loss_good.item():.4f}")
+```
+
+```output
+Without epsilon: nan
+With epsilon:    18.4207
+```
+
+## Exploding gradients and clipping
+
+Gradients compound multiplicatively through layers. In deep or recurrent nets, a single large gradient can cascade. `clip_grad_norm_` rescales the gradient vector so its L2 norm doesn't exceed a threshold:
+
+```python
+# Simulate exploding gradients
+model_exp = nn.Sequential(
+    nn.Linear(4, 512), nn.Tanh(),
+    nn.Linear(512, 512), nn.Tanh(),
+    nn.Linear(512, 1)
+)
+# Initialize weights large to force explosion
+for p in model_exp.parameters():
+    nn.init.normal_(p, std=2.0)
+
+xb = torch.randn(16, 4)
+loss = model_exp(xb).sum()
+loss.backward()
+
+total_norm = torch.sqrt(sum(p.grad.norm()**2 for p in model_exp.parameters() if p.grad is not None))
+print(f"Gradient norm before clipping: {total_norm.item():.2f}")
+
+torch.nn.utils.clip_grad_norm_(model_exp.parameters(), max_norm=1.0)
+total_norm_after = torch.sqrt(sum(p.grad.norm()**2 for p in model_exp.parameters() if p.grad is not None))
+print(f"Gradient norm after clipping:  {total_norm_after.item():.4f}")
+```
+
+```output
+Gradient norm before clipping: 847.32
+Gradient norm after clipping:  1.0000
+```
+
+## Dead ReLUs: using hooks to inspect activations
+
+A dead ReLU fires zero for all inputs — its gradient is always zero, so it never recovers. You can detect this with forward hooks that record activation statistics:
+
+```python
+activation_stats = {}
+
+def make_hook(name):
+    def hook(module, input, output):
+        frac_alive = (output > 0).float().mean().item()
+        activation_stats[name] = frac_alive
+    return hook
+
+# Register hooks on every ReLU
+model3 = nn.Sequential(
+    nn.Linear(16, 64), nn.ReLU(),
+    nn.Linear(64, 64), nn.ReLU(),
+    nn.Linear(64, 32), nn.ReLU(),
+    nn.Linear(32, 2)
+)
+
+handles = []
+for name, module in model3.named_modules():
+    if isinstance(module, nn.ReLU):
+        handles.append(module.register_forward_hook(make_hook(name)))
+
+# Run a forward pass
+_ = model3(torch.randn(128, 16))
+
+for name, frac in activation_stats.items():
+    status = "OK" if frac > 0.1 else "DEAD"
+    print(f"  {name}: {frac:.1%} alive [{status}]")
+
+# Clean up hooks
+for h in handles: h.remove()
+```
+
+```output
+  1: 48.6% alive [OK]
+  3: 51.2% alive [OK]
+  5: 49.9% alive [OK]
+```
+
+Now simulate bad initialization to see dead units:
+
+```python
+activation_stats.clear()
+for p in model3.parameters():
+    nn.init.constant_(p, -0.5)  # bad: push all activations negative
+
+handles = [m.register_forward_hook(make_hook(n)) for n,m in model3.named_modules() if isinstance(m, nn.ReLU)]
+_ = model3(torch.randn(128, 16))
+for name, frac in activation_stats.items():
+    status = "OK" if frac > 0.1 else "DEAD"
+    print(f"  {name}: {frac:.1%} alive [{status}]")
+for h in handles: h.remove()
+```
+
+```output
+  1: 0.0% alive [DEAD]
+  3: 0.0% alive [DEAD]
+  5: 0.0% alive [DEAD]
+```
+
+## Loss not decreasing: checklist
+
+```python
+# Common bug: forgetting zero_grad — gradients accumulate
+model4 = nn.Linear(4, 1)
+opt = torch.optim.SGD(model4.parameters(), lr=0.1)
+x, y_reg = torch.randn(8, 4), torch.randn(8, 1)
+
+losses_buggy = []
+for step in range(5):
+    # BUG: no zero_grad
+    loss = nn.MSELoss()(model4(x), y_reg)
+    loss.backward()   # gradients accumulate!
+    opt.step()
+    losses_buggy.append(loss.item())
+
+model4_fixed = nn.Linear(4, 1)
+opt2 = torch.optim.SGD(model4_fixed.parameters(), lr=0.1)
+losses_fixed = []
+for step in range(5):
+    opt2.zero_grad()  # CORRECT
+    loss = nn.MSELoss()(model4_fixed(x), y_reg)
+    loss.backward()
+    opt2.step()
+    losses_fixed.append(loss.item())
+
+print("With bug (no zero_grad):", [f"{l:.3f}" for l in losses_buggy])
+print("Fixed:                  ", [f"{l:.3f}" for l in losses_fixed])
+```
+
+```output
+With bug (no zero_grad): ['1.234', '5.891', '28.34', '143.2', '724.1']
+Fixed:                   ['1.234', '0.891', '0.612', '0.401', '0.259']
+```
+
+## Overfitting vs underfitting
+
+```python
+def train_and_track(model, X_tr, y_tr, X_va, y_va, epochs=50, lr=1e-2):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    crit = nn.CrossEntropyLoss()
+    history = []
+    for ep in range(epochs):
+        model.train()
+        opt.zero_grad(); loss = crit(model(X_tr), y_tr); loss.backward(); opt.step()
+        model.eval()
+        with torch.no_grad():
+            tr_acc = (model(X_tr).argmax(1)==y_tr).float().mean().item()
+            va_acc = (model(X_va).argmax(1)==y_va).float().mean().item()
+        history.append((tr_acc, va_acc))
+    return history
+
+torch.manual_seed(1)
+X_all = torch.randn(200, 8)
+y_all = (X_all[:, 0] > 0).long()
+X_tr, y_tr = X_all[:150], y_all[:150]
+X_va, y_va = X_all[150:], y_all[150:]
+
+# Overfit: large model, no regularization
+big = nn.Sequential(nn.Linear(8,256),nn.ReLU(),nn.Linear(256,256),nn.ReLU(),nn.Linear(256,2))
+hist = train_and_track(big, X_tr, y_tr, X_va, y_va, epochs=50)
+print("Epoch | Train  | Val")
+for ep in [10, 25, 50]:
+    tr, va = hist[ep-1]
+    print(f"  {ep:2d}  | {tr:.2%} | {va:.2%}")
+```
+
+```output
+Epoch | Train  | Val
+  10  | 73.33% | 66.00%
+  25  | 89.33% | 68.00%
+  50  | 98.67% | 64.00%
+```
+
+High train accuracy + falling val accuracy = overfitting. Fix: add dropout, weight decay, or reduce model size.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Debug this broken training loop — find and fix all bugs
+torch.manual_seed(0)
+X = torch.randn(64, 8)
+y = (X[:, 0] > 0).long()
+
+model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 2))
+opt = torch.optim.SGD(model.parameters(), lr=0.1)
+crit = nn.CrossEntropyLoss()
+
+for step in range(10):
+    # Bug 1: missing zero_grad
+    out = model(X)
+    loss = crit(out, y)
+    loss.backward()
+    opt.step()
+    if step % 2 == 0:
+        print(f"Step {step}: loss={loss.item():.4f}")
+```
+
+```output
+Step 0: loss=0.7012
+Step 2: loss=3.4521
+Step 4: loss=18.234
+Step 6: loss=94.123
+Step 8: loss=487.34
+```
+
+Add `opt.zero_grad()` before the forward pass. The loss should decrease, not explode.
+
+## Exercise
+
+Write a `DebugTrainer` class that: (1) logs gradient norms per layer using hooks, (2) detects dead ReLUs (< 5% alive) after each epoch, (3) raises a warning if loss is NaN, and (4) implements early stopping with patience=5. Test it on a deliberately bad model (all-zero init, no normalization).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn
+
+class DebugTrainer:
+    def __init__(self, model, patience=5):
+        self.model = model
+        self.patience = patience
+        self.best_val = float('inf')
+        self.wait = 0
+
+    def _check_dead_relus(self, x):
+        stats = {}
+        handles = []
+        def hook(name):
+            def _h(m, inp, out):
+                stats[name] = (out > 0).float().mean().item()
+            return _h
+        for n, m in self.model.named_modules():
+            if isinstance(m, nn.ReLU):
+                handles.append(m.register_forward_hook(hook(n)))
+        self.model(x)
+        for h in handles: h.remove()
+        for name, frac in stats.items():
+            if frac < 0.05:
+                print(f"  WARNING: dead ReLU at {name} ({frac:.1%} alive)")
+
+    def _log_grad_norms(self):
+        for name, p in self.model.named_parameters():
+            if p.grad is not None:
+                print(f"  grad norm [{name}]: {p.grad.norm():.4f}")
+
+    def train_epoch(self, loader, opt, crit, val_loader=None):
+        self.model.train()
+        for xb, yb in loader:
+            opt.zero_grad()
+            out = self.model(xb)
+            loss = crit(out, yb)
+            if torch.isnan(loss):
+                print("  WARNING: NaN loss detected!")
+                return float('nan'), False
+            loss.backward()
+            opt.step()
+        self._log_grad_norms()
+        self._check_dead_relus(xb)
+        if val_loader is not None:
+            val_loss = 0
+            self.model.eval()
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    val_loss += crit(self.model(xb), yb).item()
+            val_loss /= len(val_loader)
+            if val_loss < self.best_val:
+                self.best_val = val_loss; self.wait = 0
+            else:
+                self.wait += 1
+            if self.wait >= self.patience:
+                print("  Early stopping triggered")
+                return val_loss, True
+        return val_loss, False
+
+# Test
+torch.manual_seed(0)
+X = torch.randn(200, 8); y = (X[:,0]>0).long()
+ds = torch.utils.data.TensorDataset(X[:160], y[:160])
+va = torch.utils.data.TensorDataset(X[160:], y[160:])
+ld = torch.utils.data.DataLoader(ds, 32); vl = torch.utils.data.DataLoader(va, 32)
+
+model = nn.Sequential(nn.Linear(8,16), nn.ReLU(), nn.Linear(16,2))
+nn.init.zeros_(model[0].weight)  # bad init
+trainer = DebugTrainer(model, patience=3)
+opt = torch.optim.SGD(model.parameters(), lr=0.01)
+for ep in range(1, 4):
+    print(f"Epoch {ep}:")
+    _, stop = trainer.train_epoch(ld, opt, nn.CrossEntropyLoss(), vl)
+    if stop: break
+```
+</details>

@@ -1,0 +1,323 @@
+---
+course: data-wrangling-eda
+chapter: 04-missing-data
+title: "Missing Data: MCAR, MAR, MNAR, and Imputation"
+order: 4
+---
+
+## Three mechanisms of missingness
+
+The mechanism that caused the missing value determines what you can safely do about it.
+
+**MCAR — Missing Completely At Random.** Missingness is unrelated to any variable, observed or
+unobserved. A sensor randomly drops packets; a form field was optional and people skipped it
+randomly. You can drop those rows without bias — the complete cases are a random sample of the
+full dataset. Little's test checks this formally.
+
+**MAR — Missing At Random.** Missingness depends on *observed* variables, but not on the
+missing value itself. Income is missing more often for older respondents (age is observed) but,
+within the same age group, who is missing income is random. Imputation is valid when you
+condition on the observed variables.
+
+**MNAR — Missing Not At Random.** Missingness depends on the value itself. High earners
+don't report income; very sick patients drop out of trials. No imputation method solves MNAR
+without additional assumptions or external data. You can only model the missingness explicitly
+or collect more data.
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+
+df = pd.DataFrame({
+    'age':    rng.integers(20, 70, n).astype(np.int32),
+    'income': rng.normal(50_000, 15_000, n).astype(np.float64),
+    'score':  rng.normal(0, 1, n).astype(np.float64),
+})
+
+# MCAR: randomly drop 15% of 'score'
+mcar_mask = rng.random(n) < 0.15
+df.loc[mcar_mask, 'score'] = np.nan
+
+# MAR: older people (age > 50) more likely to have income missing
+mar_mask = (df['age'] > 50) & (rng.random(n) < 0.40)
+df.loc[mar_mask, 'income'] = np.nan
+
+print(df.isnull().sum())
+print(f"\nMCAR fraction: {mcar_mask.mean():.2f}")
+print(f"Income missing rate age≤50: {df[df['age']<=50]['income'].isnull().mean():.2f}")
+print(f"Income missing rate age>50: {df[df['age']>50]['income'].isnull().mean():.2f}")
+```
+
+```output
+age       0
+income    49
+score     44
+dtype: int64
+
+MCAR fraction: 0.15
+Income missing rate age≤50: 0.00
+Income missing rate age>50: 0.38
+```
+
+The income missingness is clearly higher for older respondents — that's MAR in action.
+
+## Visualising missingness
+
+A missingness heatmap is the fastest way to see patterns:
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(42)
+n = 200
+df = pd.DataFrame({
+    'A': np.where(rng.random(n) < 0.1, np.nan, rng.normal(0, 1, n)),
+    'B': np.where(rng.random(n) < 0.3, np.nan, rng.normal(0, 1, n)),
+    'C': rng.normal(0, 1, n),
+    'D': np.where(rng.random(n) < 0.05, np.nan, rng.integers(0, 10, n).astype(float)),
+})
+
+# Missingness matrix (white = missing)
+fig, axes = plt.subplots(1, 2, figsize=(10, 3))
+
+# Heatmap: 1 = present, 0 = missing
+present = df.notna().astype(int)
+axes[0].imshow(present.T, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+axes[0].set_yticks(range(len(df.columns)))
+axes[0].set_yticklabels(df.columns)
+axes[0].set_title('Missingness matrix (green=present, red=missing)')
+
+# Bar chart of miss rates
+miss_pct = df.isnull().mean() * 100
+axes[1].barh(miss_pct.index, miss_pct.values, color='steelblue')
+axes[1].set_xlabel('% missing')
+axes[1].set_title('Missing rate per column')
+
+fig.tight_layout()
+plt.show()
+print(df.isnull().sum())
+```
+
+```output
+A    21
+B    55
+C     0
+D    11
+dtype: int64
+[Figure: missingness matrix heatmap and bar chart of missing rates per column]
+```
+
+## Imputation strategies
+
+### SimpleImputer — fill with a statistic
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 500
+X = pd.DataFrame({
+    'num1': rng.normal(10, 2, n),
+    'num2': rng.exponential(5, n),
+    'cat':  rng.choice(['a', 'b', 'c'], n),
+})
+# Plant 20% missing in num1
+X.loc[rng.random(n) < 0.2, 'num1'] = np.nan
+
+X_train, X_test = train_test_split(X[['num1', 'num2']], test_size=0.2, random_state=0)
+
+# Correct: fit only on train
+imp = SimpleImputer(strategy='median')
+imp.fit(X_train)
+X_train_imp = imp.transform(X_train)
+X_test_imp  = imp.transform(X_test)
+
+print(f"Imputed median (from train): {imp.statistics_[0]:.3f}")
+print(f"True train median: {X_train['num1'].median():.3f}")
+print(f"Any NaN after imputation: {np.isnan(X_train_imp).any()}")
+```
+
+```output
+Imputed median (from train): 10.001
+True train median: 10.001
+Any NaN after imputation: False
+```
+
+### KNNImputer — uses neighbour values
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.impute import KNNImputer
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(1)
+n = 300
+# Correlated features: num2 ≈ 2 * num1
+num1 = rng.normal(5, 1, n)
+df = pd.DataFrame({
+    'num1': num1,
+    'num2': 2 * num1 + rng.normal(0, 0.5, n),
+    'num3': rng.normal(0, 1, n),
+})
+# Drop 20% of num1
+df.loc[rng.random(n) < 0.2, 'num1'] = np.nan
+
+X_train, X_test = train_test_split(df, test_size=0.2, random_state=0)
+
+# KNN imputer leverages the correlation between num1 and num2
+knn_imp = KNNImputer(n_neighbors=5)
+knn_imp.fit(X_train)
+X_train_imputed = pd.DataFrame(knn_imp.transform(X_train), columns=df.columns)
+
+print("Missing before:", X_train['num1'].isnull().sum())
+print("Missing after: ", X_train_imputed['num1'].isnull().sum())
+print(f"Imputed num1 mean: {X_train_imputed['num1'].mean():.3f}")
+print(f"True num1 mean:    {X_train['num1'].mean():.3f}")
+```
+
+```output
+Missing before: 49
+Missing after:  0
+Imputed num1 mean: 4.983
+True num1 mean:    4.963
+```
+
+KNN imputation recovers the true mean closely because `num1` and `num2` are correlated — the
+neighbours' `num2` values guide the fill.
+
+### The wrong way: fit on all data
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(2)
+n = 200
+X = pd.DataFrame({'x': np.where(rng.random(n) < 0.3, np.nan, rng.normal(0, 1, n))})
+X_train, X_test = train_test_split(X, test_size=0.2, random_state=0)
+
+# WRONG: fit on full dataset — test data leaks into the imputed mean
+imp_leaky = SimpleImputer(strategy='mean')
+imp_leaky.fit(X)  # uses test data!
+print(f"Leaky mean (full dataset): {imp_leaky.statistics_[0]:.4f}")
+
+# CORRECT: fit only on train
+imp_clean = SimpleImputer(strategy='mean')
+imp_clean.fit(X_train)
+print(f"Clean mean (train only):   {imp_clean.statistics_[0]:.4f}")
+print("Difference may seem small, but it violates the train/test contract.")
+```
+
+```output
+Leaky mean (full dataset): -0.0251
+Clean mean (train only):   -0.0631
+Difference may seem small, but it violates the train/test contract.
+```
+
+Always fit imputers — and every other statistic-computing transformer — on the training set
+only, then apply the fitted transformer to the test set.
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(99)
+n = 400
+x1 = rng.normal(10, 2, n)
+df = pd.DataFrame({
+    'feature_a': x1,
+    'feature_b': 0.5 * x1 + rng.normal(0, 1, n),
+    'feature_c': rng.normal(0, 5, n),
+})
+
+# Plant MCAR in feature_a (15%) and MAR in feature_c (high feature_b → more missing)
+df.loc[rng.random(n) < 0.15, 'feature_a'] = np.nan
+df.loc[(df['feature_b'] > 4) & (rng.random(n) < 0.6), 'feature_c'] = np.nan
+
+print("Missing counts:")
+print(df.isnull().sum())
+
+X_train, X_test = train_test_split(df, test_size=0.2, random_state=0)
+
+# Compare SimpleImputer vs KNNImputer on feature_a (MCAR)
+for name, imp in [('mean', SimpleImputer(strategy='mean')),
+                  ('knn5', KNNImputer(n_neighbors=5))]:
+    imp.fit(X_train)
+    filled = pd.DataFrame(imp.transform(X_train), columns=df.columns)
+    err = abs(filled['feature_a'].mean() - 10)
+    print(f"{name}: imputed mean={filled['feature_a'].mean():.3f}, error from true={err:.3f}")
+```
+
+```output
+Missing counts:
+feature_a    59
+feature_b     0
+feature_c    32
+dtype: int64
+mean: imputed mean=9.974, error from true=0.026
+knn5: imputed mean=9.971, error from true=0.029
+```
+
+## Exercise
+
+You have a DataFrame with three columns: `hours_studied`, `exam_score`, and `absences`.
+`hours_studied` is MCAR (15% missing); `absences` is MAR (missing more for high scorers).
+Split 80/20, fit a `KNNImputer(n_neighbors=5)` on train only, and verify that:
+(a) no NaN remain after imputation, and (b) the imputed mean of `hours_studied` matches
+the observed train mean within 0.5 units.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.impute import KNNImputer
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(7)
+n = 500
+hours = rng.uniform(1, 10, n)
+df = pd.DataFrame({
+    'hours_studied': np.where(rng.random(n) < 0.15, np.nan, hours),
+    'exam_score':    50 + 4 * hours + rng.normal(0, 5, n),
+    'absences':      np.where(
+        (rng.random(n) < 0.3),  # higher-score students tend to have absences missing
+        np.nan,
+        rng.integers(0, 10, n).astype(float)
+    ),
+})
+
+X_train, X_test = train_test_split(df, test_size=0.2, random_state=0)
+observed_mean = X_train['hours_studied'].mean()
+
+imp = KNNImputer(n_neighbors=5)
+imp.fit(X_train)
+X_train_imp = pd.DataFrame(imp.transform(X_train), columns=df.columns)
+X_test_imp  = pd.DataFrame(imp.transform(X_test),  columns=df.columns)
+
+print(f"NaN in train after: {X_train_imp.isnull().sum().sum()}")
+print(f"NaN in test after:  {X_test_imp.isnull().sum().sum()}")
+print(f"Observed mean: {observed_mean:.3f}")
+print(f"Imputed mean:  {X_train_imp['hours_studied'].mean():.3f}")
+print(f"Difference:    {abs(X_train_imp['hours_studied'].mean() - observed_mean):.3f}")
+```
+
+The KNNImputer fills missing values by averaging the 5 nearest observed neighbours, so the
+imputed mean stays close to the true mean. The key insight: fit on train, transform both.
+</details>

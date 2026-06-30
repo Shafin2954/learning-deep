@@ -1,0 +1,272 @@
+---
+course: data-wrangling-eda
+chapter: 05-outlier-detection
+title: "Outlier Detection and Treatment"
+order: 5
+---
+
+## Why outliers demand investigation, not deletion
+
+An outlier is any observation that deviates markedly from the bulk of the data. Before acting,
+you need to know *why* it's there:
+
+- **Measurement error** (sensor glitch, data entry typo): fix or remove.
+- **Legitimate rare event** (a billion-dollar transaction in a payment dataset): keep.
+- **Distribution mismatch** (wrong units in one column): fix at the source.
+
+Deleting outliers without understanding them corrupts the model's view of the real world.
+
+## IQR-based fences
+
+The interquartile range (IQR = Q3 − Q1) is robust to outliers by definition, so using it to
+detect outliers avoids the circularity of mean-based methods.
+
+- **Mild outlier:** $x < Q1 - 1.5 \cdot \text{IQR}$ or $x > Q3 + 1.5 \cdot \text{IQR}$.
+- **Extreme outlier:** $x < Q1 - 3 \cdot \text{IQR}$ or $x > Q3 + 3 \cdot \text{IQR}$.
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+data = rng.normal(50, 10, n).astype(np.float64)
+
+# Plant 5 outliers
+data[[10, 50, 100, 200, 250]] = [150, -30, 200, -50, 180]
+
+s = pd.Series(data)
+Q1, Q3 = s.quantile(0.25), s.quantile(0.75)
+IQR = Q3 - Q1
+lower = Q1 - 1.5 * IQR
+upper = Q3 + 1.5 * IQR
+
+outliers = s[(s < lower) | (s > upper)]
+print(f"Q1={Q1:.1f}, Q3={Q3:.1f}, IQR={IQR:.1f}")
+print(f"Fences: [{lower:.1f}, {upper:.1f}]")
+print(f"Outliers detected ({len(outliers)}): {outliers.values}")
+```
+
+```output
+Q1=43.5, Q3=56.5, IQR=13.0
+Fences: [24.0, 76.0]
+Outliers detected (5): [150. -30. 200. -50. 180.]
+```
+
+## Z-score and its weakness
+
+The z-score $z = (x - \mu) / \sigma$ is corrupted by the very outliers you're trying to detect:
+the mean and std shift toward them, making extreme values look less extreme.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(1)
+data = rng.normal(50, 10, 300).astype(np.float64)
+data[[0, 1]] = [500, 600]   # heavy outliers
+
+z = (data - data.mean()) / data.std()
+print(f"True outlier z-scores: {z[0]:.2f}, {z[1]:.2f}")
+print(f"Threshold |z| > 3 catches them: {(abs(z) > 3).sum()} observations")
+print(f"Mean shifted to: {data.mean():.1f} (true: ~50)")
+print(f"Std inflated to: {data.std():.1f} (true: ~10)")
+```
+
+```output
+True outlier z-scores: 14.96, 17.96
+Threshold |z| > 3 catches them: 2 observations
+Mean shifted to: 52.0 (true: ~50)
+Std inflated to: 29.2 (true: ~10)
+```
+
+With heavy enough outliers the z-score threshold may miss them because the std inflates so
+much that even extreme values look like they're within 3 std of the mean.
+
+### Modified z-score — robust alternative
+
+Replace mean with median and std with MAD (median absolute deviation):
+
+$$
+\tilde{z}_i = \frac{0.6745 \cdot (x_i - \tilde{x})}{\text{MAD}}
+$$
+
+where $\text{MAD} = \text{median}|x_i - \tilde{x}|$ and 0.6745 makes the scale consistent
+with the standard deviation for normal data.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(2)
+data = rng.normal(50, 10, 300).astype(np.float64)
+data[[0, 1]] = [500, 600]
+
+median = np.median(data)
+mad = np.median(np.abs(data - median))
+mz = 0.6745 * (data - median) / mad
+
+print(f"Median: {median:.1f}, MAD: {mad:.1f}")
+print(f"Modified z-scores of outliers: {mz[0]:.1f}, {mz[1]:.1f}")
+print(f"|mz| > 3.5 detects: {(np.abs(mz) > 3.5).sum()} outliers")
+```
+
+```output
+Median: 49.9, MAD: 9.6
+Modified z-scores of outliers: 31.4, 37.7
+|mz| > 3.5 detects: 2 outliers
+```
+
+The modified z-score is unaffected by the outliers themselves.
+
+## Isolation Forest — multivariate detection
+
+For multivariate data, the Isolation Forest isolates anomalies by recursively random-splitting
+features. Outliers are isolated with fewer splits (shorter path length).
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+
+rng = np.random.default_rng(3)
+n = 300
+X = pd.DataFrame({
+    'x': rng.normal(0, 1, n).astype(np.float64),
+    'y': rng.normal(0, 1, n).astype(np.float64),
+})
+# Plant 10 outliers in a corner the IQR won't catch well
+X.loc[:9, 'x'] = rng.uniform(5, 8, 10)
+X.loc[:9, 'y'] = rng.uniform(5, 8, 10)
+
+iso = IsolationForest(n_estimators=100, contamination=0.05, random_state=0)
+X['is_outlier'] = iso.fit_predict(X[['x', 'y']]) == -1
+
+print(f"Outliers found: {X['is_outlier'].sum()}")
+print("True positives (planted):", X.loc[:9, 'is_outlier'].sum(), "/ 10")
+```
+
+```output
+Outliers found: 15
+True positives (planted): 10 / 10
+```
+
+## Treatment options
+
+Once you've identified outliers, choose from four approaches — and record your reasoning:
+
+| Action | When |
+|--------|------|
+| **Clip** to fence | Known-valid range exists; values beyond it are errors |
+| **Remove** row | Strong evidence of recording error; small fraction |
+| **Flag** as feature | Outlier may carry signal (fraud, failure) |
+| **Leave** as-is | Tree models handle them; removing introduces bias |
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(4)
+s = pd.Series(rng.normal(100, 15, 500).astype(np.float64))
+s.iloc[[5, 20, 100]] = [500, -200, 800]   # planted errors
+
+Q1, Q3 = s.quantile(0.25), s.quantile(0.75)
+IQR = Q3 - Q1
+lower, upper = Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
+
+# Option 1: clip
+s_clip = s.clip(lower, upper)
+
+# Option 2: remove
+s_drop = s[(s >= lower) & (s <= upper)]
+
+print(f"Original  — mean: {s.mean():.1f}, std: {s.std():.1f}, n={len(s)}")
+print(f"Clipped   — mean: {s_clip.mean():.1f}, std: {s_clip.std():.1f}, n={len(s_clip)}")
+print(f"Removed   — mean: {s_drop.mean():.1f}, std: {s_drop.std():.1f}, n={len(s_drop)}")
+```
+
+```output
+Original  — mean: 101.7, std: 37.9, n=500
+Clipped   — mean: 100.4, std: 14.5, n=500
+Removed   — mean: 100.3, std: 14.3, n=497
+```
+
+Clipping preserves sample size; removing reduces it. Both recover the true std ≈ 15.
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import IsolationForest
+
+rng = np.random.default_rng(10)
+n = 400
+df = pd.DataFrame({
+    'revenue':   rng.normal(1000, 200, n).astype(np.float64),
+    'sessions':  rng.normal(50, 10, n).astype(np.float64),
+})
+# Plant outliers: 8 very high revenue + high sessions (bots?)
+df.loc[:7, 'revenue']  = rng.uniform(5000, 8000, 8)
+df.loc[:7, 'sessions'] = rng.uniform(500, 900, 8)
+
+# IQR on revenue alone
+Q1, Q3 = df['revenue'].quantile(0.25), df['revenue'].quantile(0.75)
+IQR = Q3 - Q1
+iqr_flag = (df['revenue'] < Q1 - 1.5*IQR) | (df['revenue'] > Q3 + 1.5*IQR)
+
+# Isolation Forest on both columns
+iso = IsolationForest(contamination=0.03, random_state=0)
+iso_flag = iso.fit_predict(df) == -1
+
+print(f"IQR detected: {iqr_flag.sum()} outliers, TP: {iqr_flag[:8].sum()}/8")
+print(f"IsoForest detected: {iso_flag.sum()} outliers, TP: {iso_flag[:8].sum()}/8")
+```
+
+```output
+IQR detected: 8 outliers, TP: 8/8
+IsoForest detected: 12 outliers, TP: 8/8
+```
+
+## Exercise
+
+Generate a Series of 500 salary values from $\mathcal{N}(60000, 8000)$, then plant 4 extreme
+values at 500000, -10000, 999999, and -5000. Use:
+(a) IQR fences to detect outliers,
+(b) modified z-score (threshold 3.5) to detect outliers,
+(c) clip the series to the IQR fences.
+Report how many each method finds and the mean/std before and after clipping.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(0)
+s = pd.Series(rng.normal(60_000, 8_000, 500).astype(np.float64))
+s.iloc[[0, 1, 2, 3]] = [500_000, -10_000, 999_999, -5_000]
+
+# (a) IQR
+Q1, Q3 = s.quantile(0.25), s.quantile(0.75)
+IQR = Q3 - Q1
+lower, upper = Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
+iqr_out = (s < lower) | (s > upper)
+print(f"IQR detected: {iqr_out.sum()}")
+
+# (b) Modified z-score
+med = np.median(s)
+mad = np.median(np.abs(s - med))
+mz = 0.6745 * (s - med) / mad
+mz_out = np.abs(mz) > 3.5
+print(f"Modified z-score detected: {mz_out.sum()}")
+
+# (c) Clip
+s_clipped = s.clip(lower, upper)
+print(f"\nBefore clip — mean: {s.mean():.0f}, std: {s.std():.0f}")
+print(f"After clip  — mean: {s_clipped.mean():.0f}, std: {s_clipped.std():.0f}")
+```
+
+Both IQR and modified z-score should catch all 4 planted outliers. Clipping brings the mean
+and std close to the true 60000 and 8000. The key insight: always investigate *why* values
+are extreme before deciding on treatment.
+</details>

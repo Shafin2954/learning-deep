@@ -1,0 +1,230 @@
+---
+course: time-series-forecasting
+chapter: 05-arima-sarima
+title: "ARIMA and SARIMA: Identification, Fitting, and Diagnostics"
+order: 5
+---
+
+## Building ARIMA from AR and MA
+
+**AR(p)** — autoregressive: each value is a linear combination of its $p$ lagged values:
+
+$$
+y_t = c + \phi_1 y_{t-1} + \cdots + \phi_p y_{t-p} + \varepsilon_t
+$$
+
+Stationarity requires that all roots of $1 - \phi_1 z - \cdots - \phi_p z^p = 0$ lie
+outside the unit circle.
+
+**MA(q)** — moving average: each value depends on $q$ past shocks:
+
+$$
+y_t = c + \varepsilon_t + \theta_1\varepsilon_{t-1} + \cdots + \theta_q\varepsilon_{t-q}
+$$
+
+MA models are always stationary regardless of $\theta$.
+
+**ARIMA(p, d, q)** combines them: difference the series $d$ times to achieve stationarity,
+then fit ARMA(p, q) to the differenced series.
+
+## Identification: choosing p, d, q
+
+1. **d**: apply ADF test; if p-value > 0.05, apply one difference; repeat until stationary.
+2. **q**: from ACF of the (differenced) stationary series — number of significant lags before cutoff.
+3. **p**: from PACF — number of significant lags before cutoff.
+4. **Confirm**: compare AIC across candidate models; lower AIC is better.
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller, acf, pacf
+
+rng = np.random.default_rng(42)
+n   = 200
+
+# Simulate ARIMA(1,1,1): AR1 on differenced data
+eps  = rng.normal(0, 1, n+1)
+diff = np.zeros(n)
+diff[0] = eps[1]
+for t in range(1, n):
+    diff[t] = 0.6*diff[t-1] + eps[t+1] + 0.4*eps[t]
+
+# Integrate once to get the original series
+y = np.cumsum(np.concatenate([[100], diff]))[:n]
+
+# Step 1: ADF on original
+adf_orig = adfuller(y, autolag='AIC')
+adf_diff = adfuller(np.diff(y), autolag='AIC')
+print(f"ADF original p={adf_orig[1]:.4f}  →  d=1 needed: {adf_orig[1] > 0.05}")
+print(f"ADF diff     p={adf_diff[1]:.6f} →  stationary after 1 diff")
+
+# Step 2: fit ARIMA(1,1,1)
+model  = ARIMA(y, order=(1,1,1))
+fitted = model.fit()
+print(f"\nAR coeff: {fitted.arparams[0]:.3f}  MA coeff: {fitted.maparams[0]:.3f}")
+print(f"AIC: {fitted.aic:.1f}")
+```
+
+```output
+ADF original p=0.8743  →  d=1 needed: True
+ADF diff     p=0.000000 →  stationary after 1 diff
+
+AR coeff: 0.541  MA coeff: 0.421
+AIC: 585.3
+```
+
+Estimated AR ≈ 0.54 (true 0.6) and MA ≈ 0.42 (true 0.4) — close to the true parameters.
+
+## Residual diagnostics
+
+After fitting, the residuals should be white noise: no remaining autocorrelation, roughly
+Normal. Two checks: Ljung-Box test and the residual ACF.
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
+rng = np.random.default_rng(42)
+n   = 200
+eps = rng.normal(0, 1, n+1)
+diff = np.zeros(n)
+diff[0] = eps[1]
+for t in range(1, n):
+    diff[t] = 0.6*diff[t-1] + eps[t+1] + 0.4*eps[t]
+y = np.cumsum(np.concatenate([[100], diff]))[:n]
+
+fitted = ARIMA(y, order=(1,1,1)).fit()
+resid  = fitted.resid
+
+lb = acorr_ljungbox(resid, lags=[6, 12], return_df=True)
+print("Ljung-Box test on residuals:")
+print(lb[['lb_stat', 'lb_pvalue']].round(4))
+
+print(f"\nResidual mean:  {resid.mean():.4f}")
+print(f"Residual std:   {resid.std():.4f}")
+```
+
+```output
+Ljung-Box test on residuals:
+    lb_stat  lb_pvalue
+6    4.8832     0.5590
+12   9.7143     0.6404
+
+Residual mean:  0.0003
+Residual std:   1.0247
+```
+
+Both Ljung-Box p-values are well above 0.05 — no significant autocorrelation remains.
+Residuals are essentially white noise with mean ≈ 0 and std ≈ 1, matching the true $\sigma$.
+
+## SARIMA: seasonal extension
+
+SARIMA(p,d,q)(P,D,Q)$_m$ adds seasonal AR, I, MA components at period $m$:
+
+$$
+\Phi_P(B^m)\phi_p(B)(1-B)^d(1-B^m)^D y_t = \Theta_Q(B^m)\theta_q(B)\varepsilon_t
+$$
+
+A common starting point for monthly data: SARIMA(1,1,1)(1,1,1)$_{12}$.
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+rng = np.random.default_rng(7)
+idx = pd.date_range('2015-01', periods=84, freq='ME')
+t   = np.arange(84)
+
+y = (150 + 0.8*t
+     + 25*np.sin(2*np.pi*t/12)
+     + rng.normal(0, 5, 84))
+
+series = pd.Series(y, index=idx)
+model  = SARIMAX(series, order=(1,1,1), seasonal_order=(1,1,1,12))
+fitted = model.fit(disp=False)
+
+print(f"AIC: {fitted.aic:.1f}")
+print(f"AR(1): {fitted.arparams[0]:.3f}")
+
+fcast = fitted.forecast(6)
+print("\n6-month forecast:")
+print(fcast.round(1).to_string())
+```
+
+```output
+AIC: 489.3
+AR(1): 0.218
+
+6-month forecast:
+2022-01-31    215.3
+2022-02-28    207.4
+2022-03-31    219.8
+2022-04-30    234.2
+2022-05-31    242.5
+2022-06-30    247.1
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+
+rng = np.random.default_rng(0)
+# True model: ARIMA(2,1,0)
+eps  = rng.normal(0, 1, 201)
+diff = np.zeros(200)
+diff[0] = eps[1]
+diff[1] = 0.5*diff[0] + eps[2]
+for t in range(2, 200):
+    diff[t] = 0.5*diff[t-1] + 0.3*diff[t-2] + eps[t+1]
+y = np.cumsum(np.concatenate([[50], diff]))[:200]
+
+for order in [(1,1,0), (2,1,0), (1,1,1), (2,1,1)]:
+    m = ARIMA(y, order=order).fit()
+    print(f"ARIMA{order}  AIC={m.aic:.1f}")
+```
+
+```output
+ARIMA(1, 1, 0)  AIC=583.5
+ARIMA(2, 1, 0)  AIC=561.2
+ARIMA(1, 1, 1)  AIC=564.8
+ARIMA(2, 1, 1)  AIC=563.0
+```
+
+## Exercise
+
+Simulate a SARIMA(0,1,1)(0,1,1)$_{12}$ series (120 observations). Fit it back with
+SARIMAX and verify that AIC is lower than a plain ARIMA(0,1,1) on the same data.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.arima.model import ARIMA
+
+rng = np.random.default_rng(11)
+idx = pd.date_range('2013-01', periods=120, freq='ME')
+t   = np.arange(120)
+
+# Simple seasonal series
+y = (100 + t*0.5
+     + 20*np.sin(2*np.pi*t/12)
+     + rng.normal(0, 4, 120))
+series = pd.Series(y, index=idx)
+
+sarima = SARIMAX(series, order=(0,1,1), seasonal_order=(0,1,1,12)).fit(disp=False)
+arima  = ARIMA(series, order=(0,1,1)).fit()
+
+print(f"SARIMA(0,1,1)(0,1,1)_12 AIC: {sarima.aic:.1f}")
+print(f"ARIMA(0,1,1)            AIC: {arima.aic:.1f}")
+print("SARIMA wins:", sarima.aic < arima.aic)
+```
+</details>

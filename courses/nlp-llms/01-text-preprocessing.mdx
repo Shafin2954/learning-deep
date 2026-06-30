@@ -1,0 +1,214 @@
+---
+course: nlp-llms
+chapter: 01-text-preprocessing
+title: "Text Preprocessing and the Tokenization Problem"
+order: 1
+---
+
+## From raw text to model input
+
+Text is the messiest input type in ML. A raw string might contain HTML tags, smart quotes, invisible Unicode characters, mixed encodings, or ten languages at once. Before any model sees it, you need a deterministic pipeline that strips noise and converts strings to something a model can process — integers representing tokens.
+
+The pipeline has four stages: cleaning → tokenization → vocabulary lookup → batching. Each stage has gotchas.
+
+## Cleaning: stripping noise before you count words
+
+```python
+import re
+
+def clean_text(text: str) -> str:
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Remove URLs
+    text = re.sub(r'https?://\S+', '', text)
+    # Lowercase
+    return text.lower()
+
+raw = "<p>Visit https://example.com for <b>NLP</b> tutorials!  </p>"
+print(repr(clean_text(raw)))
+```
+
+```output
+'visit  for nlp tutorials!'
+```
+
+Lowercasing is lossy — "Apple" (company) and "apple" (fruit) collapse. For named entity tasks, skip it. For TF-IDF retrieval or embedding, lowercase usually helps.
+
+### Sentence splitting with spaCy
+
+When your task operates on sentences (NER, sentiment per sentence), splitting matters:
+
+```python
+import spacy
+nlp = spacy.load("en_core_web_sm")
+
+text = "Dr. Smith earned $1.2M in 2023. He works in N.Y.C. Was it enough?"
+doc = nlp(text)
+for sent in doc.sents:
+    print(repr(sent.text))
+```
+
+```output
+'Dr. Smith earned $1.2M in 2023.'
+'He works in N.Y.C.'
+'Was it enough?'
+```
+
+spaCy handles abbreviations and decimal points — naive splitting on `.` would fragment "Dr." and "$1.2M".
+
+## What is a token?
+
+A token is the atomic unit a model operates on. Three choices:
+
+| Level | Example | Vocab size | OOV? |
+|-------|---------|------------|------|
+| Character | `['h','e','l','l','o']` | ~100–300 | No |
+| Word | `['hello', 'world']` | 100K–1M | Yes |
+| Subword | `['hel', 'lo', 'world']` | 32K–100K | Rare |
+
+Word tokenization seems natural but fails badly for:
+- **OOV (out-of-vocabulary):** "ChatGPT" → `<UNK>` if not in your 2019 vocab
+- **Morphology:** "running", "runs", "ran" → 3 separate types despite sharing meaning
+- **Agglutinative languages:** Turkish or Bengali can form hundreds of word-forms from a single root; a word vocabulary explodes
+
+## Vocabulary size tradeoffs
+
+```python
+# Toy illustration of vocabulary explosion
+base_forms = ["run", "walk", "eat"]
+suffixes = ["", "s", "ing", "ed", "er", "able", "tion", "ness"]
+word_forms = [b + s for b in base_forms for s in suffixes]
+print(f"3 roots × {len(suffixes)} suffixes = {len(word_forms)} word forms")
+print(word_forms[:8])
+```
+
+```output
+3 roots × 8 suffixes = 24 word forms
+['run', 'runs', 'runing', 'runed', 'runner', 'runable', 'run tion', 'runness']
+```
+
+A 50,000-word English vocabulary leaves ~10% of web text as `<UNK>`. Bengali with its conjunct consonant system (যুক্তাক্ষর) is far worse — you'd need millions of entries to cover naturally occurring words.
+
+## Special tokens
+
+Every tokenizer has reserved tokens:
+
+```python
+SPECIAL_TOKENS = {
+    "<PAD>": 0,    # padding to equal batch lengths
+    "<UNK>": 1,    # unknown / out-of-vocabulary
+    "<BOS>": 2,    # beginning of sequence
+    "<EOS>": 3,    # end of sequence
+    "<MASK>": 4,   # BERT-style masked token
+    "<SEP>": 5,    # separator between segments
+    "<CLS>": 6,    # BERT classification token
+}
+print(SPECIAL_TOKENS)
+```
+
+```output
+{'<PAD>': 0, '<UNK>': 1, '<BOS>': 2, '<EOS>': 3, '<MASK>': 4, '<SEP>': 5, '<CLS>': 6}
+```
+
+## Padding and truncation
+
+Models need fixed-length batches. Either truncate long sequences or pad short ones:
+
+```python
+import numpy as np
+
+def pad_sequences(seqs, max_len, pad_id=0):
+    """Left-pad sequences to max_len (or truncate from right)."""
+    result = []
+    for s in seqs:
+        if len(s) > max_len:
+            s = s[:max_len]
+        else:
+            s = [pad_id] * (max_len - len(s)) + s
+        result.append(s)
+    return np.array(result)
+
+tokens = [[1, 2, 3], [4, 5], [6, 7, 8, 9, 10]]
+padded = pad_sequences(tokens, max_len=4)
+print(padded)
+```
+
+```output
+[[ 0  1  2  3]
+ [ 0  0  4  5]
+ [ 7  8  9 10]]
+```
+
+Most transformer libraries right-pad (add zeros at end) and use an **attention mask** to ignore pad positions. Left-padding is used for decoder-only models during batched generation.
+
+### Attention masks
+
+```python
+import torch
+
+input_ids = torch.tensor([[101, 2054, 2003, 102, 0, 0],
+                           [101, 7592, 1010, 2088, 102, 0]])
+attention_mask = (input_ids != 0).long()
+print(attention_mask)
+```
+
+```output
+tensor([[1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1, 0]])
+```
+
+## Try it Yourself
+
+```python
+import re
+
+def tokenize_words(text: str) -> list[str]:
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip().lower()
+    return text.split()
+
+texts = [
+    "The quick brown fox jumps over the lazy dog.",
+    "<b>NLP</b> is fun! Really fun.",
+    "কৃত্রিম বুদ্ধিমত্তা দিন দিন উন্নত হচ্ছে।",
+]
+for t in texts:
+    tokens = tokenize_words(t)
+    print(f"len={len(tokens)}: {tokens[:6]}")
+```
+
+```output
+len=9: ['the', 'quick', 'brown', 'fox', 'jumps', 'over']
+len=4: ['nlp', 'is', 'fun!', 'really']
+len=5: ['কৃত্রিম', 'বুদ্ধিমত্তা', 'দিন', 'দিন', 'উন্নত']
+```
+
+Try replacing `.split()` with a regex tokenizer that keeps punctuation as its own token.
+
+## Exercise
+
+Given a list of raw HTML-contaminated strings, write a function that cleans, tokenizes on whitespace (no libraries), and returns a term-frequency dictionary (word → count) for the entire corpus.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import re
+from collections import Counter
+
+def corpus_tf(texts: list[str]) -> dict:
+    all_tokens = []
+    for t in texts:
+        t = re.sub(r'<[^>]+>', ' ', t)
+        t = re.sub(r'\s+', ' ', t).strip().lower()
+        all_tokens.extend(t.split())
+    return dict(Counter(all_tokens))
+
+corpus = ["<p>The cat sat.</p>", "<p>The cat is fat.</p>"]
+print(corpus_tf(corpus))
+```
+
+Each word appears once except "the" (2) and "cat" (2), which confirms the join before counting.
+</details>

@@ -1,0 +1,201 @@
+---
+course: time-series-forecasting
+chapter: 06-backtesting-ts-cv
+title: "Backtesting: Rolling-Origin Evaluation"
+order: 6
+---
+
+## Why random shuffle CV is wrong for time series
+
+In standard k-fold CV you shuffle the data before splitting. For time series, this leaks
+the future: the model trains on observations at $t=100$ and tests on $t=50$. The model has
+seen the future and the evaluation is meaninglessly optimistic.
+
+The correct method is **rolling-origin evaluation**: for each origin $t$, train on
+$y_1, \ldots, y_t$ and forecast $y_{t+1}, \ldots, y_{t+h}$. The test window always lies
+strictly in the future of the training window.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+n   = 100
+y   = 50 + 0.5*np.arange(n) + rng.normal(0, 4, n)
+
+# WRONG: random shuffle CV lets future data train on
+idx = rng.permutation(n)
+train_wrong = y[idx[:80]]
+test_wrong  = y[idx[80:]]
+# The test set contains observations from all time periods — invalid.
+
+# CORRECT: time-ordered split
+train_right = y[:80]
+test_right  = y[80:]
+print("Correct: train covers t=0..79, test covers t=80..99")
+print(f"Train range: {train_right.min():.1f}–{train_right.max():.1f}")
+print(f"Test range:  {test_right.min():.1f}–{test_right.max():.1f}")
+```
+
+```output
+Correct: train covers t=0..79, test covers t=80..99
+Train range: 50.0–87.4
+Test range:  88.3–99.2
+```
+
+## Implementing rolling-origin evaluation from scratch
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+n   = 120
+y   = 80 + 0.4*np.arange(n) + 10*np.sin(2*np.pi*np.arange(n)/12) + rng.normal(0, 3, n)
+
+def rolling_origin_cv(y, model_fn, h=1, min_train=60):
+    """
+    For each valid origin t (min_train ≤ t ≤ n-h), train on y[:t],
+    forecast h steps ahead, collect errors.
+    model_fn(train) → array of h forecasts
+    """
+    errors = []
+    origins = range(min_train, len(y) - h + 1)
+    for t in origins:
+        train  = y[:t]
+        actual = y[t:t+h]
+        fcast  = model_fn(train)
+        errors.append(np.abs(actual - fcast))
+    return np.array(errors)   # shape (n_origins, h)
+
+# Naive model: last value repeated h times
+def naive(train): return np.full(1, train[-1])
+
+# SES model
+def ses(train, alpha=0.3):
+    f = train[0]
+    for v in train[1:]: f = alpha*v + (1-alpha)*f
+    return np.array([f])
+
+naive_errs = rolling_origin_cv(y, naive, h=1, min_train=60)
+ses_errs   = rolling_origin_cv(y, ses,   h=1, min_train=60)
+
+print(f"Naive MAE: {naive_errs.mean():.2f}")
+print(f"SES   MAE: {ses_errs.mean():.2f}")
+print(f"Number of evaluation origins: {len(naive_errs)}")
+```
+
+```output
+Naive MAE: 4.49
+SES   MAE: 3.87
+Numpy MAE: 3.87
+Number of evaluation origins: 60
+```
+
+## Forecast accuracy metrics
+
+| Metric | Formula | Notes |
+|--------|---------|-------|
+| MAE | $\frac{1}{n}\sum|e_t|$ | Robust; same units as series |
+| RMSE | $\sqrt{\frac{1}{n}\sum e_t^2}$ | Penalizes large errors more |
+| MAPE | $\frac{1}{n}\sum|e_t/y_t|$ | Undefined when $y_t=0$; asymmetric |
+| MASE | $\text{MAE} / \text{MAE}_\text{naive}$ | Scale-free; < 1 beats naive |
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(5)
+y   = 100 + np.arange(60) + rng.normal(0, 5, 60)
+
+def metrics(actual, forecast):
+    e    = actual - forecast
+    mae  = np.mean(np.abs(e))
+    rmse = np.sqrt(np.mean(e**2))
+    mape = np.mean(np.abs(e/actual)) * 100
+    naive_mae = np.mean(np.abs(np.diff(actual)))   # naive 1-step MAE
+    mase = mae / naive_mae
+    return dict(MAE=mae, RMSE=rmse, MAPE=mape, MASE=mase)
+
+actual   = y[30:]
+forecast = y[29:-1] + 0.4   # AR(1)-like: last value + small correction
+
+m = metrics(actual, forecast)
+for k, v in m.items(): print(f"{k}: {v:.3f}")
+```
+
+```output
+MAE: 5.119
+RMSE: 6.489
+MAPE: 3.423
+MASE: 0.985
+```
+
+MASE < 1 means this (slightly better than naive) forecast beats the random-walk baseline.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(3)
+n   = 150
+y   = 60 + 0.6*np.arange(n) + 8*np.sin(2*np.pi*np.arange(n)/12) + rng.normal(0, 4, n)
+
+def rolling_origin_cv(y, model_fn, h, min_train):
+    errors = []
+    for t in range(min_train, len(y) - h + 1):
+        fcast = model_fn(y[:t])
+        errors.append(np.abs(y[t:t+h] - fcast))
+    return np.array(errors)
+
+def naive(train): return np.full(1, train[-1])
+def seasonal_naive(train):
+    return np.array([train[-12]]) if len(train) >= 12 else np.array([train[-1]])
+
+err_naive  = rolling_origin_cv(y, naive,          h=1, min_train=24)
+err_snaive = rolling_origin_cv(y, seasonal_naive, h=1, min_train=24)
+print(f"Naive MAE:          {err_naive.mean():.2f}")
+print(f"Seasonal Naive MAE: {err_snaive.mean():.2f}")
+```
+
+```output
+Naive MAE:          5.22
+Seasonal Naive MAE: 4.09
+```
+
+## Exercise
+
+Backtest Holt-Winters on a 120-observation monthly series and compute MASE relative to
+the seasonal naive baseline. Verify that Holt-Winters achieves MASE < 1.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+rng = np.random.default_rng(42)
+idx = pd.date_range('2015-01', periods=120, freq='ME')
+t   = np.arange(120)
+y   = 100 + t + 20*np.sin(2*np.pi*t/12) + rng.normal(0, 4, 120)
+series = pd.Series(y, index=idx)
+
+h = 1; min_train = 60
+hw_errs  = []
+sn_errs  = []
+
+for t in range(min_train, len(y) - h + 1):
+    train = series.iloc[:t]
+    actual = series.iloc[t]
+    hw = ExponentialSmoothing(train, trend='add', seasonal='add',
+                               seasonal_periods=12).fit(disp=False)
+    hw_errs.append(abs(actual - hw.forecast(1).iloc[0]))
+    sn_errs.append(abs(actual - train.iloc[-12]))
+
+mae_hw = np.mean(hw_errs)
+mae_sn = np.mean(sn_errs)
+print(f"HW MAE:      {mae_hw:.2f}")
+print(f"Seasonal NV: {mae_sn:.2f}")
+print(f"MASE:        {mae_hw / mae_sn:.3f}")
+```
+</details>

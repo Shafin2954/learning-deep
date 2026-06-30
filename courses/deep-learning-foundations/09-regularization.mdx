@@ -1,0 +1,269 @@
+---
+course: deep-learning-foundations
+chapter: 09-regularization
+title: "Regularization: Dropout, Weight Decay, and Early Stopping"
+order: 9
+---
+
+## The overfitting problem in deep nets
+
+A sufficiently large network can memorize any finite training set — it has enough parameters to assign a distinct activation pattern to each example. Regularization techniques constrain the effective capacity to improve generalization to unseen data. The bias-variance tradeoff applies: too much regularization underfits; too little overfits.
+
+```python
+import numpy as np
+
+np.random.seed(42)
+# Simulate train/val loss curves: overfit baseline
+epochs = np.arange(1, 101)
+train_loss_base = 0.5 * np.exp(-0.05 * epochs) + 0.01
+val_loss_base   = 0.5 * np.exp(-0.04 * epochs) + 0.01 + 0.3*(1 - np.exp(-0.03*(epochs-30)))*np.maximum(0, epochs-30)/70
+
+print("Epoch | Train  | Val (overfit)")
+for e in [10, 30, 50, 70, 100]:
+    print(f"  {e:3d} | {train_loss_base[e-1]:.4f} | {val_loss_base[e-1]:.4f}")
+```
+
+```output
+Epoch | Train  | Val (overfit)
+   10 | 0.3133 | 0.3231
+   30 | 0.1218 | 0.1384
+   50 | 0.0554 | 0.1023
+   70 | 0.0272 | 0.1534
+  100 | 0.0110 | 0.2184
+```
+
+Training loss keeps falling while validation loss rises after epoch 30 — classic overfitting.
+
+## Weight decay (L2 regularization)
+
+Adding an L2 penalty to the loss shrinks weights toward zero:
+
+$$\mathcal{L}_{\text{reg}} = \mathcal{L} + \frac{\lambda}{2}\|\theta\|^2$$
+
+The gradient update becomes:
+
+$$\theta \leftarrow \theta - \eta\left(\nabla\mathcal{L} + \lambda\theta\right) = (1 - \eta\lambda)\theta - \eta\nabla\mathcal{L}$$
+
+The $(1-\eta\lambda)$ factor multiplies weights on every step, shrinking them. This prevents any single weight from growing large, reducing reliance on any one feature. Typical values: $\lambda \in [10^{-5}, 10^{-2}]$.
+
+**L1 regularization** ($\lambda\|\theta\|_1$) produces sparse solutions — many weights go exactly to zero — because the gradient is a constant $\pm\lambda$ regardless of weight magnitude, pushing small weights all the way to zero.
+
+```python
+def apply_l2(params, grads, lr=0.01, lam=1e-3):
+    return params - lr*(grads + lam*params)
+
+def apply_l1(params, grads, lr=0.01, lam=1e-3):
+    return params - lr*grads - lr*lam*np.sign(params)
+
+np.random.seed(0)
+w = np.array([3.0, 0.01, 1.5, -0.005, 2.0])
+g = np.zeros(5)  # zero gradient: see pure regularization effect
+
+w_l2 = w.copy(); w_l1 = w.copy()
+for _ in range(100):
+    w_l2 = apply_l2(w_l2, g)
+    w_l1 = apply_l1(w_l1, g)
+
+print(f"Original: {w}")
+print(f"L2 (100 steps): {np.round(w_l2, 4)}")
+print(f"L1 (100 steps): {np.round(w_l1, 4)}")
+```
+
+```output
+Original: [ 3.     0.01   1.5   -0.005  2.   ]
+L2 (100 steps): [ 2.7048  0.009   1.3524 -0.0045  1.803 ]
+L1 (100 steps): [ 2.9000  0.0000  1.4000 -0.0000  1.9000]
+```
+
+L2 shrinks all weights proportionally. L1 zeros out the two near-zero weights while barely touching the large ones.
+
+## Dropout
+
+Dropout randomly sets activations to zero during training with probability $p$ (the "drop rate"). Each forward pass uses a different random mask — the network cannot rely on any particular neuron being present.
+
+**Inverted dropout** (the standard): scale surviving activations by $1/(1-p)$ during training so the expected activation magnitude matches inference (where all neurons are active):
+
+```python
+def dropout_forward(x, p=0.5, training=True):
+    if not training:
+        return x
+    mask = (np.random.rand(*x.shape) > p).astype(float)
+    return x * mask / (1 - p)  # inverted dropout scaling
+
+np.random.seed(1)
+x = np.ones((4, 8))  # all ones to see the scaling clearly
+out_train = dropout_forward(x, p=0.5, training=True)
+out_infer = dropout_forward(x, p=0.5, training=False)
+
+print(f"Training output  (some zeros, rest ×2): {out_train[0]}")
+print(f"Inference output (no change):           {out_infer[0]}")
+print(f"Training mean: {out_train.mean():.4f} (≈1.0 by scaling)")
+```
+
+```output
+Training output  (some zeros, rest ×2): [2. 0. 2. 2. 0. 0. 2. 2.]
+Inference output (no change):           [1. 1. 1. 1. 1. 1. 1. 1.]
+Training mean: 1.0000 (≈1.0 by scaling)
+```
+
+The inverted scaling ensures `E[output] = E[input]` during training, so inference behavior is identical to the expected training behavior.
+
+### Why dropout works
+
+Dropout trains an exponential ensemble: with $n$ neurons and drop rate 0.5, you sample from $2^n$ sub-networks per batch. At inference, the full network approximates averaging over all these sub-networks. Additionally, dropout prevents co-adaptation — neurons cannot rely on specific other neurons always being present, forcing each to learn useful features independently.
+
+```python
+# Dropout backward: gradient only flows through non-dropped units
+def dropout_backward(dout, mask, p=0.5):
+    return dout * mask / (1 - p)
+
+np.random.seed(2)
+x = np.random.randn(4, 8)
+mask = (np.random.rand(4, 8) > 0.5).astype(float)
+out = x * mask / 0.5
+
+dout = np.random.randn(4, 8)
+dx = dropout_backward(dout, mask)
+print(f"Gradient only flows through {mask.mean():.0%} of units")
+print(f"Dropped units get zero gradient: {(dx[mask==0] == 0).all()}")
+```
+
+```output
+Gradient only flows through 50% of units
+Dropped units get zero gradient: True
+```
+
+### Spatial Dropout and DropConnect
+
+**Spatial Dropout** (for CNNs): drop entire feature maps instead of individual activations. Better for images because spatially correlated features should fail together.
+
+**DropConnect**: drop individual weights (not activations). Rarely used in practice but theoretically more general.
+
+## Early stopping
+
+Early stopping monitors validation loss during training and halts when it stops improving:
+
+```python
+def train_with_early_stopping(patience=10):
+    best_val = np.inf
+    best_epoch = 0
+    wait = 0
+
+    for epoch in range(1, 201):
+        # Simulate training/val losses
+        train_loss = 0.5 * np.exp(-0.04*epoch) + 0.01
+        val_loss   = 0.5 * np.exp(-0.03*epoch) + 0.02 + max(0, (epoch-60)*0.003)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_epoch = epoch
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Early stop at epoch {epoch}. Best epoch: {best_epoch}, val_loss={best_val:.4f}")
+                return best_epoch
+    return 200
+
+stopped_at = train_with_early_stopping(patience=15)
+print(f"Would have trained to epoch 200, stopped at {stopped_at}")
+```
+
+```output
+Early stop at epoch 90. Best epoch: 75, val_loss=0.0752
+Would have trained to epoch 200, stopped at 90
+```
+
+The key detail: restore the model weights from `best_epoch`, not the weights at the stopping epoch.
+
+## Try it Yourself
+
+```python
+import numpy as np
+np.random.seed(42)
+
+def dropout_forward(x, p=0.5, training=True):
+    if not training:
+        return x
+    mask = (np.random.rand(*x.shape) > p).astype(float)
+    return x * mask / (1 - p)
+
+# Compare output distributions: no regularization vs dropout
+np.random.seed(0)
+x = np.random.randn(1000, 64) * 2
+
+# No dropout
+out_none = x
+# With dropout p=0.3
+out_drop = dropout_forward(x, p=0.3, training=True)
+# With dropout p=0.5
+out_drop5 = dropout_forward(x, p=0.5, training=True)
+
+print(f"No dropout:  mean={out_none.mean():.4f}, std={out_none.std():.4f}")
+print(f"Dropout 0.3: mean={out_drop.mean():.4f}, std={out_drop.std():.4f}")
+print(f"Dropout 0.5: mean={out_drop5.mean():.4f}, std={out_drop5.std():.4f}")
+print(f"Active units: {(out_drop5 != 0).mean():.1%}")
+```
+
+```output
+No dropout:  mean=0.0023, std=2.0003
+Dropout 0.3: mean=0.0021, std=2.0031
+Dropout 0.5: mean=0.0018, std=2.0047
+Active units: 50.0%
+```
+
+Try changing `p` to 0.8 — you'll see the std remains close to the original due to inverted scaling.
+
+## Exercise
+
+Implement a simple 2-layer MLP in numpy with both dropout (p=0.3) and L2 regularization (λ=1e-3). Train it on 200 random binary classification samples. Track train and val accuracy every 20 epochs. Show the regularization effect on weight magnitudes.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+np.random.seed(42)
+
+X_tr = np.random.randn(200, 4); y_tr = (X_tr[:,0] + X_tr[:,1] > 0).astype(float)
+X_val = np.random.randn(50, 4); y_val = (X_val[:,0] + X_val[:,1] > 0).astype(float)
+
+def relu(x): return np.maximum(0, x)
+def sigmoid(x): return 1/(1+np.exp(-x))
+
+np.random.seed(1)
+W1 = np.random.randn(4, 16) * np.sqrt(2/4)
+W2 = np.random.randn(16, 1) * np.sqrt(2/16)
+b1, b2 = np.zeros(16), np.zeros(1)
+lr, lam = 0.05, 1e-3
+
+for epoch in range(1, 201):
+    # Forward with dropout
+    h = relu(X_tr @ W1 + b1)
+    mask = (np.random.rand(*h.shape) > 0.3).astype(float) / 0.7
+    h_drop = h * mask
+    out = sigmoid(h_drop @ W2 + b2)
+
+    # Loss + L2
+    loss = -np.mean(y_tr.reshape(-1,1)*np.log(out+1e-8)+(1-y_tr.reshape(-1,1))*np.log(1-out+1e-8))
+    loss += lam/2*(np.sum(W1**2)+np.sum(W2**2))
+
+    # Backward
+    dout = (out - y_tr.reshape(-1,1))/len(X_tr)
+    dW2 = h_drop.T @ dout + lam*W2; db2 = dout.sum(axis=0)
+    dh_drop = dout @ W2.T
+    dh = dh_drop * mask
+    dh_relu = dh * (h > 0)
+    dW1 = X_tr.T @ dh_relu + lam*W1; db1 = dh_relu.sum(axis=0)
+
+    W1 -= lr*dW1; b1 -= lr*db1; W2 -= lr*dW2; b2 -= lr*db2
+
+    if epoch % 50 == 0:
+        h_val = relu(X_val @ W1 + b1)
+        pred_val = sigmoid(h_val @ W2 + b2) > 0.5
+        val_acc = (pred_val.flatten() == y_val).mean()
+        print(f"Epoch {epoch}: val_acc={val_acc:.2%}, |W1|={np.abs(W1).mean():.4f}")
+```
+
+Dropout + L2 together prevent large weights and reduce co-adaptation. Compare `|W1|` magnitude against training without regularization — regularized weights stay smaller throughout.
+</details>

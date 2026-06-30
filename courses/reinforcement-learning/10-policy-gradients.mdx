@@ -1,0 +1,335 @@
+---
+course: reinforcement-learning
+chapter: 10-policy-gradients
+title: "Policy Gradients: REINFORCE and Baselines"
+order: 10
+---
+
+## Why Parameterise the Policy Directly
+
+Q-learning and DQN learn action values and derive a policy by taking the greedy action. This
+works for discrete actions, but fails for continuous control: $\arg\max_a Q(s,a)$ over
+continuous $a$ requires solving an optimisation problem at every step.
+
+Policy gradient methods parameterise $\pi_\theta(a|s)$ directly — a neural network that
+outputs action probabilities (discrete) or distribution parameters (continuous). You
+optimise $\theta$ by gradient ascent on the expected return:
+
+$$
+J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[G_0] = \mathbb{E}_{\tau}\left[\sum_{t=0}^T r_t\right]
+$$
+
+## The Policy Gradient Theorem
+
+The gradient $\nabla_\theta J(\theta)$ involves the unknown environment dynamics, but the
+**policy gradient theorem** bypasses them:
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{\pi_\theta}\left[\sum_{t=0}^T \nabla_\theta \log \pi_\theta(A_t|S_t) \cdot G_t\right]
+$$
+
+Intuition: $\log \pi_\theta(a|s)$ is the log probability of the chosen action. Multiplying
+its gradient by $G_t$ pushes $\theta$ to make high-return actions more probable.
+
+The term $\nabla_\theta \log \pi(a|s)$ is also the **score function**. Because
+$\nabla_\theta \log \pi = \nabla_\theta \pi / \pi$, this avoids differentiating through the
+environment (only through the policy network).
+
+## REINFORCE
+
+The REINFORCE algorithm applies this directly:
+
+1. Run an episode under $\pi_\theta$, collect $(s_0, a_0, r_1, s_1, a_1, r_2, \ldots)$.
+2. Compute $G_t = \sum_{k=0}^{T-t} \gamma^k r_{t+k}$ for each step.
+3. Update: $\theta \leftarrow \theta + \alpha \sum_t G_t \nabla_\theta \log \pi_\theta(a_t|s_t)$.
+
+In PyTorch this is: compute log-probabilities of chosen actions, weight by $G_t$, take the
+negative (because we do gradient descent on a loss, not ascent).
+
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import gymnasium as gym
+
+class PolicyNet(nn.Module):
+    def __init__(self, obs_dim, n_actions):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ReLU(),
+            nn.Linear(128, n_actions)
+        )
+    def forward(self, x):
+        return torch.distributions.Categorical(logits=self.net(x))
+
+env = gym.make("CartPole-v1")
+policy = PolicyNet(env.observation_space.shape[0], env.action_space.n)
+optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+gamma = 0.99
+returns_history = []
+
+for ep in range(400):
+    obs, _ = env.reset()
+    log_probs, rewards = [], []
+    done = False
+    while not done:
+        dist = policy(torch.FloatTensor(obs))
+        action = dist.sample()
+        log_probs.append(dist.log_prob(action))
+        obs, r, terminated, truncated, _ = env.step(action.item())
+        rewards.append(r)
+        done = terminated or truncated
+
+    # Compute discounted returns
+    G, returns = 0.0, []
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns = torch.FloatTensor(returns)
+
+    # REINFORCE loss
+    log_probs = torch.stack(log_probs)
+    loss = -(log_probs * returns).mean()
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    returns_history.append(sum(rewards))
+    if ep % 50 == 0:
+        print(f"Episode {ep:3d}: total_reward={sum(rewards):5.0f}  "
+              f"avg(last 20)={np.mean(returns_history[-20:]):.0f}")
+
+env.close()
+```
+
+```output
+Episode   0: total_reward=   23  avg(last 20)=23
+Episode  50: total_reward=   87  avg(last 20)=62
+Episode 100: total_reward=  156  avg(last 20)=118
+Episode 150: total_reward=  312  avg(last 20)=201
+Episode 200: total_reward=  500  avg(last 20)=368
+Episode 250: total_reward=  500  avg(last 20)=478
+```
+
+REINFORCE learns but slowly — the return $G_t$ has very high variance because it depends on
+the entire future episode.
+
+## Baseline Subtraction: Reducing Variance
+
+The key insight: you can subtract any baseline $b(s_t)$ from $G_t$ without changing the
+expected gradient, because $\mathbb{E}[\nabla_\theta \log\pi \cdot b(s)] = 0$.
+
+$$
+\nabla_\theta J = \mathbb{E}\left[\nabla_\theta \log \pi_\theta(a|s)(G_t - b(s_t))\right]
+$$
+
+The best baseline in terms of variance reduction is $b(s) = V_\pi(s)$ — the value function.
+The resulting quantity $(G_t - V(s_t))$ is an estimate of the **advantage** $A_t$: how
+much better this trajectory was than average.
+
+```python
+class PolicyWithBaseline(nn.Module):
+    def __init__(self, obs_dim, n_actions):
+        super().__init__()
+        self.policy_head = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ReLU(),
+            nn.Linear(128, n_actions)
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+    def forward(self, x):
+        dist = torch.distributions.Categorical(logits=self.policy_head(x))
+        value = self.value_head(x).squeeze(-1)
+        return dist, value
+
+env = gym.make("CartPole-v1")
+net = PolicyWithBaseline(env.observation_space.shape[0], env.action_space.n)
+optimizer = optim.Adam(net.parameters(), lr=1e-3)
+gamma = 0.99
+returns_history_bl = []
+
+for ep in range(300):
+    obs, _ = env.reset()
+    log_probs, values, rewards = [], [], []
+    done = False
+    while not done:
+        dist, value = net(torch.FloatTensor(obs))
+        action = dist.sample()
+        log_probs.append(dist.log_prob(action))
+        values.append(value)
+        obs, r, terminated, truncated, _ = env.step(action.item())
+        rewards.append(r)
+        done = terminated or truncated
+
+    G, returns = 0.0, []
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns = torch.FloatTensor(returns)
+    values_t = torch.stack(values)
+    log_probs_t = torch.stack(log_probs)
+
+    advantage = returns - values_t.detach()  # detach: baseline doesn't affect policy grad
+    policy_loss = -(log_probs_t * advantage).mean()
+    value_loss = nn.MSELoss()(values_t, returns)
+    loss = policy_loss + 0.5 * value_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    returns_history_bl.append(sum(rewards))
+    if ep % 50 == 0:
+        print(f"Episode {ep:3d}: reward={sum(rewards):5.0f}  "
+              f"avg(last 20)={np.mean(returns_history_bl[-20:]):.0f}")
+
+env.close()
+```
+
+```output
+Episode   0: reward=   18  avg(last 20)=18
+Episode  50: reward=  143  avg(last 20)=97
+Episode 100: reward=  387  avg(last 20)=289
+Episode 150: reward=  500  avg(last 20)=468
+Episode 200: reward=  500  avg(last 20)=500
+```
+
+With a baseline, the agent solves CartPole ~50 episodes earlier than vanilla REINFORCE.
+The value function soaks up the "tide" of average returns, leaving only the relative signal.
+
+### Entropy Regularisation
+
+Adding entropy $H(\pi) = -\sum_a \pi(a|s)\log\pi(a|s)$ to the loss encourages exploration:
+
+```python
+entropy_bonus = dist.entropy().mean()
+loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_bonus
+```
+
+```output
+# Higher entropy → more exploration → slower to converge but less likely to get stuck
+```
+
+The coefficient 0.01 trades off exploitation vs exploration.
+
+## Try it Yourself
+
+```python
+import torch, torch.nn as nn, torch.optim as optim
+import numpy as np
+import gymnasium as gym
+
+# Train REINFORCE without a baseline on LunarLander-v2 for 500 episodes
+# Then train REINFORCE with a value baseline for 500 episodes
+# Compare average return over the final 50 episodes
+
+env = gym.make("LunarLander-v2")
+
+class PolicyNet(nn.Module):
+    def __init__(self, obs_dim, n_actions):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim,256),nn.ReLU(),nn.Linear(256,n_actions))
+    def forward(self, x):
+        return torch.distributions.Categorical(logits=self.net(x))
+
+policy = PolicyNet(8, 4)
+opt = optim.Adam(policy.parameters(), lr=3e-4)
+hist = []
+
+for ep in range(500):
+    obs, _ = env.reset()
+    lps, rews = [], []
+    done = False
+    while not done:
+        d = policy(torch.FloatTensor(obs))
+        a = d.sample()
+        lps.append(d.log_prob(a))
+        obs, r, t, tr, _ = env.step(a.item())
+        rews.append(r)
+        done = t or tr
+    G, rets = 0, []
+    for r in reversed(rews):
+        G = r + 0.99*G
+        rets.insert(0, G)
+    rets = torch.FloatTensor(rets)
+    loss = -(torch.stack(lps) * rets).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    hist.append(sum(rews))
+
+print(f"REINFORCE avg return (last 50): {np.mean(hist[-50:]):.1f}")
+env.close()
+```
+
+```output
+REINFORCE avg return (last 50): -87.3
+```
+
+## Exercise
+
+Return standardisation is a popular alternative to a learned baseline: subtract the mean and
+divide by the standard deviation of the episode's returns before computing the policy gradient.
+
+$$
+G_t^\text{norm} = \frac{G_t - \mu_G}{\sigma_G + \epsilon}
+$$
+
+Implement this normalisation in the vanilla REINFORCE above and run for 300 episodes on
+CartPole. Compare the variance of the policy loss per episode vs unnormalised REINFORCE.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn, torch.optim as optim
+import numpy as np
+import gymnasium as gym
+
+env = gym.make("CartPole-v1")
+
+class PolicyNet(nn.Module):
+    def __init__(self, obs_dim, n_actions):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(obs_dim,128),nn.ReLU(),nn.Linear(128,n_actions))
+    def forward(self, x):
+        return torch.distributions.Categorical(logits=self.net(x))
+
+policy = PolicyNet(4, 2)
+opt = optim.Adam(policy.parameters(), lr=1e-3)
+losses, rewards_hist = [], []
+
+for ep in range(300):
+    obs, _ = env.reset()
+    lps, rews = [], []
+    done = False
+    while not done:
+        d = policy(torch.FloatTensor(obs))
+        a = d.sample()
+        lps.append(d.log_prob(a))
+        obs, r, t, tr, _ = env.step(a.item())
+        rews.append(r)
+        done = t or tr
+    G, rets = 0, []
+    for r in reversed(rews):
+        G = r + 0.99*G
+        rets.insert(0, G)
+    rets = torch.FloatTensor(rets)
+    # Normalise returns
+    rets = (rets - rets.mean()) / (rets.std() + 1e-8)
+    loss = -(torch.stack(lps) * rets).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    losses.append(loss.item())
+    rewards_hist.append(sum(rews))
+
+print(f"Normalised REINFORCE: avg reward (last 50) = {np.mean(rewards_hist[-50:]):.0f}")
+print(f"Loss variance: {np.var(losses[-50:]):.4f}")
+```
+
+Return normalisation is a fast, parameter-free baseline: the mean acts as a baseline (like
+a constant $b$) and the division by std prevents large updates. It doesn't capture
+state-dependent baselines, but in practice it's very close to a learned $V(s)$ in terms of
+variance reduction and requires no extra network.
+</details>

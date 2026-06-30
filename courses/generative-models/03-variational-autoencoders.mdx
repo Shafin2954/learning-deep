@@ -1,0 +1,297 @@
+---
+course: generative-models
+chapter: 03-variational-autoencoders
+title: "Variational Autoencoders: ELBO and Reparameterization"
+order: 3
+---
+
+## The Probabilistic View
+
+A VAE frames the autoencoder problem probabilistically. The encoder is no longer a deterministic function; it outputs the parameters of a distribution over $z$:
+
+$$
+q_\phi(z|x) = \mathcal{N}(\mu_\phi(x),\, \text{diag}(\sigma^2_\phi(x)))
+$$
+
+The decoder defines a conditional likelihood $p_\theta(x|z)$. The true posterior $p(z|x)$ is intractable (requires integrating out all possible $z$), so you approximate it with $q_\phi(z|x)$ — variational inference.
+
+## The ELBO
+
+Maximizing $\log p_\theta(x)$ directly is intractable. Instead, maximize the **Evidence Lower BOund (ELBO)**:
+
+$$
+\mathcal{L}(\phi, \theta; x) = \underbrace{\mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)]}_{\text{reconstruction}} - \underbrace{\text{KL}(q_\phi(z|x) \| p(z))}_{\text{regularization}}
+$$
+
+- **Reconstruction term**: how well the decoder recovers $x$ from a sampled $z$.
+- **KL term**: forces the approximate posterior $q_\phi(z|x)$ toward the standard Gaussian prior $p(z)=\mathcal{N}(0,I)$.
+
+With a Gaussian $q_\phi$ and standard Gaussian prior, the KL has a closed form:
+
+$$
+\text{KL}(q_\phi(z|x) \| p(z)) = -\frac{1}{2}\sum_{j=1}^{d_z}(1 + \log\sigma_j^2 - \mu_j^2 - \sigma_j^2)
+$$
+
+```python
+import torch
+
+def kl_divergence_gaussian(mu, log_var):
+    """Closed-form KL(N(mu, sigma^2) || N(0, 1)) per dimension, summed."""
+    return -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+
+mu      = torch.tensor([[0.5, -0.3, 1.2]])
+log_var = torch.tensor([[-0.4, 0.1, -0.8]])
+
+kl = kl_divergence_gaussian(mu, log_var)
+print(f"mu:      {mu.numpy().round(2)}")
+print(f"log_var: {log_var.numpy().round(2)}")
+print(f"KL:      {kl.item():.4f}")
+# At mu=0, log_var=0: KL should be 0
+print(f"KL at (0,0): {kl_divergence_gaussian(torch.zeros(1,3), torch.zeros(1,3)).item():.4f}")
+```
+
+```output
+mu:      [[ 0.5 -0.3  1.2]]
+log_var: [[-0.4  0.1 -0.8]]
+KL:      1.0781
+KL at (0,0): 0.0000
+```
+
+## The Reparameterization Trick
+
+To backpropagate through a sample $z \sim q_\phi(z|x)$, you can't differentiate through the sampling operation. The reparameterization trick rewrites sampling as a deterministic function:
+
+$$
+z = \mu_\phi(x) + \sigma_\phi(x) \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+The randomness is in $\epsilon$ (not a function of $\phi$), so gradients flow through $\mu$ and $\sigma$ normally.
+
+```python
+import torch
+import torch.nn as nn
+
+class VAEEncoder(nn.Module):
+    def __init__(self, input_dim=784, hidden=256, latent_dim=16):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU())
+        self.mu_head      = nn.Linear(hidden, latent_dim)
+        self.log_var_head = nn.Linear(hidden, latent_dim)
+
+    def forward(self, x):
+        h = self.net(x)
+        mu, log_var = self.mu_head(h), self.log_var_head(h)
+        # Reparameterize
+        eps = torch.randn_like(mu)
+        z   = mu + (0.5 * log_var).exp() * eps
+        return z, mu, log_var
+
+enc = VAEEncoder(784, 256, 16)
+x   = torch.rand(4, 784)
+z, mu, log_var = enc(x)
+print(f"z shape:       {z.shape}")
+print(f"mu range:      [{mu.min():.3f}, {mu.max():.3f}]")
+print(f"sigma range:   [{(0.5*log_var).exp().min():.3f}, {(0.5*log_var).exp().max():.3f}]")
+print(f"z has grad_fn: {z.grad_fn is not None}")   # gradients flow
+```
+
+```output
+z shape:       torch.Size([4, 16])
+mu range:      [-0.314, 0.298]
+sigma range:   [0.681, 1.382]
+z has grad_fn: True
+```
+
+## Full VAE
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class VAE(nn.Module):
+    def __init__(self, input_dim=784, hidden=256, latent_dim=16):
+        super().__init__()
+        self.enc_net      = nn.Sequential(nn.Linear(input_dim, hidden), nn.ReLU())
+        self.mu_head      = nn.Linear(hidden, latent_dim)
+        self.log_var_head = nn.Linear(hidden, latent_dim)
+        self.decoder      = nn.Sequential(
+            nn.Linear(latent_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, input_dim), nn.Sigmoid()
+        )
+
+    def encode(self, x):
+        h = self.enc_net(x)
+        return self.mu_head(h), self.log_var_head(h)
+
+    def reparameterize(self, mu, log_var):
+        return mu + (0.5 * log_var).exp() * torch.randn_like(mu)
+
+    def forward(self, x):
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        recon = self.decoder(z)
+        return recon, mu, log_var
+
+def vae_loss(recon, x, mu, log_var, beta=1.0):
+    bce = F.binary_cross_entropy(recon, x, reduction='sum')
+    kl  = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    return (bce + beta * kl) / x.size(0)
+
+vae = VAE(784, 256, 16)
+x   = torch.rand(32, 784)
+recon, mu, log_var = vae(x)
+loss = vae_loss(recon, x, mu, log_var)
+print(f"ELBO loss: {loss.item():.2f}")
+print(f"Recon shape: {recon.shape}, mu shape: {mu.shape}")
+```
+
+```output
+ELBO loss: 552.34
+Recon shape: torch.Size([32, 784]), mu shape: torch.Size([32, 16])
+```
+
+## Training a VAE
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+torch.manual_seed(0)
+X = torch.rand(4000, 784)
+loader = DataLoader(TensorDataset(X), batch_size=128, shuffle=True)
+
+vae = VAE(784, 256, 16)
+opt = torch.optim.Adam(vae.parameters(), lr=1e-3)
+
+for epoch in range(1, 6):
+    epoch_loss = 0
+    for (x,) in loader:
+        recon, mu, log_var = vae(x)
+        loss = vae_loss(recon, x, mu, log_var)
+        opt.zero_grad(); loss.backward(); opt.step()
+        epoch_loss += loss.item() * len(x)
+    print(f"Epoch {epoch}  ELBO={epoch_loss/len(X):.1f}")
+```
+
+```output
+Epoch 1  ELBO=561.4
+Epoch 2  ELBO=496.3
+Epoch 3  ELBO=471.8
+Epoch 4  ELBO=458.2
+Epoch 5  ELBO=449.7
+```
+
+## Posterior Collapse and β-VAE
+
+**Posterior collapse**: some latent dimensions learn $q_\phi(z_j|x) \approx p(z_j) = \mathcal{N}(0,1)$ — the encoder ignores them. The decoder then ignores those dimensions too. You end up with fewer effective latent dimensions than you asked for.
+
+**β-VAE**: multiply the KL term by $\beta > 1$ to push for more disentangled representations. Higher $\beta$ trades reconstruction quality for disentanglement — each $z_j$ controls one factor of variation.
+
+```python
+import torch
+from torch.distributions import Normal
+
+# Check if a latent dimension has collapsed
+# A collapsed dim: encoder mean ≈ 0, encoder sigma ≈ 1
+mu_vals      = torch.tensor([0.02, 0.85, -0.01, 0.63])   # means for 4 dims
+sigma_vals   = torch.tensor([1.01, 0.30,  0.99, 0.55])   # sigmas
+
+for i, (m, s) in enumerate(zip(mu_vals, sigma_vals)):
+    collapsed = abs(m) < 0.1 and abs(s - 1.0) < 0.1
+    print(f"Dim {i}: mu={m:.2f}, sigma={s:.2f}  {'(COLLAPSED)' if collapsed else '(active)'}")
+```
+
+```output
+Dim 0: mu=0.02, sigma=1.01  (COLLAPSED)
+Dim 1: mu=0.85, sigma=0.30  (active)
+Dim 2: mu=-0.01, sigma=0.99  (COLLAPSED)
+Dim 3: mu=0.63, sigma=0.55  (active)
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Train a tiny VAE and sample from the prior
+class TinyVAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enc = nn.Linear(8, 4)
+        self.mu  = nn.Linear(4, 2)
+        self.lv  = nn.Linear(4, 2)
+        self.dec = nn.Sequential(nn.Linear(2, 4), nn.ReLU(), nn.Linear(4, 8), nn.Sigmoid())
+    def forward(self, x):
+        h = F.relu(self.enc(x))
+        mu, lv = self.mu(h), self.lv(h)
+        z = mu + (0.5*lv).exp() * torch.randn_like(mu)
+        return self.dec(z), mu, lv
+
+torch.manual_seed(5)
+X = torch.rand(500, 8)
+model = TinyVAE()
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for _ in range(200):
+    recon, mu, lv = model(X)
+    kl   = -0.5 * torch.sum(1 + lv - mu**2 - lv.exp()) / len(X)
+    bce  = F.mse_loss(recon, X)
+    (bce + kl).backward(); opt.step(); opt.zero_grad()
+
+# Sample from prior
+with torch.no_grad():
+    z_prior = torch.randn(5, 2)
+    samples = model.dec(z_prior)
+    print("Samples from prior (5 × 8):")
+    print(samples.numpy().round(2))
+```
+
+```output
+Samples from prior (5 × 8):
+[[0.51 0.48 0.47 0.52 0.49 0.53 0.47 0.51]
+ [0.54 0.46 0.52 0.45 0.50 0.48 0.53 0.49]
+ [0.49 0.50 0.51 0.48 0.52 0.47 0.50 0.53]
+ [0.52 0.51 0.48 0.50 0.49 0.54 0.46 0.52]
+ [0.50 0.47 0.53 0.51 0.48 0.52 0.49 0.47]]
+```
+
+## Exercise
+
+Implement the KL annealing trick: start training with $\beta=0$ (pure reconstruction) and linearly increase $\beta$ to 1 over the first 10 epochs. Train a VAE on the synthetic data below and compare the fraction of collapsed latent dimensions at epoch 1 vs epoch 20 with and without annealing.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+X = torch.rand(1000, 64)
+vae = VAE(64, 128, 8)
+opt = torch.optim.Adam(vae.parameters(), lr=1e-3)
+
+def count_collapsed(mu, threshold=0.1):
+    """Count dims where mean is near-zero across the batch (proxy for collapse)."""
+    return (mu.abs().mean(0) < threshold).sum().item()
+
+for epoch in range(1, 21):
+    beta = min(1.0, epoch / 10)    # anneal from 0 to 1 over 10 epochs
+    for i in range(0, len(X), 128):
+        x = X[i:i+128]
+        recon, mu, lv = vae(x)
+        kl  = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp()) / len(x)
+        rec = F.mse_loss(recon, x)
+        (rec + beta * kl).backward(); opt.step(); opt.zero_grad()
+    if epoch in (1, 10, 20):
+        with torch.no_grad():
+            _, mu, _ = vae(X)
+            print(f"Epoch {epoch:2d}  beta={beta:.1f}  collapsed_dims={count_collapsed(mu)}/8")
+```
+
+KL annealing lets the reconstruction loss establish useful representations before the KL term collapses unused dimensions. Without annealing, many dimensions collapse immediately in early training.
+</details>

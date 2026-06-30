@@ -1,0 +1,353 @@
+---
+course: graph-ml
+chapter: 11-kg-embeddings
+title: "Knowledge-Graph Embeddings: TransE, RotatE, and Beyond"
+order: 11
+---
+
+## Knowledge graphs
+
+A knowledge graph (KG) is a set of **(head, relation, tail)** triples: `(Paris, capital_of,
+France)`, `(Einstein, bornIn, Ulm)`. Nodes are entities; edges are typed relations. KGs are
+incomplete — many true triples are missing. **KG completion** (or KG embedding) learns to
+score unobserved triples so you can predict missing facts.
+
+## TransE: translation in embedding space
+
+TransE (Bordes et al., 2013) models each relation as a translation vector:
+
+$$
+h + r \approx t \quad \Rightarrow \quad \text{score}(h, r, t) = -\|h + r - t\|_1
+$$
+
+A triple is valid when the tail embedding is close to `head + relation`. TransE is elegant
+and fast but can't handle 1-to-N, N-to-1, or symmetric relations (if $h+r=t$ and $t+r=h$
+then $r=0$).
+
+## Beyond TransE
+
+| Model | Score function | Handles |
+|-------|---------------|---------|
+| TransR | $-\|M_r h + r - M_r t\|$ | N-to-N via relation-specific projection |
+| DistMult | $h^T \text{diag}(r)\, t$ | Symmetric relations |
+| ComplEx | $\text{Re}(h^T \text{diag}(r)\, \bar{t})$ | Antisymmetric + asymmetric |
+| RotatE | $\|h \circ e^{i\theta_r} - t\|$ | All relation patterns |
+
+RotatE models each relation as an element-wise rotation in complex space: $t = h \circ
+e^{i\theta_r}$, where $\circ$ is the Hadamard product.
+
+## Negative sampling for KGs
+
+For each positive triple $(h, r, t)$, generate negative triples by corrupting the head or
+tail:
+
+- Corrupt head: $(h', r, t)$ where $h' \neq h$
+- Corrupt tail: $(h, r, t')$ where $t' \neq t$
+
+The training loss is typically **self-adversarial negative sampling** or a simple **margin
+loss**: $\max(0, \gamma + \text{score}(neg) - \text{score}(pos))$.
+
+## Implementing TransE from scratch
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+# Tiny toy KG: 6 entities, 3 relations
+entities  = ['Alice', 'Bob', 'Carol', 'Dan', 'London', 'Paris']
+relations = ['knows', 'livesIn', 'bornIn']
+triples   = [
+    (0, 0, 1),   # Alice knows Bob
+    (1, 0, 2),   # Bob knows Carol
+    (0, 1, 4),   # Alice livesIn London
+    (1, 1, 4),   # Bob livesIn London
+    (2, 2, 5),   # Carol bornIn Paris
+    (3, 0, 0),   # Dan knows Alice
+]
+triples = torch.tensor(triples, dtype=torch.long)
+
+n_entities = len(entities)
+n_relations = len(relations)
+dim = 8
+
+class TransE(nn.Module):
+    def __init__(self, n_ent, n_rel, dim, margin=1.0):
+        super().__init__()
+        self.ent_emb = nn.Embedding(n_ent, dim)
+        self.rel_emb = nn.Embedding(n_rel, dim)
+        self.margin = margin
+        nn.init.uniform_(self.ent_emb.weight, -6/dim**0.5, 6/dim**0.5)
+        nn.init.uniform_(self.rel_emb.weight, -6/dim**0.5, 6/dim**0.5)
+
+    def score(self, h, r, t):
+        """Lower is better (L1 distance)."""
+        return -(self.ent_emb(h) + self.rel_emb(r) - self.ent_emb(t)).norm(p=1, dim=-1)
+
+    def forward(self, pos, neg):
+        pos_score = self.score(pos[:,0], pos[:,1], pos[:,2])
+        neg_score = self.score(neg[:,0], neg[:,1], neg[:,2])
+        return F.relu(self.margin - pos_score + neg_score).mean()
+
+model = TransE(n_entities, n_relations, dim)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+print(f"TransE model: {sum(p.numel() for p in model.parameters())} parameters")
+```
+
+```output
+TransE model: 72 parameters
+```
+
+```python
+def corrupt(triples, n_entities):
+    """Randomly corrupt head (50%) or tail (50%)."""
+    neg = triples.clone()
+    mask = torch.rand(len(triples)) > 0.5
+    rand_ent = torch.randint(0, n_entities, (len(triples),))
+    neg[mask,  0] = rand_ent[mask]    # corrupt head
+    neg[~mask, 2] = rand_ent[~mask]   # corrupt tail
+    return neg
+
+for epoch in range(500):
+    optimizer.zero_grad()
+    neg = corrupt(triples, n_entities)
+    loss = model(triples, neg)
+    loss.backward()
+    # Normalize entity embeddings (TransE constraint)
+    with torch.no_grad():
+        model.ent_emb.weight.data = F.normalize(model.ent_emb.weight.data)
+    optimizer.step()
+
+if (epoch + 1) % 100 == 0:
+    print(f"Epoch {epoch+1}  loss={loss.item():.4f}")
+```
+
+```output
+Epoch 500  loss=0.0312
+```
+
+```python
+# Score all possible tails for (Alice, livesIn, ?)
+@torch.no_grad()
+def predict_tail(model, head_id, rel_id, entities):
+    h = torch.tensor([head_id])
+    r = torch.tensor([rel_id])
+    t = torch.arange(len(entities))
+    scores = model.score(h.expand(len(entities)), r.expand(len(entities)), t)
+    ranked = scores.argsort(descending=True)
+    print(f"Predicting tail for ({entities[head_id]}, {relations[rel_id]}, ?):")
+    for rank, idx in enumerate(ranked, 1):
+        print(f"  Rank {rank}: {entities[idx]:8s}  score={scores[idx].item():.3f}")
+
+predict_tail(model, 0, 1, entities)  # Alice livesIn ?
+```
+
+```output
+Predicting tail for (Alice, livesIn, ?):
+  Rank 1: London    score=-0.041
+  Rank 2: Paris     score=-0.312
+  Rank 3: Bob       score=-0.531
+  Rank 4: Alice     score=-0.612
+  Rank 5: Carol     score=-0.714
+  Rank 6: Dan       score=-0.829
+```
+
+London ranks first — the embedding captured `livesIn(Alice, London)`.
+
+## Training on FB15k-237 with PyKEEN
+
+```python
+# Conceptual: loading and training TransE on a real KG with PyKEEN
+# (requires: pip install pykeen)
+
+"""
+from pykeen.pipeline import pipeline
+
+result = pipeline(
+    dataset='FB15k-237',
+    model='TransE',
+    model_kwargs=dict(embedding_dim=128),
+    training_kwargs=dict(num_epochs=50, batch_size=1024),
+    evaluation_kwargs=dict(batch_size=256),
+    random_seed=42,
+)
+
+print(result.metric_results.to_df())
+# MRR, Hits@1, Hits@3, Hits@10 (filtered)
+"""
+
+# Typical results on FB15k-237 with TransE (dim=128, 100 epochs):
+print("TransE on FB15k-237 (reported results):")
+print("  MRR:      0.294")
+print("  Hits@1:   0.198")
+print("  Hits@3:   0.332")
+print("  Hits@10:  0.465")
+```
+
+```output
+TransE on FB15k-237 (reported results):
+  MRR:      0.294
+  Hits@1:   0.198
+  Hits@3:   0.332
+  Hits@10:  0.465
+```
+
+## Filtered evaluation
+
+Raw ranking counts all entities as negatives, including other true answers. **Filtered** ranking
+removes other known true triples from the candidate set before computing rank, giving a fairer
+picture:
+
+```python
+def filtered_rank(model, test_triple, all_triples, n_entities, mode='tail'):
+    """Compute filtered rank for a single test triple."""
+    h, r, t = test_triple
+    true_set = set(
+        (tr[0].item(), tr[1].item(), tr[2].item()) for tr in all_triples
+        if not (tr[0] == h and tr[1] == r and tr[2] == t)
+    )
+    candidates = torch.arange(n_entities)
+    if mode == 'tail':
+        h_exp = torch.tensor([h]).expand(n_entities)
+        r_exp = torch.tensor([r]).expand(n_entities)
+        scores = model.score(h_exp, r_exp, candidates)
+        # Filter: remove known true triples (other than the test one)
+        for c_idx in range(n_entities):
+            if (h, r, c_idx) in true_set:
+                scores[c_idx] = float('-inf')
+    sorted_idx = scores.argsort(descending=True)
+    rank = (sorted_idx == t).nonzero(as_tuple=True)[0].item() + 1
+    return rank
+
+with torch.no_grad():
+    rank = filtered_rank(model, (0, 1, 4), triples, n_entities, mode='tail')
+print(f"Filtered rank for (Alice, livesIn, London): {rank}")
+```
+
+```output
+Filtered rank for (Alice, livesIn, London): 1
+```
+
+## Try it Yourself
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+# Extend the toy KG and train DistMult
+entities  = ['Alice', 'Bob', 'Carol', 'Dan', 'London', 'Paris']
+relations = ['knows', 'livesIn', 'bornIn']
+triples   = torch.tensor([
+    (0,0,1),(1,0,2),(0,1,4),(1,1,4),(2,2,5),(3,0,0)
+])
+
+class DistMult(nn.Module):
+    def __init__(self, n_ent, n_rel, dim):
+        super().__init__()
+        self.ent = nn.Embedding(n_ent, dim)
+        self.rel = nn.Embedding(n_rel, dim)
+        nn.init.xavier_uniform_(self.ent.weight)
+        nn.init.xavier_uniform_(self.rel.weight)
+    def score(self, h, r, t):
+        return (self.ent(h) * self.rel(r) * self.ent(t)).sum(-1)
+    def forward(self, pos, neg):
+        pos_s = self.score(pos[:,0], pos[:,1], pos[:,2])
+        neg_s = self.score(neg[:,0], neg[:,1], neg[:,2])
+        return F.relu(1.0 - pos_s + neg_s).mean()
+
+def corrupt(triples, n):
+    neg = triples.clone()
+    mask = torch.rand(len(triples)) > 0.5
+    r = torch.randint(0, n, (len(triples),))
+    neg[mask,0] = r[mask]; neg[~mask,2] = r[~mask]
+    return neg
+
+model = DistMult(6, 3, 16)
+opt = torch.optim.Adam(model.parameters(), lr=0.01)
+for _ in range(500):
+    opt.zero_grad(); model(triples, corrupt(triples, 6)).backward(); opt.step()
+
+with torch.no_grad():
+    scores = model.score(torch.zeros(6,dtype=torch.long),
+                         torch.ones(6,dtype=torch.long)*1,
+                         torch.arange(6))
+    print("Alice livesIn ? (DistMult):", sorted(zip(-scores.tolist(), entities))[:3])
+```
+
+```output
+Alice livesIn ? (DistMult): [(-1.872, 'London'), (-0.943, 'Paris'), (-0.512, 'Carol')]
+```
+
+## Exercise
+
+Implement **RotatE** scoring from scratch for the toy KG above. RotatE represents entities as
+complex vectors and relations as rotations: $\text{score}(h,r,t) = -\|h \circ e^{i\theta_r}
+- t\|$ where $h, t \in \mathbb{C}^{d/2}$ and $\theta_r \in \mathbb{R}^{d/2}$. Does it rank
+London first for `(Alice, livesIn, ?)`?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class RotatE(nn.Module):
+    def __init__(self, n_ent, n_rel, dim):
+        super().__init__()
+        assert dim % 2 == 0
+        self.d = dim // 2
+        self.ent_re = nn.Embedding(n_ent, self.d)
+        self.ent_im = nn.Embedding(n_ent, self.d)
+        self.rel_th = nn.Embedding(n_rel, self.d)  # rotation angle
+        nn.init.uniform_(self.ent_re.weight, -0.5, 0.5)
+        nn.init.uniform_(self.ent_im.weight, -0.5, 0.5)
+        nn.init.uniform_(self.rel_th.weight, -3.14, 3.14)
+
+    def score(self, h, r, t):
+        hr = self.ent_re(h); hi = self.ent_im(h)
+        tr = self.ent_re(t); ti = self.ent_im(t)
+        th = self.rel_th(r)
+        # Rotate h: (hr, hi) * e^{i*th}
+        rot_r = hr * th.cos() - hi * th.sin()
+        rot_i = hr * th.sin() + hi * th.cos()
+        return -((rot_r - tr)**2 + (rot_i - ti)**2).sum(-1).sqrt()
+
+    def forward(self, pos, neg):
+        return F.relu(1.0 - self.score(pos[:,0],pos[:,1],pos[:,2])
+                           + self.score(neg[:,0],neg[:,1],neg[:,2])).mean()
+
+entities = ['Alice','Bob','Carol','Dan','London','Paris']
+triples = torch.tensor([(0,0,1),(1,0,2),(0,1,4),(1,1,4),(2,2,5),(3,0,0)])
+
+def corrupt(triples, n):
+    neg = triples.clone(); mask = torch.rand(len(triples))>0.5
+    r = torch.randint(0,n,(len(triples),)); neg[mask,0]=r[mask]; neg[~mask,2]=r[~mask]
+    return neg
+
+model = RotatE(6, 3, 16); opt = torch.optim.Adam(model.parameters(), lr=0.01)
+for _ in range(1000):
+    opt.zero_grad(); model(triples, corrupt(triples,6)).backward(); opt.step()
+
+with torch.no_grad():
+    scores = model.score(torch.zeros(6,dtype=torch.long),
+                         torch.ones(6,dtype=torch.long),
+                         torch.arange(6))
+    ranked = sorted(zip(scores.tolist(), entities), reverse=True)
+    print("Alice livesIn ? (RotatE):", [(e, f"{s:.3f}") for s,e in ranked[:3]])
+```
+RotatE also ranks London first. Its advantage over TransE shows on larger KGs with
+symmetric and N-to-N relations, where translation fails but rotation succeeds.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Spectral graph theory & the graph Laplacian** — the normalized Laplacian $L = I - D^{-1/2}AD^{-1/2}$ underlies GCN; its eigenvectors form the "graph Fourier basis."
+- **Over-smoothing & over-squashing** — at depth k, GCN mixes all nodes within k hops; deep GCNs converge to the same embedding (over-smooth) or bottleneck long-range information (over-squash).
+- **Heterogeneous & temporal graphs** — multi-type nodes/edges use HAN or HGT; evolving graphs with timestamps use TGAT or TGN.
+- **Graph Transformers** — apply full attention over all nodes (no adjacency); Graphormer adds degree, spatial, and edge encodings.
+- **Expressive power & the WL test** — the 1-WL (color refinement) algorithm is the exact upper bound on MPNN expressiveness; GIN achieves it.
+- **Community detection & graph clustering** — Louvain algorithm greedily maximizes modularity $Q$; spectral clustering via eigenvectors of L.
+- **GraphRAG link** — entity and relation extraction from unstructured text builds the KG that feeds the NLP/LLM agentic RAG pipeline.

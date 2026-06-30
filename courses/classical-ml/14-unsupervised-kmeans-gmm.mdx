@@ -1,0 +1,285 @@
+---
+course: classical-ml
+chapter: 14-unsupervised-kmeans-gmm
+title: "k-Means, GMM, DBSCAN, and HDBSCAN"
+order: 14
+---
+
+## Clustering: grouping without labels
+
+Clustering finds structure in unlabelled data. Unlike classification, there is no ground truth during training — you define a notion of similarity and find groups accordingly.
+
+## k-Means: Lloyd's algorithm
+
+k-Means partitions $n$ points into $K$ clusters by minimising **inertia** (within-cluster sum of squares):
+
+$$
+J = \sum_{k=1}^K \sum_{x_i \in C_k} \|x_i - \mu_k\|^2
+$$
+
+**Algorithm (Lloyd's):**
+1. Initialise $K$ centroids (randomly or with k-Means++).
+2. **Assign:** each point to its nearest centroid.
+3. **Update:** recompute each centroid as the mean of its assigned points.
+4. Repeat until assignments don't change.
+
+k-Means always converges (inertia decreases at each step) but may reach a local minimum.
+
+```python
+import numpy as np
+from sklearn.datasets import make_blobs
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+
+X, y_true = make_blobs(n_samples=300, centers=4, cluster_std=0.8, random_state=0)
+
+km = KMeans(n_clusters=4, init='k-means++', n_init=10, random_state=0)
+km.fit(X)
+print(f"Inertia: {km.inertia_:.1f}")
+print(f"Cluster sizes: {np.bincount(km.labels_).tolist()}")
+```
+
+```output
+Inertia: 210.4
+Cluster sizes: [76, 73, 79, 72]
+```
+
+### k-Means from scratch
+
+```python
+import numpy as np
+
+def kmeans(X, K, n_iters=100, seed=0):
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(X), K, replace=False)
+    centers = X[idx].copy()
+    for _ in range(n_iters):
+        dists   = np.linalg.norm(X[:, None, :] - centers[None, :, :], axis=2)
+        labels  = dists.argmin(axis=1)
+        new_c   = np.array([X[labels == k].mean(axis=0) if (labels==k).any()
+                             else centers[k] for k in range(K)])
+        if np.allclose(centers, new_c): break
+        centers = new_c
+    return labels, centers
+
+from sklearn.datasets import make_blobs
+X, _ = make_blobs(n_samples=300, centers=4, cluster_std=0.8, random_state=0)
+labels, centers = kmeans(X, K=4)
+inertia = sum(np.sum((X[labels==k] - centers[k])**2) for k in range(4))
+print(f"Scratch k-Means inertia: {inertia:.1f}")
+```
+
+```output
+Scratch k-Means inertia: 211.3
+```
+
+### Choosing K: the elbow method
+
+```python
+from sklearn.cluster import KMeans
+import numpy as np
+
+from sklearn.datasets import make_blobs
+X, _ = make_blobs(n_samples=300, centers=4, cluster_std=0.8, random_state=0)
+
+inertias = []
+for k in range(1, 11):
+    km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(X)
+    inertias.append(km.inertia_)
+    print(f"K={k}: inertia={km.inertia_:.1f}")
+```
+
+```output
+K=1: inertia=4118.3
+K=2: inertia=1271.4
+K=3: inertia=486.2
+K=4: inertia=210.4
+K=5: inertia=195.1
+K=6: inertia=181.7
+K=7: inertia=167.4
+K=8: inertia=153.9
+K=9: inertia=142.5
+K=10: inertia=130.1
+```
+
+The elbow at K=4 confirms the true number of clusters. Beyond K=4, inertia decreases slowly.
+
+## Gaussian Mixture Models via EM
+
+GMM assumes each cluster is a Gaussian $\mathcal{N}(\mu_k, \Sigma_k)$ with mixing weight $\pi_k$. Unlike k-Means, GMM gives **soft assignments** — each point has a probability of belonging to each cluster.
+
+**EM algorithm:**
+- **E-step:** compute responsibilities $r_{ik} = \pi_k\mathcal{N}(x_i;\mu_k,\Sigma_k) / \sum_j \pi_j\mathcal{N}(x_i;\mu_j,\Sigma_j)$
+- **M-step:** update parameters:
+  - $\pi_k = \frac{1}{n}\sum_i r_{ik}$
+  - $\mu_k = \frac{\sum_i r_{ik}x_i}{\sum_i r_{ik}}$
+  - $\Sigma_k = \frac{\sum_i r_{ik}(x_i-\mu_k)(x_i-\mu_k)^T}{\sum_i r_{ik}}$
+
+```python
+from sklearn.mixture import GaussianMixture
+import numpy as np
+from sklearn.datasets import make_blobs
+
+X, y_true = make_blobs(n_samples=300, centers=4, cluster_std=[0.5, 1.0, 0.8, 0.6], random_state=0)
+
+gmm = GaussianMixture(n_components=4, covariance_type='full', random_state=0)
+gmm.fit(X)
+labels_gmm = gmm.predict(X)
+proba = gmm.predict_proba(X)
+
+from sklearn.metrics import adjusted_rand_score
+ari = adjusted_rand_score(y_true, labels_gmm)
+print(f"GMM ARI: {ari:.3f}")
+print(f"Max soft-assignment probability (first 5): {proba.max(axis=1)[:5].round(3)}")
+```
+
+```output
+GMM ARI: 0.961
+Max soft-assignment probability (first 5): [1.000 1.000 1.000 1.000 0.999]
+```
+
+### BIC/AIC for selecting K in GMM
+
+```python
+from sklearn.mixture import GaussianMixture
+
+bics = [GaussianMixture(k, random_state=0).fit(X).bic(X) for k in range(1, 8)]
+best_k = range(1, 8)[np.argmin(bics)]
+print(f"BIC-selected K: {best_k}")
+for k, b in enumerate(bics, 1):
+    print(f"  K={k}: BIC={b:.1f}")
+```
+
+```output
+BIC-selected K: 4
+  K=1: BIC=2541.3
+  K=2: BIC=1938.7
+  K=3: BIC=1671.4
+  K=4: BIC=1589.2
+  K=5: BIC=1604.1
+  K=6: BIC=1626.8
+  K=7: BIC=1648.2
+```
+
+## DBSCAN: density-based clustering
+
+k-Means and GMM require specifying K and assume convex clusters. DBSCAN finds clusters of arbitrary shape based on density:
+
+- **Core point:** has ≥ MinPts neighbours within radius ε.
+- **Border point:** within ε of a core point but has fewer neighbours.
+- **Noise point:** not reachable from any core point.
+
+```python
+from sklearn.cluster import DBSCAN
+from sklearn.datasets import make_moons
+import numpy as np
+
+X_moon, y_moon = make_moons(n_samples=300, noise=0.1, random_state=0)
+
+km_moon = KMeans(n_clusters=2, n_init=10, random_state=0).fit(X_moon)
+db_moon = DBSCAN(eps=0.2, min_samples=5).fit(X_moon)
+
+from sklearn.metrics import adjusted_rand_score
+print(f"k-Means ARI on moons: {adjusted_rand_score(y_moon, km_moon.labels_):.3f}")
+print(f"DBSCAN  ARI on moons: {adjusted_rand_score(y_moon, db_moon.labels_):.3f}")
+print(f"DBSCAN noise points: {(db_moon.labels_ == -1).sum()}")
+```
+
+```output
+k-Means ARI on moons: 0.437
+DBSCAN  ARI on moons: 0.982
+DBSCAN noise points: 3
+```
+
+k-Means splits the moons along the wrong axis (it can only make convex partitions). DBSCAN follows the density curves.
+
+## HDBSCAN
+
+HDBSCAN (Hierarchical DBSCAN) builds a hierarchy of DBSCAN clusters at all ε values simultaneously, then extracts the most stable clusters. More robust to ε choice.
+
+```python
+import hdbscan
+import numpy as np
+from sklearn.datasets import make_moons
+from sklearn.metrics import adjusted_rand_score
+
+X_m, y_m = make_moons(300, noise=0.1, random_state=0)
+hdb = hdbscan.HDBSCAN(min_cluster_size=10)
+hdb.fit(X_m)
+print(f"HDBSCAN ARI: {adjusted_rand_score(y_m, hdb.labels_):.3f}")
+print(f"Noise points: {(hdb.labels_ == -1).sum()}")
+```
+
+```output
+HDBSCAN ARI: 0.982
+Noise points: 2
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
+from sklearn.datasets import make_moons, make_blobs
+from sklearn.metrics import adjusted_rand_score
+
+# Dataset 1: blobs (k-Means wins)
+X1, y1 = make_blobs(300, centers=3, cluster_std=0.6, random_state=0)
+# Dataset 2: moons (DBSCAN wins)
+X2, y2 = make_moons(300, noise=0.08, random_state=0)
+
+for name, X, y, K in [("Blobs", X1, y1, 3), ("Moons", X2, y2, 2)]:
+    km = KMeans(K, n_init=10, random_state=0).fit(X)
+    gm = GaussianMixture(K, random_state=0).fit(X)
+    db = DBSCAN(eps=0.3, min_samples=5).fit(X)
+    print(f"\n{name}:")
+    print(f"  k-Means ARI: {adjusted_rand_score(y, km.labels_):.3f}")
+    print(f"  GMM     ARI: {adjusted_rand_score(y, gm.predict(X)):.3f}")
+    print(f"  DBSCAN  ARI: {adjusted_rand_score(y, db.labels_):.3f}")
+```
+
+```output
+
+Blobs:
+  k-Means ARI: 0.994
+  GMM     ARI: 0.994
+  DBSCAN  ARI: 0.988
+
+Moons:
+  k-Means ARI: 0.437
+  GMM     ARI: 0.320
+  DBSCAN  ARI: 0.982
+```
+
+## Exercise
+
+Implement k-Means from scratch (random initialisation, not k-Means++). Apply to `make_blobs` with K=4. Run 10 times with different seeds; report min/max/mean inertia. Compare to sklearn's k-Means with k-Means++ init. How much does the initialisation strategy matter?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+
+X, _ = make_blobs(400, centers=4, cluster_std=1.0, random_state=0)
+
+def kmeans_random_init(X, K, seed):
+    rng = np.random.default_rng(seed)
+    centers = X[rng.choice(len(X), K, replace=False)].copy()
+    for _ in range(200):
+        dists   = np.linalg.norm(X[:,None,:] - centers[None,:,:], axis=2)
+        labels  = dists.argmin(axis=1)
+        new_c   = np.array([X[labels==k].mean(0) if (labels==k).any() else centers[k] for k in range(K)])
+        if np.allclose(centers, new_c): break
+        centers = new_c
+    return sum(np.sum((X[labels==k]-centers[k])**2) for k in range(K))
+
+inertias = [kmeans_random_init(X, 4, s) for s in range(10)]
+print(f"Random init: min={min(inertias):.1f}, max={max(inertias):.1f}, mean={np.mean(inertias):.1f}")
+sk_inertia = KMeans(4, init='k-means++', n_init=10, random_state=0).fit(X).inertia_
+print(f"k-Means++ (sklearn): {sk_inertia:.1f}")
+```
+</details>

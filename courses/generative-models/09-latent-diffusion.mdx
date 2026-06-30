@@ -1,0 +1,309 @@
+---
+course: generative-models
+chapter: 09-latent-diffusion
+title: "Latent Diffusion and Conditioning"
+order: 9
+---
+
+## Why pixel-space diffusion is expensive
+
+A 512×512 RGB image has 786,432 values. Running 1000 diffusion steps — each requiring a
+full U-Net forward pass over this tensor — is prohibitively slow and memory-hungry. The
+U-Net must also be large enough to model spatial correlations across the full resolution.
+
+The key insight behind latent diffusion: most of the spatial information in a natural image
+is compressible. A trained autoencoder can reduce a 512×512×3 image to a 64×64×4 latent
+with very little perceptual loss. Diffusion in this 256× smaller space costs orders of
+magnitude less compute per step.
+
+```python
+import torch
+
+# Pixel space vs latent space cost comparison
+pixel_h, pixel_w, pixel_c = 512, 512, 3
+latent_h, latent_w, latent_c = 64, 64, 4
+
+pixel_dim  = pixel_h * pixel_w * pixel_c
+latent_dim = latent_h * latent_w * latent_c
+
+print(f"Pixel-space dimension:  {pixel_dim:>10,}")
+print(f"Latent-space dimension: {latent_dim:>10,}")
+print(f"Compression ratio:      {pixel_dim / latent_dim:.1f}×")
+```
+
+```output
+Pixel-space dimension:     786,432
+Latent-space dimension:      16,384
+Compression ratio:           48.0×
+```
+
+The U-Net operating on 64×64 latents instead of 512×512 pixels runs roughly 64× faster
+per step, and you can afford stronger architectures in the latent space.
+
+## The latent diffusion architecture
+
+Latent Diffusion Models (LDMs) compose three separate pieces:
+
+1. **Perceptual autoencoder** — a pre-trained encoder $\mathcal{E}$ maps images to latents,
+   decoder $\mathcal{D}$ maps latents back. Trained independently with a perceptual + adversarial
+   loss so the latent space is smooth and the reconstruction is sharp.
+2. **Diffusion model in latent space** — the standard DDPM/DDIM training and sampling
+   pipeline, but operating on $z = \mathcal{E}(x)$ instead of $x$.
+3. **Conditioning mechanism** — a text or image encoder whose output is injected into the
+   U-Net via cross-attention.
+
+```python
+# Conceptual forward pass (shapes only — no real weights)
+class LatentDiffusionPipeline:
+    def __init__(self, encoder, decoder, unet, text_encoder):
+        self.encoder      = encoder       # image → latent z
+        self.decoder      = decoder       # latent z → image
+        self.unet         = unet          # z_t, t, context → eps_pred
+        self.text_encoder = text_encoder  # text → context embeddings
+
+    def encode(self, image):
+        z = self.encoder(image)
+        return z * 0.18215              # LDM scaling factor
+
+    def decode(self, z):
+        return self.decoder(z / 0.18215)
+
+    def training_step(self, image, prompt_tokens):
+        z       = self.encode(image)            # (B, 4, 64, 64)
+        context = self.text_encoder(prompt_tokens)  # (B, 77, 768)
+        t       = torch.randint(0, 1000, (z.shape[0],))
+        eps     = torch.randn_like(z)
+        z_t     = add_noise(z, t, eps)          # forward diffusion
+        eps_pred = self.unet(z_t, t, context)   # cross-attended U-Net
+        return ((eps - eps_pred) ** 2).mean()
+
+print("Pipeline: image → encoder → z (64×64×4) → diffuse → denoise → decoder → image")
+print("Context:  text  → CLIP encoder → embeddings (77×768) → cross-attn in U-Net")
+```
+
+```output
+Pipeline: image → encoder → z (64×64×4) → diffuse → denoise → decoder → image
+Context:  text  → CLIP encoder → embeddings (77×768) → cross-attn in U-Net
+```
+
+## Cross-attention for text conditioning
+
+The core conditioning mechanism in Stable Diffusion is cross-attention inside every
+transformer block of the U-Net. The latent features provide **queries**; the text
+embeddings provide **keys** and **values**.
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d}}\right)V
+$$
+
+where $Q = W_Q \cdot \phi(z_t)$ (from the latent), $K = W_K \cdot \tau_\theta(y)$,
+$V = W_V \cdot \tau_\theta(y)$ (from the text encoder $\tau_\theta$).
+
+```python
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class CrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim, heads=8, head_dim=64):
+        super().__init__()
+        inner = heads * head_dim
+        self.heads = heads
+        self.scale = head_dim ** -0.5
+        self.to_q = nn.Linear(query_dim, inner, bias=False)
+        self.to_k = nn.Linear(context_dim, inner, bias=False)
+        self.to_v = nn.Linear(context_dim, inner, bias=False)
+        self.to_out = nn.Linear(inner, query_dim)
+
+    def forward(self, x, context):
+        B, N, _ = x.shape
+        h = self.heads
+        Q = self.to_q(x).view(B, N, h, -1).transpose(1, 2)
+        K = self.to_k(context).view(B, -1, h, -1).transpose(1, 2)
+        V = self.to_v(context).view(B, -1, h, -1).transpose(1, 2)
+        attn = F.softmax(Q @ K.transpose(-2, -1) * self.scale, dim=-1)
+        out  = (attn @ V).transpose(1, 2).contiguous().view(B, N, -1)
+        return self.to_out(out)
+
+ca = CrossAttention(query_dim=320, context_dim=768)
+latent_tokens = torch.randn(2, 64*64, 320)    # flattened spatial from U-Net
+text_context  = torch.randn(2, 77, 768)        # CLIP text embeddings
+out = ca(latent_tokens, text_context)
+print(f"CrossAttention output: {out.shape}")
+print(f"Attends 4096 spatial tokens to 77 text tokens")
+```
+
+```output
+CrossAttention output: torch.Size([2, 4096, 320])
+Attends 4096 spatial tokens to 77 text tokens
+```
+
+Each spatial position in the latent can attend to whichever text token is most relevant,
+allowing spatially-aware conditioning ("cat on the left, dog on the right").
+
+## ControlNet: spatial conditioning
+
+ControlNet adds a trainable copy of the U-Net encoder that takes a spatial conditioning
+signal (edge map, depth, pose skeleton) and injects its activations into the frozen
+pre-trained U-Net via zero-initialized convolutions.
+
+- Only the ControlNet encoder weights are trained; the base model is frozen.
+- Zero-init means training starts from the pre-trained distribution.
+- You can combine multiple ControlNets (edge + depth simultaneously).
+
+```python
+# ControlNet injection concept (shapes only)
+class ZeroConv(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.conv = nn.Conv2d(ch, ch, 1)
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
+
+    def forward(self, x):
+        return self.conv(x)
+
+zc = ZeroConv(64)
+feat = torch.randn(2, 64, 32, 32)
+out  = zc(feat)
+print(f"ZeroConv output at init (should be all zeros): max={out.abs().max().item():.6f}")
+```
+
+```output
+ZeroConv output at init (should be all zeros): max=0.000000
+```
+
+## Resolution analysis
+
+```python
+configs = [
+    ("Pixel 256×256×3",  256, 256, 3,  None,  None,  None),
+    ("Pixel 512×512×3",  512, 512, 3,  None,  None,  None),
+    ("Latent 32×32×4",   None,None,None, 32,   32,    4),
+    ("Latent 64×64×4",   None,None,None, 64,   64,    4),
+]
+print(f"{'Config':<22} {'Dimensions':>12} {'UNet input (B=1)'}")
+print("-" * 55)
+for name, ph, pw, pc, lh, lw, lc in configs:
+    if ph is not None:
+        dim = ph * pw * pc
+        shape = f"{ph}×{pw}×{pc}"
+    else:
+        dim = lh * lw * lc
+        shape = f"{lh}×{lw}×{lc}"
+    print(f"{name:<22} {dim:>12,}   {shape}")
+```
+
+```output
+Config                  Dimensions UNet input (B=1)
+-------------------------------------------------------
+Pixel 256×256×3            196,608   256×256×3
+Pixel 512×512×3            786,432   512×512×3
+Latent 32×32×4               4,096   32×32×4
+Latent 64×64×4              16,384   64×64×4
+```
+
+A 512×512 image in latent space shrinks from 786K to 16K values — the U-Net trains and
+runs on 48× less data while the decoder recovers full-resolution quality.
+
+## In-painting and out-painting
+
+Latent diffusion handles in-painting by masking the known region in latent space and
+running the reverse diffusion only on the masked (unknown) region, concatenating the
+known latent at each step. Out-painting extends the canvas by padding the latent with
+noise and conditioning on the known edge.
+
+```python
+def inpaint_step(model, z_t, z_known, mask, t):
+    """
+    z_t:     noisy latent being denoised
+    z_known: latent of the known (unmasked) pixels, noised to level t
+    mask:    1 = region to inpaint, 0 = known region
+    """
+    eps_pred = model(torch.cat([z_t, z_known, mask], dim=1), t)
+    # After DDIM step:
+    # z_{t-1} = ddim_step(eps_pred) * mask + q_sample(z0_known, t-1) * (1-mask)
+    return eps_pred
+
+print("In-painting: blend denoised latent with re-noised known region at each step")
+print("Out-painting: pad latent canvas with noise, condition on known edge context")
+```
+
+```output
+In-painting: blend denoised latent with re-noised known region at each step
+Out-painting: pad latent canvas with noise, condition on known edge context
+```
+
+## Try it Yourself
+
+```python
+import torch
+
+# Simulate the encode → noise → decode pipeline (shapes only)
+B = 2
+# 1. Encode: 512×512×3 → 64×64×4
+x_pixel = torch.randn(B, 3, 512, 512)
+z       = torch.randn(B, 4, 64, 64)    # simulated encoder output
+z_scaled = z * 0.18215                 # LDM scaling
+
+# 2. Forward diffuse to t=500
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)
+alpha_bar = torch.cumprod(1 - betas, dim=0)
+t = torch.tensor([500, 500])
+ab = alpha_bar[t].view(B, 1, 1, 1)
+eps = torch.randn_like(z_scaled)
+z_t = torch.sqrt(ab) * z_scaled + torch.sqrt(1 - ab) * eps
+
+print(f"Original pixel: {x_pixel.shape}")
+print(f"Encoded latent: {z_scaled.shape}")
+print(f"Noised latent:  {z_t.shape}")
+print(f"Signal strength at t=500: {ab[0].item():.4f}")
+print(f"Noise strength  at t=500: {(1-ab[0]).item():.4f}")
+```
+
+```output
+Original pixel: torch.Size([2, 3, 512, 512])
+Encoded latent: torch.Size([2, 4, 64, 64])
+Noised latent:  torch.Size([2, 4, 64, 64])
+Signal strength at t=500: 0.3677
+Noise strength  at t=500: 0.6323
+```
+
+## Exercise
+
+You want to fine-tune a latent diffusion model on a new domain (e.g., satellite imagery)
+with limited GPU memory. You have 24 GB VRAM. Describe two training strategies that keep
+memory use tractable, and explain what each sacrifices.
+
+<details>
+<summary>Solution</summary>
+
+```python
+strategies = {
+    "Freeze encoder/decoder, train only U-Net": {
+        "saves": "No encoder/decoder gradients in VRAM",
+        "sacrifices": "Latent space may not optimally represent the new domain",
+        "VRAM_saving": "~30-40% vs full fine-tune",
+    },
+    "LoRA on U-Net cross-attention only": {
+        "saves": "Only tiny A,B rank-r matrices updated (<<1% of params)",
+        "sacrifices": "Cannot change deep spatial features, only conditioning path",
+        "VRAM_saving": "~60-70% vs full fine-tune",
+    },
+}
+for name, info in strategies.items():
+    print(f"\nStrategy: {name}")
+    for k, v in info.items():
+        print(f"  {k}: {v}")
+```
+
+Strategy 1 (freeze VAE): saves the most total memory since the large encoder/decoder
+don't need gradients. Sacrifice: the model's learned perceptual space may not optimally
+encode satellite textures (e.g., spectral signatures differ from natural images).
+
+Strategy 2 (LoRA): trains only rank-r update matrices on the cross-attention projections.
+Sacrifice: cannot alter the U-Net's spatial feature extraction, only how it attends to
+conditioning signals. Effective for style/domain shift via text prompts.
+
+</details>

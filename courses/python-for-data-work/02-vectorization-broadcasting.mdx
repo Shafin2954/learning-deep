@@ -1,0 +1,242 @@
+---
+course: python-for-data-work
+chapter: 02-vectorization-broadcasting
+title: "Vectorization & Broadcasting — Why Loops Are Slow"
+order: 2
+---
+
+## Why Python loops are slow
+
+A Python `for` loop is fast for general computation. For numerical arrays it's catastrophically
+slow. Three reasons:
+
+1. **Type checking on every step.** Python doesn't know `a[i]` is a float until it looks at
+   the box around it. NumPy knows the dtype up front — no check needed.
+2. **No SIMD.** Modern CPUs can add 8 float32s in a single instruction (AVX2). A Python loop
+   adds one at a time.
+3. **No parallelism.** NumPy's C routines can release the GIL and use multiple cores. Python
+   loops hold the GIL.
+
+The fix is **vectorization**: pass the entire array to a compiled NumPy function (a *ufunc*)
+that loops in C with SIMD.
+
+## Ufuncs — the compiled loop you call once
+
+A ufunc (*universal function*) operates element-wise on arrays of any shape. NumPy ships ~60
+of them: `np.add`, `np.multiply`, `np.sqrt`, `np.sin`, `np.exp`, etc. Python operators `+`,
+`*`, `**` are just syntax sugar for the corresponding ufuncs.
+
+```python
+import numpy as np
+import time
+
+rng = np.random.default_rng(0)
+N = 5_000_000
+a = rng.standard_normal(N).astype(np.float64)
+b = rng.standard_normal(N).astype(np.float64)
+
+# Python loop (do not use)
+t0 = time.perf_counter()
+c_loop = [a[i] + b[i] for i in range(N)]
+loop_ms = (time.perf_counter() - t0) * 1000
+
+# Vectorized ufunc
+t0 = time.perf_counter()
+c_vec = np.add(a, b)          # or: a + b
+vec_ms = (time.perf_counter() - t0) * 1000
+
+print(f"Loop :  {loop_ms:.0f} ms")
+print(f"Vec  :  {vec_ms:.1f} ms")
+print(f"Speedup: {loop_ms / vec_ms:.0f}×")
+```
+
+```output
+Loop :  1847 ms
+Vec  :  7.3 ms
+Speedup: 253×
+```
+
+*(Times vary by machine. The 100–300× ratio is typical for float64 on modern hardware.)*
+
+The entire array traversal happens inside the ufunc — one Python call, millions of C operations.
+
+## Broadcasting — the shape arithmetic
+
+Broadcasting lets ufuncs operate on arrays with **compatible but unequal shapes** without
+copying data. The rule: compare shapes from the trailing (rightmost) dimension; dimensions are
+compatible if they are equal, or if one of them is 1.
+
+```python
+import numpy as np
+
+# (3,) + scalar
+a = np.array([1.0, 2.0, 3.0])
+print(a + 10)            # 10 is treated as shape (1,) → broadcast to (3,)
+```
+
+```output
+[11. 12. 13.]
+```
+
+```python
+import numpy as np
+
+# (2, 3) + (3,) — classic row-wise operation
+M = np.array([[1.0, 2.0, 3.0],
+              [4.0, 5.0, 6.0]])    # shape (2, 3)
+bias = np.array([10.0, 20.0, 30.0]) # shape    (3,)
+print(M + bias)                     # bias broadcast across rows
+```
+
+```output
+[[11. 22. 33.]
+ [14. 25. 36.]]
+```
+
+```python
+import numpy as np
+
+# (2, 3) + (2, 1) — column-wise operation
+col = np.array([[100.0],
+                [200.0]])           # shape (2, 1)
+M = np.array([[1.0, 2.0, 3.0],
+              [4.0, 5.0, 6.0]])
+print(M + col)                      # col broadcast across columns
+```
+
+```output
+[[101. 102. 103.]
+ [204. 205. 206.]]
+```
+
+### The broadcasting rules in full
+
+Align shapes on the right:
+```
+  array A :     (2, 3)   →   (1, 2, 3)   (prepend 1s)
+  array B :  (4, 1, 3)
+  result  :  (4, 2, 3)   ← take the max at each position
+```
+A dimension of 1 stretches to match the other. The stretch is **virtual** — no data is copied.
+NumPy just adjusts the stride to 0 for that axis: stepping along it costs nothing and reads the
+same element repeatedly.
+
+## A practical example: normalizing rows
+
+Given a matrix of shape `(N, D)`, subtract each row's mean and divide by its std — the
+standard scaler operation. Broadcasting makes this a two-liner.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+X = rng.standard_normal((4, 3)).astype(np.float32)  # 4 samples, 3 features
+
+mu  = X.mean(axis=1, keepdims=True)   # shape (4, 1)
+std = X.std(axis=1, keepdims=True)    # shape (4, 1)
+X_norm = (X - mu) / std               # (4,3) - (4,1) → broadcasts to (4,3)
+
+print("mean of each normalized row:", X_norm.mean(axis=1).round(5))
+print("std  of each normalized row:", X_norm.std(axis=1).round(5))
+```
+
+```output
+mean of each normalized row: [ 0.  0. -0.  0.]
+std  of each normalized row: [1. 1. 1. 1.]
+```
+
+`keepdims=True` is the key: it preserves the (4, 1) shape so broadcasting works along columns.
+Without it, `mu` has shape `(4,)` which would broadcast along rows — wrong direction.
+
+## Aggregation along axes
+
+Most NumPy aggregations accept an `axis` argument. Think of it as "collapse this axis into a
+single number":
+
+```python
+import numpy as np
+
+M = np.array([[1, 2, 3],
+              [4, 5, 6]], dtype=np.float64)
+
+print("sum all   :", M.sum())             # scalar
+print("sum axis=0:", M.sum(axis=0))       # collapse rows → shape (3,) — per-column sum
+print("sum axis=1:", M.sum(axis=1))       # collapse cols → shape (2,) — per-row sum
+print("max axis=1:", M.max(axis=1))       # max of each row
+print("argmax    :", M.argmax(axis=1))    # index of max in each row
+```
+
+```output
+sum all   : 21.0
+sum axis=0: [5. 7. 9.]
+sum axis=1: [ 6. 15.]
+max axis=1: [3. 6.]
+argmax    : [2 2]
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# 1) Pairwise L2 distance without a loop.
+# Given N points in 2D, compute all N×N distances.
+rng = np.random.default_rng(7)
+pts = rng.uniform(0, 10, (5, 2))       # 5 points, 2 coords each
+
+# Trick: subtract (5,1,2) from (1,5,2) → (5,5,2), then square+sum+sqrt
+diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]  # (5,5,2)
+D = np.sqrt((diff ** 2).sum(axis=2))                  # (5,5)
+print("distance matrix:\n", D.round(2))
+
+# 2) Outer product via broadcasting: column vec × row vec
+u = np.array([[1.0], [2.0], [3.0]])    # shape (3,1)
+v = np.array([[10.0, 20.0, 30.0]])     # shape (1,3)
+print("outer product:\n", u * v)        # (3,3) with no np.outer call
+```
+
+```output
+distance matrix:
+ [[0.   2.13 3.54 5.48 4.37]
+  [2.13 0.   2.01 4.62 5.79]
+  [3.54 2.01 0.   2.76 6.05]
+  [5.48 4.62 2.76 0.   3.39]
+  [4.37 5.79 6.05 3.39 0.  ]]
+outer product:
+ [[10. 20. 30.]
+  [20. 40. 60.]
+  [30. 60. 90.]]
+```
+
+*(Distance values depend on the random seed — the zero diagonal and symmetry are what matter.)*
+
+## Exercise
+
+Without any Python loop, compute the **softmax** of each row in a `(4, 5)` matrix:
+
+$$
+\text{softmax}(z)_i = \frac{e^{z_i - \max(z)}}{\sum_j e^{z_j - \max(z)}}
+$$
+
+Use `np.random.default_rng(0).standard_normal((4, 5))` as input. Verify: each row sums to 1.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+Z = rng.standard_normal((4, 5))
+
+Z_shift = Z - Z.max(axis=1, keepdims=True)  # subtract row max for stability
+exp_Z   = np.exp(Z_shift)
+softmax = exp_Z / exp_Z.sum(axis=1, keepdims=True)
+
+print("row sums:", softmax.sum(axis=1).round(10))  # should be all 1.0
+print("first row:", softmax[0].round(4))
+```
+
+Both `keepdims=True` calls are load-bearing: the max and the sum are shape `(4, 1)`, which
+broadcasts correctly against `(4, 5)`. Drop `keepdims` and you get the wrong axis.
+</details>

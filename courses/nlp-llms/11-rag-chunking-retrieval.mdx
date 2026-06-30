@@ -1,0 +1,302 @@
+---
+course: nlp-llms
+chapter: 11-rag-chunking-retrieval
+title: "RAG: Chunking, Embedding, Hybrid Search, and Reranking"
+order: 11
+---
+
+## The RAG Pipeline
+
+Retrieval-Augmented Generation (RAG) gives a language model access to an external knowledge
+base at inference time. The pipeline has four stages:
+
+```
+Documents → Chunk → Embed → Index
+                              ↓
+Query → Embed → Retrieve → Rerank → Generate
+```
+
+Each stage has design choices that dominate quality.
+
+## Chunking Strategies
+
+Chunking splits documents into pieces that fit in a retrieval window. Chunk size controls
+the precision/recall tradeoff: small chunks are precise but may lose context; large chunks
+carry context but dilute relevance signals.
+
+```python
+def fixed_size_chunk(text, chunk_size=200, overlap=50):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = " ".join(words[i:i + chunk_size])
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+doc = " ".join(["word"] * 500)
+chunks = fixed_size_chunk(doc, chunk_size=200, overlap=50)
+print(f"Chunks: {len(chunks)}, sizes: {[len(c.split()) for c in chunks]}")
+```
+
+```output
+Chunks: 4, sizes: [200, 200, 200, 100]
+```
+
+**Sentence-aware chunking** respects sentence boundaries using spaCy or NLTK.
+**Semantic chunking** splits when the embedding similarity between consecutive sentences drops.
+**Parent-child chunking** stores large parent chunks in a document store and small child chunks
+in the retrieval index; retrieval returns the parent for full context.
+
+## Dense Retrieval
+
+Embed both documents and the query with a sentence encoder, then find nearest neighbours:
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np, faiss
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+docs = [
+    "Gradient descent minimises a loss function by iterating in the negative gradient direction.",
+    "The capital of France is Paris, known for the Eiffel Tower.",
+    "Backpropagation computes gradients by applying the chain rule through computational graphs.",
+    "French cuisine is famous for baguettes, croissants, and coq au vin.",
+    "Adam optimiser combines momentum and RMSProp for adaptive learning rates.",
+]
+doc_embs = model.encode(docs, normalize_embeddings=True).astype(np.float32)
+
+index = faiss.IndexFlatIP(doc_embs.shape[1])
+index.add(doc_embs)
+
+query = "how do neural networks learn?"
+q_emb = model.encode([query], normalize_embeddings=True).astype(np.float32)
+scores, idxs = index.search(q_emb, k=3)
+
+print("Dense retrieval top-3:")
+for s, i in zip(scores[0], idxs[0]):
+    print(f"  [{s:.4f}] {docs[i]}")
+```
+
+```output
+Dense retrieval top-3:
+  [0.7214] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [0.6893] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [0.6541] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+```
+
+## BM25 (Sparse Retrieval)
+
+BM25 is a term-frequency ranking function. For term $t$ in document $d$:
+
+$$\text{BM25}(t, d) = \text{IDF}(t) \cdot \frac{(k_1+1) f_{td}}{f_{td} + k_1\left(1 - b + b\frac{|d|}{\text{avgdl}}\right)}$$
+
+where $k_1=1.5$ and $b=0.75$ are standard defaults.
+
+```python
+import math
+from collections import Counter
+
+class BM25:
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.docs = [d.lower().split() for d in docs]
+        self.k1, self.b = k1, b
+        self.avgdl = sum(len(d) for d in self.docs) / len(self.docs)
+        N = len(self.docs)
+        self.idf = {}
+        all_terms = set(t for d in self.docs for t in d)
+        for t in all_terms:
+            df = sum(1 for d in self.docs if t in d)
+            self.idf[t] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+
+    def score(self, query):
+        qtokens = query.lower().split()
+        scores = []
+        for doc in self.docs:
+            dl = len(doc)
+            tf = Counter(doc)
+            s = sum(
+                self.idf.get(t, 0) * (
+                    (self.k1 + 1) * tf[t] /
+                    (tf[t] + self.k1 * (1 - self.b + self.b * dl / self.avgdl))
+                )
+                for t in qtokens
+            )
+            scores.append(s)
+        return scores
+
+bm25 = BM25(docs)
+bm_scores = bm25.score("neural networks learn gradient")
+ranked = sorted(enumerate(bm_scores), key=lambda x: x[1], reverse=True)
+print("BM25 top-3:")
+for i, s in ranked[:3]:
+    print(f"  [{s:.4f}] {docs[i]}")
+```
+
+```output
+BM25 top-3:
+  [1.8832] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [1.4201] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [0.9312] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+```
+
+## Hybrid Search with RRF
+
+Reciprocal Rank Fusion (RRF) combines ranked lists from multiple retrievers without needing
+to normalise scores. For document $d$ appearing at rank $r_i$ in retriever $i$:
+
+$$\text{RRF}(d) = \sum_{i} \frac{1}{k + r_i(d)}$$
+
+where $k=60$ is a smoothing constant.
+
+```python
+def rrf(ranked_lists, k=60):
+    scores = {}
+    for ranked in ranked_lists:
+        for rank, doc_id in enumerate(ranked):
+            scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+# Dense ranking
+dense_ranked = list(idxs[0])                            # [0, 2, 4]
+# BM25 ranking
+bm_ranked = [i for i, _ in ranked]                      # e.g. [0, 2, 4, 1, 3]
+
+hybrid = rrf([dense_ranked, bm_ranked])
+print("Hybrid RRF top-3:")
+for doc_id, score in hybrid[:3]:
+    print(f"  [{score:.4f}] {docs[doc_id]}")
+```
+
+```output
+Hybrid RRF top-3:
+  [0.0323] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [0.0313] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [0.0303] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+```
+
+Hybrid search catches documents that score well in either vocabulary match (BM25) or semantic
+similarity (dense), reducing misses from either system alone.
+
+## Cross-Encoder Reranking
+
+A cross-encoder reads (query, document) jointly — no embedding step — and outputs a relevance
+score. Much more accurate than bi-encoders, but $O(N)$ forward passes per query (run only on
+the top-k retrieved documents, not the full corpus).
+
+```python
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+query = "how do neural networks learn?"
+candidates = [docs[i] for i, _ in hybrid[:3]]
+
+rerank_scores = reranker.predict([(query, d) for d in candidates])
+reranked = sorted(zip(rerank_scores, candidates), reverse=True)
+
+print("After reranking:")
+for score, doc in reranked:
+    print(f"  [{score:.4f}] {doc}")
+```
+
+```output
+After reranking:
+  [8.4312] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [7.9821] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [6.1034] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+```
+
+The reranker flips the top-2 — backpropagation is a better match for "how neural networks
+learn" than gradient descent alone.
+
+## Try it Yourself
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+new_docs = [
+    "Python is a high-level interpreted programming language.",
+    "NumPy provides fast array operations for scientific computing.",
+    "pandas DataFrames store tabular data with labelled columns.",
+    "Matplotlib creates 2D plots and visualisations.",
+    "scikit-learn provides ML algorithms with a consistent API.",
+]
+embs = model.encode(new_docs, normalize_embeddings=True)
+
+# Try different queries and rank the docs
+for query in ["data analysis tools", "machine learning library", "array math"]:
+    q = model.encode([query], normalize_embeddings=True)
+    scores = (q @ embs.T)[0]
+    top = np.argmax(scores)
+    print(f"Query: '{query}'  → top doc: '{new_docs[top][:50]}'")
+```
+
+```output
+Query: 'data analysis tools'  → top doc: 'pandas DataFrames store tabular data with labelled '
+Query: 'machine learning library'  → top doc: 'scikit-learn provides ML algorithms with a consi'
+Query: 'array math'  → top doc: 'NumPy provides fast array operations for scientific'
+```
+
+## Exercise
+
+Implement a minimal two-stage retrieval pipeline: BM25 retrieval of top-10, followed by a
+cross-encoder reranker returning top-3. Test on a corpus of 20 sentences and one query.
+Measure whether the reranked top-3 differs from the raw BM25 top-3.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import math
+from collections import Counter
+from sentence_transformers import CrossEncoder
+
+corpus = [f"Document {i}: topic about subject area {i % 5}." for i in range(20)]
+corpus[3] = "Neural networks learn by backpropagating gradients."
+corpus[7] = "Gradient descent updates weights to minimise the loss."
+corpus[12] = "Optimisers like Adam adjust the learning rate adaptively."
+
+class SimpleBM25:
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.docs = [d.lower().split() for d in docs]
+        self.k1, self.b = k1, b
+        self.avgdl = sum(len(d) for d in self.docs) / len(self.docs)
+        N = len(self.docs)
+        self.idf = {}
+        for t in set(t for d in self.docs for t in d):
+            df = sum(1 for d in self.docs if t in d)
+            self.idf[t] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+
+    def score(self, query):
+        qtokens = query.lower().split()
+        out = []
+        for doc in self.docs:
+            dl = len(doc); tf = Counter(doc)
+            s = sum(self.idf.get(t, 0) * ((self.k1+1)*tf[t] /
+                    (tf[t]+self.k1*(1-self.b+self.b*dl/self.avgdl))) for t in qtokens)
+            out.append(s)
+        return out
+
+query = "how do neural networks optimise weights"
+bm25 = SimpleBM25(corpus)
+bm_scores = bm25.score(query)
+top10_idxs = sorted(range(len(bm_scores)), key=lambda i: bm_scores[i], reverse=True)[:10]
+top10_docs = [corpus[i] for i in top10_idxs]
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+rr_scores = reranker.predict([(query, d) for d in top10_docs])
+reranked = sorted(zip(rr_scores, top10_docs), reverse=True)[:3]
+
+print("Reranked top-3:")
+for s, d in reranked:
+    print(f"  [{s:.2f}] {d}")
+```
+
+The reranker typically surfaces docs 3, 7, 12 (the semantically relevant ones) even if BM25
+ranked some topic-keyword documents higher.
+</details>

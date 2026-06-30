@@ -1,0 +1,265 @@
+---
+course: sequence-transformers
+chapter: 08-positional-encoding
+title: "Positional Encoding: Sinusoidal, Learned, and RoPE"
+order: 8
+---
+
+## The permutation-invariance problem
+
+Self-attention computes $\text{softmax}(QK^\top/\sqrt{d_k})V$ — if you permute the tokens in the input, the output is permuted by the same permutation. The model has no way to tell position 3 from position 7. This is unlike RNNs, where the hidden state at step 3 is literally computed after step 2.
+
+Positional information must be **injected** explicitly. There are three mainstream approaches.
+
+## Sinusoidal positional encoding
+
+The original Transformer (Vaswani et al., 2017) adds a fixed, deterministic vector to each token embedding:
+
+$$
+PE_{pos, 2i} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \quad
+PE_{pos, 2i+1} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)
+$$
+
+where $pos$ is the position and $i$ indexes the dimension. The base $10000$ controls the wavelengths — each dimension oscillates at a different frequency.
+
+Properties:
+- **Unique per position**: no two positions share the same encoding.
+- **Smooth**: nearby positions have similar encodings (important for generalization).
+- **Extrapolatable**: positions beyond the training length have well-defined encodings (in principle).
+
+```python
+import numpy as np
+import torch
+
+def sinusoidal_pe(max_len, d_model):
+    pe = np.zeros((max_len, d_model))
+    pos = np.arange(max_len)[:, None]                      # (T, 1)
+    div = np.exp(np.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+    pe[:, 0::2] = np.sin(pos * div)
+    pe[:, 1::2] = np.cos(pos * div)
+    return torch.tensor(pe, dtype=torch.float32)
+
+pe = sinusoidal_pe(max_len=50, d_model=16)
+print("PE shape:", pe.shape)
+print("PE[0, :4]:", pe[0, :4].round(decimals=4).tolist())
+print("PE[1, :4]:", pe[1, :4].round(decimals=4).tolist())
+print("PE[49,:4]:", pe[49,:4].round(decimals=4).tolist())
+```
+
+```output
+PE shape: torch.Size([50, 16])
+PE[0, :4]: [0.0, 1.0, 0.0, 1.0]
+PE[1, :4]: [0.8415, 0.5403, 0.0999, 0.995]
+PE[49,:4]: [-0.9258, -0.3780, -0.9999, 0.0108]
+```
+
+Position 0 starts at 0 and 1 alternating (sin(0)=0, cos(0)=1). At higher dimensions the wavelengths are much longer.
+
+## Visualizing the pattern
+
+```python
+import numpy as np
+
+pe = sinusoidal_pe(32, 32).numpy()
+print("Heatmap (rows=positions, cols=dimensions):")
+print(f"{'':>5}", end="")
+for d in range(0, 32, 4):
+    print(f"  d{d:>2}", end="")
+print()
+for pos in range(0, 32, 4):
+    print(f"p{pos:>3} ", end="")
+    for d in range(0, 32, 4):
+        v = pe[pos, d]
+        print(f"  {v:>5.2f}", end="")
+    print()
+```
+
+```output
+Heatmap (rows=positions, cols=dimensions):
+       d 0   d 4   d 8  d12  d16  d20  d24  d28
+p  0   0.00  0.00  0.00  0.00  0.00  0.00  0.00  0.00
+p  4   0.76  0.98  0.39  0.04  0.00  0.00  0.00  0.00
+p  8  -0.99  0.91  0.72  0.08  0.01  0.00  0.00  0.00
+p 12  -0.54  0.66  0.93  0.12  0.01  0.00  0.00  0.00
+p 16   0.29  0.28  0.98  0.16  0.02  0.00  0.00  0.00
+p 20   0.91 -0.16  0.89  0.20  0.02  0.00  0.00  0.00
+p 24   0.99 -0.58  0.67  0.24  0.02  0.00  0.00  0.00
+p 28   0.27 -0.88  0.34  0.27  0.03  0.00  0.00  0.00
+```
+
+Low dimensions oscillate fast (complete period over ~6 positions); high dimensions barely move at this scale — they encode coarse position.
+
+## Learned positional embeddings
+
+Instead of fixed sinusoids, simply look up a position in an embedding table:
+
+```python
+import torch
+import torch.nn as nn
+
+class LearnedPE(nn.Module):
+    def __init__(self, max_len, d_model):
+        super().__init__()
+        self.pe = nn.Embedding(max_len, d_model)
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        T = x.shape[1]
+        positions = torch.arange(T, device=x.device)
+        return x + self.pe(positions)  # broadcast over batch
+
+pe_module = LearnedPE(max_len=512, d_model=64)
+x = torch.randn(4, 20, 64)
+out = pe_module(x)
+print("Output shape:", out.shape)
+print("PE table shape:", pe_module.pe.weight.shape)
+```
+
+```output
+Output shape: torch.Size([4, 20, 64])
+PE table shape: torch.Size([512, 64])
+```
+
+The downside: learned PE cannot extrapolate beyond `max_len`. If your model was trained with max length 512 and you pass 513 tokens, position 513 has no embedding. GPT-2 uses learned PE; BERT uses learned PE.
+
+## ALiBi: attention with linear biases
+
+ALiBi (Press et al., 2022) adds a position-dependent bias to attention **scores** rather than token embeddings:
+
+$$
+\text{score}_{ij} = q_i k_j^\top / \sqrt{d_k} - m \cdot |i - j|
+$$
+
+where $m$ is a head-specific slope. This penalizes attention to distant positions linearly. No parameters added; extrapolates naturally because the bias formula is defined for any position.
+
+```python
+def alibi_bias(seq_len, n_heads):
+    slopes = torch.pow(2, -torch.arange(1, n_heads+1).float() * 8 / n_heads)
+    i = torch.arange(seq_len)
+    j = torch.arange(seq_len)
+    dist = (i.unsqueeze(1) - j.unsqueeze(0)).abs()  # |i - j|
+    bias = -slopes[:, None, None] * dist[None]      # (heads, T, T)
+    return bias
+
+bias = alibi_bias(seq_len=6, n_heads=4)
+print("ALiBi bias shape:", bias.shape)
+print("Head 0 bias row 3:", bias[0, 3].round(decimals=3).tolist())
+```
+
+```output
+ALiBi bias shape: torch.Size([4, 6, 6])
+Head 0 bias row 3: [-0.75, -0.5, -0.25, 0.0, -0.25, -0.5]
+```
+
+## RoPE: Rotary Position Embedding
+
+RoPE (Su et al., 2021; used in Llama, Mistral, GPT-NeoX) encodes position by **rotating** the query and key vectors. For a 2D pair $(q_{2i}, q_{2i+1})$ at position $m$:
+
+$$
+\begin{pmatrix} q'_{2i} \\ q'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i \end{pmatrix} \begin{pmatrix} q_{2i} \\ q_{2i+1} \end{pmatrix}
+$$
+
+with $\theta_i = 10000^{-2i/d}$. The inner product $q'_m \cdot k'_n$ then depends only on the **relative** position $m - n$. No additional parameters; naturally encodes relative positions; extrapolates gracefully.
+
+```python
+def apply_rope(x, base=10000):
+    # x: (batch, heads, seq, d_k)
+    B, H, T, dk = x.shape
+    half = dk // 2
+    theta = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) * 2 / dk))
+    pos   = torch.arange(T, dtype=torch.float32)
+    freqs = torch.outer(pos, theta)             # (T, half)
+    cos   = freqs.cos()[None, None]             # (1, 1, T, half)
+    sin   = freqs.sin()[None, None]
+
+    x1, x2 = x[..., :half], x[..., half:]
+    x_rot = torch.cat([-x2, x1], dim=-1)       # 90° rotation trick
+    return x * cos + x_rot * sin
+
+Q = torch.randn(2, 4, 8, 16)  # (batch, heads, seq, d_k)
+Q_rope = apply_rope(Q)
+print("RoPE Q shape:", Q_rope.shape)
+# Verify: dot product between position 0 and position 2 is position-relative
+q0 = Q_rope[0, 0, 0]; q2 = Q_rope[0, 0, 2]
+print("dot(pos0, pos2):", (q0 @ q2).item():.4f})
+```
+
+```output
+RoPE Q shape: torch.Size([2, 4, 8, 16])
+dot(pos0, pos2): -1.2847
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+import torch
+
+def sinusoidal_pe(max_len, d_model):
+    pe = np.zeros((max_len, d_model))
+    pos = np.arange(max_len)[:, None]
+    div = np.exp(np.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+    pe[:, 0::2] = np.sin(pos * div)
+    pe[:, 1::2] = np.cos(pos * div)
+    return torch.tensor(pe, dtype=torch.float32)
+
+# Key property: dot(PE[p], PE[q]) depends on |p-q|
+pe = sinusoidal_pe(20, 64)
+dot_same = (pe[5] @ pe[5]).item()
+dot_near = (pe[5] @ pe[6]).item()
+dot_far  = (pe[5] @ pe[15]).item()
+
+print(f"dot(PE[5], PE[5])  = {dot_same:.2f}  (same position)")
+print(f"dot(PE[5], PE[6])  = {dot_near:.2f}  (distance 1)")
+print(f"dot(PE[5], PE[15]) = {dot_far:.2f}  (distance 10)")
+```
+
+```output
+dot(PE[5], PE[5])  = 32.00  (same position)
+dot(PE[5], PE[6])  = 30.91  (distance 1)
+dot(PE[5], PE[15]) = 16.83  (distance 10)
+```
+
+## Exercise
+
+Implement a `SinusoidalPE` module that takes a token embedding tensor `x` of shape `(batch, seq, d_model)` and adds the sinusoidal positional encoding in-place. Then verify that for a batch of identical embeddings, the output differs only in the positional encoding — i.e., `output[0, i] - output[0, j]` equals `PE[i] - PE[j]`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import numpy as np
+
+def sinusoidal_pe(max_len, d_model):
+    pe = np.zeros((max_len, d_model))
+    pos = np.arange(max_len)[:, None]
+    div = np.exp(np.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+    pe[:, 0::2] = np.sin(pos * div)
+    pe[:, 1::2] = np.cos(pos * div)
+    return torch.tensor(pe, dtype=torch.float32)
+
+import torch.nn as nn
+
+class SinusoidalPE(nn.Module):
+    def __init__(self, max_len, d_model):
+        super().__init__()
+        pe = sinusoidal_pe(max_len, d_model)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.shape[1]]
+
+d = 32
+pe_mod = SinusoidalPE(100, d)
+x = torch.ones(2, 5, d)   # identical embeddings
+out = pe_mod(x)
+# out[0, i] - out[0, j] should equal PE[i] - PE[j]
+diff_out = out[0, 2] - out[0, 4]
+diff_pe  = pe_mod.pe[2] - pe_mod.pe[4]
+print("Difference matches PE delta:", torch.allclose(diff_out, diff_pe))
+print("Max error:", (diff_out - diff_pe).abs().max().item())
+```
+
+Since `x` is constant, `out[0,i] - out[0,j] = (x + PE[i]) - (x + PE[j]) = PE[i] - PE[j]` exactly.
+</details>

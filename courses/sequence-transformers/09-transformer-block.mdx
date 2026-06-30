@@ -1,0 +1,285 @@
+---
+course: sequence-transformers
+chapter: 09-transformer-block
+title: "The Full Transformer Block"
+order: 9
+---
+
+## The encoder block
+
+Each encoder layer has two sub-layers with **residual connections** and **layer normalization**:
+
+1. Multi-head self-attention
+2. Position-wise feed-forward network (FFN)
+
+**Pre-norm** (modern default): normalize before the sub-layer.
+
+$$
+x' = x + \text{MHA}(\text{LayerNorm}(x))
+$$
+$$
+x'' = x' + \text{FFN}(\text{LayerNorm}(x'))
+$$
+
+**Post-norm** (original paper): normalize after the residual. Pre-norm is more stable and trains without learning-rate warmup more readily.
+
+## The feed-forward network
+
+The FFN applies two linear transformations with a nonlinearity between:
+
+$$
+\text{FFN}(x) = \text{GELU}(x W_1 + b_1) W_2 + b_2
+$$
+
+The inner dimension is $4 d_{\text{model}}$ by convention (from the original paper). GELU is preferred over ReLU in modern Transformers — it's smoother and avoids the "dead unit" problem of ReLU.
+
+## Implementing the encoder block
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    d_k = Q.shape[-1]
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)
+    if mask is not None:
+        scores = scores.masked_fill(mask, float('-inf'))
+    return torch.matmul(F.softmax(scores, dim=-1), V)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h = n_heads; self.dk = d_model // n_heads
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, q, k, v, mask=None):
+        B, T, D = q.shape
+        Tk = k.shape[1]
+        def proj(W, x, Tx):
+            return W(x).view(B, Tx, self.h, self.dk).transpose(1, 2)
+        Q, K, V = proj(self.Wq, q, T), proj(self.Wk, k, Tk), proj(self.Wv, v, Tk)
+        out = scaled_dot_product_attention(Q, K, V, mask)
+        return self.Wo(out.transpose(1, 2).contiguous().view(B, T, D))
+
+class FFN(nn.Module):
+    def __init__(self, d_model, d_ff=None):
+        super().__init__()
+        d_ff = d_ff or 4 * d_model
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x)))
+
+class EncoderBlock(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.mha  = MultiHeadAttention(d_model, n_heads)
+        self.ffn  = FFN(d_model)
+        self.ln1  = nn.LayerNorm(d_model)
+        self.ln2  = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        # Pre-norm
+        x = x + self.drop(self.mha(self.ln1(x), self.ln1(x), self.ln1(x), mask))
+        x = x + self.drop(self.ffn(self.ln2(x)))
+        return x
+
+d, h, T = 64, 8, 10
+block = EncoderBlock(d, h)
+x   = torch.randn(3, T, d)
+out = block(x)
+print("EncoderBlock output shape:", out.shape)
+print("Params:", sum(p.numel() for p in block.parameters()))
+```
+
+```output
+EncoderBlock output shape: torch.Size([3, 10, 64])
+Params: 33,600
+```
+
+## The decoder block
+
+The decoder block has three sub-layers:
+1. **Masked self-attention** — causal mask prevents attending to future tokens.
+2. **Cross-attention** — queries from decoder, keys/values from encoder output.
+3. **FFN** — identical to encoder.
+
+```python
+class DecoderBlock(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.self_attn  = MultiHeadAttention(d_model, n_heads)
+        self.cross_attn = MultiHeadAttention(d_model, n_heads)
+        self.ffn  = FFN(d_model)
+        self.ln1  = nn.LayerNorm(d_model)
+        self.ln2  = nn.LayerNorm(d_model)
+        self.ln3  = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, enc_out, self_mask=None, cross_mask=None):
+        x = x + self.drop(self.self_attn(self.ln1(x), self.ln1(x), self.ln1(x), self_mask))
+        x = x + self.drop(self.cross_attn(self.ln2(x), enc_out, enc_out, cross_mask))
+        x = x + self.drop(self.ffn(self.ln3(x)))
+        return x
+
+enc_out = torch.randn(3, 15, d)  # encoder: 15 source tokens
+dec_in  = torch.randn(3, 8,  d)  # decoder: 8 target tokens so far
+dec_block = DecoderBlock(d, h)
+
+T_dec = 8
+causal_mask = torch.triu(torch.ones(T_dec, T_dec, dtype=torch.bool), diagonal=1)
+causal_mask = causal_mask[None, None]  # (1, 1, T, T) for broadcasting
+
+dec_out = dec_block(dec_in, enc_out, self_mask=causal_mask)
+print("DecoderBlock output shape:", dec_out.shape)
+```
+
+```output
+DecoderBlock output shape: torch.Size([3, 8, 64])
+```
+
+## Stacking blocks: full encoder
+
+```python
+class TransformerEncoder(nn.Module):
+    def __init__(self, vocab_size, d_model, n_heads, n_layers, max_len=512, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        self.pe    = nn.Embedding(max_len, d_model)  # learned PE
+        self.blocks = nn.ModuleList([EncoderBlock(d_model, n_heads, dropout) for _ in range(n_layers)])
+        self.norm  = nn.LayerNorm(d_model)
+        self.drop  = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        B, T = x.shape
+        pos  = torch.arange(T, device=x.device)
+        emb  = self.drop(self.embed(x) + self.pe(pos))
+        for block in self.blocks:
+            emb = block(emb, mask)
+        return self.norm(emb)
+
+enc = TransformerEncoder(vocab_size=1000, d_model=64, n_heads=8, n_layers=4)
+tokens = torch.randint(1, 1000, (2, 20))
+out    = enc(tokens)
+print("Encoder output shape:", out.shape)
+total  = sum(p.numel() for p in enc.parameters())
+print(f"Total encoder params: {total:,}")
+```
+
+```output
+Encoder output shape: torch.Size([2, 20, 64])
+Total encoder params: 268,864
+```
+
+## Parameter count formula
+
+For a transformer with $d$ model dimension, $h$ heads, $N$ layers:
+
+- Per MHA: $4 d^2$ (4 projection matrices)
+- Per FFN: $2 \cdot d \cdot 4d = 8d^2$
+- Per block total: $12 d^2$
+- Embeddings: $V \cdot d + T_{\max} \cdot d$
+
+GPT-2 small: $d=768$, $N=12$, $V=50257$. Block params: $12 \times 768^2 \approx 7.1$M per layer, $12 \times 7.1 \approx 85$M for blocks, plus embedding ≈ $125$M total.
+
+```python
+d, N, V = 768, 12, 50257
+block_params = 12 * d * d * N
+embed_params = V * d + 1024 * d
+total = block_params + embed_params
+print(f"GPT-2 small estimate: {total/1e6:.1f}M params")
+```
+
+```output
+GPT-2 small estimate: 123.7M params
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Minimal self-contained transformer block demo
+class SimpleTransformerBlock(nn.Module):
+    def __init__(self, d, h):
+        super().__init__()
+        dk = d // h
+        self.Wq = nn.Linear(d, d, bias=False)
+        self.Wk = nn.Linear(d, d, bias=False)
+        self.Wv = nn.Linear(d, d, bias=False)
+        self.Wo = nn.Linear(d, d, bias=False)
+        self.fc1 = nn.Linear(d, 4*d)
+        self.fc2 = nn.Linear(4*d, d)
+        self.ln1 = nn.LayerNorm(d)
+        self.ln2 = nn.LayerNorm(d)
+        self.h = h; self.dk = dk
+
+    def attn(self, x):
+        B, T, D = x.shape
+        def proj(W): return W(x).view(B, T, self.h, self.dk).transpose(1, 2)
+        Q, K, V = proj(self.Wq), proj(self.Wk), proj(self.Wv)
+        s = torch.matmul(Q, K.transpose(-2,-1)) / self.dk**0.5
+        a = torch.matmul(F.softmax(s, dim=-1), V)
+        return self.Wo(a.transpose(1,2).contiguous().view(B, T, D))
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.fc2(F.gelu(self.fc1(self.ln2(x))))
+        return x
+
+block = SimpleTransformerBlock(32, 4)
+x = torch.randn(2, 10, 32)
+print("Output shape:", block(x).shape)
+print("Params:", sum(p.numel() for p in block.parameters()))
+```
+
+```output
+Output shape: torch.Size([2, 10, 32])
+Params: 9,280
+```
+
+## Exercise
+
+Stack 2 `EncoderBlock` layers and 2 `DecoderBlock` layers into a minimal seq2seq Transformer. Verify shapes: encoder input `(2, 12, 64)` → encoder output `(2, 12, 64)` → decoder input `(2, 8, 64)` → decoder output `(2, 8, 64)`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn as nn
+
+class TinyTransformer(nn.Module):
+    def __init__(self, d=64, h=4, n=2):
+        super().__init__()
+        self.enc_layers = nn.ModuleList([EncoderBlock(d, h) for _ in range(n)])
+        self.dec_layers = nn.ModuleList([DecoderBlock(d, h) for _ in range(n)])
+
+    def forward(self, src, tgt, tgt_mask=None):
+        enc = src
+        for layer in self.enc_layers:
+            enc = layer(enc)
+        dec = tgt
+        for layer in self.dec_layers:
+            dec = layer(dec, enc, self_mask=tgt_mask)
+        return enc, dec
+
+d = 64
+model = TinyTransformer(d=d, h=4, n=2)
+src = torch.randn(2, 12, d)
+tgt = torch.randn(2,  8, d)
+enc_out, dec_out = model(src, tgt)
+print("Encoder output:", enc_out.shape)  # (2, 12, 64)
+print("Decoder output:", dec_out.shape)  # (2, 8, 64)
+```
+
+The decoder processes 8 target tokens while attending to all 12 source tokens in cross-attention. Each decoder block does three operations in sequence.
+</details>

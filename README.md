@@ -46,6 +46,46 @@ a floating button.
               └──────────────────────────────────┘
 ```
 
+## Courses
+
+20-course curriculum (basic → advanced), plus 3 fast-track courses.
+**14 of 20 curriculum courses are live.** Remaining 6 are planned and will be added in PLAN order.
+
+### Full curriculum
+
+| # | Course | Group | Chapters | Status |
+|---|--------|-------|----------|--------|
+| 1 | Python for Data Work | Foundations | 13 | ✅ Live |
+| 2 | Math & Optimization | Foundations | 13 | ✅ Live |
+| 3 | Probability & Statistics | Foundations | 17 | ✅ Live |
+| 4 | Data Wrangling & EDA | Foundations | 15 | ✅ Live |
+| 5 | Classical ML | Core ML | 17 | ✅ Live |
+| 6 | Time Series Forecasting | Core ML | 13 | ✅ Live |
+| 7 | Deep Learning Foundations | Deep Learning | 14 | ✅ Live |
+| 8 | CNNs & Computer Vision | Deep Learning | 13 | ✅ Live |
+| 9 | Sequences & Transformers | Deep Learning | 13 | ✅ Live |
+| 10 | Generative Models | Deep Learning | 12 | ✅ Live |
+| 11 | Modern Architectures | Deep Learning | 13 | ✅ Live |
+| 12 | NLP & LLMs | Deep Learning | 16 | ✅ Live |
+| 13 | Reinforcement Learning | Specialized | 14 | ✅ Live |
+| 14 | Graph ML | Specialized | 12 | ✅ Live |
+| 15 | Recommender Systems | Specialized | — | ⏳ Planned |
+| 16 | Bayesian & Probabilistic ML | Specialized | — | ⏳ Planned |
+| 17 | Evaluation, Tuning & Interpretability | Applied / Prod | — | ⏳ Planned |
+| 18 | Applied / Competition ML | Applied / Prod | — | ⏳ Planned |
+| 19 | System Design & Architecture | Applied / Prod | — | ⏳ Planned |
+| 20 | MLOps & Productionization | Applied / Prod | — | ⏳ Planned |
+
+### Fast-track courses ✦
+
+Pre-existing focused courses that run alongside the curriculum.
+
+| Course | Chapters |
+|--------|----------|
+| Foundations for LLM ✦ | 15 |
+| Bengali LLM ✦ | 18 |
+| Tabular Kaggle ✦ | 19 |
+
 ## Quickstart — recommended path
 
 **Step 0 — prerequisites:**
@@ -125,10 +165,26 @@ learning-deep/
 │   │   └── OutputBlock.tsx     # renders stdout/html/image/error outputs
 │   └── lib/
 │       └── runner.ts           # typed API client (runCode / resetSession)
-├── courses/                # MDX content: foundations-for-llm, bengali-llm,
-│   │                       #              tabular-kaggle, GLOSSARY.md
+├── courses/
+│   ├── foundations-for-llm/   # fast-track ✦ (frozen)
+│   ├── bengali-llm/           # fast-track ✦ (frozen)
+│   ├── tabular-kaggle/        # fast-track ✦ (frozen)
+│   ├── python-for-data-work/  # curriculum courses 1-14 (live)
+│   ├── math-optimization/
+│   ├── probability-statistics/
+│   ├── data-wrangling-eda/
+│   ├── classical-ml/
+│   ├── time-series-forecasting/
+│   ├── deep-learning-foundations/
+│   ├── cnns-computer-vision/
+│   ├── sequence-transformers/
+│   ├── generative-models/
+│   ├── modern-architectures/
+│   ├── nlp-llms/
+│   ├── reinforcement-learning/
+│   └── graph-ml/
 ├── docker-compose.yml
-└── docs/PLAN.md            # curriculum + course syllabi
+└── docs/PLAN.md            # full 20-course curriculum + syllabi
 ```
 
 ## API
@@ -165,5 +221,7 @@ deployment, run each kernel in a locked-down container (mem/cpu/pid limits, no
 network, read-only FS) — flags are stubbed in `docker-compose.yml`.
 
 ---
-Course contents curated by Claude Opus.
-Not implemented yet per the real order, as a competition is ahead and I need to learn deep...
+
+14 of 20 curriculum courses live. Remaining 6 (Recommender Systems, Bayesian ML,
+Eval/Tuning, Competition ML, System Design, MLOps) in progress per PLAN.md order.
+Course contents curated by Claude.

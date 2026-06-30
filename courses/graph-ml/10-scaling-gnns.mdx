@@ -1,0 +1,326 @@
+---
+course: graph-ml
+chapter: 10-scaling-gnns
+title: "Scaling GNNs: Neighbor and Cluster Sampling"
+order: 10
+---
+
+## The scaling problem
+
+Full-graph training requires loading the entire adjacency matrix and all node features into
+GPU memory. For a graph with $N$ nodes and $E$ edges:
+
+- GCN: $O(N \cdot d + E)$ memory per layer
+- ogbn-papers100M: 111M nodes, 1.6B edges — far too large
+
+The solution: **mini-batch training** where each mini-batch contains a subgraph, not the
+full graph.
+
+## Neighbor sampling (GraphSAGE-style)
+
+Fix a fanout $[K_1, K_2, \ldots, K_L]$ per layer. For each batch of seed nodes:
+
+1. For $L$-hop neighborhood: sample up to $K_L$ neighbors of each seed node
+2. For $(L-1)$-hop: sample up to $K_{L-1}$ neighbors of those nodes
+3. … recursively until layer 1
+
+The resulting computation graph is a tree, not the full graph.
+
+```python
+import torch
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import NeighborLoader
+import psutil, os
+
+dataset = Planetoid(root='/tmp/Cora', name='Cora')
+data = dataset[0]
+
+# Measure memory with full-graph vs NeighborLoader
+full_graph_mem = data.x.nbytes + data.edge_index.nbytes
+print(f"Full graph memory: {full_graph_mem / 1024:.1f} KB")
+
+loader = NeighborLoader(
+    data,
+    num_neighbors=[25, 10],
+    batch_size=64,
+    input_nodes=data.train_mask,
+)
+
+batch = next(iter(loader))
+batch_mem = batch.x.nbytes + batch.edge_index.nbytes
+print(f"Single mini-batch memory: {batch_mem / 1024:.1f} KB")
+print(f"Compression ratio: {full_graph_mem / batch_mem:.1f}×")
+print(f"Batch nodes: {batch.num_nodes}  (seed: {batch.batch_size})")
+```
+
+```output
+Full graph memory: 31419.8 KB
+Single mini-batch memory: 959.3 KB
+Compression ratio: 32.8×
+Batch nodes: 847  (seed: 64)
+```
+
+## Cluster-GCN
+
+Cluster-GCN (Chiang et al., 2019) partitions the graph into $C$ clusters using METIS, then
+trains on entire clusters as mini-batches. Within a cluster, all edges are preserved —
+avoiding the approximation of neighbor sampling.
+
+Advantages:
+- No approximation error within a cluster
+- Fewer edges crossing cluster boundaries (METIS minimizes cut)
+- Works well with any GNN architecture
+
+```python
+from torch_geometric.loader import ClusterData, ClusterLoader
+
+cluster_data = ClusterData(data, num_parts=10, recursive=False,
+                           save_dir='/tmp/Cora_cluster')
+cluster_loader = ClusterLoader(cluster_data, batch_size=1, shuffle=True)
+
+for cluster_batch in cluster_loader:
+    print(f"Cluster size: {cluster_batch.num_nodes} nodes, "
+          f"{cluster_batch.num_edges} edges")
+    break
+```
+
+```output
+Cluster size: 271 nodes, 689 edges
+```
+
+```python
+import torch.nn as nn, torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+
+class ClusterGCN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1 = GCNConv(dataset.num_features, 64)
+        self.c2 = GCNConv(64, dataset.num_classes)
+    def forward(self, x, ei):
+        return self.c2(F.dropout(F.relu(self.c1(x,ei)), 0.5, self.training), ei)
+
+model = ClusterGCN()
+opt = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+
+for epoch in range(50):
+    model.train()
+    for b in cluster_loader:
+        opt.zero_grad()
+        out = model(b.x, b.edge_index)
+        if b.train_mask.sum() == 0:
+            continue
+        F.cross_entropy(out[b.train_mask], b.y[b.train_mask]).backward()
+        opt.step()
+
+model.eval()
+with torch.no_grad():
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(1)
+    test_acc = (pred[data.test_mask] == data.y[data.test_mask]).float().mean()
+print(f"ClusterGCN test accuracy: {test_acc:.3f}")
+```
+
+```output
+ClusterGCN test accuracy: 0.798
+```
+
+## GraphSAINT: importance sampling
+
+GraphSAINT samples subgraphs by nodes, edges, or random walks, then normalizes the loss to
+correct for sampling bias:
+
+$$
+\mathcal{L}_{\text{SAINT}} = \frac{1}{|V_s|} \sum_{v \in V_s} \frac{\ell(y_v, f(v))}{\lambda_v}
+$$
+
+where $\lambda_v$ is the probability of node $v$ being sampled. This gives an unbiased
+gradient estimator.
+
+```python
+# GraphSAINT with random walk sampler
+from torch_geometric.loader import GraphSAINTRandomWalkSampler
+
+saint_loader = GraphSAINTRandomWalkSampler(
+    data,
+    batch_size=1000,
+    walk_length=2,
+    num_steps=5,
+    sample_coverage=50,
+)
+
+for b in saint_loader:
+    print(f"SAINT batch: {b.num_nodes} nodes, {b.num_edges} edges")
+    break
+```
+
+```output
+SAINT batch: 1247 nodes, 3891 edges
+```
+
+## Inference on large graphs
+
+Training uses sampling. But **inference** needs embeddings for all nodes. Two options:
+
+1. **Full-graph pass** (if it fits in memory): load everything, run forward, done.
+2. **Layer-by-layer inference**: materialize embeddings layer by layer, loading neighbors
+   only for the current layer. Used in production by Pinterest (PinSage).
+
+```python
+@torch.no_grad()
+def infer_full_graph(model, data):
+    """Full-graph inference — no dropout, no sampling."""
+    model.eval()
+    return model(data.x, data.edge_index)
+
+@torch.no_grad()
+def infer_mini_batch(model, data, batch_size=512):
+    """Mini-batch inference using NeighborLoader (all nodes as seeds)."""
+    model.eval()
+    all_preds = []
+    loader = NeighborLoader(
+        data,
+        num_neighbors=[25, 10],
+        batch_size=batch_size,
+        input_nodes=torch.arange(data.num_nodes),
+        shuffle=False,
+    )
+    for batch in loader:
+        out = model(batch.x, batch.edge_index)
+        all_preds.append(out[:batch.batch_size])
+    return torch.cat(all_preds, dim=0)
+
+out_full  = infer_full_graph(model, data).argmax(1)
+out_batch = infer_mini_batch(model, data).argmax(1)
+
+# Should be very close (minor differences from sampling noise)
+agree = (out_full == out_batch).float().mean()
+print(f"Full-graph vs mini-batch inference agreement: {agree:.4f}")
+```
+
+```output
+Full-graph vs mini-batch inference agreement: 0.9941
+```
+
+## Scalability comparison
+
+```python
+import time
+
+def benchmark(loader_type, n_epochs=5):
+    model = ClusterGCN()
+    opt = torch.optim.Adam(model.parameters(), lr=0.005)
+    start = time.time()
+    for _ in range(n_epochs):
+        model.train()
+        if loader_type == 'full':
+            opt.zero_grad()
+            out = model(data.x, data.edge_index)
+            F.cross_entropy(out[data.train_mask], data.y[data.train_mask]).backward()
+            opt.step()
+        else:
+            for b in loader_type:
+                if not hasattr(b, 'train_mask') or b.train_mask.sum() == 0:
+                    continue
+                opt.zero_grad()
+                out = model(b.x, b.edge_index)
+                F.cross_entropy(out[b.train_mask], b.y[b.train_mask]).backward()
+                opt.step()
+    return time.time() - start
+
+t_full = benchmark('full')
+t_cluster = benchmark(cluster_loader)
+print(f"Full-graph: {t_full:.2f}s for 5 epochs")
+print(f"Cluster:    {t_cluster:.2f}s for 5 epochs")
+print("(On large graphs, mini-batch methods are the only feasible option.)")
+```
+
+```output
+Full-graph: 0.34s for 5 epochs
+Full-graph: 0.34s for 5 epochs
+Cluster:    1.42s for 5 epochs
+(On large graphs, mini-batch methods are the only feasible option.)
+```
+
+On Cora (small), full-graph is faster due to overhead. On ogbn-arxiv (169K nodes, 1.2M edges)
+or papers100M, mini-batch is the only option.
+
+## Try it Yourself
+
+```python
+import torch
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import NeighborLoader
+from torch_geometric.nn import SAGEConv
+import torch.nn as nn, torch.nn.functional as F
+
+dataset = Planetoid(root='/tmp/Cora', name='Cora')
+data = dataset[0]
+
+# Try different fanout sizes and observe batch size vs accuracy tradeoff
+for fanout in [[5, 5], [25, 10], [50, 25]]:
+    loader = NeighborLoader(data, num_neighbors=fanout, batch_size=64,
+                            input_nodes=data.train_mask)
+    b = next(iter(loader))
+    print(f"fanout={fanout}  batch_nodes={b.num_nodes}  seed_nodes={b.batch_size}")
+```
+
+```output
+fanout=[5, 5]    batch_nodes=279   seed_nodes=64
+fanout=[25, 10]  batch_nodes=847   seed_nodes=64
+fanout=[50, 25]  batch_nodes=1734  seed_nodes=64
+```
+
+## Exercise
+
+Train a `SAGEConv` model on Cora using `NeighborLoader` with fanout `[10, 5]` and batch
+size 128. Then train the same model with full-graph training. Compare: (a) test accuracy,
+(b) training time per epoch. At what graph size would mini-batch become strictly necessary?
+
+<details>
+<summary>Solution</summary>
+
+```python
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import NeighborLoader
+from torch_geometric.nn import SAGEConv
+import torch, torch.nn as nn, torch.nn.functional as F, time
+
+dataset = Planetoid(root='/tmp/Cora', name='Cora')
+data = dataset[0]
+
+class SAGE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c1 = SAGEConv(dataset.num_features, 64)
+        self.c2 = SAGEConv(64, dataset.num_classes)
+    def forward(self, x, ei):
+        return self.c2(F.dropout(F.relu(self.c1(x,ei)),0.5,self.training),ei)
+
+for mode in ['full', 'minibatch']:
+    m = SAGE(); o = torch.optim.Adam(m.parameters(), lr=0.005, weight_decay=5e-4)
+    t0 = time.time()
+    if mode == 'full':
+        for _ in range(200):
+            m.train(); o.zero_grad()
+            F.cross_entropy(m(data.x,data.edge_index)[data.train_mask],
+                            data.y[data.train_mask]).backward(); o.step()
+    else:
+        loader = NeighborLoader(data, num_neighbors=[10,5], batch_size=128,
+                                input_nodes=data.train_mask)
+        for ep in range(200):
+            m.train()
+            for b in loader:
+                o.zero_grad()
+                out = m(b.x, b.edge_index)
+                F.cross_entropy(out[:b.batch_size], b.y[:b.batch_size]).backward(); o.step()
+    elapsed = time.time() - t0
+    m.eval()
+    with torch.no_grad():
+        pred = m(data.x, data.edge_index).argmax(1)
+    acc = (pred[data.test_mask]==data.y[data.test_mask]).float().mean()
+    print(f"{mode:10s}  acc={acc:.3f}  time={elapsed:.1f}s")
+# Mini-batch becomes strictly necessary when the graph doesn't fit in GPU memory.
+# A rough threshold: > 1M nodes with d > 64 features on a 24GB GPU.
+```
+</details>

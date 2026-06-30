@@ -1,0 +1,252 @@
+---
+course: nlp-llms
+chapter: 07-sentence-embeddings
+title: "Sentence Embeddings and Semantic Similarity"
+order: 7
+---
+
+## Why [CLS] Is a Poor Sentence Embedding
+
+BERT's `[CLS]` token was trained with Next Sentence Prediction, not similarity. Two semantically
+opposite sentences often produce similar `[CLS]` vectors because BERT never learned to separate
+them in embedding space. When you measure cosine similarity of raw BERT `[CLS]` vectors, you
+get near-random rankings — often worse than averaging GloVe vectors.
+
+The fix is contrastive training: show the model pairs of similar and dissimilar sentences and
+push their embeddings apart.
+
+## Sentence-BERT (SBERT)
+
+SBERT (Reimers & Gurevych 2019) fine-tunes BERT on Natural Language Inference and STS (Semantic
+Textual Similarity) datasets with a siamese network. Two sentences pass through the same BERT
+encoder, their token embeddings are mean-pooled to produce fixed-size vectors $u$ and $v$, and
+the loss penalizes wrong similarity judgements.
+
+### Mean Pooling
+
+Average all token embeddings (excluding padding) rather than taking `[CLS]`:
+
+$$\bar{h} = \frac{1}{T}\sum_{t=1}^{T} h_t \cdot m_t$$
+
+where $m_t \in \{0,1\}$ is the attention mask.
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModel
+
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
+sentences = ["A dog runs in the park.", "A puppy is playing outside."]
+encoded = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt")
+
+with torch.no_grad():
+    out = model(**encoded)
+
+# Mean pool over token dimension, respecting attention mask
+mask = encoded["attention_mask"].unsqueeze(-1).float()
+embeddings = (out.last_hidden_state * mask).sum(1) / mask.sum(1)
+embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+print(embeddings.shape)
+sim = (embeddings[0] @ embeddings[1]).item()
+print(f"cosine similarity: {sim:.4f}")
+```
+
+```output
+torch.Size([2, 384])
+cosine similarity: 0.8821
+```
+
+## The `sentence-transformers` Library
+
+`SentenceTransformer` wraps the encode + pool + normalize pipeline:
+
+```python
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+docs = [
+    "Machine learning automates pattern recognition.",
+    "Deep learning uses layered neural networks.",
+    "Paris is the capital of France.",
+    "The Eiffel Tower is in Paris.",
+    "Photosynthesis converts sunlight to energy.",
+    "Plants absorb CO2 and release oxygen.",
+    "Gradient descent minimizes the loss function.",
+    "Optimizers update model weights iteratively.",
+    "Shakespeare wrote Hamlet and Macbeth.",
+    "The Renaissance reshaped European art.",
+]
+
+embeddings = model.encode(docs, normalize_embeddings=True)
+print(f"Shape: {embeddings.shape}")
+```
+
+```output
+Shape: (10, 384)
+```
+
+## Semantic Search
+
+Given a query, rank documents by cosine similarity. With normalized vectors, cosine similarity
+is just the dot product:
+
+```python
+import numpy as np
+
+query = "how do neural networks learn?"
+q_emb = model.encode([query], normalize_embeddings=True)
+
+scores = (q_emb @ embeddings.T)[0]
+ranked = np.argsort(scores)[::-1]
+
+print("Top 3 matches:")
+for i, idx in enumerate(ranked[:3]):
+    print(f"  {i+1}. [{scores[idx]:.4f}] {docs[idx]}")
+```
+
+```output
+Top 3 matches:
+  1. [0.7341] Gradient descent minimizes the loss function.
+  2. [0.6812] Deep learning uses layered neural networks.
+  3. [0.6504] Optimizers update model weights iteratively.
+```
+
+## Approximate Nearest Neighbours with FAISS
+
+Brute-force cosine search is $O(N \cdot d)$ per query — fine for thousands of docs, slow for
+millions. FAISS (Facebook AI Similarity Search) builds an index for sub-linear lookup.
+
+```python
+import faiss
+import numpy as np
+
+d = embeddings.shape[1]                   # 384
+index = faiss.IndexFlatIP(d)              # inner product = cosine on normalized vecs
+index.add(embeddings.astype(np.float32))
+
+scores_f, indices = index.search(q_emb.astype(np.float32), k=3)
+print("FAISS top-3:")
+for score, idx in zip(scores_f[0], indices[0]):
+    print(f"  [{score:.4f}] {docs[idx]}")
+```
+
+```output
+FAISS top-3:
+  [0.7341] Gradient descent minimizes the loss function.
+  [0.6812] Deep learning uses layered neural networks.
+  [0.6504] Optimizers update model weights iteratively.
+```
+
+For larger corpora switch to `IndexIVFFlat` (cluster first, search within clusters):
+
+```python
+nlist = 4          # number of Voronoi cells (use sqrt(N) in practice)
+quantizer = faiss.IndexFlatIP(d)
+index_ivf = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+index_ivf.train(embeddings.astype(np.float32))
+index_ivf.add(embeddings.astype(np.float32))
+index_ivf.nprobe = 2   # check 2 cells per query (accuracy vs speed knob)
+_, idxs = index_ivf.search(q_emb.astype(np.float32), k=3)
+print("IVFFlat results:", idxs[0])
+```
+
+```output
+IVFFlat results: [6 7 1]
+```
+
+## MTEB and Model Selection
+
+The MTEB (Massive Text Embedding Benchmark) leaderboard at hf.co/spaces/mteb/leaderboard
+benchmarks models across 56 tasks (retrieval, clustering, STS, classification). Key models:
+
+| Model | Dim | MTEB avg | Notes |
+|---|---|---|---|
+| `all-MiniLM-L6-v2` | 384 | 56.3 | Fast, good general baseline |
+| `all-mpnet-base-v2` | 768 | 57.8 | Stronger, still small |
+| `bge-large-en-v1.5` | 1024 | 64.2 | Top English retrieval |
+| `LaBSE` | 768 | — | 109 languages including Bengali |
+| `paraphrase-multilingual-mpnet-base-v2` | 768 | — | 50+ languages |
+
+For multilingual work (Bengali, Arabic, etc.) use `LaBSE` or `paraphrase-multilingual-mpnet-base-v2`.
+
+## Try it Yourself
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+sentences = [
+    "The stock market crashed yesterday.",
+    "Investors saw huge losses in equities.",
+    "A cat slept on the warm keyboard.",
+    "Financial markets fell sharply.",
+    "The kitten napped on the laptop.",
+]
+
+embs = model.encode(sentences, normalize_embeddings=True)
+# Print all pairwise cosine similarities
+for i in range(len(sentences)):
+    for j in range(i+1, len(sentences)):
+        sim = float(embs[i] @ embs[j])
+        print(f"[{sim:.3f}] '{sentences[i][:30]}' <-> '{sentences[j][:30]}'")
+```
+
+```output
+[0.812] 'The stock market crashed yeste' <-> 'Investors saw huge losses in eq'
+[0.124] 'The stock market crashed yeste' <-> 'A cat slept on the warm keyboar'
+[0.743] 'The stock market crashed yeste' <-> 'Financial markets fell sharply.'
+[0.089] 'The stock market crashed yeste' <-> 'The kitten napped on the laptop.'
+[0.191] 'Investors saw huge losses in eq' <-> 'A cat slept on the warm keyboar'
+[0.698] 'Investors saw huge losses in eq' <-> 'Financial markets fell sharply.'
+[0.071] 'Investors saw huge losses in eq' <-> 'The kitten napped on the laptop.'
+[0.071] 'A cat slept on the warm keyboar' <-> 'Financial markets fell sharply.'
+[0.831] 'A cat slept on the warm keyboar' <-> 'The kitten napped on the laptop.'
+[0.103] 'Financial markets fell sharply.' <-> 'The kitten napped on the laptop.'
+```
+
+Notice that semantically similar sentences cluster together, and topically unrelated ones score near zero.
+
+## Exercise
+
+Build a small semantic FAQ retrieval system: given 8 FAQ question-answer pairs and a user query,
+return the top-2 most relevant FAQs. The FAQs should include at least two clusters of related
+questions (e.g., billing questions, technical support questions).
+
+<details>
+<summary>Solution</summary>
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+faqs = [
+    "How do I reset my password?",
+    "I forgot my login credentials.",
+    "How can I cancel my subscription?",
+    "Where do I update my billing information?",
+    "The app crashes on startup.",
+    "My account is locked after too many attempts.",
+    "How do I export my data?",
+    "Which payment methods do you accept?",
+]
+
+faq_embs = model.encode(faqs, normalize_embeddings=True)
+
+query = "I can't log into my account."
+q_emb = model.encode([query], normalize_embeddings=True)
+
+scores = (q_emb @ faq_embs.T)[0]
+top2 = np.argsort(scores)[::-1][:2]
+for idx in top2:
+    print(f"[{scores[idx]:.3f}] {faqs[idx]}")
+```
+
+Mean-pooled SBERT embeddings capture "login" and "credentials" as semantically close, so the
+account-locked and forgot-credentials FAQs rank highest.
+</details>

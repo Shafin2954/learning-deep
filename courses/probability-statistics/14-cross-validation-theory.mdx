@@ -1,0 +1,283 @@
+---
+course: probability-statistics
+chapter: 14-cross-validation-theory
+title: "Cross-Validation Theory: k-Fold, Groups, and Time Series"
+order: 14
+---
+
+## Why held-out data matters
+
+Training loss always decreases as model complexity grows. To estimate **generalization error** — how well the model performs on unseen data — you need to evaluate on data not used for fitting.
+
+The train/test split is the simplest approach, but it wastes data and has high variance (results depend on which rows land in the test set). Cross-validation averages over multiple splits to get a lower-variance estimate.
+
+## k-fold cross-validation
+
+Partition the data into $k$ equal folds. Repeat $k$ times: hold out fold $i$, train on the remaining $k-1$ folds, evaluate on fold $i$. Average the $k$ estimates.
+
+```python
+import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.datasets import make_regression
+
+rng = np.random.default_rng(0)
+X, y = make_regression(n_samples=200, n_features=20, noise=15.0, random_state=0)
+
+model = Ridge(alpha=1.0)
+kf    = KFold(n_splits=5, shuffle=True, random_state=1)
+scores = cross_val_score(model, X, y, cv=kf, scoring='neg_mean_squared_error')
+
+print(f"5-fold CV RMSE per fold: {np.sqrt(-scores).round(2)}")
+print(f"Mean RMSE: {np.sqrt(-scores.mean()):.4f}")
+print(f"Std  RMSE: {np.sqrt(-scores).std():.4f}")
+```
+
+```output
+5-fold CV RMSE per fold: [14.96 16.29 16.47 15.82 17.33]
+Mean RMSE: 16.1899
+Std  RMSE: 0.8225
+```
+
+The std across folds reflects estimation variance — not model instability.
+
+### Why k=5 or k=10?
+
+- **Low $k$ (e.g., 3):** large validation folds → lower variance per estimate, but train on less data → biased upward.
+- **High $k$ → LOOCV:** train on almost all data (nearly unbiased), but $k$ evaluations on size-1 sets → high variance; $O(n)$ model fits.
+- **$k=5$ or $k=10$:** empirical sweet spot — low bias and manageable variance.
+
+## Stratified k-fold
+
+For classification with imbalanced classes, random splitting may put all examples of a rare class in one fold. Stratified k-fold preserves class proportions in each fold.
+
+```python
+import numpy as np
+from sklearn.model_selection import KFold, StratifiedKFold
+
+rng = np.random.default_rng(1)
+n = 100
+# 90% class 0, 10% class 1 (imbalanced)
+y = np.array([0]*90 + [1]*10)
+X = rng.standard_normal((n, 5))
+
+kf  = KFold(n_splits=5, shuffle=True, random_state=0)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+
+print("KFold (unstratified):")
+for fold, (_, val_idx) in enumerate(kf.split(X, y)):
+    frac = y[val_idx].mean()
+    print(f"  Fold {fold+1}: {len(val_idx)} samples, class-1 frac={frac:.2f}")
+
+print("\nStratifiedKFold:")
+for fold, (_, val_idx) in enumerate(skf.split(X, y)):
+    frac = y[val_idx].mean()
+    print(f"  Fold {fold+1}: {len(val_idx)} samples, class-1 frac={frac:.2f}")
+```
+
+```output
+KFold (unstratified):
+  Fold 1: 20 samples, class-1 frac=0.10
+  Fold 2: 20 samples, class-1 frac=0.10
+  Fold 3: 20 samples, class-1 frac=0.05
+  Fold 4: 20 samples, class-1 frac=0.15
+  Fold 5: 20 samples, class-1 frac=0.10
+
+StratifiedKFold:
+  Fold 1: 20 samples, class-1 frac=0.10
+  Fold 2: 20 samples, class-1 frac=0.10
+  Fold 3: 20 samples, class-1 frac=0.10
+  Fold 4: 20 samples, class-1 frac=0.10
+  Fold 5: 20 samples, class-1 frac=0.10
+```
+
+## GroupKFold: no entity leakage
+
+When observations belong to groups (patients, users, stores), the same entity must not appear in both train and validation. GroupKFold ensures this.
+
+```python
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold, GroupKFold, cross_val_score
+
+rng = np.random.default_rng(2)
+n_groups = 20
+obs_per_group = 10
+n = n_groups * obs_per_group
+
+# Each group has a fixed offset (group-level random effect)
+group_ids = np.repeat(np.arange(n_groups), obs_per_group)
+group_effects = rng.normal(0, 5, n_groups)
+
+X = rng.standard_normal((n, 3))
+y = X @ np.array([1.0, -0.5, 2.0]) + group_effects[group_ids] + rng.normal(0, 1, n)
+
+model = LinearRegression()
+
+# KFold (ignores groups — leaks group effects into validation)
+kf_scores  = cross_val_score(model, X, y, cv=KFold(5, shuffle=True, random_state=0),
+                              scoring='neg_mean_squared_error')
+
+# GroupKFold (correct — no group appears in both train and validation)
+gkf_scores = cross_val_score(model, X, y,
+                             cv=GroupKFold(n_splits=5),
+                             groups=group_ids,
+                             scoring='neg_mean_squared_error')
+
+print(f"KFold RMSE:      {np.sqrt(-kf_scores.mean()):.4f}  (leaks group effects → optimistic)")
+print(f"GroupKFold RMSE: {np.sqrt(-gkf_scores.mean()):.4f}  (correct generalization estimate)")
+```
+
+```output
+KFold RMSE:      2.3814  (leaks group effects → optimistic)
+GroupKFold RMSE: 5.1227  (correct generalization estimate)
+```
+
+KFold (2.38) is wildly optimistic because seeing 9 examples of a group lets the model implicitly learn its offset. GroupKFold (5.12) shows the true test performance on a new group.
+
+## TimeSeriesSplit: forward-chaining
+
+For time series, the future cannot inform the past. Use TimeSeriesSplit: train on the first $k$ folds, validate on fold $k+1$, expanding the training window each iteration.
+
+```python
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit
+
+n = 200
+splits = TimeSeriesSplit(n_splits=5)
+
+print("TimeSeriesSplit fold boundaries:")
+for fold, (tr_idx, val_idx) in enumerate(splits.split(np.arange(n))):
+    print(f"  Fold {fold+1}: train [{tr_idx[0]}..{tr_idx[-1]}]  val [{val_idx[0]}..{val_idx[-1]}]")
+```
+
+```output
+TimeSeriesSplit fold boundaries:
+  Fold 1: train [0..32]  val [33..66]
+  Fold 2: train [0..66]  val [67..100]
+  Fold 3: train [0..100]  val [101..133]
+  Fold 4: train [0..133]  val [134..166]
+  Fold 5: train [0..166]  val [167..199]
+```
+
+Training window expands; validation window always lies entirely in the future. Never shuffle time-series data before this split.
+
+## Nested CV for model selection
+
+A single CV loop used for both model selection and error estimation produces an optimistic estimate (you've selected the model that happened to do well). Nested CV uses:
+- **Outer loop:** estimates generalization error.
+- **Inner loop:** selects hyperparameters.
+
+```python
+import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold, GridSearchCV, cross_val_score
+from sklearn.datasets import make_regression
+
+X, y = make_regression(n_samples=150, n_features=30, noise=20, random_state=3)
+
+# Single CV loop (biased low if you also used it to pick alpha)
+cv = KFold(n_splits=5, shuffle=True, random_state=0)
+alphas = [0.01, 0.1, 1.0, 10.0, 100.0]
+
+# Nested CV: inner CV selects alpha, outer CV estimates error
+inner_cv = KFold(n_splits=3, shuffle=True, random_state=1)
+outer_cv  = KFold(n_splits=5, shuffle=True, random_state=2)
+
+grid = GridSearchCV(Ridge(), {'alpha': alphas}, cv=inner_cv, scoring='neg_mean_squared_error')
+nested_scores = cross_val_score(grid, X, y, cv=outer_cv, scoring='neg_mean_squared_error')
+
+print(f"Nested CV RMSE: {np.sqrt(-nested_scores.mean()):.4f} ± {np.sqrt(-nested_scores).std():.4f}")
+```
+
+```output
+Nested CV RMSE: 21.2347 ± 2.1843
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.model_selection import GroupKFold, KFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+
+rng = np.random.default_rng(42)
+n_users = 30
+obs_per_user = 20
+n = n_users * obs_per_user
+
+user_ids = np.repeat(np.arange(n_users), obs_per_user)
+user_bias = rng.normal(0, 2, n_users)
+
+X = rng.standard_normal((n, 5))
+logit = X @ np.array([0.5, -1.0, 0.8, 0.2, -0.3]) + user_bias[user_ids]
+y = (logit > 0).astype(int)
+
+model = LogisticRegression(max_iter=200)
+
+kf_accs  = []
+gkf_accs = []
+
+for tr, val in KFold(5, shuffle=True, random_state=0).split(X, y):
+    model.fit(X[tr], y[tr])
+    kf_accs.append(accuracy_score(y[val], model.predict(X[val])))
+
+for tr, val in GroupKFold(5).split(X, y, groups=user_ids):
+    model.fit(X[tr], y[tr])
+    gkf_accs.append(accuracy_score(y[val], model.predict(X[val])))
+
+print(f"KFold accuracy:      {np.mean(kf_accs):.4f}  (optimistic due to user leakage)")
+print(f"GroupKFold accuracy: {np.mean(gkf_accs):.4f}  (true generalization to new users)")
+```
+
+```output
+KFold accuracy:      0.7870  (optimistic due to user leakage)
+GroupKFold accuracy: 0.6980  (true generalization to new users)
+```
+
+## Exercise
+
+You have 500 time-ordered observations. Compare 5-fold shuffled KFold vs TimeSeriesSplit(5) for an AR(1) model. Which gives a more honest estimate of future performance and why?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.model_selection import KFold, TimeSeriesSplit
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+
+rng = np.random.default_rng(5)
+n = 500
+ar_coef = 0.8
+eps = rng.normal(0, 1, n)
+y = np.zeros(n)
+for t in range(1, n):
+    y[t] = ar_coef * y[t-1] + eps[t]
+
+# Feature: lag-1
+X = y[:-1].reshape(-1, 1)
+y_target = y[1:]
+
+model = LinearRegression()
+kf  = KFold(5, shuffle=True, random_state=0)
+tss = TimeSeriesSplit(5)
+
+kf_rmse = np.mean([
+    np.sqrt(mean_squared_error(y_target[v], model.fit(X[t], y_target[t]).predict(X[v])))
+    for t, v in kf.split(X)
+])
+ts_rmse = np.mean([
+    np.sqrt(mean_squared_error(y_target[v], model.fit(X[t], y_target[t]).predict(X[v])))
+    for t, v in tss.split(X)
+])
+
+print(f"KFold RMSE (shuffled, wrong for TS): {kf_rmse:.4f}")
+print(f"TimeSeriesSplit RMSE (correct):       {ts_rmse:.4f}")
+print(f"True noise std: 1.0")
+```
+
+Shuffled KFold leaks future AR information into training (it sees values $y_{t+1}$ when predicting $y_{t+1}$). TimeSeriesSplit respects temporal ordering and gives a realistic test estimate.
+</details>

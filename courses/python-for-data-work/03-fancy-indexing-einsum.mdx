@@ -1,0 +1,277 @@
+---
+course: python-for-data-work
+chapter: 03-fancy-indexing-einsum
+title: "Fancy Indexing, Boolean Masks, where, and einsum"
+order: 3
+---
+
+## Three ways to index an array
+
+NumPy has three indexing modes. They look similar but behave very differently:
+
+| Mode | Example | Returns | Copies? |
+|------|---------|---------|---------|
+| Slice | `a[1:4]` | view | no |
+| Fancy (int array) | `a[[0, 2, 4]]` | new array | yes |
+| Boolean mask | `a[a > 0]` | new array | yes |
+
+You already know slices (ch. 1). This chapter covers the other two, plus `np.where` and
+`np.einsum`, which together handle most indexing patterns in ML code.
+
+## Fancy indexing with integer arrays
+
+Pass an array of integers to select (and reorder) elements. The result shape matches the
+index array.
+
+```python
+import numpy as np
+
+a = np.array([10, 20, 30, 40, 50], dtype=np.int64)
+idx = np.array([3, 0, 4, 1])   # pick elements at these positions
+print(a[idx])                   # result shape = idx.shape = (4,)
+```
+
+```output
+[40 10 50 20]
+```
+
+In 2-D: index rows and columns independently. This is how batch look-ups in an embedding
+matrix work — grab `B` rows out of an `(V, D)` table in one call.
+
+```python
+import numpy as np
+
+E = np.arange(20, dtype=np.float32).reshape(5, 4)  # 5 embeddings, dim 4
+token_ids = np.array([2, 0, 4, 2])                  # a batch of token ids
+print(E[token_ids])                                  # shape (4, 4)
+```
+
+```output
+[[ 8.  9. 10. 11.]
+ [ 0.  1.  2.  3.]
+ [16. 17. 18. 19.]
+ [ 8.  9. 10. 11.]]
+```
+
+Row 2 appears twice (id=2 selected twice) — that's legal and common. Because fancy indexing
+copies, modifying the result doesn't touch `E`.
+
+### Simultaneous row + column fancy indexing
+
+To select element `(i, j)` pairs (not a sub-grid), pass two arrays of the same length:
+
+```python
+import numpy as np
+
+M = np.array([[1, 2, 3],
+              [4, 5, 6],
+              [7, 8, 9]], dtype=np.int64)
+
+rows = np.array([0, 1, 2])
+cols = np.array([2, 0, 1])
+print(M[rows, cols])   # picks M[0,2], M[1,0], M[2,1]
+```
+
+```output
+[3 4 8]
+```
+
+This is the pattern for cross-entropy: `log_probs[np.arange(B), y]` picks the log-probability
+of the true class for each of the `B` examples in the batch.
+
+## Boolean masking — filter without a loop
+
+A boolean array of the same shape as `a` selects elements where the mask is `True`.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(5)
+x = rng.standard_normal(8).astype(np.float32).round(2)
+print("x       :", x)
+
+mask = x > 0
+print("mask    :", mask)
+print("x[mask] :", x[mask])          # only positive values
+print("count   :", mask.sum())        # True counts as 1
+```
+
+```output
+x       : [-0.44 -0.6   0.06  1.44  0.59 -1.25  0.74  0.88]
+mask    : [False False  True  True  True False  True  True]
+x[mask] : [0.06 1.44 0.59 0.74 0.88]
+count   : 5
+```
+
+Compound conditions: use `&` (and), `|` (or), `~` (not). Always wrap each condition in
+parentheses — Python's operator precedence bites here.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(5)
+x = rng.standard_normal(8).astype(np.float32).round(2)
+small_pos = x[(x > 0) & (x < 0.5)]
+print(small_pos)
+```
+
+```output
+[0.06]
+```
+
+## `np.where` — conditional element selection
+
+`np.where(condition, x, y)` returns elements from `x` where condition is True, else from `y`.
+Both `x` and `y` broadcast normally.
+
+```python
+import numpy as np
+
+a = np.array([-3.0, 1.0, -1.0, 2.0, -0.5])
+relu = np.where(a > 0, a, 0.0)          # ReLU activation
+print("relu:", relu)
+
+# Replace outliers (|a| > 2) with the clip value
+clipped = np.where(np.abs(a) > 2, np.sign(a) * 2.0, a)
+print("clipped:", clipped)
+```
+
+```output
+relu: [0.  1.  0.  2.  0. ]
+clipped: [-2.  1. -1.  2. -0.5]
+```
+
+`np.where` is a ufunc: it applies the condition element-wise with no Python loop and
+broadcasts `x` and `y` against each other if needed.
+
+## `np.einsum` — express any tensor contraction in one string
+
+`np.einsum` uses Einstein summation notation to express any axis-based operation concisely.
+The string `'ij,jk->ik'` means: contract axes `j` (the inner dimension), keep `i` and `k`.
+That's matrix multiplication.
+
+```python
+import numpy as np
+
+A = np.array([[1., 2.], [3., 4.]])   # (2,2)
+B = np.array([[5., 6.], [7., 8.]])   # (2,2)
+
+# Matrix multiply: ij,jk->ik
+C = np.einsum('ij,jk->ik', A, B)
+print("matmul:\n", C)
+
+# Dot product of two vectors
+u = np.array([1., 2., 3.])
+v = np.array([4., 5., 6.])
+print("dot:", np.einsum('i,i->', u, v))   # 1*4+2*5+3*6=32
+
+# Trace: sum of diagonal elements
+print("trace:", np.einsum('ii->', A))     # 1+4=5
+
+# Outer product: ij (no shared index)
+print("outer:\n", np.einsum('i,j->ij', u[:2], v[:2]))
+```
+
+```output
+matmul:
+ [[19. 22.]
+  [43. 50.]]
+dot: 32.0
+trace: 5.0
+outer:
+ [[ 4.  5.]
+  [ 8. 10.]]
+```
+
+### When to use einsum vs standard ops
+
+Use `einsum` when the operation involves three or more arrays, unusual contraction patterns,
+or when the alternative requires an awkward chain of `transpose` + `matmul`. For standard
+matrix multiply, `A @ B` or `np.matmul` is clearer and sometimes faster (it calls BLAS
+directly). For complex batched attention operations, `einsum` wins on readability.
+
+```python
+import numpy as np
+
+# Batched matrix multiply: (B, n, m) × (B, m, k) → (B, n, k)
+rng = np.random.default_rng(0)
+A = rng.standard_normal((4, 3, 5)).astype(np.float32)   # batch=4, (3,5)
+B = rng.standard_normal((4, 5, 2)).astype(np.float32)   # batch=4, (5,2)
+C = np.einsum('bni,bio->bno', A, B)
+print("batched matmul shape:", C.shape)
+```
+
+```output
+batched matmul shape: (4, 3, 2)
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# 1) Use fancy indexing to implement cross-entropy on a batch.
+#    log_probs[i, y[i]] is the log-probability of the true class for example i.
+rng = np.random.default_rng(1)
+logits = rng.standard_normal((5, 4)).astype(np.float32)  # 5 examples, 4 classes
+y = np.array([2, 0, 3, 1, 2])                            # true class indices
+
+# softmax (stable)
+logits -= logits.max(axis=1, keepdims=True)
+probs = np.exp(logits)
+probs /= probs.sum(axis=1, keepdims=True)
+
+log_probs = np.log(probs)
+loss = -log_probs[np.arange(5), y].mean()
+print("CE loss:", round(float(loss), 4))
+
+# 2) einsum for attention-style scores: Q@K^T scaled
+Q = rng.standard_normal((3, 4)).astype(np.float32)   # 3 queries, dim 4
+K = rng.standard_normal((6, 4)).astype(np.float32)   # 6 keys,   dim 4
+scores = np.einsum('qd,kd->qk', Q, K) / np.sqrt(4)  # (3, 6)
+print("attention scores shape:", scores.shape)
+print("first query scores:", scores[0].round(3))
+```
+
+```output
+CE loss: 1.5793
+attention scores shape: (3, 6)
+first query scores: [-0.469  0.221 -0.287 -0.447  0.632 -0.065]
+```
+
+## Exercise
+
+Given a 2-D array `X` of shape `(100, 5)`, use boolean masking and `np.where` to do the
+following **without any Python loop**:
+
+1. Select all rows where the sum of the row exceeds 0.
+2. Replace all negative values with 0 (ReLU-style clip in-place using `np.where`).
+3. Verify the clipped array has no negative values.
+
+Use `np.random.default_rng(42).standard_normal((100, 5))` as input.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+X = rng.standard_normal((100, 5))
+
+# 1) Rows with positive sum
+row_sums = X.sum(axis=1)          # shape (100,)
+pos_rows = X[row_sums > 0]        # boolean mask on axis 0
+print("rows with sum > 0:", len(pos_rows))
+
+# 2) ReLU clip
+X_relu = np.where(X > 0, X, 0.0)
+
+# 3) Verify
+print("any negatives:", (X_relu < 0).any())   # False
+print("min value    :", X_relu.min())           # 0.0
+```
+
+`X[row_sums > 0]` applies the mask along axis 0 (rows), because `row_sums` has shape `(100,)`
+matching the first dimension of `X`. No loop, no enumerate.
+</details>

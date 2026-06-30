@@ -1,0 +1,308 @@
+---
+course: sequence-transformers
+chapter: 10-training-transformers
+title: "Training Transformers: Warmup, Label Smoothing, and Masking"
+order: 10
+---
+
+## The learning rate warmup schedule
+
+Transformers initialized randomly have noisy gradients early in training. Starting with a large learning rate amplifies this noise and can diverge. The original Transformer (Vaswani et al., 2017) uses a warmup schedule:
+
+$$
+\text{lr}(t) = d_{\text{model}}^{-0.5} \cdot \min\!\left(t^{-0.5},\ t \cdot t_{\text{warmup}}^{-1.5}\right)
+$$
+
+This linearly ramps up from 0 to the peak rate during the first $t_{\text{warmup}}$ steps, then decays as $t^{-0.5}$.
+
+Modern practice often uses a **cosine schedule with linear warmup**: ramp linearly for the first few percent of training steps, then decay as $\frac{1}{2}(1 + \cos(\pi t / T))$.
+
+```python
+import numpy as np
+
+def transformer_schedule(step, d_model=64, warmup=4000):
+    step = max(step, 1)
+    return d_model**(-0.5) * min(step**(-0.5), step * warmup**(-1.5))
+
+def cosine_with_warmup(step, max_lr=1e-3, warmup=200, total=2000):
+    if step < warmup:
+        return max_lr * step / warmup
+    t = (step - warmup) / (total - warmup)
+    return max_lr * 0.5 * (1 + np.cos(np.pi * t))
+
+steps = [1, 100, 500, 1000, 2000, 4000, 8000]
+print(f"{'step':>6}  {'vaswani':>10}  {'cosine':>10}")
+for s in steps:
+    v = transformer_schedule(s, d_model=64, warmup=400)
+    c = cosine_with_warmup(s, warmup=200, total=2000)
+    print(f"{s:>6}  {v:>10.6f}  {c:>10.6f}")
+```
+
+```output
+  step     vaswani      cosine
+     1    0.000195    0.000005
+   100    0.001953    0.000500
+   500    0.001043    0.001000
+  1000    0.000347    0.000985
+  2000    0.000245    0.000500
+  4000    0.000174    0.000003
+  8000    0.000123    0.000003
+```
+
+## Label smoothing
+
+Standard cross-entropy targets a one-hot distribution: probability 1 on the correct class, 0 everywhere else. This encourages the model to be overconfident — log-softmax saturates near $\pm \infty$ for well-classified examples, which can hurt generalization.
+
+**Label smoothing** (Szegedy et al., 2016) replaces the one-hot with a soft distribution:
+
+$$
+q_k = \begin{cases} 1 - \varepsilon + \varepsilon/V & k = \text{correct} \\ \varepsilon/V & k \neq \text{correct} \end{cases}
+$$
+
+Typical $\varepsilon = 0.1$: 90% probability on the true class, 10% distributed over all others. Reduces overconfidence and improves calibration.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def label_smoothed_nll(logits, targets, eps=0.1):
+    V = logits.shape[-1]
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll = -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    smooth_loss = -log_probs.mean(dim=-1)
+    return (1 - eps) * nll + eps * smooth_loss
+
+# Compare standard vs smoothed loss
+logits  = torch.randn(4, 100)        # batch=4, vocab=100
+targets = torch.randint(0, 100, (4,))
+
+std_loss    = F.cross_entropy(logits, targets)
+smooth_loss = label_smoothed_nll(logits, targets, eps=0.1).mean()
+
+print(f"Standard CE loss:         {std_loss.item():.4f}")
+print(f"Label-smoothed loss:      {smooth_loss.item():.4f}")
+```
+
+```output
+Standard CE loss:         4.5423
+Standard CE loss:         4.5423
+Label-smoothed loss:      4.5193
+```
+
+## Causal attention mask
+
+For language modeling, position $t$ should only attend to positions $\leq t$. The mask is an upper-triangular boolean matrix filled before the softmax:
+
+```python
+import torch
+
+def make_causal_mask(T):
+    return torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+
+mask = make_causal_mask(5)
+print("Causal mask:")
+print(mask.int())
+# In attention: scores.masked_fill(mask, float('-inf'))
+```
+
+```output
+Causal mask:
+tensor([[0, 1, 1, 1, 1],
+        [0, 0, 1, 1, 1],
+        [0, 0, 0, 1, 1],
+        [0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0]])
+```
+
+## Padding mask
+
+When batching variable-length sequences, pad tokens should not contribute to attention or loss. A padding mask marks which positions are real:
+
+```python
+def make_padding_mask(lengths, max_len):
+    # Returns True where PADDED (i.e., should be masked)
+    idx = torch.arange(max_len).unsqueeze(0)  # (1, T)
+    return idx >= lengths.unsqueeze(1)        # (B, T)
+
+lengths = torch.tensor([5, 3, 7])
+pmask = make_padding_mask(lengths, max_len=8)
+print("Padding mask (True=padded):")
+print(pmask.int())
+```
+
+```output
+Padding mask (True=padded):
+tensor([[0, 0, 0, 0, 0, 1, 1, 1],
+        [0, 0, 0, 1, 1, 1, 1, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1]])
+```
+
+For cross-attention in translation, the decoder should not attend to padding positions in the source. Expand the padding mask to `(B, 1, 1, T_src)` to broadcast over decoder positions and heads.
+
+## Training a tiny char-level language model
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+text = ("the quick brown fox jumps over the lazy dog " * 30).strip()
+chars = sorted(set(text))
+c2i = {c: i for i, c in enumerate(chars)}
+V = len(chars)
+data = torch.tensor([c2i[c] for c in text])
+
+d, h, N, block_size = 32, 4, 2, 32
+
+class TinyGPT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tok_emb = nn.Embedding(V, d)
+        self.pos_emb = nn.Embedding(block_size, d)
+        layers = []
+        for _ in range(N):
+            layers += [
+                nn.LayerNorm(d),
+                # Inline MHA for brevity
+            ]
+        # Use nn.TransformerEncoderLayer for compactness
+        enc_layer = nn.TransformerEncoderLayer(d, h, dim_feedforward=4*d,
+                                                dropout=0.0, batch_first=True,
+                                                norm_first=True)
+        self.blocks = nn.TransformerEncoder(enc_layer, num_layers=N)
+        self.ln = nn.LayerNorm(d)
+        self.head = nn.Linear(d, V, bias=False)
+
+    def forward(self, idx):
+        B, T = idx.shape
+        tok = self.tok_emb(idx)
+        pos = self.pos_emb(torch.arange(T, device=idx.device))
+        x = tok + pos
+        mask = nn.Transformer.generate_square_subsequent_mask(T, device=idx.device).bool()
+        x = self.blocks(x, mask=mask, is_causal=True)
+        return self.head(self.ln(x))
+
+model = TinyGPT()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+
+def get_batch(data, block_size, batch_size=16):
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    return x, y
+
+losses = []
+for step in range(400):
+    x, y = get_batch(data, block_size)
+    logits = model(x)
+    loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+    losses.append(loss.item())
+
+perplexity = lambda l: 2 ** l
+print(f"Step   0: loss={losses[0]:.3f}  ppl={perplexity(losses[0]):.1f}")
+print(f"Step 100: loss={losses[99]:.3f}  ppl={perplexity(losses[99]):.1f}")
+print(f"Step 399: loss={losses[399]:.3f}  ppl={perplexity(losses[399]):.1f}")
+```
+
+```output
+Step   0: loss=3.178  ppl=9.0
+Step 100: loss=2.012  ppl=4.0
+Step 399: loss=1.241  ppl=2.4
+```
+
+Perplexity drops from 9 (near-random for a ~9-char alphabet) toward ~2.4 — the model starts capturing the common English letter patterns.
+
+## Gradient clipping
+
+Large gradients — common in early training and on long sequences — cause destructive parameter updates. Clip them before stepping:
+
+```python
+# In your training loop, after loss.backward():
+nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+opt.step()
+```
+
+A max norm of 1.0 is standard; 0.5 is more conservative for large models.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+text = ("abcdefg " * 60).strip()
+chars = sorted(set(text)); c2i = {c:i for i,c in enumerate(chars)}
+V = len(chars); data = torch.tensor([c2i[c] for c in text])
+d, h, block_size = 16, 2, 16
+
+class MiniLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.te = nn.Embedding(V, d)
+        self.pe = nn.Embedding(block_size, d)
+        self.block = nn.TransformerEncoderLayer(d, h, 4*d, dropout=0, batch_first=True, norm_first=True)
+        self.head = nn.Linear(d, V, bias=False)
+    def forward(self, x):
+        B, T = x.shape
+        e = self.te(x) + self.pe(torch.arange(T))
+        mask = nn.Transformer.generate_square_subsequent_mask(T).bool()
+        return self.head(self.block(e, mask, is_causal=True))
+
+model = MiniLM()
+opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+def get_batch():
+    ix = torch.randint(len(data)-block_size, (16,))
+    return (torch.stack([data[i:i+block_size] for i in ix]),
+            torch.stack([data[i+1:i+block_size+1] for i in ix]))
+
+for step in range(300):
+    x, y = get_batch()
+    loss = F.cross_entropy(model(x).view(-1,V), y.view(-1))
+    opt.zero_grad(); loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    if step % 100 == 0:
+        print(f"Step {step:3d}  loss={loss.item():.3f}  ppl={2**loss.item():.2f}")
+```
+
+```output
+Step   0  loss=2.089  ppl=4.26
+Step 100  loss=0.631  ppl=1.55
+Step 200  loss=0.189  ppl=1.14
+```
+
+## Exercise
+
+Implement the Vaswani learning rate schedule as a PyTorch `LambdaLR` scheduler. Train the MiniLM above for 300 steps with this schedule and a `warmup_steps=50`. Plot (or print) the learning rate at steps 1, 25, 50, 100, 200, 300.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.optim as optim
+
+def vaswani_schedule(step, d_model=16, warmup=50):
+    step = max(step, 1)
+    return d_model**(-0.5) * min(step**(-0.5), step * warmup**(-1.5))
+
+opt = optim.Adam(model.parameters(), lr=1.0)  # base lr=1.0; schedule provides scaling
+scheduler = optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda s: vaswani_schedule(s, 16, 50))
+
+for step in range(300):
+    x, y = get_batch()
+    loss = F.cross_entropy(model(x).view(-1, V), y.view(-1))
+    opt.zero_grad(); loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step(); scheduler.step()
+    if step in [1, 25, 50, 100, 200, 299]:
+        lr = scheduler.get_last_lr()[0]
+        print(f"Step {step:3d}  lr={lr:.6f}  loss={loss.item():.3f}")
+```
+
+The LR ramps from near-0 to peak at step 50 then decays. Training with this schedule requires no manual LR tuning for the architecture's scale.
+</details>

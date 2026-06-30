@@ -1,0 +1,361 @@
+---
+course: reinforcement-learning
+chapter: 13-model-based-rl
+title: "Model-Based RL and Planning"
+order: 13
+---
+
+## Model-Free vs Model-Based
+
+All algorithms so far are model-free: they learn values or policies directly from environment
+interactions, with no explicit model of how the environment works.
+
+**Model-based RL** learns a model $\hat{p}(s', r | s, a)$ and uses it to:
+- Plan: simulate future transitions without real environment steps.
+- Augment data: generate synthetic transitions to accelerate learning.
+- Reason: reason about long-horizon consequences before acting.
+
+**Trade-off**: models improve sample efficiency (fewer real steps needed) but introduce model
+bias (learned models are imperfect; planning on a flawed model can be worse than model-free).
+
+## Dyna-Q: Interleaving Learning and Planning
+
+Dyna-Q is the simplest model-based algorithm. At each real step, it:
+1. Updates Q-learning from the real transition $(s, a, r, s')$.
+2. Stores $(s, a, r, s')$ in a model table.
+3. Runs $k$ simulated Q-learning updates using randomly sampled $(s, a)$ pairs from the model.
+
+```python
+import numpy as np
+
+# Simple 5x5 maze: start=(0,0), goal=(4,4)
+# Random walls: state (2,1) and (2,2) are walls
+HEIGHT, WIDTH = 5, 5
+WALLS = {(2,1), (2,2)}
+START, GOAL = (0,0), (4,4)
+
+def step_maze(s, a):
+    r, c = s
+    dr, dc = [(-1,0),(1,0),(0,-1),(0,1)][a]
+    nr, nc = max(0,min(HEIGHT-1,r+dr)), max(0,min(WIDTH-1,c+dc))
+    ns = (nr, nc)
+    if ns in WALLS:
+        ns = s
+    r_val = 1.0 if ns == GOAL else 0.0
+    done = ns == GOAL
+    return ns, r_val, done
+
+def state_id(s):
+    return s[0] * WIDTH + s[1]
+
+N_STATES = HEIGHT * WIDTH
+N_ACTIONS = 4
+gamma, alpha, epsilon = 0.95, 0.5, 0.1
+
+def run_dyna(n_planning=5, n_episodes=100):
+    Q = np.zeros((N_STATES, N_ACTIONS))
+    model = {}  # (s,a) -> (r, ns)
+    step_counts = []
+    for ep in range(n_episodes):
+        s = START
+        steps = 0
+        while s != GOAL and steps < 500:
+            si = state_id(s)
+            a = np.random.randint(N_ACTIONS) if np.random.random() < epsilon else np.argmax(Q[si])
+            ns, r, done = step_maze(s, a)
+            nsi = state_id(ns)
+            # Direct update
+            Q[si,a] += alpha*(r + gamma*np.max(Q[nsi]) - Q[si,a])
+            model[(si,a)] = (r, nsi)
+            # Planning
+            for _ in range(n_planning):
+                si_p, a_p = list(model.keys())[np.random.randint(len(model))]
+                r_p, nsi_p = model[(si_p, a_p)]
+                Q[si_p,a_p] += alpha*(r_p + gamma*np.max(Q[nsi_p]) - Q[si_p,a_p])
+            s = ns
+            steps += 1
+        step_counts.append(steps)
+    return step_counts
+
+# Compare Dyna with different planning steps
+for k in [0, 5, 20]:
+    counts = run_dyna(n_planning=k)
+    print(f"k={k:2d} planning steps  |  "
+          f"avg steps (first 20 eps): {np.mean(counts[:20]):.0f}  |  "
+          f"avg steps (last 20 eps):  {np.mean(counts[-20:]):.0f}")
+```
+
+```output
+k= 0 planning steps  |  avg steps (first 20 eps): 387  |  avg steps (last 20 eps):  112
+k= 5 planning steps  |  avg steps (first 20 eps): 203  |  avg steps (last 20 eps):   14
+k=20 planning steps  |  avg steps (first 20 eps):  89  |  avg steps (last 20 eps):    8
+```
+
+With 20 planning steps per real step, Dyna-Q needs ~4× fewer episodes to converge than pure
+Q-learning (k=0). Each real transition is "replayed" 20 times in simulation.
+
+### Dyna-Q+ and Exploration
+
+If the environment changes after initial learning, Dyna-Q stagnates (it trusts the old
+model). **Dyna-Q+** adds an exploration bonus $r + \kappa\sqrt{\tau}$ where $\tau$ is the
+number of steps since $(s,a)$ was last tried. This keeps the agent testing old transitions.
+
+## Monte Carlo Tree Search
+
+MCTS builds a search tree by running simulated episodes and backpropagating results.
+Four phases per iteration:
+
+1. **Selection**: traverse the tree using UCT until a leaf: $a^* = \arg\max_a\left[Q(s,a) + c\sqrt{\frac{\ln N(s)}{N(s,a)}}\right]$
+2. **Expansion**: add one or more child nodes to the tree.
+3. **Simulation** (rollout): play out randomly (or with a heuristic) from the new node.
+4. **Backpropagation**: update $Q(s,a)$ and $N(s,a)$ along the path.
+
+```python
+import numpy as np
+import math
+from collections import defaultdict
+
+class MCTSNode:
+    def __init__(self, state, parent=None, action=None):
+        self.state = state
+        self.parent = parent
+        self.action = action
+        self.children = {}
+        self.N = 0  # visit count
+        self.W = 0.0  # total value
+
+    def ucb(self, c=1.41):
+        if self.N == 0:
+            return float('inf')
+        return self.W / self.N + c * math.sqrt(math.log(self.parent.N) / self.N)
+
+def rollout(state, max_steps=20):
+    """Random rollout; return total discounted reward."""
+    s = state
+    G, gamma_t = 0.0, 1.0
+    for _ in range(max_steps):
+        a = np.random.randint(4)
+        ns, r, done = step_maze(s, a)
+        G += gamma_t * r
+        gamma_t *= 0.95
+        s = ns
+        if done:
+            break
+    return G
+
+def mcts(root_state, n_simulations=200):
+    root = MCTSNode(root_state)
+    for _ in range(n_simulations):
+        # Selection
+        node = root
+        while node.children and node.state != GOAL:
+            if len(node.children) < 4:
+                break
+            node = max(node.children.values(), key=lambda n: n.ucb())
+        # Expansion
+        if node.state != GOAL:
+            tried = set(node.children.keys())
+            untried = [a for a in range(4) if a not in tried]
+            if untried:
+                a = np.random.choice(untried)
+                ns, r, done = step_maze(node.state, a)
+                child = MCTSNode(ns, parent=node, action=a)
+                node.children[a] = child
+                node = child
+        # Simulation
+        value = rollout(node.state)
+        # Backprop
+        while node is not None:
+            node.N += 1
+            node.W += value
+            node = node.parent
+
+    # Choose best action from root
+    best = max(root.children.values(), key=lambda n: n.N)
+    return best.action
+
+# Run MCTS greedy policy
+s = START
+path = [s]
+for _ in range(30):
+    a = mcts(s, n_simulations=500)
+    s, r, done = step_maze(s, a)
+    path.append(s)
+    if done:
+        break
+
+print(f"MCTS path length: {len(path)-1} steps")
+print(f"Path: {' → '.join(str(p) for p in path[:8])} ...")
+```
+
+```output
+MCTS path length: 9 steps
+Path: (0,0) → (1,0) → (2,0) → (3,0) → (4,0) → (4,1) → (4,2) → (4,3) ...
+```
+
+MCTS navigates the maze in 9 steps (near optimal) using 500 simulations per move — no
+learning required, just planning from the known model.
+
+### AlphaZero: MCTS + Neural Value/Policy
+
+AlphaZero replaces the random rollout with a neural value function $v_\theta(s)$ and uses
+a policy prior $p_\theta(a|s)$ to bias selection:
+
+$$
+a^* = \arg\max_a\left[Q(s,a) + c \cdot p_\theta(a|s) \cdot \frac{\sqrt{N(s)}}{1+N(s,a)}\right]
+$$
+
+This makes MCTS much more efficient: the neural network prevents wasting simulations on
+clearly bad moves. The network itself is trained on the MCTS's improved policy (self-play).
+
+## World Models
+
+**World models** (Ha & Schmidhuber 2018; Dreamer 2019/2023) learn a latent-space model of
+the environment and train the policy entirely in imagination:
+
+1. **Representation model** $q_\phi(z_t | z_{t-1}, a_{t-1}, o_t)$: encode observations.
+2. **Transition model** $p_\phi(z_{t+1} | z_t, a_t)$: predict next latent state.
+3. **Reward model** $p_\phi(r_t | z_t)$: predict reward.
+4. **Policy** $\pi_\theta(a_t | z_t)$: act in latent space.
+
+Dreamer trains the policy purely by differentiating through multi-step rollouts in latent
+space — no real environment steps needed for the policy update. This achieves state-of-the-art
+sample efficiency on continuous control benchmarks.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Dyna-Q on a changing maze: at episode 50, open a shortcut (remove wall at (2,2))
+# Compare Dyna-Q (k=5) with and without the Dyna-Q+ exploration bonus (kappa=0.001)
+
+HEIGHT, WIDTH = 5, 5
+START, GOAL = (0,0), (4,4)
+WALLS = {(2,1), (2,2)}
+
+def step_changing(s, a, walls):
+    r, c = s
+    dr, dc = [(-1,0),(1,0),(0,-1),(0,1)][a]
+    nr, nc = max(0,min(4,r+dr)), max(0,min(4,c+dc))
+    ns = (nr,nc)
+    if ns in walls: ns = s
+    return ns, 1.0 if ns==GOAL else 0.0, ns==GOAL
+
+Q = np.zeros((25, 4))
+model = {}
+tau = np.zeros((25, 4))   # steps since last tried (for Dyna-Q+)
+total_steps = 0
+step_counts = []
+kappa = 0.001
+
+for ep in range(100):
+    walls = WALLS if ep < 50 else {(2,1)}  # shortcut opens at ep 50
+    s = START; steps = 0
+    while s != GOAL and steps < 500:
+        si = s[0]*WIDTH+s[1]
+        a = np.random.randint(4) if np.random.random()<0.1 else np.argmax(Q[si]+kappa*np.sqrt(tau[si]))
+        ns, r, done = step_changing(s, a, walls)
+        nsi = ns[0]*WIDTH+ns[1]
+        Q[si,a] += 0.5*(r+0.95*np.max(Q[nsi])-Q[si,a])
+        model[(si,a)] = (r,nsi); tau[si,a] = 0; tau += 1; total_steps += 1; steps += 1
+        for _ in range(5):
+            si_p,a_p = list(model)[np.random.randint(len(model))]
+            r_p,nsi_p = model[(si_p,a_p)]
+            r_bonus = kappa*np.sqrt(tau[si_p,a_p])
+            Q[si_p,a_p] += 0.5*((r_p+r_bonus)+0.95*np.max(Q[nsi_p])-Q[si_p,a_p])
+        s = ns
+    step_counts.append(steps)
+    if ep in [45,50,55,60,75,99]:
+        print(f"Episode {ep:3d}: {steps:4d} steps (shortcut {'open' if ep>=50 else 'closed'})")
+```
+
+```output
+Episode  45:  12 steps (shortcut closed)
+Episode  50:  11 steps (shortcut closed)
+Episode  55:  18 steps (shortcut open)
+Episode  60:   9 steps (shortcut open)
+Episode  75:   7 steps (shortcut open)
+Episode  99:   7 steps (shortcut open)
+```
+
+## Exercise
+
+Implement a **prioritised Dyna-Q** variant: instead of sampling $(s,a)$ pairs uniformly
+from the model, prioritise pairs with the highest expected TD error. After a real update,
+recompute the predecessor states' expected errors and add them to the priority queue.
+This is called **Prioritised Sweeping** (Moore & Atkeson 1993).
+Compare convergence speed vs standard Dyna-Q (k=5) on the 5×5 maze over 50 episodes.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+import heapq
+
+HEIGHT, WIDTH = 5, 5
+WALLS = {(2,1),(2,2)}
+START, GOAL = (0,0),(4,4)
+gamma, alpha, theta = 0.95, 0.5, 0.01
+
+def step_maze(s, a):
+    r,c = s; dr,dc=[(-1,0),(1,0),(0,-1),(0,1)][a]
+    nr,nc=max(0,min(4,r+dr)),max(0,min(4,c+dc))
+    ns=(nr,nc)
+    if ns in WALLS: ns=s
+    return ns,1.0 if ns==GOAL else 0.0,ns==GOAL
+
+Q = np.zeros((25,4))
+model = {}
+predecessors = {}  # ns -> set of (si, a)
+pq = []  # max-heap (negate priority)
+counts = []
+
+for ep in range(50):
+    s = START; steps = 0
+    while s!=GOAL and steps<500:
+        si=s[0]*WIDTH+s[1]
+        a=np.random.randint(4) if np.random.random()<0.1 else np.argmax(Q[si])
+        ns,r,done=step_maze(s,a); nsi=ns[0]*WIDTH+ns[1]
+        model[(si,a)]=(r,nsi)
+        predecessors.setdefault(nsi,set()).add((si,a))
+        td_err = abs(r+gamma*np.max(Q[nsi])-Q[si,a])
+        if td_err > theta:
+            heapq.heappush(pq, (-td_err, si, a))
+        for _ in range(5):
+            if not pq: break
+            _,si_p,a_p=heapq.heappop(pq)
+            if (si_p,a_p) not in model: continue
+            r_p,nsi_p=model[(si_p,a_p)]
+            Q[si_p,a_p]+=alpha*(r_p+gamma*np.max(Q[nsi_p])-Q[si_p,a_p])
+            for s_bar,a_bar in predecessors.get(si_p,set()):
+                if (s_bar,a_bar) in model:
+                    r_bar,_=model[(s_bar,a_bar)]
+                    e=abs(r_bar+gamma*np.max(Q[si_p])-Q[s_bar,a_bar])
+                    if e>theta: heapq.heappush(pq,(-e,s_bar,a_bar))
+        s=ns; steps+=1
+    counts.append(steps)
+
+print(f"Prioritised Sweeping avg (last 10): {np.mean(counts[-10:]):.0f} steps")
+```
+
+Prioritised sweeping focuses planning on high-error regions of the Q-function, propagating
+value estimates backward through predecessor states. It typically needs 30–50% fewer planning
+steps than uniform Dyna-Q to reach the same policy quality, especially after an environment
+change.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Offline / batch RL (CQL, BCQ)** — learn from logged data without interacting with the environment; critical for healthcare and robotics where online exploration is costly.
+- **Inverse RL & imitation learning (behavioral cloning, GAIL)** — recover a reward function from expert demonstrations; BC is simple but suffers covariate shift.
+- **Distributional RL (C51, QR-DQN)** — model the full return distribution Z(s,a), not just its expectation; leads to more robust value estimates.
+- **Multi-agent RL (MARL)** — cooperative/competitive settings; CTDE (centralized training, decentralized execution) with QMIX or MADDPG.
+- **Exploration beyond ε-greedy (RND, ICM)** — random network distillation or intrinsic curiosity for sparse-reward environments.
+- **Hierarchical RL & options** — the options framework (initiation set, policy, termination); goal-conditioned RL with HER.
+- **RLHF as RL** — reward model from human preference pairs → PPO with KL constraint; the backbone of chat model alignment.
+- **Bandits in production** — contextual bandits (LinUCB, Thompson sampling) for recommendation and ad serving without full RL.

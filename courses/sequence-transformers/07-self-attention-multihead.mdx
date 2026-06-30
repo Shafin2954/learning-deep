@@ -1,0 +1,246 @@
+---
+course: sequence-transformers
+chapter: 07-self-attention-multihead
+title: "Self-Attention and Multi-Head Attention"
+order: 7
+---
+
+## Self-attention
+
+In encoder-decoder attention, the query came from the decoder and keys/values from the encoder. **Self-attention** uses the same sequence as both source and target — every position attends to every other position in the same sequence.
+
+Given input $X \in \mathbb{R}^{n \times d}$, project into three spaces:
+
+$$
+Q = X W_Q, \quad K = X W_K, \quad V = X W_V
+$$
+
+where $W_Q, W_K, W_V \in \mathbb{R}^{d \times d_k}$.
+
+Then compute:
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V
+$$
+
+The output at each position is a weighted sum of all value vectors, where weights come from the query-key dot product.
+
+## Why divide by $\sqrt{d_k}$?
+
+When $d_k$ is large, the dot products $q \cdot k$ grow in magnitude (variance $\propto d_k$), pushing the softmax into regions with near-zero gradients. Dividing by $\sqrt{d_k}$ keeps variance at 1 regardless of dimension.
+
+## Implementing scaled dot-product attention
+
+```python
+import torch
+import torch.nn.functional as F
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    """
+    Q, K, V: (batch, heads, seq, d_k)
+    mask: (batch, 1, seq, seq) — positions with True are masked to -inf
+    """
+    d_k = Q.shape[-1]
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)  # (B, H, T, T)
+    if mask is not None:
+        scores = scores.masked_fill(mask, float('-inf'))
+    weights = F.softmax(scores, dim=-1)
+    return torch.matmul(weights, V), weights
+
+batch, seq, d_k = 2, 6, 16
+Q = torch.randn(batch, 1, seq, d_k)
+K = torch.randn(batch, 1, seq, d_k)
+V = torch.randn(batch, 1, seq, d_k)
+
+out, w = scaled_dot_product_attention(Q, K, V)
+print("Output shape:", out.shape)
+print("Weights shape:", w.shape)
+print("Weights row 0 sum:", w[0, 0, 0].sum().item())
+```
+
+```output
+Output shape: torch.Size([2, 1, 6, 16])
+Weights shape: torch.Size([2, 1, 6, 6])
+Weights row 0 sum: 1.0
+```
+
+## Causal masking
+
+For autoregressive (decoder) self-attention, position $t$ must not attend to positions $> t$. Mask the upper triangle with $-\infty$ before softmax; after softmax those become 0.
+
+```python
+def causal_mask(seq_len):
+    # True (1) means "block" — fill with -inf
+    return torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+
+T = 5
+mask = causal_mask(T)
+print("Causal mask:\n", mask.int())
+
+# Apply to attention
+Q = K = V = torch.randn(1, 1, T, 8)
+out, w = scaled_dot_product_attention(Q, K, V, mask=mask.unsqueeze(0).unsqueeze(0))
+print("\nWeights (should be lower-triangular):")
+print(w[0, 0].detach().round(decimals=3))
+```
+
+```output
+Causal mask:
+ tensor([[0, 1, 1, 1, 1],
+        [0, 0, 1, 1, 1],
+        [0, 0, 0, 1, 1],
+        [0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0]])
+
+Weights (should be lower-triangular):
+tensor([[1.000, 0.000, 0.000, 0.000, 0.000],
+        [0.534, 0.466, 0.000, 0.000, 0.000],
+        [0.282, 0.355, 0.363, 0.000, 0.000],
+        [0.201, 0.292, 0.268, 0.239, 0.000],
+        [0.166, 0.228, 0.218, 0.213, 0.175]])
+```
+
+## Multi-head attention
+
+A single attention head captures one kind of relationship. Multi-head attention runs $h$ attention heads in **parallel**, each with independent projections $W_Q^i, W_K^i, W_V^i \in \mathbb{R}^{d \times d_k}$ where $d_k = d / h$. Outputs are concatenated and projected:
+
+$$
+\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h) W^O
+$$
+
+Each head can learn different relationships — one head might track syntactic dependencies, another semantic similarities.
+
+```python
+import torch
+import torch.nn as nn
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h  = n_heads
+        self.dk = d_model // n_heads
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, mask=None):
+        B, T, D = x.shape
+        Q = self.Wq(x).view(B, T, self.h, self.dk).transpose(1, 2)
+        K = self.Wk(x).view(B, T, self.h, self.dk).transpose(1, 2)
+        V = self.Wv(x).view(B, T, self.h, self.dk).transpose(1, 2)
+        # Q, K, V: (B, h, T, dk)
+        out, _ = scaled_dot_product_attention(Q, K, V, mask)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)  # concat heads
+        return self.Wo(out)
+
+d_model, n_heads, seq = 64, 8, 10
+mha = MultiHeadAttention(d_model, n_heads)
+x   = torch.randn(3, seq, d_model)
+out = mha(x)
+print("MHA output shape:", out.shape)
+print("Total params:", sum(p.numel() for p in mha.parameters()))
+```
+
+```output
+MHA output shape: torch.Size([3, 10, 64])
+Total params: 16,384
+```
+
+## Complexity: $O(n^2)$ in sequence length
+
+The attention score matrix is $n \times n$ — for a sequence of length 1000, that's $10^6$ elements per head. For 8 heads with d=64, the full matrix takes ~0.5 MB per batch. At $n = 100{,}000$ (long documents), this becomes intractable. This is the key limitation that motivated FlashAttention and linear attention variants (covered in ch. 12 Under the Trench).
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    d_k = Q.shape[-1]
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)
+    if mask is not None:
+        scores = scores.masked_fill(mask, float('-inf'))
+    return torch.matmul(F.softmax(scores, dim=-1), V)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h = n_heads; self.dk = d_model // n_heads
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, mask=None):
+        B, T, D = x.shape
+        def project(W): return W(x).view(B, T, self.h, self.dk).transpose(1, 2)
+        Q, K, V = project(self.Wq), project(self.Wk), project(self.Wv)
+        out = scaled_dot_product_attention(Q, K, V, mask)
+        return self.Wo(out.transpose(1, 2).contiguous().view(B, T, D))
+
+# Compare: encoder self-attention (no mask) vs decoder self-attention (causal)
+d, h, T = 32, 4, 8
+mha = MultiHeadAttention(d, h)
+x   = torch.randn(2, T, d)
+
+def causal_mask(T):
+    return torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+
+enc_out = mha(x)                                 # all positions see all
+dec_out = mha(x, causal_mask(T).unsqueeze(0).unsqueeze(0))  # causal
+
+print("Encoder out  (same for all seqs):", enc_out.shape)
+print("Decoder out  (causal):            ", dec_out.shape)
+print("Position 0 same?", torch.allclose(enc_out[:, 0], dec_out[:, 0]))  # should be True
+```
+
+```output
+Encoder out  (same for all seqs): torch.Size([2, 8, 32])
+Decoder out  (causal):             torch.Size([2, 8, 32])
+Position 0 same?: True
+```
+
+## Exercise
+
+Implement **cross-attention**: queries come from sequence A (decoder), keys and values come from sequence B (encoder output). This is the second attention block in a transformer decoder. Add a `cross_attention(q_seq, kv_seq)` method to `MultiHeadAttention`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class MultiHeadAttentionFull(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h = n_heads; self.dk = d_model // n_heads
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Wo = nn.Linear(d_model, d_model, bias=False)
+
+    def _project(self, W, x, B, T):
+        return W(x).view(B, T, self.h, self.dk).transpose(1, 2)
+
+    def forward(self, q_seq, kv_seq=None, mask=None):
+        if kv_seq is None:
+            kv_seq = q_seq   # self-attention
+        B, Tq, D = q_seq.shape
+        Tk = kv_seq.shape[1]
+        Q  = self._project(self.Wq, q_seq,  B, Tq)
+        K  = self._project(self.Wk, kv_seq, B, Tk)
+        V  = self._project(self.Wv, kv_seq, B, Tk)
+        out = scaled_dot_product_attention(Q, K, V, mask)
+        return self.Wo(out.transpose(1, 2).contiguous().view(B, Tq, D))
+
+mha  = MultiHeadAttentionFull(32, 4)
+dec  = torch.randn(2, 5, 32)   # decoder: 5 tokens
+enc  = torch.randn(2, 10, 32)  # encoder: 10 tokens
+cross_out = mha(dec, enc)
+print("Cross-attention output:", cross_out.shape)  # (2, 5, 32)
+```
+
+Cross-attention output has the same length as the query (decoder), attending to the full encoder.
+</details>

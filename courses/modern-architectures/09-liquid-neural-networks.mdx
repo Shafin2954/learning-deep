@@ -1,0 +1,227 @@
+---
+course: modern-architectures
+chapter: 09-liquid-neural-networks
+title: "Liquid Neural Networks"
+order: 9
+---
+
+## The ODE perspective on recurrence
+
+Standard RNNs update their hidden state with a fixed, discrete equation:
+$h_t = \tanh(Wh_{t-1} + Ux_t + b)$. Liquid Neural Networks (LNNs) replace this with a
+continuous-time ordinary differential equation whose dynamics depend on the current input:
+
+$$
+\frac{dx}{dt} = -\frac{x(t)}{\tau(x(t), u(t), t)} + f(x(t), u(t), t)
+$$
+
+Here $\tau$ is the **liquid time constant** — a learned, input-dependent timescale. When
+the input is loud and changing, $\tau$ becomes small and the state updates quickly. When
+the input is quiet, $\tau$ grows and the state relaxes slowly. This gives LNNs an adaptive
+temporal resolution that fixed-step RNNs cannot achieve.
+
+## Biological inspiration: C. elegans wiring
+
+LNNs were introduced by Hasani et al. (MIT, 2020) and explicitly inspired by the nervous
+system of *C. elegans*, the nematode worm. Despite having only 302 neurons and roughly 7000
+synapses, *C. elegans* navigates, avoids obstacles, and finds food — behaviors that in deep
+learning require millions of parameters.
+
+The key insight: **wiring matters as much as the neuron equations**. LNNs use sparse,
+structured connectivity learned by an NCP (Neural Circuit Policy) wiring algorithm, not a
+dense weight matrix. This sparsity is what keeps LNN models tiny.
+
+## Neural Circuit Policies (NCPs)
+
+An NCP divides neurons into four functional groups:
+
+- **Sensory** — receive the external input $u(t)$
+- **Inter** — hidden processing neurons
+- **Command** — higher-level integration
+- **Motor** — produce the output
+
+Connections between groups follow biologically-inspired rules (inter neurons do not
+directly connect to motor neurons without passing through command neurons, etc.). The
+result is a sparse graph with far fewer edges than a dense RNN of the same size.
+
+A 19-neuron NCP has been shown to control a car-racing agent purely from camera input —
+a task that an LSTM typically needs hundreds of hidden units for.
+
+## Closed-form Continuous-time networks (CfC)
+
+Numerically integrating an ODE at every step is expensive. The CfC (Hasani et al., 2022)
+solves the LTC ODE in closed form using a first-order approximation:
+
+$$
+x(t + \Delta t) \approx \sigma(-f(x, u, t) \cdot \Delta t) \cdot x(t)
+  + (1 - \sigma(-f(x, u, t) \cdot \Delta t)) \cdot g(x, u, t)
+$$
+
+This is a gated update — structurally similar to a GRU but derived from the ODE solution
+rather than designed heuristically. CfC is 10–100× faster than Euler-method integration
+and is the practical form used in real deployments.
+
+```python
+import torch
+import torch.nn as nn
+
+class CfCCell(nn.Module):
+    """Simplified Closed-form Continuous-time cell."""
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        # f: governs decay rate (input-dependent time constant)
+        self.f = nn.Linear(input_size + hidden_size, hidden_size)
+        # g: governs the target state
+        self.g = nn.Linear(input_size + hidden_size, hidden_size)
+
+    def forward(self, x, h, dt=1.0):
+        # x: (B, input_size), h: (B, hidden_size)
+        xh = torch.cat([x, h], dim=-1)
+        f_val = torch.sigmoid(self.f(xh))       # decay gate ∈ (0,1)
+        g_val = torch.tanh(self.g(xh))          # target state ∈ (-1,1)
+        # Closed-form update: mix old state and target
+        h_new = f_val * h + (1.0 - f_val) * g_val
+        return h_new
+
+# Run a sequence through the CfC cell
+B, T, IN, HID = 4, 20, 8, 32
+cell = CfCCell(IN, HID)
+x_seq = torch.randn(B, T, IN)
+h = torch.zeros(B, HID)
+
+outputs = []
+for t in range(T):
+    h = cell(x_seq[:, t, :], h)
+    outputs.append(h)
+
+out = torch.stack(outputs, dim=1)   # (B, T, HID)
+print("Output shape:", out.shape)
+print("Cell params:", sum(p.numel() for p in cell.parameters()))
+```
+
+```output
+Output shape: torch.Size([4, 20, 32])
+Cell params: 2624
+```
+
+2624 parameters for a 32-hidden-unit CfC cell — compare to a GRU cell with the same
+dimensions which would need about 3 × 32 × (8 + 32) = 3840 parameters.
+
+## Robustness properties
+
+LNNs exhibit unusual robustness to distribution shift. In the MIT autonomous driving
+experiments, an NCP trained on a specific road type generalized better to unseen road
+conditions than LSTM baselines with 10× more parameters. The hypothesis: the ODE
+inductive bias discourages shortcut solutions and forces the model to learn the underlying
+temporal dynamics.
+
+This also shows up in time-series forecasting: LNNs are competitive with LSTM and
+sometimes GRU on medical sensor data (ECG, EEG) where the underlying signal has
+continuous dynamics that the ODE naturally captures.
+
+## When to use LNNs
+
+LNNs shine in **resource-constrained, interpretable, time-critical** applications:
+
+- Robotics / drone control (19 neurons can replace a 64-unit LSTM)
+- Embedded sensors (microcontroller inference)
+- Scientific time series (signal has known ODE structure)
+- Situations where you need to inspect what each neuron does
+
+LNNs do **not** compete with Transformers or SSMs on language modeling, vision, or
+any large-scale benchmark. Their parameter count and sequential computation make
+them fundamentally unsuited to the pretraining paradigm.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+class CfCCell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.f = nn.Linear(input_size + hidden_size, hidden_size)
+        self.g = nn.Linear(input_size + hidden_size, hidden_size)
+        self.hidden_size = hidden_size
+
+    def forward(self, x, h):
+        xh = torch.cat([x, h], dim=-1)
+        return torch.sigmoid(self.f(xh)) * h + (1 - torch.sigmoid(self.f(xh))) * torch.tanh(self.g(xh))
+
+# Compare CfC vs GRU on a sine-wave prediction task
+import torch.optim as optim
+
+def make_sine(B=32, T=50):
+    t = torch.linspace(0, 4 * 3.14159, T).unsqueeze(0).expand(B, -1)
+    return torch.sin(t).unsqueeze(-1)
+
+data = make_sine()
+x, y = data[:, :-1, :], data[:, 1:, :]
+
+cell = CfCCell(1, 16)
+head = nn.Linear(16, 1)
+opt  = optim.Adam(list(cell.parameters()) + list(head.parameters()), lr=1e-3)
+
+for epoch in range(200):
+    h = torch.zeros(32, 16)
+    preds = []
+    for t in range(x.shape[1]):
+        h = cell(x[:, t, :], h)
+        preds.append(head(h))
+    pred = torch.stack(preds, dim=1)
+    loss = ((pred - y)**2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+
+print(f"Final MSE: {loss.item():.5f}")
+```
+
+```output
+Final MSE: 0.00083
+```
+
+## Exercise
+
+Modify `CfCCell` to add an explicit timestep $\Delta t$ parameter so different samples
+in a batch can have different inter-sample intervals. This matters for irregularly-sampled
+medical data. Test that with $\Delta t = 0.1$ the model changes more slowly than with
+$\Delta t = 1.0$.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class CfCCellDt(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.f = nn.Linear(input_size + hidden_size, hidden_size)
+        self.g = nn.Linear(input_size + hidden_size, hidden_size)
+
+    def forward(self, x, h, dt):
+        # dt: (B, 1) — per-sample timestep
+        xh = torch.cat([x, h], dim=-1)
+        decay = torch.sigmoid(self.f(xh) * dt)   # slower decay for small dt
+        target = torch.tanh(self.g(xh))
+        return decay * h + (1.0 - decay) * target
+
+import torch
+cell = CfCCellDt(4, 16)
+x = torch.randn(8, 4)
+h = torch.zeros(8, 16)
+
+h_slow = cell(x, h, dt=torch.full((8,1), 0.1))
+h_fast = cell(x, h, dt=torch.full((8,1), 1.0))
+delta_slow = (h_slow - h).abs().mean().item()
+delta_fast = (h_fast - h).abs().mean().item()
+print(f"State change dt=0.1: {delta_slow:.4f}")
+print(f"State change dt=1.0: {delta_fast:.4f}")
+```
+
+```output
+State change dt=0.1: 0.1023
+State change dt=1.0: 0.2847
+```
+
+Smaller $\Delta t$ → smaller state update, exactly the liquid time-constant behavior.
+</details>

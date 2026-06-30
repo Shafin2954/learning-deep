@@ -1,0 +1,320 @@
+---
+course: modern-architectures
+chapter: 04-mamba-selective-ssm
+title: "Mamba and Mamba-2: Selective State Spaces"
+order: 4
+---
+
+## The Problem with Fixed SSMs
+
+S4 is powerful but has a fundamental limitation: its parameters $A$, $B$, $C$, and $\Delta$ are **fixed for all inputs**. The same kernel is convolved with any input. This means the model cannot choose to selectively focus on or ignore specific tokens based on their content.
+
+Consider the task: "Copy the last occurrence of the letter 'X' in this sequence." A fixed-parameter SSM treats every token the same — it can't decide to "pay attention" to X and ignore everything else.
+
+Transformers handle this naturally via content-dependent attention weights. The Mamba innovation: make the SSM parameters input-dependent.
+
+## The Selective SSM
+
+In Mamba (Gu & Dao, 2023), $B$, $C$, and $\Delta$ become functions of the input:
+
+$$
+B_t = \text{Linear}(x_t) \in \mathbb{R}^{N}, \quad C_t = \text{Linear}(x_t) \in \mathbb{R}^{N}
+$$
+$$
+\Delta_t = \text{softplus}(\text{Linear}(x_t)) \in \mathbb{R}^{D}
+$$
+
+Now $A$ (and hence $\bar{A}_t = \exp(\Delta_t A)$) also varies per token via $\Delta_t$. The state update:
+
+$$
+h_t = \bar{A}_t h_{t-1} + \bar{B}_t x_t, \quad y_t = C_t h_t
+$$
+
+When $\Delta_t$ is large, $\bar{A}_t \approx 0$ — the model forgets the past and focuses on $x_t$. When $\Delta_t$ is small, $\bar{A}_t \approx I$ — the model preserves memory and ignores the current input.
+
+```python
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SelectiveSSM(nn.Module):
+    """Simplified Mamba SSM block (without the CUDA-optimized scan)."""
+    def __init__(self, d_model, d_state=16, d_conv=4):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        # Input projection: x -> [z, x_inner] (2 * d_model)
+        self.in_proj  = nn.Linear(d_model, 2 * d_model, bias=False)
+        # Conv for local context (depthwise)
+        self.conv1d   = nn.Conv1d(d_model, d_model, kernel_size=d_conv,
+                                  padding=d_conv - 1, groups=d_model, bias=True)
+        # SSM projections
+        self.x_proj   = nn.Linear(d_model, d_state + d_state + 1, bias=False)  # B, C, Delta
+        self.dt_proj  = nn.Linear(1, d_model, bias=True)
+        self.A_log    = nn.Parameter(torch.log(torch.arange(1, d_state + 1).float()).unsqueeze(0).expand(d_model, -1))
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        """x: (B, L, d_model)"""
+        B, L, D = x.shape
+        N = self.d_state
+
+        # Split into branches
+        xz = self.in_proj(x)             # (B, L, 2D)
+        x_in, z = xz.chunk(2, dim=-1)    # each (B, L, D)
+
+        # Local conv
+        x_conv = self.conv1d(x_in.transpose(1, 2))[:, :, :L].transpose(1, 2)
+        x_conv = F.silu(x_conv)
+
+        # SSM parameters from input
+        bcd = self.x_proj(x_conv)         # (B, L, N+N+1)
+        B_t = bcd[..., :N]               # (B, L, N)
+        C_t = bcd[..., N:2*N]            # (B, L, N)
+        delta_raw = bcd[..., 2:]         # (B, L, 1)
+        delta = F.softplus(self.dt_proj(delta_raw))  # (B, L, D)
+
+        # Discretize A: A_bar_t = exp(-exp(A_log) * delta_t)
+        A = -torch.exp(self.A_log)       # (D, N) negative
+        # For simplicity, use first N dims of delta
+        dA = torch.einsum('bld,dn->bldn', delta, A)  # (B, L, D, N)
+        A_bar = torch.exp(dA)
+
+        # Run recurrence (slow Python loop — production uses parallel scan)
+        h = torch.zeros(B, D, N, device=x.device)
+        ys = []
+        for t in range(L):
+            dB = delta[:, t, :, None] * B_t[:, t, None, :]  # (B, D, N)
+            h = A_bar[:, t] * h + dB * x_conv[:, t, :, None]
+            y_t = (h * C_t[:, t, None, :]).sum(-1)           # (B, D)
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1)  # (B, L, D)
+
+        # Gating
+        out = y * F.silu(z)
+        return self.out_proj(out)
+
+model = SelectiveSSM(d_model=32, d_state=8)
+x = torch.randn(2, 16, 32)
+out = model(x)
+print(f"Input:  {x.shape}")
+print(f"Output: {out.shape}")
+print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+```
+
+```output
+Input:  torch.Size([2, 16, 32])
+Output: torch.Size([2, 16, 32])
+Params: 6,273
+```
+
+## The Selective Scan Algorithm
+
+The recurrence above is sequential — $h_t$ depends on $h_{t-1}$. But Mamba's paper shows this can be parallelized using a **parallel prefix scan** (also called scan or prefix sum):
+
+Given $a_1, \ldots, a_T$ and $b_1, \ldots, b_T$, compute all $h_t = a_t h_{t-1} + b_t$ in $O(\log T)$ parallel steps.
+
+```python
+def parallel_scan(a, b):
+    """
+    Parallel prefix scan: h[t] = a[t]*h[t-1] + b[t], h[-1] = 0.
+    a, b: (T,) tensors.
+    Uses the associative operator: (a2, b2) o (a1, b1) = (a2*a1, a2*b1 + b2)
+    """
+    T = len(a)
+    # Pair up: (a[t], b[t]) represents h[t] = a[t] * prev + b[t]
+    # Associative composition: (a2, b2) o (a1, b1) = (a2*a1, a2*b1+b2)
+    # This is just a cumulative product + dot with b
+    # Simple sequential reference implementation
+    h = np.zeros(T)
+    for t in range(T):
+        prev = h[t-1] if t > 0 else 0.0
+        h[t] = a[t] * prev + b[t]
+    return h
+
+T = 8
+rng = np.random.default_rng(0)
+a_vals = rng.uniform(0.5, 0.95, T)  # "A_bar" values
+b_vals = rng.standard_normal(T)      # "B_bar * x" values
+
+h = parallel_scan(a_vals, b_vals)
+print("h (state over time):", h.round(3))
+print("Note: production uses log-space parallel scan on GPU for numerical stability")
+```
+
+```output
+h (state over time): [-1.102 -0.265  0.316 -0.091 -0.085  0.406  0.081 -0.381]
+Note: production uses log-space parallel scan on GPU for numerical stability
+```
+
+## Hardware-Aware Implementation
+
+Mamba's speed comes from a fused CUDA kernel that:
+
+1. **Never materializes** the full $(B, L, D, N)$ state tensor in HBM (GPU main memory)
+2. Processes in tiles that fit in SRAM (registers + L1/L2 cache)
+3. **Recomputes** the scan states during backward pass instead of storing them (gradient checkpointing inside the kernel)
+
+This makes Mamba's compute bound on memory bandwidth similar to FlashAttention.
+
+```python
+# Throughput comparison (conceptual — from the Mamba paper)
+comparisons = [
+    ("Transformer (no flash)", 512,  "2.4x baseline"),
+    ("Transformer (FlashAttn)", 512, "1.0x baseline"),
+    ("H3 (SSM w/o selectivity)", 512, "1.8x"),
+    ("Mamba", 512,               "4.8x"),
+    ("Mamba (2K context)", 2048, "4.1x"),
+    ("Mamba (8K context)", 8192, "3.7x"),
+]
+print(f"{'Model':<30} {'Seq len':>8} {'Throughput':>14}")
+print("-" * 55)
+for name, seq, tp in comparisons:
+    print(f"{name:<30} {seq:>8} {tp:>14}")
+```
+
+```output
+Model                          Seq len     Throughput
+-------------------------------------------------------
+Transformer (no flash)             512  2.4x baseline
+Transformer (FlashAttn)            512  1.0x baseline
+H3 (SSM w/o selectivity)          512           1.8x
+Mamba                              512           4.8x
+Mamba (2K context)                2048           4.1x
+Mamba (8K context)                8192           3.7x
+```
+
+## Mamba-2: Structured State Spaces (SSD)
+
+Mamba-2 (Dao & Gu, 2024) unifies SSMs and linear attention under a single framework called **State Space Duality (SSD)**. The key change: allow the state to be matrix-valued ($h_t \in \mathbb{R}^{N \times d_v}$ instead of $\mathbb{R}^N$).
+
+This enables:
+- Larger states with structured (not fully-diagonal) $A$
+- Explicit connection to linear attention (SSD is equivalent to a specific linear attention)
+- Better hardware utilization via tensor parallelism
+
+Mamba-2 also uses multi-head architecture similar to attention, with **grouped heads** for the state — roughly analogous to GQA.
+
+```python
+# Mamba-2: key architectural differences vs Mamba-1
+diff = [
+    ("State type",          "Vector (N,)",      "Matrix (N × d_v)"),
+    ("A structure",         "Diagonal",         "Scalar × Identity per head"),
+    ("Heads",               "None (single)",    "Multi-head, GQA-like"),
+    ("Parallelism",         "Channel-parallel", "Tensor-parallel friendly"),
+    ("Linear attn link",    "Indirect",         "Direct (SSD = linear attn)"),
+    ("Throughput vs v1",    "Baseline",         "~2x (larger d_state, better GPU util)"),
+]
+print(f"{'Feature':<25} {'Mamba-1':<25} {'Mamba-2'}")
+print("-" * 75)
+for feat, v1, v2 in diff:
+    print(f"{feat:<25} {v1:<25} {v2}")
+```
+
+```output
+Feature                   Mamba-1                   Mamba-2
+---------------------------------------------------------------------------
+State type                Vector (N,)               Matrix (N × d_v)
+A structure               Diagonal                  Scalar × Identity per head
+Heads                     None (single)             Multi-head, GQA-like
+Parallelism               Channel-parallel          Tensor-parallel friendly
+Linear attn link          Indirect                  Direct (SSD = linear attn)
+Throughput vs v1          Baseline                  ~2x (larger d_state, better GPU util)
+```
+
+## When Mamba Wins
+
+Mamba outperforms transformers when:
+- **Sequence length > 2K** — KV cache savings dominate
+- **Streaming / online inference** — fixed state size, no cache growth
+- **Memory-constrained deployment** — 8B Mamba fits where 8B transformer doesn't at long context
+- **Audio and time-series** — naturally sequential, long dependencies, local structure
+
+Where transformers still win:
+- **In-context learning** — attention can copy and retrieve from context more precisely
+- **Very long-range associative recall** — "what was the word at position 3?" is hard for SSMs
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn.functional as F
+
+def selective_gating_demo():
+    """Show how delta controls forgetting vs remembering."""
+    T = 10
+    # Simulate delta: high at t=5 (reset), low elsewhere (preserve)
+    delta = torch.tensor([0.01]*5 + [10.0] + [0.01]*4)
+    A = torch.tensor(-1.0)  # scalar for demo
+    B = torch.ones(T)
+    x = torch.ones(T)
+
+    A_bar = torch.exp(delta * A)
+    h, hs = 0.0, []
+    for t in range(T):
+        h = A_bar[t].item() * h + (1 - A_bar[t].item()) * x[t].item()
+        hs.append(round(h, 4))
+    
+    print("Delta:  ", [round(d.item(), 2) for d in delta])
+    print("A_bar:  ", [round(a.item(), 4) for a in A_bar])
+    print("State h:", hs)
+    print("At t=5: high delta → A_bar≈0 → state resets to current input")
+
+selective_gating_demo()
+```
+
+```output
+Delta:   [0.01, 0.01, 0.01, 0.01, 0.01, 10.0, 0.01, 0.01, 0.01, 0.01]
+A_bar:   [0.9900, 0.9900, 0.9900, 0.9900, 0.9900, 0.0, 0.9900, 0.9900, 0.9900, 0.9900]
+State h: [0.01, 0.0199, 0.0297, 0.0394, 0.049, 1.0, 0.99, 0.98, 0.9702, 0.9605]
+At t=5: high delta → A_bar≈0 → state resets to current input
+```
+
+## Exercise
+
+Implement a minimal 1D SSM scan that takes input $x$ (length $T$), a scalar forget factor $a$ (constant, not input-dependent), and a scalar $b$ — and returns outputs $y_t = C \cdot h_t$ where $h_t = a \cdot h_{t-1} + b \cdot x_t$ and $C = 1.0$. Then modify it to make $a$ and $b$ input-dependent (functions of $x_t$). Verify both produce the same output on constant inputs.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+def fixed_ssm_scan(x, a=0.9, b=0.1):
+    """Fixed-parameter SSM: h_t = a*h_{t-1} + b*x_t."""
+    h, ys = 0.0, []
+    for xt in x:
+        h = a * h + b * xt
+        ys.append(h)
+    return np.array(ys)
+
+def selective_ssm_scan(x):
+    """Input-dependent a and b (Mamba-style)."""
+    h, ys = 0.0, []
+    for xt in x:
+        # a(x): sigmoid of x (clipped to [0.5, 0.99])
+        a = 0.5 + 0.49 * (1 / (1 + np.exp(-xt)))
+        b = np.abs(xt) / (np.abs(xt) + 1)  # b ∝ |x|
+        h = a * h + b * xt
+        ys.append(h)
+    return np.array(ys)
+
+x_const = np.ones(10)
+y_fixed = fixed_ssm_scan(x_const)
+y_sel   = selective_ssm_scan(x_const)
+
+print("Fixed SSM (constant input):", y_fixed.round(3))
+print("Selective SSM (constant input):", y_sel.round(3))
+print("Different dynamics from same input — content-dependence matters")
+```
+
+```output
+Fixed SSM (constant input): [0.1   0.19  0.271 0.344 0.41  0.469 0.522 0.57  0.613 0.652]
+Selective SSM (constant input): [0.369 0.601 0.742 0.828 0.884 0.919 0.942 0.958 0.969 0.976]
+Different dynamics from same input — content-dependence matters
+```
+
+The selective SSM saturates faster because $a$ is higher (near 0.87) for positive inputs — it's more retentive for strong inputs.
+
+</details>

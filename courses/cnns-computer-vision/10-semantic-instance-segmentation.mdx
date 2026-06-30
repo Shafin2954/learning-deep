@@ -1,0 +1,261 @@
+---
+course: cnns-computer-vision
+chapter: 10-semantic-instance-segmentation
+title: "Semantic and Instance Segmentation"
+order: 10
+---
+
+## Pixel-wise prediction
+
+Detection gives you a box. Segmentation gives you which pixel belongs to what:
+
+- **Semantic segmentation** — assign a class label to every pixel. All pixels of the same class get the same label (two cats = same label).
+- **Instance segmentation** — distinguish individual object instances. Two cats get different labels.
+- **Panoptic segmentation** — combine both: "things" (countable objects, per-instance) and "stuff" (uncountable regions, per-class).
+
+Evaluation: **mIoU** (mean intersection-over-union per class), computed per-pixel across the dataset.
+
+## FCN: fully convolutional networks
+
+The first successful deep semantic segmenter (Long et al. 2015) replaced the fully-connected head of a classification net with 1×1 convolutions and added **transposed convolutions** (learnable upsampling) to recover spatial resolution.
+
+FCN-8s adds skip connections from pool3 and pool4 for finer boundaries.
+
+```python
+import torch
+import torch.nn as nn
+
+class SimpleFCN(nn.Module):
+    """Toy FCN: encoder (stride-down) + decoder (transpose-up)."""
+    def __init__(self, num_classes: int = 21):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),  # /2
+            nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.ReLU(),  # /4
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), nn.ReLU(),  # ×2
+            nn.ConvTranspose2d(32, num_classes, 4, stride=2, padding=1),    # ×2
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+fcn = SimpleFCN(21)
+x   = torch.randn(2, 3, 64, 64)
+out = fcn(x)
+print("FCN output:", out.shape)   # (B, C, H, W) same spatial as input
+```
+
+```output
+FCN output: torch.Size([2, 21, 64, 64])
+```
+
+## U-Net: encoder-decoder with skip connections
+
+U-Net (Ronneberger 2015, biomedical) adds **skip connections** from each encoder level to the corresponding decoder level, concatenating fine spatial features with coarse semantic features. This recovers sharp object boundaries.
+
+```python
+class UNetBlock(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, padding=1), nn.BatchNorm2d(out_c), nn.ReLU(),
+            nn.Conv2d(out_c, out_c, 3, padding=1), nn.BatchNorm2d(out_c), nn.ReLU(),
+        )
+    def forward(self, x): return self.net(x)
+
+class UNet(nn.Module):
+    def __init__(self, in_c: int = 3, num_classes: int = 2):
+        super().__init__()
+        self.enc1 = UNetBlock(in_c,  64)
+        self.enc2 = UNetBlock(64,   128)
+        self.enc3 = UNetBlock(128,  256)
+        self.pool = nn.MaxPool2d(2)
+
+        self.bottleneck = UNetBlock(256, 512)
+
+        self.up3  = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec3 = UNetBlock(512, 256)   # 256 from up + 256 skip
+        self.up2  = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec2 = UNetBlock(256, 128)
+        self.up1  = nn.ConvTranspose2d(128,  64, 2, stride=2)
+        self.dec1 = UNetBlock(128,  64)
+
+        self.out  = nn.Conv2d(64, num_classes, 1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+
+        b = self.bottleneck(self.pool(e3))
+
+        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return self.out(d1)
+
+import torch
+unet = UNet(in_c=3, num_classes=2)
+x    = torch.randn(2, 3, 128, 128)
+out  = unet(x)
+print("U-Net output:", out.shape)
+params = sum(p.numel() for p in unet.parameters())
+print(f"Total params: {params:,}")
+```
+
+```output
+U-Net output: torch.Size([2, 2, 128, 128])
+Total params: 7,763,010
+```
+
+Shape in = shape out. Each pixel gets a per-class logit.
+
+## DeepLab: dilated convolutions for dense prediction
+
+Pooling discards spatial resolution. DeepLab keeps it by replacing standard convolutions with **dilated (atrous) convolutions** — kernels spaced with gaps:
+
+$$
+(F *_d w)[i] = \sum_k w[k] \cdot F[i + dk]
+$$
+
+A dilation rate $d=2$ gives a 3×3 kernel a 5×5 effective receptive field without extra parameters.
+
+**ASPP (Atrous Spatial Pyramid Pooling)** in DeepLabV3+ applies dilated convolutions at multiple rates in parallel, capturing multi-scale context.
+
+```python
+x = torch.randn(2, 64, 32, 32)
+d1 = nn.Conv2d(64, 64, 3, padding=1,  dilation=1)
+d2 = nn.Conv2d(64, 64, 3, padding=2,  dilation=2)
+d4 = nn.Conv2d(64, 64, 3, padding=4,  dilation=4)
+d8 = nn.Conv2d(64, 64, 3, padding=8,  dilation=8)
+for d, layer in zip([1,2,4,8], [d1,d2,d4,d8]):
+    out = layer(x)
+    print(f"dilation={d}: output {out.shape}  (eff receptive field {2*d+1}×{2*d+1})")
+```
+
+```output
+dilation=1: output torch.Size([2, 64, 32, 32])  (eff receptive field 3×3)
+dilation=2: output torch.Size([2, 64, 32, 32])  (eff receptive field 5×5)
+dilation=4: output torch.Size([2, 64, 32, 32])  (eff receptive field 9×9)
+dilation=8: output torch.Size([2, 64, 32, 32])  (eff receptive field 17×17)
+```
+
+All same spatial size, progressively larger receptive fields — perfect for ASPP.
+
+## Mask R-CNN: instance segmentation
+
+Mask R-CNN (He et al. 2017) extends Faster R-CNN with a third head — a small FCN that predicts a binary mask for each detected object, run in parallel with the class and box heads.
+
+Key fix over RoI Pooling: **RoI Align** uses bilinear interpolation instead of quantization, giving sub-pixel accuracy for masks.
+
+```python
+import torchvision
+
+model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+    weights=torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+)
+model.eval()
+
+x = [torch.rand(3, 400, 500)]
+with torch.no_grad():
+    out = model(x)
+
+print("Keys:", list(out[0].keys()))
+print("Boxes:", out[0]['boxes'].shape)
+print("Masks:", out[0]['masks'].shape)   # (N_instances, 1, H, W) ∈ [0,1]
+```
+
+```output
+Keys: ['boxes', 'labels', 'scores', 'masks']
+Boxes: torch.Size([12, 4])
+Masks: torch.Size([12, 1, 400, 500])
+```
+
+Each mask is a soft per-pixel probability for its instance. Threshold at 0.5 to get a binary mask.
+
+## Panoptic segmentation
+
+Panoptic (Kirillov 2019) merges semantic and instance:
+- **"Things"** (person, car) → instance-segmented.
+- **"Stuff"** (sky, road) → semantically segmented.
+
+All pixels are labelled; no pixel is left unassigned. `torchvision` includes `panoptic_resnet50_fpn`.
+
+```python
+print("Panoptic segmentation:")
+print("  Things (countable objects) → instance labels, e.g. person_1, person_2")
+print("  Stuff (uncountable regions) → semantic labels, e.g. sky, grass")
+print("  All pixels labelled. PQ = SQ × RQ per class.")
+```
+
+```output
+Panoptic segmentation:
+  Things (countable objects) → instance labels, e.g. person_1, person_2
+  Stuff (uncountable regions) → semantic labels, e.g. sky, grass
+  All pixels labelled. PQ = SQ × RQ per class.
+```
+
+PQ (panoptic quality) = segmentation quality × recognition quality.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Build and run U-Net, inspect per-layer shapes
+unet  = UNet(in_c=1, num_classes=2)   # grayscale binary segmentation
+x     = torch.randn(4, 1, 64, 64)
+out   = unet(x)
+
+print("Input:", x.shape)
+print("Output:", out.shape)
+
+# Compute a pixel-wise cross-entropy loss
+mask = torch.randint(0, 2, (4, 64, 64))   # ground-truth binary mask
+loss = nn.CrossEntropyLoss()(out, mask)
+print(f"Loss: {loss.item():.4f}")
+```
+
+```output
+Input: torch.Size([4, 1, 64, 64])
+Output: torch.Size([4, 2, 64, 64])
+Loss: 0.7129
+```
+
+Try replacing `MaxPool2d` in the encoder with strided convolutions and see if the parameter count changes. Then add a Dice loss term alongside cross-entropy (common in medical imaging).
+
+## Exercise
+
+Compute mIoU for a batch of semantic segmentation predictions. Given `preds` (B, H, W) integer class IDs and `targets` (B, H, W) integer class IDs with `num_classes=3`, compute the mean IoU across all classes and return it as a float.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+
+def mean_iou(preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> float:
+    ious = []
+    for c in range(num_classes):
+        p = preds == c
+        t = targets == c
+        inter = (p & t).sum().item()
+        union = (p | t).sum().item()
+        if union > 0:
+            ious.append(inter / union)
+    return sum(ious) / len(ious) if ious else 0.0
+
+preds   = torch.randint(0, 3, (4, 64, 64))
+targets = torch.randint(0, 3, (4, 64, 64))
+print(f"mIoU: {mean_iou(preds, targets, 3):.4f}")
+
+# Perfect predictions should give mIoU=1
+print(f"mIoU (perfect): {mean_iou(targets, targets, 3):.4f}")
+```
+
+The formula is per-class: sum pixels where pred=c and target=c (intersection) divided by sum where pred=c or target=c (union). Averaging across classes gives mIoU.
+</details>

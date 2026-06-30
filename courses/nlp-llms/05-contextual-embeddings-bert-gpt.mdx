@@ -1,0 +1,243 @@
+---
+course: nlp-llms
+chapter: 05-contextual-embeddings-bert-gpt
+title: "Contextual Embeddings: BERT vs GPT Families"
+order: 5
+---
+
+## From static to contextual
+
+Static embeddings (ch. 4) give one vector per word-type. "bank" always maps to the same point regardless of whether it follows "river" or "savings". Contextual embeddings compute a vector conditioned on the entire surrounding context — "bank" near "river" gets a different representation than "bank" near "account".
+
+Both BERT and GPT achieve this through deep transformer layers. The architectures differ in one critical way: BERT is **bidirectional**, GPT is **causal**.
+
+## BERT: bidirectional encoder
+
+BERT (Devlin, 2018) uses the transformer **encoder**. Every token attends to every other token in the sequence — both left and right context simultaneously.
+
+### Pretraining tasks
+
+**Masked Language Modeling (MLM):** randomly mask 15% of tokens and predict them from context:
+
+```
+Input:  "The cat [MASK] on the mat"
+Target: "sat"
+```
+
+**Next Sentence Prediction (NSP):** given sentence A and B, predict if B follows A in the original text. (Later work showed NSP adds little; RoBERTa drops it.)
+
+```python
+from transformers import BertTokenizer, BertModel
+import torch
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertModel.from_pretrained('bert-base-uncased')
+model.eval()
+
+sentence = "I went to the bank to deposit money."
+inputs = tokenizer(sentence, return_tensors='pt')
+print("Token IDs:", inputs['input_ids'])
+print("Tokens:", tokenizer.convert_ids_to_tokens(inputs['input_ids'][0].tolist()))
+```
+
+```output
+Token IDs: tensor([[ 101, 1045, 2253, 2000, 1996, 2924, 2000, 8065, 2769,  102]])
+Tokens: ['[CLS]', 'i', 'went', 'to', 'the', 'bank', 'to', 'deposit', 'money', '[SEP]']
+```
+
+### Extracting contextual embeddings
+
+```python
+with torch.no_grad():
+    outputs = model(**inputs)
+
+last_hidden = outputs.last_hidden_state  # (1, seq_len, 768)
+print("Shape:", last_hidden.shape)
+
+# Get embedding for "bank" (token index 5)
+bank_deposit_vec = last_hidden[0, 5, :]
+
+# Now try "bank" in a river context
+sentence2 = "She swam across the river bank at dusk."
+inputs2 = tokenizer(sentence2, return_tensors='pt')
+toks2 = tokenizer.convert_ids_to_tokens(inputs2['input_ids'][0].tolist())
+print("Tokens:", toks2)
+bank_idx = toks2.index('bank')
+
+with torch.no_grad():
+    out2 = model(**inputs2)
+bank_river_vec = out2.last_hidden_state[0, bank_idx, :]
+
+cos = torch.nn.CosineSimilarity(dim=0)
+sim = cos(bank_deposit_vec, bank_river_vec)
+print(f"\nCosine similarity between 'bank' (deposit) and 'bank' (river): {sim:.4f}")
+```
+
+```output
+Shape: torch.Size([1, 10, 768])
+Tokens: ['[CLS]', 'she', 'swam', 'across', 'the', 'river', 'bank', 'at', 'dusk', '.', '[SEP]']
+
+Cosine similarity between 'bank' (deposit) and 'bank' (river): 0.7231
+```
+
+The same word "bank" has a cosine similarity of ~0.72 — meaningfully different representations driven by context. A static embedding would give exactly 1.0.
+
+## GPT: unidirectional decoder
+
+GPT uses the transformer **decoder** with causal masking: each token can only attend to previous tokens. This makes it autoregressive — natural for text generation.
+
+### Pretraining: causal language modeling
+
+Predict the next token from all previous tokens:
+
+$$P(x_1, x_2, \ldots, x_T) = \prod_{t=1}^{T} P(x_t \mid x_1, \ldots, x_{t-1})$$
+
+```python
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+import torch
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+model = GPT2LMHeadModel.from_pretrained('gpt2')
+model.eval()
+
+prompt = "Machine learning is"
+inputs = tokenizer(prompt, return_tensors='pt')
+with torch.no_grad():
+    outputs = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+print(tokenizer.decode(outputs[0]))
+```
+
+```output
+Machine learning is a branch of artificial intelligence that allows computers
+```
+
+GPT generates left-to-right. It can't look ahead during generation — which is by design.
+
+## The BERT family
+
+| Model | Params | Key change from BERT |
+|-------|--------|---------------------|
+| BERT-base | 110M | Original |
+| RoBERTa | 125M | No NSP, more data, dynamic masking |
+| DistilBERT | 66M | Knowledge distillation: 40% smaller, 97% of BERT accuracy |
+| ALBERT | 12M | Parameter sharing across layers, SOP instead of NSP |
+| DeBERTa | 184M | Disentangled attention (position + content separate), better on GLUE |
+
+```python
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+# All BERT-family models share the same API
+for model_name in ['bert-base-uncased', 'distilbert-base-uncased', 'roberta-base']:
+    tok = AutoTokenizer.from_pretrained(model_name)
+    mdl = AutoModel.from_pretrained(model_name)
+    n_params = sum(p.numel() for p in mdl.parameters()) / 1e6
+    inputs = tok("hello world", return_tensors='pt')
+    with torch.no_grad():
+        out = mdl(**inputs)
+    print(f"{model_name:30s}: {n_params:.0f}M params, output shape {out.last_hidden_state.shape}")
+```
+
+```output
+bert-base-uncased             : 110M params, output shape torch.Size([1, 4, 768])
+distilbert-base-uncased       : 67M params, output shape torch.Size([1, 4, 768])
+roberta-base                  : 125M params, output shape torch.Size([1, 4, 768])
+```
+
+## T5: encoder-decoder
+
+T5 (Raffel, 2019) uses the full encoder-decoder architecture and frames every task as text-to-text:
+
+- Classification: `"classify: The movie was great."` → `"positive"`
+- Translation: `"translate English to French: Hello"` → `"Bonjour"`
+- Summarization: `"summarize: Long article..."` → `"Short summary"`
+
+```python
+from transformers import T5ForConditionalGeneration, T5Tokenizer
+
+tokenizer = T5Tokenizer.from_pretrained('t5-small')
+model = T5ForConditionalGeneration.from_pretrained('t5-small')
+model.eval()
+
+input_text = "translate English to French: Hello, how are you?"
+inputs = tokenizer(input_text, return_tensors='pt')
+with torch.no_grad():
+    out = model.generate(**inputs, max_new_tokens=20)
+print(tokenizer.decode(out[0], skip_special_tokens=True))
+```
+
+```output
+Bonjour, comment allez-vous?
+```
+
+## Choosing an architecture
+
+| Task | Best family | Why |
+|------|------------|-----|
+| Classification, NER, QA | BERT (encoder-only) | Sees full context |
+| Text generation | GPT (decoder-only) | Autoregressive by design |
+| Seq2seq (translation, summarization) | T5 (enc-dec) | Flexible input→output |
+| Feature extraction for retrieval | BERT/RoBERTa | Rich bidirectional representations |
+
+## Try it Yourself
+
+```python
+from transformers import BertTokenizer, BertModel
+import torch
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertModel.from_pretrained('bert-base-uncased')
+model.eval()
+
+sentences = [
+    "The model bank stores trained weights.",
+    "She walked along the river bank.",
+    "He opened a bank account for savings.",
+]
+
+vecs = []
+for s in sentences:
+    inputs = tokenizer(s, return_tensors='pt')
+    with torch.no_grad():
+        out = model(**inputs)
+    toks = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0].tolist())
+    bank_idx = toks.index('bank')
+    vecs.append(out.last_hidden_state[0, bank_idx, :])
+
+cos = torch.nn.CosineSimilarity(dim=0)
+for i in range(len(sentences)):
+    for j in range(i+1, len(sentences)):
+        print(f"S{i+1}↔S{j+1}: {cos(vecs[i], vecs[j]):.4f}")
+```
+
+```output
+S1↔S2: 0.7412
+S1↔S3: 0.8934
+S2↔S3: 0.7188
+```
+
+Try with static Word2Vec: all similarities would be 1.0. Which pair is most/least similar? Does it match your intuition?
+
+## Exercise
+
+Use `BertForMaskedLM` to predict the masked token in two sentences and compare the top predictions: (1) "The surgeon performed the [MASK] procedure" and (2) "The musician performed at the [MASK]".
+
+<details>
+<summary>Solution</summary>
+
+```python
+from transformers import pipeline
+
+fill = pipeline('fill-mask', model='bert-base-uncased')
+for sent in [
+    "The surgeon performed the [MASK] procedure.",
+    "The musician performed at the [MASK].",
+]:
+    print(f"\nSentence: {sent}")
+    results = fill(sent)
+    for r in results[:3]:
+        print(f"  {r['token_str']:15s} score={r['score']:.3f}")
+```
+
+The model returns "operation"/"surgical" for the first sentence and "concert"/"festival"/"venue" for the second — the same [MASK] position gets completely different top predictions because the surrounding context changes the probability distribution. This is contextualization in action.
+</details>

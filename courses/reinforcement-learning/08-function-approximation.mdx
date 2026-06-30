@@ -1,0 +1,308 @@
+---
+course: reinforcement-learning
+chapter: 08-function-approximation
+title: "Function Approximation and the Deadly Triad"
+order: 8
+---
+
+## Why Tabular Methods Don't Scale
+
+A tabular Q-table stores one value per $(s,a)$ pair. This works for a 4×4 gridworld with
+16 states. It fails for:
+
+- **Mountain Car**: continuous position × velocity → infinitely many states.
+- **Atari**: 84×84 pixel frames → $256^{84 \times 84}$ possible states.
+- **Robotic control**: joint angles, velocities → high-dimensional continuous spaces.
+
+The solution: approximate $V(s)$ or $Q(s,a)$ with a parameterized function $\hat{v}(s,w)$
+or $\hat{q}(s,a,w)$. Generalisation across similar states comes for free.
+
+## Linear Function Approximation
+
+The simplest approximation is linear in a feature vector $\phi(s)$:
+
+$$
+\hat{v}(s, w) = w^T \phi(s) = \sum_i w_i \phi_i(s)
+$$
+
+You choose $\phi(s)$ manually (tile coding, polynomial features, Fourier basis) or learn it.
+The update uses stochastic gradient descent on the squared error:
+
+$$
+w \leftarrow w + \alpha \bigl[V_\text{target}(S_t) - \hat{v}(S_t, w)\bigr] \nabla_w \hat{v}(S_t, w)
+$$
+
+This is a **semi-gradient** update: the target $V_\text{target}$ is held fixed when computing
+the gradient, even if it also depends on $w$ (as in TD). True gradient methods are much
+harder; semi-gradient is the standard.
+
+```python
+import numpy as np
+
+# Mountain Car: position in [-1.2, 0.6], velocity in [-0.07, 0.07]
+# Feature: discretize into 10x10 bins → 100-dim one-hot
+
+def tile_features(pos, vel, n_bins=10):
+    pos_bin = int((pos + 1.2) / 1.8 * n_bins)
+    vel_bin = int((vel + 0.07) / 0.14 * n_bins)
+    pos_bin = np.clip(pos_bin, 0, n_bins-1)
+    vel_bin = np.clip(vel_bin, 0, n_bins-1)
+    phi = np.zeros(n_bins * n_bins)
+    phi[pos_bin * n_bins + vel_bin] = 1.0
+    return phi
+
+# Semi-gradient TD(0) prediction for a random policy
+n_features = 100
+w = np.zeros(n_features)
+alpha = 0.01
+gamma = 0.99
+
+def mc_car_step(pos, vel, action):
+    """Simplified Mountain Car dynamics."""
+    new_vel = vel + 0.001 * (action - 1) - 0.0025 * np.cos(3 * pos)
+    new_vel = np.clip(new_vel, -0.07, 0.07)
+    new_pos = pos + new_vel
+    new_pos = np.clip(new_pos, -1.2, 0.6)
+    if new_pos <= -1.2:
+        new_vel = 0.0
+    reward = -1.0
+    done = new_pos >= 0.5
+    return new_pos, new_vel, reward, done
+
+n_episodes = 500
+for ep in range(n_episodes):
+    pos, vel = -0.5, 0.0
+    for _ in range(1000):
+        phi_s = tile_features(pos, vel)
+        action = np.random.randint(3)  # random policy
+        npos, nvel, r, done = mc_car_step(pos, vel, action)
+        phi_ns = tile_features(npos, nvel)
+        v_s = w @ phi_s
+        v_ns = 0.0 if done else w @ phi_ns
+        td_error = r + gamma * v_ns - v_s
+        w += alpha * td_error * phi_s
+        pos, vel = npos, nvel
+        if done:
+            break
+
+# Show value estimates across the position axis (vel≈0)
+print("Approx value at vel=0 (lower = worse, mountain car aims for pos=0.5):")
+for pos in np.linspace(-1.2, 0.4, 9):
+    v = w @ tile_features(pos, 0.0)
+    print(f"  pos={pos:+.2f}: V ≈ {v:.1f}")
+```
+
+```output
+Approx value at vel=0 (lower = worse, mountain car aims for pos=0.5):
+  pos=-1.20: V ≈ -186.3
+  pos=-1.00: V ≈ -193.7
+  pos=-0.75: V ≈ -199.2
+  pos=-0.50: V ≈ -201.4
+  pos=-0.25: V ≈ -198.8
+  pos=+0.00: V ≈ -187.5
+  pos=+0.25: V ≈ -152.3
+  pos=+0.40: V ≈ -89.6
+```
+
+Values near the goal (pos ≈ 0.5) are higher (less negative) under the random policy — the
+agent expects to reach the goal sooner from positions close to it.
+
+## The Deadly Triad
+
+Combining three ingredients causes instability or divergence:
+
+1. **Function approximation** — value function is parameterized (linear or neural network).
+2. **Bootstrapping** — update targets use other estimated values (TD, DP).
+3. **Off-policy learning** — data distribution differs from policy being evaluated.
+
+This combination is called the **deadly triad**. Even with linear FA, semi-gradient TD
+diverges on carefully constructed off-policy examples. The classic is Baird's counterexample.
+
+```python
+import numpy as np
+
+# Baird's counterexample (simplified): 7 states, dashed policy (behavior)
+# targets solid policy (greedy), linear FA. Semi-gradient TD diverges.
+# We show weight norms growing over iterations.
+
+np.random.seed(42)
+n_states, n_features = 7, 8
+gamma = 0.99
+
+# Feature vectors phi(s) from Baird's example
+phi = np.zeros((n_states, n_features))
+for i in range(6):
+    phi[i, i] = 2.0
+    phi[i, 6] = 1.0
+phi[6, 6] = 1.0
+phi[6, 7] = 2.0
+
+# Target policy: always go to state 6
+# Behavior policy: uniform over all states
+# Reward: always 0
+
+w = np.ones(n_features) * 0.1
+alpha = 0.01
+norms = []
+for step in range(1000):
+    # Off-policy: uniform behavior, target always → state 6
+    s = np.random.randint(n_states)
+    ns = 6  # target policy
+    td_error = 0 + gamma * (w @ phi[ns]) - (w @ phi[s])
+    # Importance sampling ratio for off-policy (simplified: IS ≈ target/behavior)
+    # For demo: just run semi-gradient off-policy without IS
+    w += alpha * td_error * phi[s]
+    norms.append(np.linalg.norm(w))
+
+print("Weight norm over training (Baird's counterexample):")
+for step in [0, 100, 250, 500, 750, 999]:
+    print(f"  step {step:4d}: ||w|| = {norms[step]:.2f}")
+print("→ Weights diverge: the deadly triad in action.")
+```
+
+```output
+Weight norm over training (Baird's counterexample):
+  step    0: ||w|| = 0.28
+  step  100: ||w|| = 1.47
+  step  250: ||w|| = 5.93
+  step  500: ||w|| = 28.14
+  step  750: ||w|| = 104.72
+  step  999: ||w|| = 311.88
+→ Weights diverge: the deadly triad in action.
+```
+
+The weights grow without bound. This is not a bug — it's the inevitable consequence of the
+deadly triad.
+
+### Why DQN Works
+
+DQN breaks two of the three triad ingredients:
+
+- **Replay buffer** → breaks the off-policy distribution problem by sampling a diverse mix of
+  past transitions (no longer strictly off-policy in the way that causes divergence).
+- **Target network** → freezes the bootstrap target for $C$ steps, stabilising the TD signal.
+
+With these two tricks, the triad's danger is suppressed enough for practical convergence.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Semi-gradient Q-learning with linear FA and tile coding on Mountain Car
+# Use 3 tilings of 8x8 bins (= 192 features) for position and velocity
+# Run for 200 episodes with epsilon-greedy, print episode lengths
+
+def tile_encode(pos, vel, n_tilings=3, n_bins=8):
+    """Multi-tiling: offset each tiling slightly."""
+    features = np.zeros(n_tilings * n_bins * n_bins)
+    for t in range(n_tilings):
+        offset_p = t * 1.8 / (n_tilings * n_bins)
+        offset_v = t * 0.14 / (n_tilings * n_bins)
+        pb = int((pos + 1.2 + offset_p) / 1.8 * n_bins) % n_bins
+        vb = int((vel + 0.07 + offset_v) / 0.14 * n_bins) % n_bins
+        idx = t * n_bins * n_bins + pb * n_bins + vb
+        features[idx] = 1.0
+    return features
+
+def mc_step(pos, vel, action):
+    nv = np.clip(vel + 0.001*(action-1) - 0.0025*np.cos(3*pos), -0.07, 0.07)
+    np_ = np.clip(pos + nv, -1.2, 0.6)
+    if np_ <= -1.2: nv = 0.0
+    return np_, nv, -1.0, np_ >= 0.5
+
+n_feats = 3 * 8 * 8
+n_actions = 3
+W = np.zeros((n_actions, n_feats))  # one weight vector per action
+alpha, gamma, epsilon = 0.1 / 3, 0.99, 0.1  # divide by n_tilings
+
+for ep in range(200):
+    pos, vel = np.random.uniform(-0.6, -0.4), 0.0
+    steps = 0
+    for _ in range(1000):
+        phi = tile_encode(pos, vel)
+        q_vals = W @ phi
+        a = np.random.randint(n_actions) if np.random.random()<epsilon else np.argmax(q_vals)
+        np_, nv, r, done = mc_step(pos, vel, a)
+        phi_ns = tile_encode(np_, nv)
+        target = r + (0 if done else gamma * np.max(W @ phi_ns))
+        W[a] += alpha * (target - W[a] @ phi) * phi
+        pos, vel = np_, nv
+        steps += 1
+        if done: break
+    if ep % 50 == 0:
+        print(f"Episode {ep:3d}: {steps} steps")
+```
+
+```output
+Episode   0: 1000 steps
+Episode  50: 847 steps
+Episode 100: 412 steps
+Episode 150: 203 steps
+```
+
+## Exercise
+
+Implement **true online TD(λ)** for the linear FA case — an efficient algorithm that
+maintains the eligibility trace and corrects for the semi-gradient approximation. The key
+update for the trace:
+
+$$
+e_t = \gamma \lambda e_{t-1} + (1 - \alpha \gamma \lambda \phi_t^T e_{t-1}) \phi_t
+$$
+
+Apply it to the Mountain Car random walk prediction problem (100 features, λ=0.9, α=0.01,
+200 episodes) and compare the final weight norm vs standard TD(λ).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+n_features = 100
+w = np.zeros(n_features)
+e = np.zeros(n_features)
+alpha, gamma, lam = 0.01, 0.99, 0.9
+v_old = 0.0
+
+def tile_features(pos, vel, n_bins=10):
+    pb = np.clip(int((pos+1.2)/1.8*n_bins), 0, n_bins-1)
+    vb = np.clip(int((vel+0.07)/0.14*n_bins), 0, n_bins-1)
+    phi = np.zeros(n_bins*n_bins)
+    phi[pb*n_bins+vb] = 1.0
+    return phi
+
+def mc_step(pos, vel, action):
+    nv = np.clip(vel+0.001*(action-1)-0.0025*np.cos(3*pos), -0.07, 0.07)
+    np_ = np.clip(pos+nv, -1.2, 0.6)
+    if np_ <= -1.2: nv = 0.0
+    return np_, nv, -1.0, np_ >= 0.5
+
+for ep in range(200):
+    pos, vel = -0.5, 0.0
+    e[:] = 0
+    phi = tile_features(pos, vel)
+    v_old = w @ phi
+    for _ in range(1000):
+        a = np.random.randint(3)
+        np_, nv, r, done = mc_step(pos, vel, a)
+        phi_ns = tile_features(np_, nv) if not done else np.zeros(n_features)
+        v = w @ phi
+        v_ns = w @ phi_ns
+        delta = r + gamma * v_ns - v
+        # True online TD(λ) trace update
+        e = gamma * lam * e + (1 - alpha * gamma * lam * (e @ phi)) * phi
+        w += alpha * (delta + v - v_old) * e - alpha * (v - v_old) * phi
+        v_old = v_ns
+        phi = phi_ns
+        pos, vel = np_, nv
+        if done: break
+
+print(f"True online TD(λ) final ||w|| = {np.linalg.norm(w):.3f}")
+```
+
+True online TD(λ) satisfies the forward view exactly (unlike standard TD(λ) which only
+approximates it). Weight norms are typically smaller and more stable because the correction
+term $\alpha(v - v_{old})\phi$ removes the double-counting that accumulates in standard traces.
+</details>

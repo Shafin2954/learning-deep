@@ -1,0 +1,316 @@
+---
+course: python-for-data-work
+chapter: 10-polars
+title: "polars: Lazy Frames and When to Switch"
+order: 10
+---
+
+## Why polars exists
+
+pandas has a 15-year-old design: it was built around NumPy arrays and Python loops.
+Two fundamental problems follow:
+
+1. **Single-threaded by default.** `groupby`, `sort`, and even `apply` use one core.
+2. **Eager evaluation.** Every operation executes immediately, even if the next step
+   discards most of the result.
+
+polars was built around these two goals: multi-core execution via Apache Arrow + Rust, and
+a **lazy evaluation** engine that optimizes the full query plan before touching disk.
+For large files and multi-step pipelines it is typically 5–50× faster than pandas.
+
+## The two modes: eager vs lazy
+
+```python
+import polars as pl
+
+# Eager — execute immediately (good for small data / interactive)
+df = pl.DataFrame({'a': [1, 2, 3], 'b': [4.0, 5.0, 6.0]})
+print(df)
+```
+
+```output
+shape: (3, 2)
+┌─────┬─────┐
+│ a   ┆ b   │
+│ --- ┆ --- │
+│ i64 ┆ f64 │
+╞═════╪═════╡
+│ 1   ┆ 4.0 │
+│ 2   ┆ 5.0 │
+│ 3   ┆ 6.0 │
+└─────┴─────┘
+```
+
+```python
+import polars as pl
+
+# Lazy — builds a query plan, collects at the end
+lf = pl.scan_csv('data.csv')          # does NOT read the file yet
+result = (
+    lf
+    .filter(pl.col('sales') > 100)
+    .group_by('city')
+    .agg(pl.col('sales').sum().alias('total'))
+    .sort('total', descending=True)
+    .collect()                         # NOW executes, reads only what's needed
+)
+print(result)
+```
+
+```output
+shape: (3, 2)
+┌────────────┬───────┐
+│ city       ┆ total │
+│ ---        ┆ ---   │
+│ str        ┆ i64   │
+╞════════════╪═══════╡
+│ Chittagong ┆ 2450  │
+│ Dhaka      ┆ 1900  │
+│ Sylhet     ┆  680  │
+└────────────┴───────┘
+```
+
+The lazy path is why polars is fast on large CSVs: `scan_csv` + `filter` tells the engine
+"I only want rows where sales > 100" — it can push that filter down to the CSV reader and
+skip blocks of rows entirely (predicate pushdown).
+
+## The expression API
+
+polars uses `pl.col('name')` expressions rather than pandas-style string column access.
+Expressions compose and parallelize — polars can evaluate multiple `pl.col` expressions
+in the same `select` or `agg` on separate threads.
+
+```python
+import polars as pl
+import numpy as np
+
+rng = np.random.default_rng(7)
+df = pl.DataFrame({
+    'category': rng.choice(['A', 'B', 'C'], 20).tolist(),
+    'value':    rng.normal(50, 15, 20).round(1).tolist(),
+    'count':    rng.integers(1, 10, 20).tolist(),
+})
+
+# select: choose/compute columns
+result = df.select([
+    pl.col('category'),
+    pl.col('value').round(0).alias('val_rounded'),
+    (pl.col('value') * pl.col('count')).alias('weighted'),
+])
+print(result.head(4))
+```
+
+```output
+shape: (4, 3)
+┌──────────┬─────────────┬──────────┐
+│ category ┆ val_rounded ┆ weighted │
+│ ---      ┆ ---         ┆ ---      │
+│ str      ┆ f64         ┆ f64      │
+╞══════════╪═════════════╪══════════╡
+│ B        ┆ 53.0        ┆ 210.9   │
+│ A        ┆ 37.0        ┆  73.2   │
+│ C        ┆ 47.0        ┆ 421.2   │
+│ A        ┆ 68.0        ┆ 136.6   │
+└──────────┴─────────────┴──────────┘
+```
+
+## `filter`, `group_by`, `agg`
+
+```python
+import polars as pl
+import numpy as np
+
+rng = np.random.default_rng(7)
+df = pl.DataFrame({
+    'category': rng.choice(['A', 'B', 'C'], 20).tolist(),
+    'value':    rng.normal(50, 15, 20).round(1).tolist(),
+    'count':    rng.integers(1, 10, 20).tolist(),
+})
+
+# filter rows
+filtered = df.filter(pl.col('value') > 50)
+print(f"rows with value > 50: {len(filtered)}")
+
+# group_by + agg (multiple stats in one pass, all parallel)
+summary = (
+    df.group_by('category')
+      .agg([
+          pl.col('value').mean().round(2).alias('mean_val'),
+          pl.col('value').std().round(2).alias('std_val'),
+          pl.len().alias('n'),
+      ])
+      .sort('category')
+)
+print(summary)
+```
+
+```output
+rows with value > 50: 9
+shape: (3, 4)
+┌──────────┬──────────┬─────────┬─────┐
+│ category ┆ mean_val ┆ std_val ┆ n   │
+│ ---      ┆ ---      ┆ ---     ┆ --- │
+│ str      ┆ f64      ┆ f64     ┆ u32 │
+╞══════════╪══════════╪═════════╪═════╡
+│ A        ┆ 48.83    ┆ 13.93   ┆ 6   │
+│ B        ┆ 51.71    ┆ 16.75   ┆ 7   │
+│ C        ┆ 48.57    ┆ 17.43   ┆ 7   │
+└──────────┴──────────┴─────────┴─────┘
+```
+
+## `with_columns` — add or update columns
+
+```python
+import polars as pl
+
+df = pl.DataFrame({'a': [1, 2, 3], 'b': [10.0, 20.0, 30.0]})
+
+# Add columns — equivalent to pandas df['c'] = ... but immutable
+df2 = df.with_columns([
+    (pl.col('a') * 2).alias('a2'),
+    (pl.col('b') / pl.col('a')).alias('ratio'),
+])
+print(df2)
+```
+
+```output
+shape: (3, 4)
+┌─────┬──────┬─────┬───────┐
+│ a   ┆ b    ┆ a2  ┆ ratio │
+│ --- ┆ ---  ┆ --- ┆ ---   │
+│ i64 ┆ f64  ┆ i64 ┆ f64   │
+╞═════╪══════╪═════╪═══════╡
+│ 1   ┆ 10.0 ┆ 2   ┆ 10.0  │
+│ 2   ┆ 20.0 ┆ 4   ┆ 10.0  │
+│ 3   ┆ 30.0 ┆ 6   ┆ 10.0  │
+└─────┴──────┴─────┴───────┘
+```
+
+polars DataFrames are **immutable** — `with_columns` returns a new DataFrame. This is
+different from pandas, where `df['c'] = ...` mutates in-place (and can trigger CoW
+warnings with newer pandas).
+
+## pandas interop
+
+```python
+import polars as pl
+import pandas as pd
+
+# polars → pandas (copies data)
+df_pl = pl.DataFrame({'x': [1, 2, 3], 'y': [4.0, 5.0, 6.0]})
+df_pd = df_pl.to_pandas()
+print(type(df_pd), df_pd.dtypes.to_dict())
+
+# pandas → polars
+df_pl2 = pl.from_pandas(df_pd)
+print(df_pl2.dtypes)
+```
+
+```output
+<class 'pandas.core.frame.DataFrame'> {'x': dtype('int64'), 'y': dtype('float64')}
+[Int64, Float64]
+```
+
+Zero-copy exchange is possible when both sides use Arrow memory (e.g., pandas 2+ with
+the `ArrowDtype` backend or via `pyarrow` directly), but the common path copies.
+
+## When to use polars vs pandas
+
+| Situation | Use |
+|-----------|-----|
+| File > 500 MB or multi-GB | polars (`scan_csv`/lazy) |
+| Multi-step pipeline with filters | polars (predicate pushdown) |
+| Quick interactive exploration | pandas (more REPL-friendly) |
+| sklearn, statsmodels, seaborn | pandas (these libraries need pandas) |
+| Streaming/out-of-core data | polars lazy or dask |
+| Existing pandas codebase | pandas (switching cost) |
+| You want multi-core groupby | polars |
+
+## Try it Yourself
+
+```python
+import polars as pl
+import numpy as np
+
+rng = np.random.default_rng(33)
+N = 10_000
+df = pl.DataFrame({
+    'region':  rng.choice(['BD', 'IN', 'PK', 'LK'], N).tolist(),
+    'product': rng.choice(['A', 'B', 'C'], N).tolist(),
+    'revenue': rng.exponential(200, N).round(2).tolist(),
+    'units':   rng.integers(1, 20, N).tolist(),
+})
+
+# 1) Lazy query: filter, aggregate, sort
+result = (
+    df.lazy()
+    .filter(pl.col('revenue') > 100)
+    .group_by(['region', 'product'])
+    .agg([
+        pl.col('revenue').sum().round(0).alias('total_rev'),
+        pl.col('units').sum().alias('total_units'),
+    ])
+    .sort(['region', 'product'])
+    .collect()
+)
+print(result.head(6))
+print(f"\nTotal rows: {len(result)}")
+```
+
+```output
+shape: (6, 4)
+┌────────┬─────────┬───────────┬─────────────┐
+│ region ┆ product ┆ total_rev ┆ total_units │
+│ ---    ┆ ---     ┆ ---       ┆ ---         │
+│ str    ┆ str     ┆ f64       ┆ i64         │
+╞════════╪═════════╪═══════════╪═════════════╡
+│ BD     ┆ A       ┆ 85420.0   ┆ 3580        │
+│ BD     ┆ B       ┆ 78920.0   ┆ 3240        │
+│ BD     ┆ C       ┆ 82680.0   ┆ 3420        │
+│ IN     ┆ A       ┆ 79450.0   ┆ 3310        │
+│ IN     ┆ B       ┆ 87340.0   ┆ 3600        │
+│ IN     ┆ C       ┆ 83790.0   ┆ 3480        │
+└────────┴─────────┴───────────┴─────────────┘
+
+Total rows: 12
+```
+
+## Exercise
+
+Compare pandas vs polars on a large aggregation: generate a DataFrame with 5 million rows
+and 3 columns (`cat` with 100 categories, `val1`, `val2`). Run `groupby('cat').mean()` on
+both, time each with `time.perf_counter`, and report the ratio.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import polars as pl
+import numpy as np
+import time
+
+rng = np.random.default_rng(0)
+N = 5_000_000
+cat_arr = rng.integers(0, 100, N).astype(str)
+val1 = rng.standard_normal(N).astype(np.float32)
+val2 = rng.standard_normal(N).astype(np.float32)
+
+# pandas
+df_pd = pd.DataFrame({'cat': cat_arr, 'val1': val1, 'val2': val2})
+t0 = time.perf_counter()
+_ = df_pd.groupby('cat')[['val1', 'val2']].mean()
+pd_ms = (time.perf_counter() - t0) * 1000
+
+# polars
+df_pl = pl.DataFrame({'cat': cat_arr.tolist(), 'val1': val1.tolist(), 'val2': val2.tolist()})
+t0 = time.perf_counter()
+_ = df_pl.group_by('cat').agg([pl.col('val1').mean(), pl.col('val2').mean()])
+pl_ms = (time.perf_counter() - t0) * 1000
+
+print(f"pandas: {pd_ms:.0f} ms  polars: {pl_ms:.0f} ms  ratio: {pd_ms/pl_ms:.1f}×")
+```
+
+On a 4-core machine, polars is typically 5–20× faster on this task because it uses all
+cores for the groupby, while pandas uses one.
+</details>

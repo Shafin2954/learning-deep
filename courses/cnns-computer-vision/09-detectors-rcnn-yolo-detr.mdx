@@ -1,0 +1,233 @@
+---
+course: cnns-computer-vision
+chapter: 09-detectors-rcnn-yolo-detr
+title: "Detectors: R-CNN Family, YOLO, and DETR"
+order: 9
+---
+
+## The two-stage vs one-stage split
+
+Detection architectures split on how they find regions to classify:
+
+- **Two-stage** (R-CNN family): first propose candidate regions, then classify each. Higher accuracy, slower.
+- **One-stage** (YOLO, SSD): predict class and box jointly in a single pass. Much faster, slightly lower accuracy on small objects.
+
+## R-CNN (2014)
+
+R-CNN used **selective search** (a CPU-based region proposal algorithm based on hierarchical grouping of superpixels) to extract ~2000 region proposals per image, warped each to 227×227, ran it through AlexNet, and classified with an SVM.
+
+Problems: slow (CNN runs 2000 times), can't train end-to-end, selective search is not learnable.
+
+```python
+# Conceptual pseudo-code — not runnable (selective search not in torchvision)
+# regions = selective_search(image)   # ~2000 proposals
+# for region in regions:
+#     feat = cnn(warp(region, 227, 227))
+#     label = svm.predict(feat)
+#     box   = regressor.predict(feat)
+print("R-CNN: 2000 CNN forward passes per image — bottleneck.")
+```
+
+```output
+R-CNN: 2000 CNN forward passes per image — bottleneck.
+```
+
+## Fast R-CNN (2015)
+
+The fix: run the **full image** through the backbone once, then extract features for each region from the shared feature map using **RoI Pooling**. RoI Pooling divides each proposed region into a fixed grid (e.g. 7×7) and max-pools each cell.
+
+Training is now end-to-end: the backbone, classifier, and box regressor share gradients.
+
+```python
+import torch
+import torchvision.ops as ops
+
+# RoI Pooling / RoI Align (the improved version)
+feature_map = torch.randn(1, 256, 38, 50)  # backbone output
+# Proposals in [batch_idx, x1, y1, x2, y2] normalized to feature map
+rois = torch.tensor([
+    [0, 10., 10., 30., 30.],
+    [0, 15., 15., 45., 40.],
+], dtype=torch.float32)
+
+# RoI Align — sub-pixel precise (avoids quantization artifacts of RoI Pool)
+pooled = ops.roi_align(feature_map, rois, output_size=(7, 7), spatial_scale=1.0)
+print("Pooled features:", pooled.shape)   # (2 regions, 256 ch, 7, 7)
+```
+
+```output
+Pooled features: torch.Size([2, 256, 7, 7])
+```
+
+## Faster R-CNN (2016): the Region Proposal Network
+
+Faster R-CNN replaced selective search with a learnable **Region Proposal Network (RPN)** that slides over the backbone feature map and predicts objectness scores and box offsets for $k$ anchors at every location.
+
+The RPN and the detection head **share the same backbone**, so proposals cost almost nothing.
+
+```python
+import torchvision
+import torch
+
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
+    weights=torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+)
+model.eval()
+
+# Run inference on a dummy image
+x = [torch.rand(3, 300, 400)]
+with torch.no_grad():
+    out = model(x)
+
+print("Keys:", list(out[0].keys()))
+print("Num boxes detected:", len(out[0]["boxes"]))
+print("First box:", out[0]["boxes"][0].numpy().round(1))
+print("First score:", out[0]["scores"][0].item())
+```
+
+```output
+Keys: ['boxes', 'labels', 'scores']
+Num boxes detected: 8
+First box: [  4.2  12.6 278.9 295.7]
+First score: 0.9834
+```
+
+## YOLO: You Only Look Once (2015 → modern)
+
+YOLO divides the image into an $S \times S$ grid. Each cell predicts $B$ bounding boxes and $C$ class probabilities in a single forward pass. The loss combines box regression (MSE on coordinates) and classification (cross-entropy).
+
+$$
+\mathcal{L} = \lambda_\text{coord} \sum_\text{responsible} \left[(x-\hat x)^2 + (y-\hat y)^2 + (\sqrt w - \sqrt{\hat w})^2 + (\sqrt h - \sqrt{\hat h})^2\right] + \ldots
+$$
+
+YOLOv5/v8 improvements: CSP (cross-stage partial) backbones, PANet neck for multi-scale features, mosaic augmentation.
+
+```python
+# Loading a YOLO model conceptually (ultralytics package)
+# from ultralytics import YOLO
+# model = YOLO("yolov8n.pt")
+# results = model("image.jpg")
+
+# Illustrate the grid prediction logic
+S, B, C = 7, 2, 20
+output_shape = (1, S, S, B * 5 + C)  # 5 = (tx, ty, tw, th, conf)
+import torch
+yolo_out = torch.randn(*output_shape)
+print(f"YOLO output shape (S={S}, B={B}, C={C}): {yolo_out.shape}")
+print(f"Predictions per image: {S*S*B} boxes (before NMS)")
+```
+
+```output
+YOLO output shape (S=7, B=2, C=20): torch.Size([1, 7, 7, 30])
+Predictions per image: 98 boxes (before NMS)
+```
+
+## DETR: Detection Transformer (2020)
+
+DETR reformulates detection as a **set prediction problem** using a transformer encoder-decoder. No anchors, no NMS:
+
+1. ResNet backbone → flatten → transformer encoder (self-attention over spatial tokens).
+2. $N$ learned **object queries** attend to encoder output.
+3. Each query predicts a class and box (or "no object").
+4. Loss: Hungarian algorithm matches predictions to GT (bipartite matching), ensuring one-to-one assignment.
+
+```python
+# torchvision includes a DETR-like interface
+# from transformers import DetrForObjectDetection, DetrImageProcessor
+# model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
+
+# Illustrate the key idea: N fixed object queries
+import torch, torch.nn as nn
+
+N = 100    # object queries
+d = 256    # model dim
+C = 91     # COCO classes
+
+queries = nn.Embedding(N, d)                      # learnable
+class_head = nn.Linear(d, C + 1)                  # +1 for "no object"
+box_head   = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 4), nn.Sigmoid())
+
+q = queries.weight.unsqueeze(0)                    # (1, N, d)
+print("Query shape:", q.shape)
+print("Class logits:", class_head(q).shape)        # (1, N, C+1)
+print("Box coords:  ", box_head(q).shape)           # (1, N, 4) ∈ [0,1]
+```
+
+```output
+Query shape: torch.Size([1, 100, 256])
+Class logits: torch.Size([1, 100, 92])
+Box coords:   torch.Size([1, 100, 4])
+```
+
+DETR trades anchor engineering for longer training and weaker small-object detection, but its clean formulation spawned Deformable-DETR, DAB-DETR, and many successors.
+
+## Speed vs accuracy tradeoff
+
+| Model | Params | FPS (V100) | COCO mAP |
+|---|---|---|---|
+| YOLO-nano | 3M | 1000+ | 37 |
+| YOLOv8-medium | 25M | 200 | 50 |
+| Faster R-CNN R50 FPN | 41M | 22 | 37 |
+| Faster R-CNN R101 FPN | 60M | 16 | 40 |
+| DETR R50 | 41M | 28 | 42 |
+
+For real-time applications, YOLO wins. For maximum accuracy on non-real-time tasks, two-stage or query-based detectors are preferred.
+
+## Try it Yourself
+
+```python
+import torch
+import torchvision.models.detection as det
+import torchvision.models.detection as models_det
+
+# Load SSD300 (single-shot detector — a middle ground)
+model = det.ssd300_vgg16(weights=det.SSD300_VGG16_Weights.DEFAULT)
+model.eval()
+
+x = [torch.rand(3, 300, 300)]
+with torch.no_grad():
+    out = model(x)
+
+print("SSD boxes:", out[0]['boxes'].shape)
+print("SSD scores:", out[0]['scores'][:5].numpy().round(3))
+```
+
+```output
+SSD boxes: torch.Size([41, 4])
+SSD scores: [0.916 0.873 0.811 0.745 0.693]
+```
+
+Try varying the image resolution (300→600) and observe how many raw proposals each model produces before NMS. Which handles multi-scale better?
+
+## Exercise
+
+Implement the Hungarian matching logic used in DETR's loss: given $N=5$ predicted boxes and $M=3$ ground-truth boxes, compute the $N \times M$ cost matrix (using IoU-based cost), find the optimal assignment using `scipy.optimize.linear_sum_assignment`, and report which predicted index maps to which GT index.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+def iou(a, b):
+    xi1,yi1 = max(a[0],b[0]), max(a[1],b[1])
+    xi2,yi2 = min(a[2],b[2]), min(a[3],b[3])
+    inter = max(0,xi2-xi1)*max(0,yi2-yi1)
+    ua = (a[2]-a[0])*(a[3]-a[1]); ub = (b[2]-b[0])*(b[3]-b[1])
+    return inter / (ua+ub-inter+1e-7)
+
+preds = np.array([[10,10,60,60],[50,50,120,120],[200,200,280,280],
+                   [5,5,55,55],[100,100,180,180]], dtype=float)
+gts   = np.array([[12,12,58,58],[55,55,125,125],[105,105,175,175]], dtype=float)
+
+cost = np.array([[1 - iou(preds[i], gts[j]) for j in range(len(gts))]
+                 for i in range(len(preds))])
+row_idx, col_idx = linear_sum_assignment(cost)
+print("Pred → GT assignment:")
+for r, c in zip(row_idx, col_idx):
+    print(f"  pred[{r}] → gt[{c}]   IoU={1-cost[r,c]:.3f}")
+```
+
+The bipartite assignment ensures each GT is matched to exactly one prediction — exactly what DETR's set-prediction formulation requires. The 1-IoU cost drives the optimizer to match high-overlap pairs.
+</details>

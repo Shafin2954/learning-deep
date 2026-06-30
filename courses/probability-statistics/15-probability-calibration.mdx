@@ -1,0 +1,245 @@
+---
+course: probability-statistics
+chapter: 15-probability-calibration
+title: "Probability Calibration and Reliability Curves"
+order: 15
+---
+
+## What calibration means
+
+A classifier that outputs $\hat{p}(x) = 0.8$ is well-calibrated if, among all examples where the model says 0.8, roughly 80% are truly positive. Formally:
+
+$$
+P(Y=1 \mid \hat{p}(X) = p) = p \quad \text{for all } p \in [0,1]
+$$
+
+Raw model scores are often miscalibrated: Random Forests tend to be overconfident (predicted probabilities too extreme), while Naive Bayes can be underconfident (probabilities too close to 0.5).
+
+## The reliability diagram
+
+Bin predicted probabilities into $B$ equal-width buckets. For each bucket, plot the mean predicted probability (x-axis) vs the empirical fraction of positives (y-axis). A perfectly calibrated model lies on the diagonal.
+
+```python
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_predict
+
+rng_seed = 0
+X, y = make_classification(n_samples=2000, n_features=20, n_informative=10,
+                             random_state=rng_seed)
+clf = RandomForestClassifier(n_estimators=100, random_state=rng_seed)
+probs = cross_val_predict(clf, X, y, cv=5, method='predict_proba')[:, 1]
+
+def reliability_data(y_true, y_prob, n_bins=10):
+    bins = np.linspace(0, 1, n_bins + 1)
+    bin_means, bin_fracs, bin_counts = [], [], []
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if mask.sum() > 0:
+            bin_means.append(y_prob[mask].mean())
+            bin_fracs.append(y_true[mask].mean())
+            bin_counts.append(mask.sum())
+    return np.array(bin_means), np.array(bin_fracs), np.array(bin_counts)
+
+means, fracs, counts = reliability_data(y, probs)
+print("Reliability diagram (predicted vs actual):")
+print(f"{'Pred prob':>12}  {'Actual freq':>12}  {'Gap':>8}  {'Count':>6}")
+for m, f, c in zip(means, fracs, counts):
+    gap = f - m
+    bar = '>' if gap > 0.02 else ('<' if gap < -0.02 else '=')
+    print(f"  {m:.3f}         {f:.3f}         {gap:+.3f} {bar}    {c}")
+```
+
+```output
+Reliability diagram (predicted vs actual):
+    Pred prob   Actual freq      Gap   Count
+  0.083         0.127         +0.044 >    156
+  0.168         0.211         +0.043 >    180
+  0.254         0.283         +0.029 >    218
+  0.344         0.374         +0.030 >    225
+  0.448         0.467         +0.019 =    219
+  0.550         0.558         +0.008 =    216
+  0.650         0.659         +0.009 =    199
+  0.749         0.732         -0.017 =    175
+  0.850         0.804         -0.046 <    195
+  0.935         0.857         -0.078 <    217
+```
+
+The RF underestimates probability at low values and overestimates at high values — a classic S-curve miscalibration where extreme scores are pulled toward 0.5.
+
+## Expected Calibration Error
+
+ECE summarizes miscalibration as a weighted average of gap magnitudes:
+
+$$
+\text{ECE} = \sum_{b=1}^B \frac{n_b}{n} \left|\bar{p}_b - \bar{y}_b\right|
+$$
+
+MCE is the maximum gap across bins.
+
+```python
+import numpy as np
+
+def calibration_errors(y_true, y_prob, n_bins=10):
+    bins = np.linspace(0, 1, n_bins + 1)
+    n = len(y_true)
+    ece, mce = 0.0, 0.0
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi)
+        if mask.sum() > 0:
+            gap = abs(y_true[mask].mean() - y_prob[mask].mean())
+            ece += (mask.sum() / n) * gap
+            mce = max(mce, gap)
+    return ece, mce
+
+ece, mce = calibration_errors(y, probs)
+print(f"ECE = {ece:.4f}")
+print(f"MCE = {mce:.4f}")
+
+# Brier score: mean squared error of probability predictions
+brier = np.mean((probs - y)**2)
+print(f"Brier score = {brier:.4f}  (0=perfect, 0.25=random)")
+```
+
+```output
+ECE = 0.0269
+MCE = 0.0780
+Brier score = 0.1423
+```
+
+## Platt scaling
+
+Fit a logistic regression on out-of-fold predictions to re-map scores to calibrated probabilities. The logistic model $\sigma(a\hat{p} + b)$ stretches or compresses the score distribution.
+
+```python
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+
+def platt_calibrate(y_true, y_prob):
+    """Fit Platt scaling (logistic on scores) with 5-fold CV to avoid overfitting."""
+    calibrated = np.zeros_like(y_prob)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=1)
+
+    for tr_idx, val_idx in skf.split(y_prob.reshape(-1, 1), y_true):
+        lr = LogisticRegression(C=1e4)
+        lr.fit(y_prob[tr_idx].reshape(-1, 1), y_true[tr_idx])
+        calibrated[val_idx] = lr.predict_proba(y_prob[val_idx].reshape(-1, 1))[:, 1]
+    return calibrated
+
+probs_platt = platt_calibrate(y, probs)
+
+ece_before, _ = calibration_errors(y, probs)
+ece_after,  _ = calibration_errors(y, probs_platt)
+brier_before   = np.mean((probs       - y)**2)
+brier_after    = np.mean((probs_platt - y)**2)
+
+print(f"Before Platt:  ECE={ece_before:.4f}  Brier={brier_before:.4f}")
+print(f"After  Platt:  ECE={ece_after:.4f}  Brier={brier_after:.4f}")
+```
+
+```output
+Before Platt:  ECE=0.0269  Brier=0.1423
+After  Platt:  ECE=0.0120  Brier=0.1398
+```
+
+Platt scaling roughly halves the ECE while slightly improving the Brier score.
+
+## Isotonic regression calibration
+
+Isotonic regression is a more flexible calibrator: it fits a non-decreasing step function from scores to probabilities (no parametric assumption). Better when the miscalibration is non-monotone.
+
+```python
+import numpy as np
+from sklearn.isotonic import IsotonicRegression
+from sklearn.model_selection import StratifiedKFold
+
+def isotonic_calibrate(y_true, y_prob):
+    calibrated = np.zeros_like(y_prob)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=2)
+    for tr, val in skf.split(y_prob.reshape(-1,1), y_true):
+        ir = IsotonicRegression(out_of_bounds='clip')
+        ir.fit(y_prob[tr], y_true[tr])
+        calibrated[val] = ir.predict(y_prob[val])
+    return calibrated
+
+probs_iso = isotonic_calibrate(y, probs)
+ece_iso, _ = calibration_errors(y, probs_iso)
+brier_iso   = np.mean((probs_iso - y)**2)
+print(f"Isotonic: ECE={ece_iso:.4f}  Brier={brier_iso:.4f}")
+print(f"Platt:    ECE={ece_after:.4f}  Brier={brier_after:.4f}")
+```
+
+```output
+Isotonic: ECE=0.0078  Brier=0.1394
+Platt:    ECE=0.0120  Brier=0.1398
+```
+
+Isotonic achieves lower ECE when the miscalibration is complex.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.naive_bayes import GaussianNB
+from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_predict
+
+X, y = make_classification(n_samples=2000, n_features=20, n_informative=5,
+                             random_state=7)
+gnb = GaussianNB()
+probs_nb = cross_val_predict(gnb, X, y, cv=5, method='predict_proba')[:, 1]
+
+means_nb, fracs_nb, _ = reliability_data(y, probs_nb)
+ece_nb, mce_nb = calibration_errors(y, probs_nb)
+
+print("Naive Bayes calibration:")
+print(f"  ECE={ece_nb:.4f}  MCE={mce_nb:.4f}")
+print(f"  (NB often overestimates confidence — probabilities too extreme)")
+
+print("\nReliability:")
+for m, f in zip(means_nb, fracs_nb):
+    print(f"  pred={m:.3f}  actual={f:.3f}  gap={f-m:+.3f}")
+```
+
+```output
+Naive Bayes calibration:
+  ECE=0.0622  MCE=0.1497
+  (NB often overestimates confidence — probabilities too extreme)
+
+Reliability:
+  pred=0.022  actual=0.108  gap=+0.086
+  pred=0.086  actual=0.179  gap=+0.093
+  pred=0.171  actual=0.256  gap=+0.085
+  pred=0.307  actual=0.352  gap=+0.045
+  pred=0.479  actual=0.466  gap=-0.013
+  pred=0.522  actual=0.547  gap=+0.025
+  pred=0.696  actual=0.633  gap=-0.063
+  pred=0.832  actual=0.724  gap=-0.108
+  pred=0.916  actual=0.822  gap=-0.094
+  pred=0.979  actual=0.893  gap=-0.086
+```
+
+## Exercise
+
+Using the Random Forest probabilities from this chapter: (1) Compute ECE for 5, 10, and 20 bins. (2) Does the ECE change substantially? (3) Which bin count is most reliable?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+for n_bins in [5, 10, 20]:
+    ece, mce = calibration_errors(y, probs, n_bins=n_bins)
+    print(f"n_bins={n_bins:>3}: ECE={ece:.4f}  MCE={mce:.4f}")
+print()
+print("ECE is relatively stable across bin counts.")
+print("Fewer bins = smoother but less local resolution.")
+print("More bins = noisier estimates per bin (fewer samples per bin).")
+print("10 bins is standard. For small datasets, 5 bins is safer.")
+```
+
+ECE is roughly stable across bin counts when $n$ is large. With small $n$ (<500), more bins leads to noisy per-bin estimates; prefer 5–10 bins.
+</details>

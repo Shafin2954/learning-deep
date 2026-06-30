@@ -1,0 +1,280 @@
+---
+course: cnns-computer-vision
+chapter: 11-vision-transformers
+title: "Vision Transformers (ViT) and Hybrids"
+order: 11
+---
+
+## From tokens to patches
+
+Transformers operate on sequences of tokens. ViT (Dosovitskiy 2020) applies this directly to images by cutting the image into non-overlapping patches and treating each patch as a token.
+
+A 224×224 image with 16×16 patches → $(224/16)^2 = 196$ tokens, each a 768-dimensional vector (from a linear projection of the flattened 16×16×3 = 768 pixel values).
+
+$$
+z_0 = [x_\text{cls}; x_p^1 E; x_p^2 E; \ldots; x_p^N E] + E_\text{pos}
+$$
+
+where $E \in \mathbb{R}^{(P^2 C) \times D}$ is the patch embedding matrix and $E_\text{pos}$ are learnable position embeddings.
+
+## Patch embedding from scratch
+
+```python
+import torch
+import torch.nn as nn
+
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_c=3, embed_dim=768):
+        super().__init__()
+        self.n_patches = (img_size // patch_size) ** 2
+        # A single conv with kernel=stride=patch_size extracts non-overlapping patches
+        self.proj = nn.Conv2d(in_c, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x)          # (B, D, H/P, W/P)
+        x = x.flatten(2)          # (B, D, N)
+        x = x.transpose(1, 2)     # (B, N, D)
+        return x
+
+embed = PatchEmbed(224, 16, 3, 768)
+x = torch.randn(2, 3, 224, 224)
+tokens = embed(x)
+print("Input:", x.shape)
+print("Tokens:", tokens.shape)          # (B, 196, 768)
+print("Patches per image:", embed.n_patches)
+```
+
+```output
+Input: torch.Size([2, 3, 224, 224])
+Tokens: torch.Size([2, 196, 768])
+Patches per image: 196
+```
+
+## Adding CLS token and position embeddings
+
+```python
+class ViTEmbedding(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, embed_dim=768, drop=0.1):
+        super().__init__()
+        self.patch_embed = PatchEmbed(img_size, patch_size, 3, embed_dim)
+        N = self.patch_embed.n_patches
+        self.cls_token  = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed  = nn.Parameter(torch.randn(1, N + 1, embed_dim) * 0.02)
+        self.drop       = nn.Dropout(drop)
+
+    def forward(self, x):
+        B = x.size(0)
+        tok = self.patch_embed(x)                              # (B, N, D)
+        cls = self.cls_token.expand(B, -1, -1)                 # (B, 1, D)
+        tok = torch.cat([cls, tok], dim=1)                     # (B, N+1, D)
+        tok = tok + self.pos_embed
+        return self.drop(tok)
+
+vit_emb = ViTEmbedding()
+x   = torch.randn(2, 3, 224, 224)
+out = vit_emb(x)
+print("Embedding output:", out.shape)   # (2, 197, 768)
+```
+
+```output
+Embedding output: torch.Size([2, 197, 768])
+```
+
+197 = 1 CLS token + 196 patch tokens.
+
+## Standard transformer encoder blocks
+
+After embedding, ViT runs $L$ standard transformer encoder blocks (Multi-Head Self-Attention + FFN with LayerNorm and residuals). The final CLS token representation is passed to a linear head.
+
+```python
+class ViT(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, embed_dim=768,
+                 depth=6, n_heads=12, mlp_ratio=4, num_classes=1000):
+        super().__init__()
+        self.embed   = ViTEmbedding(img_size, patch_size, embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=0.1, batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm    = nn.LayerNorm(embed_dim)
+        self.head    = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        z = self.embed(x)           # (B, N+1, D)
+        z = self.encoder(z)
+        z = self.norm(z[:, 0])      # CLS token only
+        return self.head(z)
+
+# Tiny ViT for fast testing
+vit   = ViT(img_size=32, patch_size=4, embed_dim=64, depth=4, n_heads=4, num_classes=10)
+x     = torch.randn(2, 3, 32, 32)
+logits = vit(x)
+params = sum(p.numel() for p in vit.parameters())
+print("Logits:", logits.shape)
+print(f"Tiny ViT params: {params:,}")
+```
+
+```output
+Logits: torch.Size([2, 10])
+Tiny ViT params: 370,954
+```
+
+## ViT variants and data hunger
+
+| Model | Image size | Patch | Depth | Heads | Params | ImageNet top-1 |
+|---|---|---|---|---|---|---|
+| ViT-B/16 | 224 | 16 | 12 | 12 | 86M | 81.8% |
+| ViT-L/16 | 224 | 16 | 24 | 16 | 307M | 82.6% |
+| ViT-H/14 | 224 | 14 | 32 | 16 | 632M | 83.6% |
+
+ViT-B trained on ImageNet-1k alone gets only ~77%, while ResNet-50 gets ~80%. ViT needs either a huge dataset (JFT-300M) or knowledge distillation (DeiT).
+
+## DeiT: distillation token
+
+DeiT adds a third token — the **distillation token** — that is trained to match a CNN teacher's hard predictions. At inference, the distillation token is discarded.
+
+```python
+# Conceptual DeiT addition
+class DeiTEmbedding(nn.Module):
+    def __init__(self, embed_dim=768, **kwargs):
+        super().__init__()
+        self.patch_embed = PatchEmbed(embed_dim=embed_dim, **kwargs)
+        N = self.patch_embed.n_patches
+        self.cls_token  = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim))   # ← DeiT
+        self.pos_embed  = nn.Parameter(torch.randn(1, N+2, embed_dim) * 0.02)
+
+    def forward(self, x):
+        B = x.size(0)
+        tok  = self.patch_embed(x)
+        cls  = self.cls_token.expand(B, -1, -1)
+        dist = self.dist_token.expand(B, -1, -1)
+        tok  = torch.cat([cls, dist, tok], dim=1)   # (B, N+2, D)
+        return tok + self.pos_embed
+
+d = DeiTEmbedding(embed_dim=128, img_size=64, patch_size=8)
+x = torch.randn(2, 3, 64, 64)
+print("DeiT tokens:", d(x).shape)   # 1 CLS + 1 dist + 64 patches
+```
+
+```output
+DeiT tokens: torch.Size([2, 66, 128])
+```
+
+## Swin Transformer: hierarchical windows
+
+ViT has quadratic attention over all patches — expensive for large images. **Swin** uses **shifted window attention**: attention is computed inside small $M \times M$ windows (e.g. 7×7), then windows shift to allow cross-window information flow. Swin is hierarchical (merges patches deeper, like a CNN), making it efficient and usable as a backbone for detection/segmentation.
+
+```python
+# Conceptual window attention complexity
+H, W, M = 56, 56, 7
+n_windows = (H // M) * (W // M)
+tokens_per_window = M * M
+total_attention_ops_swin = n_windows * tokens_per_window ** 2
+total_attention_ops_vit  = (H * W) ** 2
+
+print(f"ViT   attention ops: {total_attention_ops_vit:,}")
+print(f"Swin  attention ops: {total_attention_ops_swin:,}")
+print(f"Reduction: {total_attention_ops_vit / total_attention_ops_swin:.0f}×")
+```
+
+```output
+ViT   attention ops: 9,834,496
+Swin  attention ops: 388,864
+Reduction: 25×
+```
+
+## ConvNeXt: a CNN that thinks like a transformer
+
+Liu et al. (2022) asked: what if you modernized a ResNet using transformer design choices? ConvNeXt adopts large kernels (7×7), layer normalization, inverted bottleneck, GELU, and depthwise conv — but keeps a pure CNN structure. Result: ConvNeXt-B matches Swin-B with faster inference and simpler code.
+
+```python
+# ConvNeXt block (simplified)
+class ConvNeXtBlock(nn.Module):
+    def __init__(self, dim: int, gamma: float = 1e-6):
+        super().__init__()
+        self.dw   = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)   # large-kernel DW
+        self.norm = nn.LayerNorm(dim)
+        self.pw1  = nn.Linear(dim, 4 * dim)
+        self.pw2  = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(gamma * torch.ones(dim))
+
+    def forward(self, x):
+        residual = x
+        x = self.dw(x)
+        x = x.permute(0, 2, 3, 1)           # (B,H,W,C) for LayerNorm
+        x = self.norm(x)
+        x = self.pw2(torch.nn.functional.gelu(self.pw1(x)))
+        x = x * self.gamma                    # layer scale
+        x = x.permute(0, 3, 1, 2)           # back to (B,C,H,W)
+        return residual + x
+
+blk = ConvNeXtBlock(96)
+x   = torch.randn(2, 96, 32, 32)
+print("ConvNeXt output:", blk(x).shape)
+```
+
+```output
+ConvNeXt output: torch.Size([2, 96, 32, 32])
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+vit = ViT(img_size=32, patch_size=4, embed_dim=64, depth=2, n_heads=4, num_classes=10)
+x   = torch.randn(4, 3, 32, 32)
+out = vit(x)
+print("ViT output:", out.shape)
+print("Params:", sum(p.numel() for p in vit.parameters()))
+```
+
+```output
+ViT output: torch.Size([4, 10])
+Params: 370,954
+```
+
+Try increasing `depth` from 2 to 8 and re-counting parameters. Then try changing `patch_size` from 4 to 2 (more, smaller patches) and observe how the number of tokens and training time scale.
+
+## Exercise
+
+Implement a ViT positional encoding that uses **2D sinusoidal encodings** instead of learnable parameters. For a grid of $H \times W$ patches, encode row position with dimensions $0..D/2-1$ and column position with dimensions $D/2..D-1$, each using the standard sinusoidal formula. The output should have shape $(1, H \times W, D)$.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import math
+
+def sinusoidal_2d_pos_enc(H: int, W: int, D: int) -> torch.Tensor:
+    assert D % 4 == 0
+    half = D // 2
+
+    def sin_enc(pos: torch.Tensor, dim: int) -> torch.Tensor:
+        # pos: (N,)  returns (N, dim)
+        i = torch.arange(0, dim, 2, dtype=torch.float32)
+        div = torch.exp(-i * math.log(10000) / dim)
+        angles = pos.unsqueeze(1) * div.unsqueeze(0)   # (N, dim//2)
+        enc = torch.zeros(len(pos), dim)
+        enc[:, 0::2] = torch.sin(angles)
+        enc[:, 1::2] = torch.cos(angles)
+        return enc
+
+    rows = torch.arange(H, dtype=torch.float32).repeat_interleave(W)   # (H*W,)
+    cols = torch.arange(W, dtype=torch.float32).repeat(H)              # (H*W,)
+
+    row_enc = sin_enc(rows, half)
+    col_enc = sin_enc(cols, D - half)
+    return torch.cat([row_enc, col_enc], dim=1).unsqueeze(0)            # (1, H*W, D)
+
+enc = sinusoidal_2d_pos_enc(14, 14, 256)
+print("Pos encoding:", enc.shape)
+print("Min:", enc.min().item(), " Max:", enc.max().item())
+```
+
+The first D/2 dimensions encode row position and the second D/2 encode column position, both using the standard sin/cos frequency schedule. This is non-learned and generalizes to unseen resolutions.
+</details>

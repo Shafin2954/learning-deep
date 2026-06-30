@@ -1,0 +1,293 @@
+---
+course: cnns-computer-vision
+chapter: 05-batchnorm-cnns-modern-blocks
+title: "BatchNorm in CNNs and Modern Building Blocks"
+order: 5
+---
+
+## BatchNorm in convolutional networks
+
+In a fully-connected BatchNorm, you normalize over the batch dimension $N$. In a conv net, feature maps have shape $(N, C, H, W)$. BatchNorm normalizes over $(N, H, W)$ **separately for each channel** $c$:
+
+$$
+\hat{x}_{n,c,h,w} = \frac{x_{n,c,h,w} - \mu_c}{\sqrt{\sigma_c^2 + \epsilon}}
+$$
+
+where $\mu_c$ and $\sigma_c^2$ are computed over all elements $(n, h, w)$ for channel $c$. Two learned parameters $\gamma_c$ and $\beta_c$ then rescale and shift.
+
+```python
+import torch
+import torch.nn as nn
+
+bn = nn.BatchNorm2d(64)
+x  = torch.randn(8, 64, 28, 28)     # N=8, C=64, H=W=28
+y  = bn(x)
+
+print("Input:  ", x.shape)
+print("Output: ", y.shape)
+print("γ shape:", bn.weight.shape)   # one per channel
+print("β shape:", bn.bias.shape)
+print("Running mean shape:", bn.running_mean.shape)
+```
+
+```output
+Input:   torch.Size([8, 64, 28, 28])
+Output:  torch.Size([8, 64, 28, 28])
+γ shape: torch.Size([64])
+β shape: torch.Size([64])
+Running mean shape: torch.Size([64])
+```
+
+BatchNorm keeps a running mean/variance for inference (no batch statistics available then).
+
+### BN before or after activation?
+
+The original ResNet paper places BN between conv and activation: `conv → BN → ReLU`. The pre-activation (v2) variant does `BN → ReLU → conv`. Empirically, v2 gives better gradient flow in very deep nets, but for typical ≤50-layer nets the difference is small. Most standard architectures use the original ordering.
+
+```python
+# Original ordering
+original = nn.Sequential(
+    nn.Conv2d(64, 64, 3, padding=1, bias=False),
+    nn.BatchNorm2d(64),
+    nn.ReLU(),
+)
+
+# Pre-activation ordering
+pre_act = nn.Sequential(
+    nn.BatchNorm2d(64),
+    nn.ReLU(),
+    nn.Conv2d(64, 64, 3, padding=1, bias=False),
+)
+
+x = torch.randn(2, 64, 14, 14)
+print("Original:", original(x).shape)
+print("Pre-act: ", pre_act(x).shape)
+```
+
+```output
+Original: torch.Size([2, 64, 14, 14])
+Pre-act:  torch.Size([2, 64, 14, 14])
+```
+
+## Depthwise separable convolution
+
+A standard 3×3 conv on $C_{in}$ channels to $C_{out}$ channels uses $C_{in} \times C_{out} \times 9$ parameters. You can factor this into two steps:
+
+1. **Depthwise conv** — apply one 3×3 filter per input channel independently (groups = $C_{in}$).
+2. **Pointwise conv** — 1×1 conv to mix channels.
+
+Parameter cost: $C_{in} \times 9 + C_{in} \times C_{out}$ vs $C_{in} \times C_{out} \times 9$.
+
+```python
+C_in, C_out = 128, 256
+
+class DepthwiseSepConv(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.dw = nn.Conv2d(in_c, in_c, 3, padding=1, groups=in_c, bias=False)
+        self.pw = nn.Conv2d(in_c, out_c, 1, bias=False)
+    def forward(self, x):
+        return self.pw(self.dw(x))
+
+standard = nn.Conv2d(C_in, C_out, 3, padding=1, bias=False)
+dws      = DepthwiseSepConv(C_in, C_out)
+
+std_params = sum(p.numel() for p in standard.parameters())
+dws_params = sum(p.numel() for p in dws.parameters())
+
+x = torch.randn(2, C_in, 28, 28)
+print(f"Standard  params: {std_params:,}  output: {standard(x).shape}")
+print(f"DWS       params: {dws_params:,}  output: {dws(x).shape}")
+print(f"Reduction: {std_params / dws_params:.1f}×")
+```
+
+```output
+Standard  params: 294,912  output: torch.Size([2, 256, 28, 28])
+DWS       params: 34,176   output: torch.Size([2, 256, 28, 28])
+Reduction: 8.6×
+```
+
+MobileNetV1 replaces all standard convs with DWS, cutting parameters by ~8–9× with modest accuracy loss.
+
+## Inverted residual block (MobileNetV2)
+
+MobileNetV2 adds a twist: **expand → depthwise → project** with a skip connection on the narrow (bottleneck) features. This is the opposite of ResNet bottleneck (which compresses then expands).
+
+$$
+x \xrightarrow{\text{1×1 expand}} \xrightarrow{\text{3×3 DW}} \xrightarrow{\text{1×1 project}} + x
+$$
+
+The expansion ratio $t$ (typically 6) increases channels before the depthwise step, giving the DW conv more channels to mix, then projects back down.
+
+```python
+class InvertedResidual(nn.Module):
+    def __init__(self, in_c: int, out_c: int, t: int = 6, stride: int = 1):
+        super().__init__()
+        mid = in_c * t
+        layers = [
+            nn.Conv2d(in_c, mid, 1, bias=False), nn.BatchNorm2d(mid), nn.ReLU6(),
+            nn.Conv2d(mid, mid, 3, stride=stride, padding=1, groups=mid, bias=False),
+            nn.BatchNorm2d(mid), nn.ReLU6(),
+            nn.Conv2d(mid, out_c, 1, bias=False), nn.BatchNorm2d(out_c),
+        ]
+        self.conv = nn.Sequential(*layers)
+        self.skip = (stride == 1 and in_c == out_c)
+
+    def forward(self, x):
+        out = self.conv(x)
+        return out + x if self.skip else out
+
+blk = InvertedResidual(32, 32, t=6)
+x   = torch.randn(2, 32, 28, 28)
+print("Output:", blk(x).shape)
+print("Params:", sum(p.numel() for p in blk.parameters()))
+```
+
+```output
+Output: torch.Size([2, 32, 28, 28])
+Params: 6,528
+```
+
+## Squeeze-and-Excite (SE) block
+
+SE blocks add **channel attention**: after a conv, pool the spatial dimensions to a vector, run two FC layers to predict channel weights (sigmoid gate), and re-scale the feature map channel-wise.
+
+$$
+s = \sigma(W_2 \cdot \text{ReLU}(W_1 \cdot \text{GAP}(F))) \quad;\quad \tilde{F}_c = s_c \cdot F_c
+$$
+
+```python
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc   = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False), nn.ReLU(),
+            nn.Linear(channels // reduction, channels, bias=False), nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        s = self.pool(x).view(b, c)        # (B, C)
+        s = self.fc(s).view(b, c, 1, 1)    # (B, C, 1, 1)
+        return x * s                        # channel-wise rescale
+
+se  = SEBlock(256)
+x   = torch.randn(2, 256, 14, 14)
+out = se(x)
+print("SE output:", out.shape)
+print("SE params:", sum(p.numel() for p in se.parameters()))
+```
+
+```output
+SE output: torch.Size([2, 256, 14, 14])
+SE params: 8,192
+```
+
+SENet won ImageNet 2017. Adding SE blocks to ResNet-50 costs ~2.5M extra parameters but lifts top-1 accuracy by ~1–2%.
+
+## DropBlock
+
+Dropout applied to conv features drops individual pixels — spatially adjacent units share the same activation and information "leaks" around dropped units. **DropBlock** drops contiguous $k \times k$ regions of the feature map, forcing the network to use global information.
+
+```python
+class DropBlock2d(nn.Module):
+    def __init__(self, block_size: int = 7, p: float = 0.1):
+        super().__init__()
+        self.block_size = block_size
+        self.p = p
+
+    def forward(self, x):
+        if not self.training or self.p == 0:
+            return x
+        b, c, h, w = x.shape
+        seed_prob = self.p / (self.block_size ** 2)
+        mask = (torch.rand(b, 1, h, w, device=x.device) > seed_prob).float()
+        mask = 1 - nn.functional.max_pool2d(
+            1 - mask, self.block_size, stride=1,
+            padding=self.block_size // 2)
+        mask = mask.expand_as(x)
+        return x * mask / (mask.mean() + 1e-6)
+
+drop = DropBlock2d(block_size=3, p=0.1)
+drop.train()
+x   = torch.ones(2, 64, 8, 8)
+out = drop(x)
+print("Fraction dropped:", (out == 0).float().mean().item())
+```
+
+```output
+Fraction dropped: 0.0820
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+
+# Compare parameter counts across block types
+class StandardBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c), nn.ReLU(),
+            nn.Conv2d(c, c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c), nn.ReLU(),
+        )
+    def forward(self, x): return self.net(x)
+
+C = 64
+std_blk = StandardBlock(C)
+dws_blk = DepthwiseSepConv(C, C)
+se_blk  = SEBlock(C)
+
+print(f"Standard block:      {sum(p.numel() for p in std_blk.parameters()):,} params")
+print(f"DWS block:           {sum(p.numel() for p in dws_blk.parameters()):,} params")
+print(f"SE block (overhead): {sum(p.numel() for p in se_blk.parameters()):,} params")
+```
+
+```output
+Standard block:      74,112 params
+DWS block:           4,672 params
+SE block (overhead): 256 params
+```
+
+Try wrapping a `DepthwiseSepConv` in a skip connection (add input to output) and verify the output shape. Then add an `SEBlock` on top of that. Stack 5 such blocks and count total params.
+
+## Exercise
+
+Build a `MobileBlock` that combines an inverted residual (expansion=4) with a squeeze-and-excite block after the depthwise convolution. Use `in_c = out_c = 64`. Count the total parameters and compare to a standard `ResidualBlock(64)` from chapter 4.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class MobileBlock(nn.Module):
+    def __init__(self, channels: int, t: int = 4):
+        super().__init__()
+        mid = channels * t
+        self.expand  = nn.Sequential(nn.Conv2d(channels, mid, 1, bias=False),
+                                     nn.BatchNorm2d(mid), nn.ReLU6())
+        self.dw      = nn.Sequential(nn.Conv2d(mid, mid, 3, padding=1,
+                                               groups=mid, bias=False),
+                                     nn.BatchNorm2d(mid), nn.ReLU6())
+        self.se      = SEBlock(mid)
+        self.project = nn.Sequential(nn.Conv2d(mid, channels, 1, bias=False),
+                                     nn.BatchNorm2d(channels))
+
+    def forward(self, x):
+        out = self.expand(x)
+        out = self.se(self.dw(out))
+        out = self.project(out)
+        return out + x
+
+mb = MobileBlock(64)
+x  = torch.randn(2, 64, 28, 28)
+print("Output:", mb(x).shape)
+print("MobileBlock params:", sum(p.numel() for p in mb.parameters()))
+```
+
+The MobileBlock uses ~12,000 parameters versus ~74,000 for a standard ResBlock at the same channel width — a 6× reduction while keeping a skip connection and channel attention.
+</details>

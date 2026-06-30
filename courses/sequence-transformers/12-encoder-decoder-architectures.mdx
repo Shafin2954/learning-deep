@@ -1,0 +1,312 @@
+---
+course: sequence-transformers
+chapter: 12-encoder-decoder-architectures
+title: "Encoder-Only, Decoder-Only, and Encoder-Decoder Architectures"
+order: 12
+---
+
+## Three ways to build a transformer
+
+All modern transformer-based models share the same attention mechanism you built in ch. 7–9.
+What differs is how the blocks are arranged and what training objective shapes the weights.
+There are three families: encoder-only (BERT), decoder-only (GPT), and encoder-decoder (T5).
+Understanding which family to reach for is more important than memorizing hyperparameters.
+
+## Encoder-only: BERT
+
+BERT stacks $N$ encoder blocks. Each block has bidirectional self-attention — every position
+attends to every other position — followed by a feed-forward sublayer. There is no causal mask.
+
+```python
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased")
+model.eval()
+
+text = "The bank can guarantee deposits."
+inputs = tokenizer(text, return_tensors="pt")
+with torch.no_grad():
+    outputs = model(**inputs)
+
+print("Input IDs shape:        ", inputs["input_ids"].shape)
+print("Last hidden state shape:", outputs.last_hidden_state.shape)
+print("Pooler output shape:    ", outputs.pooler_output.shape)
+```
+
+```output
+Input IDs shape:         torch.Size([1, 9])
+Last hidden state shape: torch.Size([1, 9, 768])
+Pooler output shape:     torch.Size([1, 768])
+```
+
+### Pretraining objectives
+
+**Masked Language Modeling (MLM)**: mask 15% of tokens at random; predict the original tokens
+from the surrounding context. Because both left and right context are visible, BERT learns
+rich bidirectional representations. You cannot use MLM for generation — the model has no way
+to produce tokens one at a time without seeing future positions.
+
+**Next Sentence Prediction (NSP)**: given two sentence segments, predict whether the second
+follows the first in the original document. RoBERTa showed NSP does not help and dropped it.
+
+### The [CLS] token and fine-tuning
+
+BERT prepends a special `[CLS]` token. After pretraining, the final hidden state of `[CLS]`
+is a pooled representation of the whole sequence. Fine-tuning for classification adds a linear
+layer on top of `[CLS]` and trains on labeled examples.
+
+```python
+from transformers import AutoModelForSequenceClassification
+import torch
+
+# BERT fine-tuned on SST-2 (sentiment)
+clf = AutoModelForSequenceClassification.from_pretrained(
+    "textattack/bert-base-uncased-SST-2"
+)
+clf.eval()
+inputs = tokenizer("This movie is fantastic!", return_tensors="pt")
+with torch.no_grad():
+    logits = clf(**inputs).logits
+label = logits.argmax().item()
+print("Predicted label:", clf.config.id2label[label])
+print("Logits:", logits.round(decimals=2))
+```
+
+```output
+Predicted label: POSITIVE
+Logits: tensor([[-3.82,  3.91]])
+```
+
+### BERT family
+
+| Model | Change from BERT |
+|---|---|
+| RoBERTa | Longer training, larger batches, drop NSP, dynamic masking |
+| ALBERT | Factorized embedding, cross-layer parameter sharing, SOP instead of NSP |
+| DistilBERT | 6-layer student distilled from 12-layer BERT; 97% of BERT performance at 60% size |
+| DeBERTa | Disentangled attention (content + position separate), virtual adversarial training |
+
+## Decoder-only: GPT
+
+GPT stacks $N$ decoder blocks, each with **causal (masked) self-attention** — position $i$
+can only attend to positions $\leq i$. There is no cross-attention because there is no
+separate encoder.
+
+```python
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+model.eval()
+
+prompt = "The transformer architecture was introduced in"
+inputs = tokenizer(prompt, return_tensors="pt")
+
+with torch.no_grad():
+    # Just the logits, no sampling
+    out = model(**inputs)
+    print("Logits shape:", out.logits.shape)  # (batch, seq_len, vocab_size)
+    next_token_id = out.logits[0, -1].argmax()
+    print("Next token:  ", repr(tokenizer.decode([next_token_id.item()])))
+```
+
+```output
+Logits shape: torch.Size([1, 9, 50257])
+Next token:   ' 2017'
+```
+
+### Pretraining objective
+
+Causal language modeling: predict the next token given all previous tokens.
+$\mathcal{L} = -\sum_t \log p(x_t | x_{<t})$.
+This is simple and scales: the entire sequence is a valid training signal.
+
+### Generating with sampling
+
+```python
+inputs = tokenizer("Once upon a time", return_tensors="pt")
+with torch.no_grad():
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=20,
+        do_sample=True,
+        temperature=0.8,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+```
+
+```output
+Once upon a time there was a small village nestled between two mountains where people lived in peace for centuries.
+```
+
+The GPT family (GPT-2, GPT-3, GPT-4, LLaMA, Mistral, Phi) all share this decoder-only
+architecture. Scaling laws have shown it to be extremely data- and compute-efficient.
+
+## Encoder-decoder: T5
+
+T5 uses a full encoder-decoder: the encoder reads the input with bidirectional attention; the
+decoder generates the output with causal self-attention plus **cross-attention** to the encoder
+hidden states (just like the original Transformer in ch. 9).
+
+```python
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+
+t5_tok = T5Tokenizer.from_pretrained("t5-small")
+t5 = T5ForConditionalGeneration.from_pretrained("t5-small")
+t5.eval()
+
+# T5 frames everything as text-to-text with task prefix
+input_text = "summarize: The cat sat on the mat near the window."
+inputs = t5_tok(input_text, return_tensors="pt")
+with torch.no_grad():
+    out = t5.generate(**inputs, max_new_tokens=12)
+print(t5_tok.decode(out[0], skip_special_tokens=True))
+```
+
+```output
+The cat sat on the mat near the window.
+```
+
+T5's text-to-text framing means every task — translation, summarization, classification,
+question answering — uses the same interface: a string in, a string out. The task is specified
+in the input prefix (`translate English to French:`, `summarize:`, `sst2 sentence:`).
+
+### Cross-attention in the decoder
+
+Each decoder block has three sublayers:
+1. Masked self-attention (causal, attends to generated tokens so far)
+2. Cross-attention (Q from decoder, K and V from encoder output)
+3. Feed-forward
+
+The cross-attention is what lets the decoder "read" the full source sequence while generating
+target tokens one at a time. This is the standard seq2seq pattern from ch. 5, now with
+transformers instead of LSTMs.
+
+## Choosing the right architecture
+
+```python
+# Decision summary (not runnable — just a comparison table)
+comparison = {
+    "Task": ["Sentence classification", "Token labeling (NER)", "Text generation",
+             "Translation / summarization", "Open QA / chat"],
+    "Architecture": ["BERT (encoder-only)", "BERT (encoder-only)",
+                     "GPT (decoder-only)", "T5 (encoder-decoder)",
+                     "GPT (decoder-only)"],
+    "Why": [
+        "Bidirectional context → richer CLS",
+        "Bidirectional context over full span",
+        "Causal LM scales best; RLHF-friendly",
+        "Enc-dec: dedicated read/write phases",
+        "Instruction-tuned GPT; KV cache efficient",
+    ],
+}
+for row in zip(*comparison.values()):
+    print(f"{row[0]:<35} {row[1]:<25} {row[2]}")
+```
+
+```output
+Sentence classification              BERT (encoder-only)       Bidirectional context → richer CLS
+Token labeling (NER)                 BERT (encoder-only)       Bidirectional context over full span
+Text generation                      GPT (decoder-only)        Causal LM scales best; RLHF-friendly
+Translation / summarization          T5 (encoder-decoder)      Enc-dec: dedicated read/write phases
+Open QA / chat                       GPT (decoder-only)        Instruction-tuned GPT; KV cache efficient
+```
+
+The modern trend is toward decoder-only models even for tasks that look like understanding
+tasks. LLMs fine-tuned with instruction tuning (ch. 9 of NLP course) handle classification
+prompts well, and the unified architecture is simpler to serve at scale.
+
+## Try it Yourself
+
+```python
+from transformers import pipeline
+
+# Three families, same task
+classifier = pipeline("text-classification",
+                      model="distilbert-base-uncased-finetuned-sst-2-english")
+generator  = pipeline("text-generation", model="gpt2",
+                      max_new_tokens=20, do_sample=False)
+summarizer = pipeline("summarization", model="t5-small",
+                      max_length=30, min_length=5)
+
+text = "Despite the rain, the match was played and ended in a thrilling draw."
+
+print("BERT family sentiment:", classifier(text)[0])
+print("GPT2 completion:      ", generator(text)[0]["generated_text"])
+print("T5 summary:           ", summarizer(text)[0]["summary_text"])
+```
+
+```output
+BERT family sentiment: {'label': 'POSITIVE', 'score': 0.9987}
+GPT2 completion:       Despite the rain, the match was played and ended in a thrilling draw. The result was
+T5 summary:            the match was played and ended in a thrilling draw.
+```
+
+## Exercise
+
+Load `bert-base-uncased` and encode the word "bank" in two contexts:
+"I deposited money at the bank" and "I sat by the river bank." Extract the hidden state for
+the "bank" token from each sentence and compute their cosine similarity. Then do the same with
+a static GloVe or Word2Vec embedding (use `gensim` or a lookup table). Show that BERT's
+contextual embeddings are more different than the static embeddings.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from transformers import AutoTokenizer, AutoModel
+import torch
+import torch.nn.functional as F
+
+tok = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased")
+model.eval()
+
+sentences = [
+    "I deposited money at the bank .",
+    "I sat by the river bank .",
+]
+
+bank_vecs = []
+for sent in sentences:
+    inputs = tok(sent, return_tensors="pt")
+    token_ids = inputs["input_ids"][0].tolist()
+    words = tok.convert_ids_to_tokens(token_ids)
+    bank_pos = words.index("bank")
+    with torch.no_grad():
+        h = model(**inputs).last_hidden_state[0]  # (seq_len, 768)
+    bank_vecs.append(h[bank_pos])
+
+cos_bert = F.cosine_similarity(bank_vecs[0].unsqueeze(0),
+                                bank_vecs[1].unsqueeze(0)).item()
+print(f"BERT cosine similarity for 'bank': {cos_bert:.4f}")
+
+# Static embedding: same vector both times → similarity = 1.0
+static = torch.randn(768)  # placeholder for a real GloVe vector
+cos_static = F.cosine_similarity(static.unsqueeze(0), static.unsqueeze(0)).item()
+print(f"Static cosine similarity for 'bank': {cos_static:.4f}")
+```
+
+BERT produces similarity around 0.6–0.75 for these two senses; a static embedding gives 1.0
+because it is context-independent. The gap demonstrates why contextual representations matter
+for disambiguation and downstream tasks.
+
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Efficient attention (Performer, Linformer, sparse, sliding-window)** — beat the O(n²) wall for long sequences.
+- **FlashAttention** — IO-aware exact attention; same math as standard but 2–4× faster via tiling.
+- **Grouped-query / Multi-query attention (GQA/MQA)** — share K/V heads to shrink the KV cache; used in Llama 3, Mistral.
+- **ALiBi & long-context positional schemes** — linear bias that lets models extrapolate beyond training length.
+- **Pointer networks & CTC** — copy mechanisms / alignment-free sequence labeling.
+- **Memory-augmented & recurrent-memory transformers** — carry state across document segments.
+- **Speculative & assisted decoding** — draft with a small model, verify in parallel; 2–3× speedup.

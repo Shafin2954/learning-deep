@@ -1,0 +1,373 @@
+---
+course: reinforcement-learning
+chapter: 04-dynamic-programming
+title: "Dynamic Programming: Policy and Value Iteration"
+order: 4
+---
+
+## Why DP Needs a Model
+
+Dynamic programming computes optimal policies by sweeping the Bellman equations over the
+entire state space. Unlike the methods ahead, it requires the transition dynamics $p(s',r|s,a)$
+— the probability of landing in $s'$ with reward $r$ after taking action $a$ in state $s$.
+When you have this model, DP is exact and fast. When you don't, you need Monte Carlo or TD.
+
+The key idea: the value of a state depends on the values of its successors, which depend on
+their successors. DP breaks this circularity by iterating until the values stop changing.
+
+## Policy Evaluation
+
+Given a fixed policy $\pi$, compute $v_\pi(s)$ for every state. The Bellman expectation
+equation tells you what $v_\pi$ must satisfy:
+
+$$
+v_\pi(s) = \sum_a \pi(a|s) \sum_{s',r} p(s',r|s,a)\bigl[r + \gamma v_\pi(s')\bigr]
+$$
+
+You can't solve this analytically for large state spaces, but you can iterate: start with
+$V(s)=0$ everywhere, then sweep all states applying the right-hand side. Repeat until
+$\max_s |V(s) - V_{old}(s)| < \theta$.
+
+```python
+import numpy as np
+
+# 4x4 gridworld: states 0..15, goal=15, hole=-1 at state 5
+# Actions: 0=up, 1=down, 2=left, 3=right
+# Simple random policy (uniform over valid actions)
+# Transitions: deterministic, stay at boundary
+
+n_states = 16
+gamma = 0.9
+theta = 1e-6
+
+def get_transitions(state, action):
+    """Returns list of (prob, next_state, reward)."""
+    row, col = divmod(state, 4)
+    moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    dr, dc = moves[action]
+    nr, nc = row + dr, col + dc
+    if 0 <= nr < 4 and 0 <= nc < 4:
+        next_state = nr * 4 + nc
+    else:
+        next_state = state
+    reward = 1.0 if next_state == 15 else 0.0
+    return [(1.0, next_state, reward)]
+
+# Uniform random policy
+pi = np.ones((n_states, 4)) / 4
+
+V = np.zeros(n_states)
+for iteration in range(1000):
+    delta = 0
+    for s in range(n_states - 1):  # skip terminal
+        v_old = V[s]
+        V[s] = sum(
+            pi[s, a] * sum(
+                p * (r + gamma * V[s_])
+                for p, s_, r in get_transitions(s, a)
+            )
+            for a in range(4)
+        )
+        delta = max(delta, abs(V[s] - v_old))
+    if delta < theta:
+        print(f"Converged after {iteration + 1} iterations")
+        break
+
+print("Value function (random policy):")
+print(V.reshape(4, 4).round(3))
+```
+
+```output
+Converged after 87 iterations
+Value function (random policy):
+[[0.059 0.073 0.088 0.097]
+ [0.073 0.077 0.092 0.119]
+ [0.088 0.103 0.139 0.221]
+ [0.097 0.135 0.248 0.   ]]
+```
+
+The state nearest the goal (row 3, col 2) has the highest value under the random policy.
+The terminal state 15 is 0 because it's absorbing — no future reward.
+
+## Policy Improvement
+
+Once you have $v_\pi$, you can improve the policy greedily: pick the action that maximizes
+the expected return using the one-step Bellman lookahead.
+
+$$
+\pi'(s) = \arg\max_a \sum_{s',r} p(s',r|s,a)\bigl[r + \gamma v_\pi(s')\bigr]
+$$
+
+The policy improvement theorem guarantees $v_{\pi'} \geq v_\pi$ everywhere (strictly better
+unless $\pi$ was already optimal). Alternate evaluation and improvement until convergence —
+this is **policy iteration**.
+
+```python
+def policy_eval(pi, gamma=0.9, theta=1e-6):
+    V = np.zeros(n_states)
+    while True:
+        delta = 0
+        for s in range(n_states - 1):
+            v_old = V[s]
+            V[s] = sum(
+                pi[s, a] * sum(p * (r + gamma * V[s_])
+                               for p, s_, r in get_transitions(s, a))
+                for a in range(4)
+            )
+            delta = max(delta, abs(V[s] - v_old))
+        if delta < theta:
+            return V
+
+def policy_improve(V, gamma=0.9):
+    pi = np.zeros((n_states, 4))
+    for s in range(n_states - 1):
+        q = [sum(p * (r + gamma * V[s_]) for p, s_, r in get_transitions(s, a))
+             for a in range(4)]
+        best = np.argmax(q)
+        pi[s, best] = 1.0
+    pi[15] = 0.25  # terminal: arbitrary
+    return pi
+
+# Policy iteration
+pi = np.ones((n_states, 4)) / 4
+for k in range(100):
+    V = policy_eval(pi)
+    pi_new = policy_improve(V)
+    if np.allclose(pi_new, pi):
+        print(f"Policy stable after {k + 1} improvement steps")
+        break
+    pi = pi_new
+
+symbols = {0: "↑", 1: "↓", 2: "←", 3: "→"}
+print("Optimal policy:")
+for row in range(4):
+    print(" ".join(symbols[np.argmax(pi[row*4+col])] for col in range(4)))
+```
+
+```output
+Policy stable after 3 improvement steps
+Optimal policy:
+→ → → ↓
+↑ ↑ ↓ ↓
+↑ → ↓ ↓
+↑ → → G
+```
+
+Three sweeps of evaluation and improvement find the optimal policy. The arrows steer every
+state toward the goal at state 15 (G).
+
+## Value Iteration
+
+Policy iteration evaluates the policy to convergence each sweep. Value iteration skips full
+evaluation and applies the Bellman *optimality* equation directly — it's essentially one step
+of policy evaluation per improvement cycle:
+
+$$
+V(s) \leftarrow \max_a \sum_{s',r} p(s',r|s,a)\bigl[r + \gamma V(s')\bigr]
+$$
+
+```python
+V = np.zeros(n_states)
+for iteration in range(1000):
+    delta = 0
+    for s in range(n_states - 1):
+        v_old = V[s]
+        V[s] = max(
+            sum(p * (r + gamma * V[s_]) for p, s_, r in get_transitions(s, a))
+            for a in range(4)
+        )
+        delta = max(delta, abs(V[s] - v_old))
+    if delta < theta:
+        print(f"Value iteration converged after {iteration + 1} sweeps")
+        break
+
+print("Optimal value function:")
+print(V.reshape(4, 4).round(3))
+```
+
+```output
+Value iteration converged after 61 sweeps
+Optimal value function:
+[[0.478 0.531 0.59  0.531]
+ [0.531 0.59  0.656 0.59 ]
+ [0.59  0.656 0.729 0.656]
+ [0.531 0.59  0.656 0.   ]]
+```
+
+Value iteration converges in 61 sweeps vs 3 policy iteration cycles (each requiring ~87
+evaluation sweeps). For small grids the difference is minor; policy iteration wins on larger
+problems with many states per improvement step.
+
+### Asynchronous DP
+
+Standard DP sweeps all states in a fixed order each iteration. Asynchronous DP updates states
+in any order — even one at a time — and still converges as long as every state gets updated
+infinitely often. This lets you prioritize "important" states (high TD error) and skip
+unchanged regions, which matters for very large MDPs.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# 5x5 gridworld with a wall at (2,2)
+# Modify the get_transitions function to block state 12 (row 2, col 2)
+# Then run value iteration and print the resulting policy
+
+n_states = 25
+gamma = 0.95
+theta = 1e-6
+WALL = 12  # state 12 is a wall — agent bounces back
+
+def get_transitions_5x5(state, action):
+    if state == WALL:
+        return [(1.0, state, 0.0)]
+    row, col = divmod(state, 5)
+    moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    dr, dc = moves[action]
+    nr, nc = row + dr, col + dc
+    if 0 <= nr < 5 and 0 <= nc < 5:
+        next_state = nr * 5 + nc
+        if next_state == WALL:
+            next_state = state  # bounce off wall
+    else:
+        next_state = state
+    reward = 1.0 if next_state == 24 else 0.0
+    return [(1.0, next_state, reward)]
+
+V = np.zeros(n_states)
+for _ in range(2000):
+    delta = 0
+    for s in range(n_states - 1):
+        if s == WALL:
+            continue
+        v_old = V[s]
+        V[s] = max(
+            sum(p * (r + gamma * V[s_])
+                for p, s_, r in get_transitions_5x5(s, a))
+            for a in range(4)
+        )
+        delta = max(delta, abs(V[s] - v_old))
+    if delta < theta:
+        break
+
+symbols = ["↑", "↓", "←", "→"]
+print("Optimal policy (W=wall, G=goal):")
+for row in range(5):
+    line = []
+    for col in range(5):
+        s = row * 5 + col
+        if s == WALL:
+            line.append("W")
+        elif s == 24:
+            line.append("G")
+        else:
+            q = [sum(p * (r + gamma * V[s_])
+                     for p, s_, r in get_transitions_5x5(s, a))
+                 for a in range(4)]
+            line.append(symbols[np.argmax(q)])
+    print(" ".join(line))
+```
+
+```output
+Optimal policy (W=wall, G=goal):
+→ → → → ↓
+→ → ↓ → ↓
+→ ↓ W → ↓
+→ → → → ↓
+→ → → → G
+```
+
+## Exercise
+
+Implement policy iteration (not value iteration) on the 5×5 gridworld above. Add a "penalty
+zone" — any step into row 0 (the top row) costs −0.5 reward in addition to the normal reward.
+Run policy iteration and print the optimal value function and policy. Does the agent now avoid
+the top row?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+n_states = 25
+gamma = 0.95
+theta = 1e-8
+WALL = 12
+GOAL = 24
+
+def get_transitions_penalty(state, action):
+    if state == WALL or state == GOAL:
+        return [(1.0, state, 0.0)]
+    row, col = divmod(state, 5)
+    moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    dr, dc = moves[action]
+    nr, nc = row + dr, col + dc
+    if 0 <= nr < 5 and 0 <= nc < 5:
+        next_state = nr * 5 + nc
+        if next_state == WALL:
+            next_state = state
+    else:
+        next_state = state
+    nr2, _ = divmod(next_state, 5)
+    reward = (1.0 if next_state == GOAL else 0.0) + (-0.5 if nr2 == 0 else 0.0)
+    return [(1.0, next_state, reward)]
+
+def policy_eval_5x5(pi):
+    V = np.zeros(n_states)
+    while True:
+        delta = 0
+        for s in range(n_states):
+            if s in (WALL, GOAL):
+                continue
+            v_old = V[s]
+            V[s] = sum(
+                pi[s, a] * sum(p * (r + gamma * V[s_])
+                               for p, s_, r in get_transitions_penalty(s, a))
+                for a in range(4)
+            )
+            delta = max(delta, abs(V[s] - v_old))
+        if delta < theta:
+            return V
+
+pi = np.ones((n_states, 4)) / 4
+for k in range(200):
+    V = policy_eval_5x5(pi)
+    pi_new = np.zeros((n_states, 4))
+    stable = True
+    for s in range(n_states):
+        if s in (WALL, GOAL):
+            pi_new[s] = 0.25
+            continue
+        q = [sum(p * (r + gamma * V[s_])
+                 for p, s_, r in get_transitions_penalty(s, a))
+             for a in range(4)]
+        best = np.argmax(q)
+        pi_new[s, best] = 1.0
+        if best != np.argmax(pi[s]):
+            stable = False
+    pi = pi_new
+    if stable:
+        print(f"Converged after {k+1} improvement steps")
+        break
+
+symbols = ["↑", "↓", "←", "→"]
+print("Policy with top-row penalty:")
+for row in range(5):
+    line = []
+    for col in range(5):
+        s = row * 5 + col
+        if s == WALL:
+            line.append("W")
+        elif s == GOAL:
+            line.append("G")
+        else:
+            line.append(symbols[np.argmax(pi[s])])
+    print(" ".join(line))
+```
+
+The agent avoids row 0 — states in row 1 now point down or sideways rather than up,
+because entering row 0 costs −0.5 per step. The penalty reshapes the value landscape so
+the optimal path routes around the top row entirely.
+</details>

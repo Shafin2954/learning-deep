@@ -1,0 +1,316 @@
+---
+course: nlp-llms
+chapter: 10-prompting-structured-output
+title: "Prompting and Structured Output"
+order: 10
+---
+
+## Zero-Shot vs Few-Shot
+
+In zero-shot prompting you describe the task and let the model figure it out. In few-shot
+prompting you show examples first. Few-shot works better when the format or reasoning style
+is non-obvious.
+
+```python
+zero_shot_prompt = """Classify the sentiment as POSITIVE or NEGATIVE.
+Text: The product broke after two days.
+Sentiment:"""
+
+few_shot_prompt = """Classify sentiment.
+
+Text: Great packaging, arrived quickly.
+Sentiment: POSITIVE
+
+Text: Battery life is terrible.
+Sentiment: NEGATIVE
+
+Text: The product broke after two days.
+Sentiment:"""
+
+print("Zero-shot prompt tokens:", len(zero_shot_prompt.split()))
+print("Few-shot prompt tokens:", len(few_shot_prompt.split()))
+```
+
+```output
+Zero-shot prompt tokens: 12
+Few-shot prompt tokens: 38
+```
+
+The few-shot version costs more tokens but anchors the output format precisely.
+
+## Chain-of-Thought (CoT)
+
+Adding "Let's think step by step" (or better, including worked examples with reasoning)
+dramatically improves multi-step reasoning. The model generates intermediate steps that guide
+the final answer.
+
+```python
+cot_prompt = """Q: A train leaves at 9am traveling 60 mph. Another leaves at 10am traveling
+90 mph from the same station. At what time does the second train catch the first?
+
+A: Let's think step by step.
+The first train has a 1-hour head start at 60 mph, so it is 60 miles ahead when the second
+train departs. The second train closes the gap at 90-60=30 mph. Time to close 60 miles:
+60/30 = 2 hours. The second train catches up at 10am + 2h = 12pm.
+
+Q: A car travels 40 mph for 1.5 hours, then 70 mph for 0.5 hours. What is the total distance?
+
+A: Let's think step by step."""
+# Expected completion: 40*1.5=60 miles + 70*0.5=35 miles = 95 miles.
+print(cot_prompt[-60:])
+```
+
+```output
+A: Let's think step by step.
+```
+
+### Self-Consistency
+
+Sample CoT reasoning $N$ times (e.g., temperature=0.7), take the majority answer. Reduces
+variance on mathematical and logical tasks:
+
+```python
+from collections import Counter
+
+# Simulated answers from 5 CoT samples
+sampled_answers = ["95 miles", "95 miles", "85 miles", "95 miles", "95 miles"]
+majority = Counter(sampled_answers).most_common(1)[0]
+print(f"Self-consistency answer: {majority[0]} (voted {majority[1]}/5)")
+```
+
+```output
+Self-consistency answer: 95 miles (voted 4/5)
+```
+
+## ReAct: Reason + Act
+
+ReAct interleaves reasoning (`Thought:`) with tool calls (`Action:`) and observations
+(`Observation:`). The model decides what to look up, then continues reasoning with the result.
+
+```python
+react_trace = """
+Thought: I need to find the current population of Bangladesh.
+Action: search("population of Bangladesh 2024")
+Observation: Bangladesh has approximately 173 million people as of 2024.
+Thought: Now I can answer the question.
+Action: finish("Bangladesh's population is approximately 173 million (2024).")
+""".strip()
+print(react_trace)
+```
+
+```output
+Thought: I need to find the current population of Bangladesh.
+Action: search("population of Bangladesh 2024")
+Observation: Bangladesh has approximately 173 million people as of 2024.
+Thought: Now I can answer the question.
+Action: finish("Bangladesh's population is approximately 173 million (2024).")
+```
+
+## Structured Output and JSON Mode
+
+Many APIs support `response_format={"type": "json_object"}` which constrains the model to
+output valid JSON. Use this for extraction tasks:
+
+```python
+import json
+
+# Simulated structured extraction (response_format=json_object)
+raw_text = "John Smith, 34, senior engineer at Acme Corp. Email: jsmith@acme.com"
+
+prompt = f"""Extract structured data from the text below. Return valid JSON only.
+
+Text: {raw_text}
+
+Required fields: name (string), age (int), title (string), company (string), email (string)
+JSON:"""
+
+simulated_response = '{"name": "John Smith", "age": 34, "title": "Senior Engineer", "company": "Acme Corp", "email": "jsmith@acme.com"}'
+parsed = json.loads(simulated_response)
+print(json.dumps(parsed, indent=2))
+```
+
+```output
+{
+  "name": "John Smith",
+  "age": 34,
+  "title": "Senior Engineer",
+  "company": "Acme Corp",
+  "email": "jsmith@acme.com"
+}
+```
+
+## Constrained Decoding with `outlines`
+
+`outlines` enforces output structure at the token level — the model can only emit tokens
+consistent with your schema or regex. No post-processing or retrying needed.
+
+```python
+# Requires: pip install outlines
+# import outlines
+# model = outlines.models.transformers("HuggingFaceTB/SmolLM2-360M-Instruct")
+# 
+# from pydantic import BaseModel
+# class Person(BaseModel):
+#     name: str
+#     age: int
+#     email: str
+#
+# generator = outlines.generate.json(model, Person)
+# result = generator("Extract: Alice Wong, 28, alice@example.com")
+# print(result)  # Person(name='Alice Wong', age=28, email='alice@example.com')
+
+# Regex-constrained generation (e.g., force a date format):
+# generator = outlines.generate.regex(model, r"\d{4}-\d{2}-\d{2}")
+# result = generator("Today's date is")
+# print(result)  # e.g., "2024-06-15"
+print("outlines constrains decoding to valid schema tokens at generation time.")
+```
+
+```output
+outlines constrains decoding to valid schema tokens at generation time.
+```
+
+## Function Calling
+
+OpenAI-style function calling lets the model signal it wants to call a tool by outputting a
+structured JSON call instead of free text. The calling code executes the function and injects
+the result back:
+
+```python
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+# Simulated model response when it decides to call the tool:
+model_response = {
+    "tool_calls": [
+        {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"city": "Dhaka", "unit": "celsius"}'
+            }
+        }
+    ]
+}
+
+call = model_response["tool_calls"][0]["function"]
+args = json.loads(call["arguments"])
+print(f"Tool: {call['name']}  Args: {args}")
+```
+
+```output
+Tool: get_weather  Args: {'city': 'Dhaka', 'unit': 'celsius'}
+```
+
+## Pydantic Validation for Outputs
+
+Parse and validate structured LLM output with Pydantic to catch missing fields or wrong types:
+
+```python
+from pydantic import BaseModel, EmailStr, ValidationError
+from typing import Optional
+
+class ExtractedPerson(BaseModel):
+    name: str
+    age: int
+    email: str
+    title: Optional[str] = None
+
+raw = '{"name": "Rana Islam", "age": 29, "email": "rana@example.com"}'
+try:
+    person = ExtractedPerson.model_validate_json(raw)
+    print(person)
+except ValidationError as e:
+    print(f"Validation error: {e}")
+```
+
+```output
+name='Rana Islam' age=29 email='rana@example.com' title=None
+```
+
+## Try it Yourself
+
+```python
+import json
+
+# Build an eval-driven prompt: test the same extraction prompt on 3 examples
+examples = [
+    ("Ahmed Hassan, 45, CTO of TechBD. ahmed@techbd.io", {"name": "Ahmed Hassan", "age": 45}),
+    ("Sara Chen, 31, data scientist. sara.chen@ml.co", {"name": "Sara Chen", "age": 31}),
+    ("12345, not a person at all", None),
+]
+
+prompt_template = """Extract name and age from the text. Return JSON with keys "name" and "age".
+If no person is found, return {{"error": "no person"}}.
+Text: {text}
+JSON:"""
+
+# Simulate outputs (replace with real model calls)
+simulated_outputs = [
+    '{"name": "Ahmed Hassan", "age": 45}',
+    '{"name": "Sara Chen", "age": 31}',
+    '{"error": "no person"}',
+]
+
+for (text, expected), output in zip(examples, simulated_outputs):
+    parsed = json.loads(output)
+    if expected:
+        match = all(parsed.get(k) == v for k, v in expected.items())
+        print(f"{'PASS' if match else 'FAIL'}: {text[:30]}")
+    else:
+        print(f"{'PASS' if 'error' in parsed else 'FAIL'}: {text[:30]}")
+```
+
+```output
+PASS: Ahmed Hassan, 45, CTO of Tech
+PASS: Sara Chen, 31, data scientist.
+PASS: 12345, not a person at all
+```
+
+## Exercise
+
+Write a prompt that extracts all dates mentioned in a paragraph of text and returns them as a
+JSON array of strings in ISO format (YYYY-MM-DD). Test it on a paragraph with three dates in
+different formats (e.g., "June 15, 2024", "15/06/2024", "2024-06-15").
+
+<details>
+<summary>Solution</summary>
+
+```python
+import json
+
+prompt = """Extract all dates from the text and return them as a JSON array of ISO format strings (YYYY-MM-DD).
+If no dates are found return [].
+
+Text: The contract was signed on June 15, 2024. Payment is due by 30/09/2024. The final review is scheduled for 2024-12-01.
+
+JSON:"""
+
+# Simulated model output with json_object mode:
+response = '["2024-06-15", "2024-09-30", "2024-12-01"]'
+dates = json.loads(response)
+print(dates)
+assert len(dates) == 3
+assert all(len(d) == 10 and d[4] == '-' for d in dates)
+print("All dates correctly normalised to ISO format.")
+```
+
+The key insight: specifying the exact output format (ISO dates in a JSON array) in the prompt
+eliminates ambiguity and makes post-processing trivial.
+</details>

@@ -1,0 +1,238 @@
+---
+course: sequence-transformers
+chapter: 01-sequence-problems-tokenization
+title: "Sequence Problems and Tokenization Basics"
+order: 1
+---
+
+## What makes a problem sequential
+
+A problem is sequential when the **order of inputs matters** and the output depends on context across positions. A bag of words ignores order — "dog bites man" and "man bites dog" are identical. Sequences preserve that order, making position meaningful.
+
+Three distinguishing properties: inputs are variable-length; position carries information; and outputs may themselves be sequences of different lengths.
+
+## The core sequence tasks
+
+**Sequence classification** — one label per sequence. Sentiment analysis ("positive"), spam detection, intent recognition. The entire input maps to one output.
+
+**Sequence labeling** — one label per token. Named entity recognition (NER) tags "London" as `LOC`; part-of-speech (POS) tags "runs" as `VB`. Output length equals input length.
+
+**Sequence generation** — produce a new sequence from scratch, conditioned on a prompt. Language modeling, code completion.
+
+**Sequence-to-sequence (seq2seq)** — map one sequence to another of potentially different length. Machine translation, summarization, question answering.
+
+## Characters vs words vs subwords
+
+The unit you tokenize into determines vocabulary size and how you handle unknown text.
+
+**Character tokenization** gives the smallest vocabulary (≈100 for ASCII, ≈thousands for Unicode). Every string is representable with no out-of-vocabulary (OOV) tokens. The downside: sequences get very long, and the model must learn that "c", "a", "t" together mean something.
+
+**Word tokenization** splits on whitespace and punctuation. Vocabulary balloons to 50k–500k for real corpora. Rare words and misspellings become `<UNK>`. "unhappiness" might not appear in training but "unhappy" does.
+
+**Subword tokenization** (BPE, WordPiece, Unigram) finds a middle ground: common words stay whole, rare words split into pieces. "unhappiness" → ["un", "##happiness"] or ["un", "happy", "ness"]. Covered in Course 12 (NLP & LLMs); here we use characters.
+
+## Building a character vocabulary
+
+```python
+corpus = [
+    "the cat sat on the mat",
+    "a cat sat by the door",
+    "the dog ran through the park",
+]
+
+# Build character-level vocabulary
+chars = sorted(set("".join(corpus)))
+special = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+vocab = special + chars
+char2idx = {c: i for i, c in enumerate(vocab)}
+idx2char = {i: c for c, i in char2idx.items()}
+
+print(f"Vocab size: {len(vocab)}")
+print(f"First 10 tokens: {vocab[:10]}")
+print(f"'a' index: {char2idx['a']}, 't' index: {char2idx['t']}")
+```
+
+```output
+Vocab size: 30
+First 10 tokens: ['<PAD>', '<UNK>', '<BOS>', '<EOS>', ' ', 'a', 'b', 'c', 'd', 'e']
+'a' index: 5, 't' index: 21
+```
+
+The four special tokens serve fixed roles:
+- `<PAD>` (index 0) — fill shorter sequences to match batch length
+- `<UNK>` (index 1) — replace characters not seen at train time
+- `<BOS>` (index 2) — "beginning of sequence" marker for decoders
+- `<EOS>` (index 3) — "end of sequence" signal; generation stops here
+
+## Tokenizing and encoding
+
+```python
+def encode(text, char2idx, add_bos=False, add_eos=False):
+    tokens = []
+    if add_bos:
+        tokens.append(char2idx["<BOS>"])
+    for c in text:
+        tokens.append(char2idx.get(c, char2idx["<UNK>"]))
+    if add_eos:
+        tokens.append(char2idx["<EOS>"])
+    return tokens
+
+def decode(indices, idx2char):
+    return "".join(idx2char[i] for i in indices
+                   if idx2char[i] not in {"<PAD>", "<BOS>", "<EOS>"})
+
+sample = "the cat"
+encoded = encode(sample, char2idx, add_bos=True, add_eos=True)
+print(f"Encoded: {encoded}")
+print(f"Decoded: {decode(encoded, idx2char)}")
+```
+
+```output
+Encoded: [2, 21, 10, 8, 4, 7, 5, 21, 3]
+Decoded: the cat
+```
+
+## Padding to batch
+
+Neural networks process fixed-size tensors. When you batch sequences of different lengths, you pad the shorter ones to match the longest, then tell the model which positions to ignore.
+
+```python
+import numpy as np
+
+sentences = ["the cat sat", "a dog ran through the park", "hi"]
+encoded_seqs = [encode(s, char2idx) for s in sentences]
+lengths = [len(s) for s in encoded_seqs]
+max_len = max(lengths)
+pad_idx = char2idx["<PAD>"]
+
+# Pad to max_len
+batch = np.full((len(encoded_seqs), max_len), pad_idx, dtype=np.int32)
+for i, seq in enumerate(encoded_seqs):
+    batch[i, :len(seq)] = seq
+
+# Padding mask: True where NOT padded
+mask = (batch != pad_idx)
+
+print("Batch shape:", batch.shape)
+print("Lengths:", lengths)
+print("Batch row 0:", batch[0])
+print("Mask row 2 (short seq):", mask[2].astype(int))
+```
+
+```output
+Batch shape: (3, 26)
+Lengths: [11, 26, 2]
+Batch row 0: [21 10  8  4  7  5 21  4 20  5 21  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0]
+Mask row 2 (short seq): [1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+```
+
+The mask is fed to the model so attention and loss computations skip pad positions.
+
+## One-hot encoding
+
+Before learned embeddings, each token index becomes a one-hot vector of size `|V|`. It's sparse and high-dimensional, but shows the structural idea clearly.
+
+```python
+def one_hot(idx, vocab_size):
+    v = np.zeros(vocab_size)
+    v[idx] = 1.0
+    return v
+
+V = len(vocab)
+token = "a"
+oh = one_hot(char2idx[token], V)
+print(f"One-hot for '{token}': shape={oh.shape}, nonzero at {oh.argmax()}")
+print(f"First 8 values: {oh[:8]}")
+```
+
+```output
+One-hot for 'a': shape=(30,), nonzero at 5
+First 8 values: [0. 0. 0. 0. 0. 1. 0. 0.]
+```
+
+One-hot vectors have no notion of similarity — every pair of tokens is equidistant. Learned embeddings fix this by projecting tokens into a dense space where similar tokens cluster.
+
+## Try it Yourself
+
+```python
+corpus = [
+    "the quick brown fox jumps over the lazy dog",
+    "pack my box with five dozen liquor jugs",
+]
+
+chars = sorted(set("".join(corpus)))
+special = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+vocab = special + chars
+char2idx = {c: i for i, c in enumerate(vocab)}
+idx2char = {i: c for c, i in char2idx.items()}
+
+def encode(text, char2idx, add_bos=False, add_eos=False):
+    tokens = []
+    if add_bos:
+        tokens.append(char2idx["<BOS>"])
+    for c in text:
+        tokens.append(char2idx.get(c, char2idx["<UNK>"]))
+    if add_eos:
+        tokens.append(char2idx["<EOS>"])
+    return tokens
+
+seq = encode("the fox", char2idx, add_bos=True, add_eos=True)
+print("Encoded:", seq)
+print("Vocab size:", len(vocab))
+
+# Try a character not in vocab
+seq2 = encode("THE FOX", char2idx)
+print("Uppercase (OOV) encoded:", seq2)
+print("UNK index:", char2idx["<UNK>"])
+```
+
+```output
+Encoded: [2, 21, 10, 8, 4, 12, 16, 24, 3]
+Vocab size: 29
+Uppercase (OOV) encoded: [1, 1, 1, 4, 1, 1, 1]
+UNK index: 1
+```
+
+## Exercise
+
+Build a word-level tokenizer for the corpus below. Your tokenizer should:
+1. Split on whitespace.
+2. Include `<PAD>`, `<UNK>`, `<BOS>`, `<EOS>`.
+3. Encode the sentence "the cat chases rats" — where "chases" and "rats" are OOV.
+4. Pad a batch of three sentences to the same length.
+
+```python
+corpus = ["the cat sat", "the dog ran far", "a bird flew"]
+```
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+corpus = ["the cat sat", "the dog ran far", "a bird flew"]
+words = sorted(set(w for s in corpus for w in s.split()))
+special = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+vocab = special + words
+w2i = {w: i for i, w in enumerate(vocab)}
+i2w = {i: w for w, i in w2i.items()}
+
+def encode_words(text, w2i):
+    return [w2i.get(w, w2i["<UNK>"]) for w in text.split()]
+
+test = encode_words("the cat chases rats", w2i)
+print("Encoded:", test)
+print("Decoded:", [i2w[i] for i in test])
+
+sentences = [encode_words(s, w2i) for s in corpus]
+sentences.append(encode_words("the cat chases rats", w2i))
+max_len = max(len(s) for s in sentences)
+batch = np.full((len(sentences), max_len), w2i["<PAD>"], dtype=np.int32)
+for i, s in enumerate(sentences):
+    batch[i, :len(s)] = s
+print("Batch:\n", batch)
+```
+
+OOV tokens map to index 1 (`<UNK>`). The padding mask is `batch != 0`.
+</details>

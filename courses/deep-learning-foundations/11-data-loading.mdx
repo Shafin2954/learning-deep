@@ -1,0 +1,280 @@
+---
+course: deep-learning-foundations
+chapter: 11-data-loading
+title: "Data Loading, Batching, and Augmentation Pipelines"
+order: 11
+---
+
+## Dataset and DataLoader
+
+PyTorch separates *what* data to load (`Dataset`) from *how* to batch and shuffle it (`DataLoader`).
+
+A map-style `Dataset` requires two methods: `__len__` and `__getitem__`. The DataLoader calls `__getitem__` on multiple indices in parallel (via `num_workers`) and collates the results into a batch.
+
+```python
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+
+class TabularDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+np.random.seed(0)
+X = np.random.randn(1000, 16)
+y = (X[:, 0] + X[:, 1] > 0).astype(int)
+
+ds = TabularDataset(X, y)
+print(f"Dataset size: {len(ds)}")
+x0, y0 = ds[0]
+print(f"First item: x shape={x0.shape}, label={y0.item()}")
+```
+
+```output
+Dataset size: 1000
+First item: x shape=torch.Size([16]), label=1
+```
+
+## DataLoader options
+
+```python
+loader = DataLoader(
+    ds,
+    batch_size=64,
+    shuffle=True,       # randomize order each epoch
+    num_workers=0,      # 0 = main process; >0 for parallel prefetch
+    pin_memory=False,   # True speeds up CPU→GPU transfer
+    drop_last=False,    # True: drop final incomplete batch
+)
+
+batch_x, batch_y = next(iter(loader))
+print(f"Batch x: {batch_x.shape}, batch y: {batch_y.shape}")
+print(f"Batches per epoch: {len(loader)}")
+```
+
+```output
+Batch x: torch.Size([64, 16]), batch y: torch.Size([64])
+Batches per epoch: 16
+```
+
+`num_workers > 0` spawns worker processes that prefetch data in parallel with the GPU. On Windows, always use `if __name__ == "__main__":` guards for multiprocessing — otherwise worker spawning fails. `pin_memory=True` allocates batches in pinned (page-locked) CPU memory so the CUDA DMA engine can transfer them faster.
+
+## Image Dataset from files
+
+```python
+import os
+from PIL import Image
+import torchvision.transforms as T
+
+class ImageFolderDataset(Dataset):
+    """Flat folder of images with filename-encoded labels: cat_001.jpg, dog_002.jpg."""
+    def __init__(self, folder, transform=None):
+        self.paths = [os.path.join(folder, f) for f in os.listdir(folder)
+                      if f.endswith(('.jpg', '.png'))]
+        self.labels = [0 if os.path.basename(p).startswith('cat') else 1
+                       for p in self.paths]
+        self.transform = transform
+
+    def __len__(self): return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, self.labels[idx]
+
+# Example transforms pipeline (without actual files):
+transform = T.Compose([
+    T.Resize(256),
+    T.CenterCrop(224),
+    T.ToTensor(),                         # PIL → [0,1] float tensor, CHW
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]),  # ImageNet stats
+])
+print("Transform pipeline defined (Resize → CenterCrop → ToTensor → Normalize)")
+print("Output tensor range after Normalize: approximately [-2.1, 2.6]")
+```
+
+```output
+Transform pipeline defined (Resize → CenterCrop → ToTensor → Normalize)
+Output tensor range after Normalize: approximately [-2.1, 2.6]
+```
+
+## Augmentation transforms
+
+Data augmentation applies random perturbations during training to synthetically expand the dataset and regularize the model. Use `T.RandomHorizontalFlip`, `T.RandomCrop`, `T.ColorJitter`, etc. Crucially, use different transforms for train vs validation:
+
+```python
+train_transform = T.Compose([
+    T.RandomResizedCrop(224, scale=(0.7, 1.0)),
+    T.RandomHorizontalFlip(p=0.5),
+    T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+    T.RandomGrayscale(p=0.05),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+val_transform = T.Compose([
+    T.Resize(256),
+    T.CenterCrop(224),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+# Simulate what the pipeline does to a tensor
+dummy = torch.randint(0, 256, (224, 224, 3), dtype=torch.uint8)
+pil_img = Image.fromarray(dummy.numpy())
+tensor_train = train_transform(pil_img)
+tensor_val = val_transform(pil_img)
+print(f"Train tensor: {tensor_train.shape}, mean={tensor_train.mean():.3f}")
+print(f"Val tensor:   {tensor_val.shape},   mean={tensor_val.mean():.3f}")
+```
+
+```output
+Train tensor: torch.Size([3, 224, 224]), mean=0.012
+Val tensor:   torch.Size([3, 224, 224]), mean=0.011
+```
+
+## Handling class imbalance
+
+When classes are imbalanced, `WeightedRandomSampler` oversamples minority classes so each batch sees a balanced distribution:
+
+```python
+from torch.utils.data import WeightedRandomSampler
+
+# Simulate imbalanced labels: 900 class-0, 100 class-1
+labels = torch.cat([torch.zeros(900), torch.ones(100)]).long()
+class_counts = torch.bincount(labels)
+class_weights = 1.0 / class_counts.float()
+sample_weights = class_weights[labels]
+
+sampler = WeightedRandomSampler(sample_weights, num_samples=len(labels), replacement=True)
+
+ds_dummy = torch.utils.data.TensorDataset(torch.randn(1000, 4), labels)
+loader_balanced = DataLoader(ds_dummy, batch_size=64, sampler=sampler)
+
+# Check one epoch's label distribution
+all_labels = torch.cat([yb for _, yb in loader_balanced])
+counts = torch.bincount(all_labels)
+print(f"Balanced loader — class 0: {counts[0]}, class 1: {counts[1]}")
+print(f"Ratio: {counts[1]/counts[0]:.2f} (close to 1.0 if balanced)")
+```
+
+```output
+Balanced loader — class 0: 512, class 1: 488
+Ratio: 0.95 (close to 1.0 if balanced)
+```
+
+## Custom collate_fn for variable-length inputs
+
+When inputs have different lengths (sequences, documents), the default collator can't stack them into a tensor. Supply a custom `collate_fn`:
+
+```python
+def pad_collate(batch):
+    xs, ys = zip(*batch)
+    lengths = [len(x) for x in xs]
+    max_len = max(lengths)
+    padded = torch.zeros(len(xs), max_len)
+    for i, x in enumerate(xs):
+        padded[i, :len(x)] = x
+    return padded, torch.tensor(lengths), torch.tensor(ys)
+
+# Simulate variable-length sequences
+seqs = [torch.randn(np.random.randint(5, 20)) for _ in range(8)]
+labs = torch.randint(0, 2, (8,))
+raw_batch = list(zip(seqs, labs.tolist()))
+padded, lengths, batch_labels = pad_collate(raw_batch)
+print(f"Padded tensor: {padded.shape}")
+print(f"Lengths: {lengths.tolist()}")
+```
+
+```output
+Padded tensor: torch.Size([8, 19])
+Lengths: [7, 16, 14, 19, 9, 11, 18, 6]
+```
+
+## Try it Yourself
+
+```python
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+
+np.random.seed(42)
+
+class SineDataset(Dataset):
+    """y = sin(2π x) + noise"""
+    def __init__(self, n=500):
+        self.x = torch.linspace(0, 2, n).unsqueeze(1)
+        self.y = torch.sin(2*3.14159*self.x) + 0.1*torch.randn_like(self.x)
+
+    def __len__(self): return len(self.x)
+    def __getitem__(self, idx): return self.x[idx], self.y[idx]
+
+ds = SineDataset(500)
+loader = DataLoader(ds, batch_size=32, shuffle=True)
+
+for i, (xb, yb) in enumerate(loader):
+    if i == 0:
+        print(f"First batch: x range=[{xb.min():.2f}, {xb.max():.2f}], y shape={yb.shape}")
+
+print(f"Total batches: {len(loader)}, total samples: {len(ds)}")
+```
+
+```output
+First batch: x range=[0.00, 1.98], y shape=torch.Size([32, 1])
+Total batches: 16, total samples: 500
+```
+
+Try increasing `num_workers=2` (on Linux/Mac) and measuring how long one epoch takes vs `num_workers=0`.
+
+## Exercise
+
+Build an `AugmentedTensorDataset` that wraps a tensor `(N, C, H, W)` and applies random horizontal flip and Gaussian noise during `__getitem__` (training mode) but returns clean tensors in eval mode. Verify that the augmented and clean versions have different pixel values.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+from torch.utils.data import Dataset
+
+class AugmentedTensorDataset(Dataset):
+    def __init__(self, X, y, noise_std=0.05):
+        self.X = X.float()
+        self.y = y
+        self.noise_std = noise_std
+        self.training = True
+
+    def __len__(self): return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx].clone()
+        if self.training:
+            if torch.rand(1).item() > 0.5:
+                x = torch.flip(x, dims=[-1])  # horizontal flip on last dim
+            x = x + torch.randn_like(x) * self.noise_std
+        return x, self.y[idx]
+
+torch.manual_seed(0)
+X = torch.arange(0, 4*3*8*8, dtype=torch.float32).reshape(4, 3, 8, 8) / 100
+y = torch.tensor([0, 1, 0, 1])
+
+ds = AugmentedTensorDataset(X, y)
+x_aug, _ = ds[0]
+ds.training = False
+x_clean, _ = ds[0]
+
+print(f"Augmented same as clean: {torch.allclose(x_aug, x_clean)}")
+print(f"Max pixel diff: {(x_aug - x_clean).abs().max():.4f}")
+```
+
+Set `ds.training = True` before creating the train DataLoader and `False` before the val DataLoader.
+</details>

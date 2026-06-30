@@ -1,0 +1,207 @@
+---
+course: classical-ml
+chapter: 03-regularization-ridge-lasso
+title: "Ridge, Lasso, and Elastic Net: Geometry of Regularization"
+order: 3
+---
+
+## Why regularization
+
+Linear regression minimises $\|y - Xw\|_2^2$. When features are correlated or $p$ is close to $n$, the normal equations become ill-conditioned: tiny changes in data cause huge swings in $w$. Regularization adds a penalty to the loss that keeps coefficients small.
+
+$$
+L_{\text{reg}}(w) = \underbrace{\|y - Xw\|_2^2}_{\text{fit}} + \underbrace{\text{penalty}(w)}_{\text{complexity}}
+$$
+
+The two canonical penalties produce very different geometries.
+
+## Ridge regression (L2 penalty)
+
+Add $\lambda\|w\|_2^2$:
+
+$$
+L_{\text{Ridge}} = \|y - Xw\|_2^2 + \lambda\|w\|_2^2
+$$
+
+Taking the gradient and setting to zero gives a closed-form solution:
+
+$$
+w_{\text{Ridge}} = (X^TX + \lambda I)^{-1}X^Ty
+$$
+
+Adding $\lambda I$ makes the matrix invertible even when $X^TX$ is singular. Ridge shrinks all coefficients toward 0 proportionally — large coefficients are penalised more — but none ever reach exactly zero.
+
+```python
+import numpy as np
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.datasets import make_regression
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+X, y, true_coef = make_regression(n_samples=100, n_features=20,
+                                   n_informative=5, noise=10,
+                                   coef=True, random_state=0)
+sc = StandardScaler()
+X = sc.fit_transform(X)
+
+ridge = Ridge(alpha=1.0).fit(X, y)
+nonzero = np.sum(np.abs(ridge.coef_) > 1e-10)
+print(f"Ridge: {nonzero}/20 nonzero coefs, max |coef| = {np.abs(ridge.coef_).max():.3f}")
+```
+
+```output
+Ridge: 20/20 nonzero coefs, max |coef| = 40.312
+```
+
+## Lasso regression (L1 penalty)
+
+Add $\lambda\|w\|_1$:
+
+$$
+L_{\text{Lasso}} = \|y - Xw\|_2^2 + \lambda\|w\|_1
+$$
+
+There is no closed form because the L1 norm is non-differentiable at zero. The standard solver is **coordinate descent**: cycle through each $w_j$, hold others fixed, and apply the soft-threshold operator $S(z, \lambda) = \text{sign}(z)\max(|z|-\lambda, 0)$.
+
+Lasso induces **sparsity**: many coefficients go to exactly zero, performing automatic feature selection.
+
+```python
+lasso = Lasso(alpha=0.5).fit(X, y)
+nonzero_lasso = np.sum(np.abs(lasso.coef_) > 1e-10)
+print(f"Lasso: {nonzero_lasso}/20 nonzero coefs")
+print(f"Active features: {np.where(np.abs(lasso.coef_) > 1e-10)[0].tolist()}")
+```
+
+```output
+Lasso: 5/20 nonzero coefs
+Active features: [1, 5, 10, 14, 17]
+```
+
+### Geometric intuition
+
+The unconstrained loss has elliptical contours. Adding a constraint $\|w\|_q \le t$ forces the solution to lie within the feasible region. For L2 (a ball), contours typically touch the smooth surface away from axes — all components nonzero. For L1 (a diamond in 2D), contours usually touch a **corner** of the diamond, which lies on an axis — forcing one component to zero.
+
+This is why L1 produces sparse solutions geometrically, not just numerically.
+
+## Coefficient paths
+
+```python
+import matplotlib.pyplot as plt
+from sklearn.linear_model import lasso_path
+
+alphas, coefs, _ = lasso_path(X, y, alphas=np.logspace(-2, 2, 100))
+
+fig, ax = plt.subplots(figsize=(7, 4))
+for i in range(coefs.shape[0]):
+    ax.plot(np.log10(alphas), coefs[i], alpha=0.6, linewidth=1)
+ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+ax.set_xlabel('log10(alpha)')
+ax.set_ylabel('coefficient value')
+ax.set_title('Lasso coefficient paths — shrink to zero as alpha increases')
+plt.tight_layout()
+plt.show()
+```
+
+```output
+[Figure: Lasso coefficient paths — most features collapse to zero at higher alpha; 5 survive longest]
+```
+
+## Elastic Net
+
+Elastic Net combines both penalties:
+
+$$
+L_{\text{EN}} = \|y - Xw\|_2^2 + \alpha_1\|w\|_1 + \alpha_2\|w\|_2^2
+$$
+
+In sklearn, `l1_ratio` controls the mix: `l1_ratio=1` → pure Lasso, `l1_ratio=0` → pure Ridge. Elastic Net is useful when features are grouped and correlated — Lasso tends to pick one from each group arbitrarily, Elastic Net can select the whole group.
+
+```python
+en = ElasticNet(alpha=0.5, l1_ratio=0.5).fit(X, y)
+nonzero_en = np.sum(np.abs(en.coef_) > 1e-10)
+print(f"ElasticNet (l1_ratio=0.5): {nonzero_en}/20 nonzero coefs")
+```
+
+```output
+ElasticNet (l1_ratio=0.5): 8/20 nonzero coefs
+```
+
+## Choosing lambda with cross-validation
+
+```python
+from sklearn.linear_model import LassoCV, RidgeCV
+
+lasso_cv = LassoCV(cv=5, random_state=0).fit(X, y)
+ridge_cv = RidgeCV(alphas=np.logspace(-3, 3, 50), cv=5).fit(X, y)
+
+print(f"LassoCV best alpha: {lasso_cv.alpha_:.4f}")
+print(f"RidgeCV best alpha: {ridge_cv.alpha_:.4f}")
+```
+
+```output
+LassoCV best alpha: 0.0968
+RidgeCV best alpha: 3.1623
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(42)
+n, p = 80, 30
+# Correlated features: first 5 are informative, rest are noise
+X = rng.standard_normal((n, p))
+X[:, 1] = X[:, 0] + rng.normal(0, 0.1, n)  # feature 1 ≈ feature 0
+true_w = np.zeros(p)
+true_w[:5] = [3, -2, 1.5, -1, 2]
+y = X @ true_w + rng.normal(0, 0.5, n)
+
+X = StandardScaler().fit_transform(X)
+
+for name, model in [("Ridge", Ridge(alpha=1.0)), ("Lasso", Lasso(alpha=0.1))]:
+    model.fit(X, y)
+    nz = np.sum(np.abs(model.coef_) > 0.01)
+    err = np.mean((model.predict(X) - y)**2)
+    print(f"{name}: {nz} nonzero, MSE={err:.3f}")
+```
+
+```output
+Ridge: 30 nonzero, MSE=0.291
+Lasso: 6 nonzero, MSE=0.289
+```
+
+## Exercise
+
+Generate 200 samples with 50 features where only 8 are truly informative. Fit Ridge, Lasso, and ElasticNet. Report how many features each selects (coefficients > 0.01) and which method recovers the true informative features most accurately.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.linear_model import Ridge, Lasso, ElasticNet, LassoCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.datasets import make_regression
+
+X, y, coef = make_regression(n_samples=200, n_features=50, n_informative=8,
+                               noise=5, coef=True, random_state=7)
+X = StandardScaler().fit_transform(X)
+true_nz = set(np.where(np.abs(coef) > 0)[0])
+
+for name, model in [
+    ("Ridge", Ridge(alpha=1.0)),
+    ("Lasso (CV)", LassoCV(cv=5, random_state=0)),
+    ("ElasticNet", ElasticNet(alpha=0.1, l1_ratio=0.5)),
+]:
+    model.fit(X, y)
+    pred_nz = set(np.where(np.abs(model.coef_) > 0.01)[0])
+    tp = len(true_nz & pred_nz)
+    fp = len(pred_nz - true_nz)
+    print(f"{name}: selected={len(pred_nz)}, TP={tp}/8, FP={fp}")
+```
+
+Lasso (via LassoCV) typically recovers all 8 informative features with the fewest false positives.
+</details>

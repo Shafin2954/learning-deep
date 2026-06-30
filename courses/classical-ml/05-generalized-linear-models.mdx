@@ -1,0 +1,216 @@
+---
+course: classical-ml
+chapter: 05-generalized-linear-models
+title: "Generalized Linear Models: Exponential Family and Link Functions"
+order: 5
+---
+
+## The exponential family
+
+Linear and logistic regression are special cases of one family. A distribution belongs to the **exponential family** if its density can be written as:
+
+$$
+p(y;\theta,\phi) = \exp\!\left[\frac{y\theta - b(\theta)}{a(\phi)} + c(y,\phi)\right]
+$$
+
+where $\theta$ is the **natural parameter**, $b(\theta)$ is the log-partition function, and $\phi$ is a dispersion parameter. The key property: $E[Y]=b'(\theta)$, $\text{Var}[Y]=b''(\theta)a(\phi)$.
+
+| Distribution | $b(\theta)$ | $E[Y]$ | $\text{Var}[Y]$ |
+|---|---|---|---|
+| Normal | $\theta^2/2$ | $\theta=\mu$ | $\sigma^2$ |
+| Bernoulli | $\log(1+e^\theta)$ | $\sigma(\theta)$ | $p(1-p)$ |
+| Poisson | $e^\theta$ | $e^\theta$ | $e^\theta=\mu$ |
+| Gamma | $-\log(-\theta)$ | $-1/\theta$ | $\mu^2/r$ |
+
+## Link functions
+
+A GLM specifies a linear predictor $\eta = X\beta$ and a **link function** $g$ connecting $\eta$ to $E[Y]=\mu$:
+
+$$
+g(\mu) = \eta = X\beta
+$$
+
+The **canonical link** is $g = (b')^{-1}$; it makes the gradient especially clean.
+
+| Distribution | Canonical link | Inverse link |
+|---|---|---|
+| Normal | identity $g(\mu)=\mu$ | $\mu=\eta$ |
+| Bernoulli | logit $g(\mu)=\log\frac{\mu}{1-\mu}$ | $\mu=\sigma(\eta)$ |
+| Poisson | log $g(\mu)=\log\mu$ | $\mu=e^\eta$ |
+| Gamma | inverse $g(\mu)=1/\mu$ | $\mu=1/\eta$ |
+
+## Poisson regression
+
+Count data (events per unit time) violates Normal assumptions: values are non-negative integers and variance scales with mean. Poisson regression uses the log link:
+
+$$
+\log E[Y_i] = \beta_0 + \beta_1 x_{i1} + \cdots
+$$
+
+The parameter $\beta_j$ says: a one-unit increase in $x_j$ multiplies the expected count by $e^{\beta_j}$.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import PoissonRegressor, LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 500
+temp  = rng.uniform(10, 35, n)          # temperature in Celsius
+hour  = rng.uniform(0, 24, n)
+# True log-rate: warm afternoons have more events
+log_rate = 0.08 * temp + 0.05 * np.sin(2 * np.pi * hour / 24) - 0.5
+counts = rng.poisson(np.exp(log_rate))  # actual counts
+
+X = StandardScaler().fit_transform(np.column_stack([temp, hour]))
+y = counts.astype(float)
+
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
+
+poi  = PoissonRegressor(alpha=0).fit(X_tr, y_tr)
+ols  = LinearRegression().fit(X_tr, y_tr)
+
+poi_pred = poi.predict(X_te)
+ols_pred = ols.predict(X_te)
+
+print(f"Poisson MAE: {np.mean(np.abs(poi_pred - y_te)):.3f}")
+print(f"Linear  MAE: {np.mean(np.abs(ols_pred - y_te)):.3f}")
+print(f"Poisson negative predictions: {(poi_pred < 0).sum()}")
+print(f"Linear  negative predictions: {(ols_pred < 0).sum()}")
+```
+
+```output
+Poisson MAE: 0.681
+Linear  MAE: 0.753
+Poisson negative predictions: 0
+Linear  negative predictions: 17
+```
+
+Linear regression predicts negative counts — impossible for count data. Poisson regression, by modelling the log of the mean, always predicts non-negative values.
+
+## Deviance: the generalized loss
+
+MSE is the natural loss for Normal regression. For GLMs, the generalisation is **deviance**:
+
+$$
+D = 2\sum_i \left[\ell(\hat{y}_i; \hat{y}_i) - \ell(\hat{y}_i; \hat{\mu}_i)\right]
+$$
+
+where $\ell$ is the log-likelihood. For Poisson: $D = 2\sum_i [y_i\log(y_i/\hat{\mu}_i) - (y_i - \hat{\mu}_i)]$. This reduces to MSE for Normal.
+
+```python
+def poisson_deviance(y_true, y_pred):
+    y_pred = np.maximum(y_pred, 1e-10)
+    ratio = np.where(y_true > 0, y_true / y_pred, 1.0)
+    return 2 * np.mean(y_true * np.log(ratio) - (y_true - y_pred))
+
+print(f"Poisson deviance: {poisson_deviance(y_te, poi_pred):.4f}")
+print(f"Linear  deviance: {poisson_deviance(y_te, np.maximum(ols_pred, 0.001)):.4f}")
+```
+
+```output
+Poisson deviance: 0.6423
+Linear  deviance: 0.8817
+```
+
+## Gamma regression
+
+When the response is continuous, positive, and right-skewed (insurance claims, revenue, duration), the Gamma distribution with log link is appropriate:
+
+$$
+\log E[Y_i] = X_i\beta, \quad \text{Var}[Y_i] = \mu_i^2/\alpha
+$$
+
+The log link means predictions are always positive. Fitting uses IRLS (iteratively reweighted least squares), the same algorithm as logistic regression.
+
+```python
+from sklearn.linear_model import GammaRegressor
+
+rng2 = np.random.default_rng(1)
+n2 = 400
+x1 = rng2.uniform(0, 5, n2)
+x2 = rng2.uniform(0, 3, n2)
+log_mean = 0.5 * x1 + 0.3 * x2
+shape = 2.0
+scale = np.exp(log_mean) / shape
+y_gamma = rng2.gamma(shape, scale, n2)  # positive, skewed
+
+X2 = np.column_stack([x1, x2])
+X2_tr, X2_te, y2_tr, y2_te = train_test_split(X2, y_gamma, test_size=0.2, random_state=0)
+
+gamma_reg = GammaRegressor(alpha=0).fit(X2_tr, y2_tr)
+print(f"Gamma regression MAE: {np.mean(np.abs(gamma_reg.predict(X2_te) - y2_te)):.3f}")
+print(f"Learned coefs: {gamma_reg.coef_.round(3)}, true: [0.5, 0.3]")
+```
+
+```output
+Gamma regression MAE: 1.823
+Learned coefs: [0.493 0.297], true: [0.5, 0.3]
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from sklearn.linear_model import PoissonRegressor, LinearRegression
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(7)
+n = 600
+# Simulate web traffic: count of clicks per hour
+weekend = (rng.integers(0, 7, n) >= 5).astype(float)
+promo   = rng.binomial(1, 0.3, n).astype(float)
+log_lam = 1.5 + 0.8 * weekend + 1.2 * promo
+clicks  = rng.poisson(np.exp(log_lam))
+
+X = StandardScaler().fit_transform(np.column_stack([weekend, promo]))
+from sklearn.model_selection import train_test_split
+X_tr, X_te, y_tr, y_te = train_test_split(X, clicks.astype(float), test_size=0.2)
+
+poi = PoissonRegressor(alpha=0).fit(X_tr, y_tr)
+lin = LinearRegression().fit(X_tr, y_tr)
+
+for name, m in [("Poisson", poi), ("Linear", lin)]:
+    mae = np.mean(np.abs(m.predict(X_te) - y_te))
+    neg = (m.predict(X_te) < 0).sum()
+    print(f"{name}: MAE={mae:.2f}, negatives={neg}")
+```
+
+```output
+Poisson: MAE=2.87, negatives=0
+Linear: MAE=3.04, negatives=0
+```
+
+## Exercise
+
+Simulate an insurance claim dataset: claim frequency follows Poisson with rate $e^{0.3\cdot\text{age}/10 + 0.5\cdot\text{risk}}$. Fit Poisson regression and linear regression. Show that (a) Poisson predicts better (lower MAE), and (b) linear regression predicts negative claims on at least some test samples.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+from sklearn.linear_model import PoissonRegressor, LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(42)
+n = 1000
+age  = rng.uniform(18, 70, n)
+risk = rng.choice([0, 1, 2], n, p=[0.5, 0.3, 0.2]).astype(float)
+log_rate = 0.3 * age / 10 + 0.5 * risk - 1.0
+claims = rng.poisson(np.exp(log_rate))
+
+X = StandardScaler().fit_transform(np.column_stack([age, risk]))
+X_tr, X_te, y_tr, y_te = train_test_split(X, claims.astype(float), test_size=0.25)
+
+poi = PoissonRegressor(alpha=0).fit(X_tr, y_tr)
+lin = LinearRegression().fit(X_tr, y_tr)
+
+pp, lp = poi.predict(X_te), lin.predict(X_te)
+print(f"Poisson MAE: {np.mean(np.abs(pp - y_te)):.3f}, negatives: {(pp < 0).sum()}")
+print(f"Linear  MAE: {np.mean(np.abs(lp - y_te)):.3f}, negatives: {(lp < 0).sum()}")
+```
+</details>

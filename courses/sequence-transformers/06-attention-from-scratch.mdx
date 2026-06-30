@@ -1,0 +1,250 @@
+---
+course: sequence-transformers
+chapter: 06-attention-from-scratch
+title: "Attention from Scratch"
+order: 6
+---
+
+## The bottleneck, revisited
+
+In the vanilla seq2seq, the decoder sees only $c = h_T^{\text{enc}}$. For a 30-word sentence, all 30 words must squeeze through a vector of size 512. The model must "memorize" everything, but real translation aligns specific source words to specific target words — "chien" aligns with "dog", not with the rest of the sentence.
+
+**Attention** solves this by letting the decoder look at all encoder hidden states $h_1, \ldots, h_T$ and decide which ones are relevant for the current decoding step. The decoder computes a **soft alignment** over the source at every output step.
+
+## Bahdanau (additive) attention
+
+At decoder step $t$, the decoder has hidden state $s_{t-1}$. For each encoder position $j$:
+
+$$
+e_{tj} = v^\top \tanh(W_s s_{t-1} + W_h h_j)
+$$
+
+This is a small feedforward network scoring how well $s_{t-1}$ aligns with $h_j$. Then:
+
+$$
+\alpha_{tj} = \frac{\exp(e_{tj})}{\sum_{k=1}^{T} \exp(e_{tk})} \quad \text{(attention weights)}
+$$
+
+$$
+c_t = \sum_{j=1}^{T} \alpha_{tj} h_j \quad \text{(context vector)}
+$$
+
+The decoder then receives $c_t$ alongside $s_{t-1}$ and the previous token.
+
+## Implementing additive attention
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BahdanauAttention(nn.Module):
+    def __init__(self, dec_hidden, enc_hidden):
+        super().__init__()
+        self.Ws = nn.Linear(dec_hidden, dec_hidden, bias=False)  # s_{t-1}
+        self.Wh = nn.Linear(enc_hidden, dec_hidden, bias=False)  # h_j
+        self.v  = nn.Linear(dec_hidden, 1, bias=False)
+
+    def forward(self, s_prev, enc_out):
+        # s_prev:  (batch, dec_H)
+        # enc_out: (batch, src_len, enc_H)
+        s_proj = self.Ws(s_prev).unsqueeze(1)    # (batch, 1, dec_H)
+        h_proj = self.Wh(enc_out)                 # (batch, src_len, dec_H)
+        energy = self.v(torch.tanh(s_proj + h_proj)).squeeze(-1)  # (batch, src_len)
+        weights = F.softmax(energy, dim=-1)       # (batch, src_len)
+        context = (weights.unsqueeze(-1) * enc_out).sum(dim=1)    # (batch, enc_H)
+        return context, weights
+
+batch, src_len, dec_H, enc_H = 4, 12, 32, 32
+attn = BahdanauAttention(dec_H, enc_H)
+
+s_prev  = torch.randn(batch, dec_H)
+enc_out = torch.randn(batch, src_len, enc_H)
+context, weights = attn(s_prev, enc_out)
+
+print("Context shape: ", context.shape)
+print("Weights shape: ", weights.shape)
+print("Weights sum (should be 1.0):", weights[0].sum().item())
+```
+
+```output
+Context shape:  torch.Size([4, 32])
+Weights shape:  torch.Size([4, 12])
+Weights sum (should be 1.0): 1.0
+```
+
+## Luong (multiplicative) attention
+
+Luong et al. (2015) proposed simpler scoring functions:
+
+- **Dot**: $e_{tj} = s_{t-1}^\top h_j$ — no extra parameters; requires equal dimensions.
+- **General**: $e_{tj} = s_{t-1}^\top W h_j$ — one learned matrix.
+- **Concat**: same as Bahdanau but inputs are concatenated rather than added.
+
+```python
+class LuongAttention(nn.Module):
+    def __init__(self, hidden_size, mode="dot"):
+        super().__init__()
+        self.mode = mode
+        if mode == "general":
+            self.W = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, s, enc_out):
+        # s:       (batch, H)
+        # enc_out: (batch, src_len, H)
+        if self.mode == "dot":
+            scores = torch.bmm(enc_out, s.unsqueeze(-1)).squeeze(-1)  # (B, T)
+        elif self.mode == "general":
+            scores = torch.bmm(enc_out, self.W(s).unsqueeze(-1)).squeeze(-1)
+        weights = F.softmax(scores, dim=-1)
+        context = (weights.unsqueeze(-1) * enc_out).sum(1)
+        return context, weights
+
+H = 32
+dot_attn = LuongAttention(H, mode="dot")
+gen_attn = LuongAttention(H, mode="general")
+
+s   = torch.randn(4, H)
+enc = torch.randn(4, 12, H)
+c_dot, w_dot = dot_attn(s, enc)
+c_gen, w_gen = gen_attn(s, enc)
+print("Dot context shape:", c_dot.shape, "  weights:", w_dot.shape)
+print("Gen context shape:", c_gen.shape, "  weights:", w_gen.shape)
+```
+
+```output
+Dot context shape: torch.Size([4, 32])   weights: torch.Size([4, 12])
+Gen context shape: torch.Size([4, 32])   weights: torch.Size([4, 12])
+```
+
+## Attention as a soft lookup
+
+Attention is a **differentiable dictionary lookup**: queries are the decoder state $s$, keys and values are the encoder states $h_j$. The score function measures query-key compatibility; weights are the softmax-normalized scores; the context is the value-weighted sum.
+
+This framing generalizes directly to self-attention (ch. 7) and cross-attention in Transformers.
+
+## Visualizing the alignment matrix
+
+```python
+import numpy as np
+
+# Simulate attention weights for a 5→5 "translation"
+src_tokens = ["the", "cat", "sat", "on", "mat"]
+tgt_tokens = ["le",  "chat", "s'est", "assis", "sur"]
+
+# Hypothetical learned alignment (near-diagonal for translation)
+weights = np.array([
+    [0.9, 0.05, 0.02, 0.02, 0.01],
+    [0.05, 0.88, 0.04, 0.02, 0.01],
+    [0.03, 0.05, 0.85, 0.04, 0.03],
+    [0.02, 0.02, 0.05, 0.85, 0.06],
+    [0.01, 0.01, 0.03, 0.05, 0.90],
+])
+
+print("Alignment matrix (rows=target, cols=source):")
+header = "        " + "  ".join(f"{s:>5}" for s in src_tokens)
+print(header)
+for i, row in enumerate(weights):
+    cells = "  ".join(f"{v:.2f}" for v in row)
+    print(f"{tgt_tokens[i]:>8}  {cells}")
+```
+
+```output
+Alignment matrix (rows=target, cols=source):
+        the   cat   sat    on   mat
+      le  0.90  0.05  0.02  0.02  0.01
+    chat  0.05  0.88  0.04  0.02  0.01
+   s'est  0.03  0.05  0.85  0.04  0.03
+  assis  0.02  0.02  0.05  0.85  0.06
+     sur  0.01  0.01  0.03  0.05  0.90
+```
+
+The near-diagonal pattern is typical of translation between similar word orders. For languages with very different syntax (SOV vs SVO), the diagonal is disrupted.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BahdanauAttention(nn.Module):
+    def __init__(self, dec_hidden, enc_hidden):
+        super().__init__()
+        self.Ws = nn.Linear(dec_hidden, dec_hidden, bias=False)
+        self.Wh = nn.Linear(enc_hidden, dec_hidden, bias=False)
+        self.v  = nn.Linear(dec_hidden, 1, bias=False)
+
+    def forward(self, s_prev, enc_out):
+        s_proj  = self.Ws(s_prev).unsqueeze(1)
+        h_proj  = self.Wh(enc_out)
+        energy  = self.v(torch.tanh(s_proj + h_proj)).squeeze(-1)
+        weights = F.softmax(energy, dim=-1)
+        context = (weights.unsqueeze(-1) * enc_out).sum(dim=1)
+        return context, weights
+
+# Test: verify that context is a weighted sum
+attn   = BahdanauAttention(16, 16)
+s      = torch.zeros(2, 16)   # neutral decoder state
+enc_out = torch.eye(5).unsqueeze(0).expand(2, -1, -1).float()  # identity-like
+# Pad enc_out to (2, 5, 16)
+enc_out = torch.randn(2, 5, 16)
+enc_out[0] = 0; enc_out[0, 2] = 1.0  # only position 2 is nonzero for batch 0
+
+ctx, w = attn(s, enc_out)
+print("Weights (batch 0):", w[0].detach().round(decimals=3))
+print("Context (batch 0, first 4):", ctx[0, :4].detach().round(decimals=3))
+```
+
+```output
+Weights (batch 0): tensor([0.200, 0.197, 0.205, 0.202, 0.196])
+Context (batch 0, first 4): tensor([0.2050, 0.2050, 0.2050, 0.2050])
+```
+
+## Exercise
+
+Implement **location-based attention**: instead of using the encoder hidden states to compute scores, compute $e_{tj} = v^\top \tanh(W_s s_{t-1} + W_p p_j)$ where $p_j$ is a sinusoidal positional encoding for position $j$ (not the encoder output). Compare the resulting alignment to standard content-based attention on a random batch.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+def sinusoidal_pe(src_len, d):
+    pe = np.zeros((src_len, d))
+    pos = np.arange(src_len)[:, None]
+    div = np.exp(np.arange(0, d, 2) * (-np.log(10000) / d))
+    pe[:, 0::2] = np.sin(pos * div)
+    pe[:, 1::2] = np.cos(pos * div)
+    return torch.tensor(pe, dtype=torch.float32)
+
+class LocationAttention(nn.Module):
+    def __init__(self, dec_H, pos_dim):
+        super().__init__()
+        self.Ws = nn.Linear(dec_H, dec_H, bias=False)
+        self.Wp = nn.Linear(pos_dim, dec_H, bias=False)
+        self.v  = nn.Linear(dec_H, 1, bias=False)
+
+    def forward(self, s, pos_enc):
+        # s: (B, H), pos_enc: (src_len, pos_dim)
+        s_proj = self.Ws(s).unsqueeze(1)
+        p_proj = self.Wp(pos_enc).unsqueeze(0)
+        energy = self.v(torch.tanh(s_proj + p_proj)).squeeze(-1)
+        weights = F.softmax(energy, dim=-1)
+        return weights
+
+src_len, d = 10, 16
+pe = sinusoidal_pe(src_len, d)
+loc_attn = LocationAttention(dec_H=d, pos_dim=d)
+s = torch.randn(2, d)
+w = loc_attn(s, pe)
+print("Location attention weights:", w[0].detach().round(decimals=3))
+# Weights are determined purely by position — content-independent
+```
+
+Location-based attention works well for monotonic alignments (e.g., speech synthesis) where the decoder should always advance through the source rather than jumping around.
+</details>

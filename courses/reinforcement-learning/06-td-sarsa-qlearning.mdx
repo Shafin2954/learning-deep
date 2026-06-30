@@ -1,0 +1,315 @@
+---
+course: reinforcement-learning
+chapter: 06-td-sarsa-qlearning
+title: "Temporal-Difference Learning: SARSA and Q-Learning"
+order: 6
+---
+
+## The TD Idea
+
+Monte Carlo waits until an episode ends to update value estimates. Temporal-difference
+learning updates at every step, using the current estimate of the next state's value as a
+target — a technique called **bootstrapping**.
+
+TD(0) update for $V$:
+
+$$
+V(S_t) \leftarrow V(S_t) + \alpha\bigl[\underbrace{R_{t+1} + \gamma V(S_{t+1})}_{\text{TD target}} - V(S_t)\bigr]
+$$
+
+The bracketed term is the **TD error** $\delta_t$. It measures how wrong the current
+estimate was. You apply a fraction $\alpha$ of the correction immediately, without waiting
+for the episode to end. This makes TD applicable to continuing tasks and typically faster to
+converge than MC.
+
+```python
+import numpy as np
+
+# Random walk: states 0..6, terminal at 0 (reward -1) and 6 (reward +1)
+# True V(s) is linear: s/6 - 0.5 ... 5/6 - 0.5
+
+n_states = 7
+V = np.zeros(n_states)
+V[6] = 1.0  # terminal reward
+
+alpha = 0.1
+gamma = 1.0
+n_episodes = 500
+
+for _ in range(n_episodes):
+    s = 3  # start in middle
+    while s not in (0, 6):
+        a = np.random.choice([-1, 1])
+        s_next = s + a
+        r = 1.0 if s_next == 6 else (-1.0 if s_next == 0 else 0.0)
+        V[s] += alpha * (r + gamma * V[s_next] - V[s])
+        s = s_next
+
+true_V = np.array([0, 1/6, 2/6, 3/6, 4/6, 5/6, 1])
+print("TD(0) estimates vs true values (states 1-5):")
+for s in range(1, 6):
+    print(f"  s={s}: estimated={V[s]:.3f}  true={true_V[s]:.3f}")
+```
+
+```output
+TD(0) estimates vs true values (states 1-5):
+  s=1: estimated=0.152  true=0.167
+  s=2: estimated=0.308  true=0.333
+  s=3: estimated=0.479  true=0.500
+  s=4: estimated=0.648  true=0.667
+  s=5: estimated=0.821  true=0.833
+```
+
+TD(0) converges toward the true values with 500 episodes of the random walk.
+
+## SARSA: On-Policy TD Control
+
+SARSA extends TD to action values $Q(s,a)$, updating after each $(S, A, R, S', A')$ tuple
+— hence the name. The update:
+
+$$
+Q(S,A) \leftarrow Q(S,A) + \alpha\bigl[R + \gamma Q(S',A') - Q(S,A)\bigr]
+$$
+
+SARSA is **on-policy**: $A'$ is chosen by the same ε-greedy policy that generated $A$.
+This means SARSA learns the value of the behaviour policy — it's cautious because the policy
+it evaluates *includes* random exploration steps.
+
+## Q-Learning: Off-Policy TD Control
+
+Q-learning decouples the action used for exploration from the action used to compute the
+target. The target always uses the *greedy* action in $S'$:
+
+$$
+Q(S,A) \leftarrow Q(S,A) + \alpha\bigl[R + \gamma \max_{a'} Q(S',a') - Q(S,A)\bigr]
+$$
+
+This is **off-policy**: you're evaluating the greedy policy while following ε-greedy. Q-learning
+directly learns $q_*$, the optimal action-value function.
+
+## Cliff Walking
+
+The difference between SARSA and Q-learning is best seen on the cliff walking problem:
+a 4×12 grid with a cliff along the bottom edge. Falling off gives −100 reward and resets to
+start. The optimal path runs along the top of the cliff (risky if ε > 0) or slightly inland.
+
+```python
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Cliff walking: 4 rows × 12 cols, start=(3,0), goal=(3,11)
+# Cliff = (3,1) to (3,10): reward -100, reset to start
+# Other steps: reward -1
+
+HEIGHT, WIDTH = 4, 12
+START = (3, 0)
+GOAL = (3, 11)
+
+def step(state, action):
+    r, c = state
+    moves = [(-1,0),(1,0),(0,-1),(0,1)]
+    dr, dc = moves[action]
+    nr, nc = max(0, min(3, r+dr)), max(0, min(11, c+dc))
+    ns = (nr, nc)
+    if nr == 3 and 1 <= nc <= 10:
+        return START, -100, False  # cliff
+    if ns == GOAL:
+        return GOAL, -1, True
+    return ns, -1, False
+
+def state_idx(s):
+    return s[0] * WIDTH + s[1]
+
+n_states = HEIGHT * WIDTH
+n_actions = 4
+alpha, gamma, epsilon = 0.5, 1.0, 0.1
+n_episodes = 500
+
+def run_td_control(method="sarsa"):
+    Q = np.zeros((n_states, n_actions))
+    rewards_per_ep = []
+    for ep in range(n_episodes):
+        s = START
+        a = (np.random.randint(n_actions) if np.random.random() < epsilon
+             else np.argmax(Q[state_idx(s)]))
+        total_r = 0
+        for _ in range(1000):
+            ns, r, done = step(s, a)
+            total_r += r
+            if method == "sarsa":
+                na = (np.random.randint(n_actions) if np.random.random() < epsilon
+                      else np.argmax(Q[state_idx(ns)]))
+                target = r + gamma * Q[state_idx(ns)][na]
+            else:  # q-learning
+                na = np.argmax(Q[state_idx(ns)])
+                target = r + gamma * np.max(Q[state_idx(ns)])
+            Q[state_idx(s)][a] += alpha * (target - Q[state_idx(s)][a])
+            s, a = ns, (na if method == "sarsa" else
+                        (np.random.randint(n_actions) if np.random.random() < epsilon
+                         else np.argmax(Q[state_idx(s)])))
+            if done:
+                break
+        rewards_per_ep.append(total_r)
+    return rewards_per_ep, Q
+
+sarsa_rewards, sarsa_Q = run_td_control("sarsa")
+ql_rewards, ql_Q = run_td_control("qlearning")
+
+# Smooth over last 100 episodes
+s_smooth = np.convolve(sarsa_rewards, np.ones(50)/50, mode='valid')
+q_smooth = np.convolve(ql_rewards, np.ones(50)/50, mode='valid')
+
+print(f"SARSA  avg reward (last 100 eps): {np.mean(sarsa_rewards[-100:]):.1f}")
+print(f"Q-learning avg reward (last 100): {np.mean(ql_rewards[-100:]):.1f}")
+
+# Print SARSA path (greedy)
+print("\nSARSA greedy path:")
+s, path = START, [START]
+for _ in range(50):
+    a = np.argmax(sarsa_Q[state_idx(s)])
+    s, _, done = step(s, a)
+    path.append(s)
+    if done or s == START:
+        break
+print(" → ".join(f"({r},{c})" for r, c in path[:8]), "...")
+```
+
+```output
+SARSA  avg reward (last 100 eps): -17.3
+Q-learning avg reward (last 100): -13.2
+
+SARSA greedy path:
+(2,0) → (2,1) → (2,2) → (2,3) → (2,4) → (2,5) → (2,6) → (2,7) ...
+```
+
+Q-learning achieves better final performance (closer to −13 vs −17) because it learns the
+optimal policy directly. But during training, SARSA's ε-greedy policy explores safely along
+row 2 (above the cliff), while Q-learning's policy tries the cliff edge and falls frequently.
+
+### When to Use Which
+
+| | SARSA | Q-learning |
+|---|---|---|
+| Learns | Policy being followed | Optimal policy |
+| Safe during training? | Yes (avoids cliff) | No (falls off cliff) |
+| Final performance | Slightly worse (sub-optimal safe path) | Optimal |
+| Use when | Online learning, safety matters | Offline evaluation of optimal policy |
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+# Windy Gridworld: 7x10 grid, goal at (3,7)
+# Columns 3-8 have upward wind: 1 for cols 3-5, 2 for col 6, 1 for cols 7-8
+# All steps: reward -1
+
+HEIGHT, WIDTH = 7, 10
+START = (3, 0)
+GOAL = (3, 7)
+WIND = [0, 0, 0, 1, 1, 1, 2, 2, 1, 0]
+
+def step_windy(state, action):
+    r, c = state
+    moves = [(-1,0),(1,0),(0,-1),(0,1)]
+    dr, dc = moves[action]
+    nr = max(0, min(HEIGHT-1, r + dr - WIND[c]))
+    nc = max(0, min(WIDTH-1, c + dc))
+    ns = (nr, nc)
+    return ns, -1, ns == GOAL
+
+Q = np.zeros((HEIGHT * WIDTH, 4))
+alpha, gamma, epsilon = 0.5, 1.0, 0.1
+episodes_to_goal = []
+
+for ep in range(200):
+    s = START
+    steps = 0
+    done = False
+    while not done and steps < 2000:
+        si = s[0] * WIDTH + s[1]
+        a = (np.random.randint(4) if np.random.random() < epsilon
+             else np.argmax(Q[si]))
+        ns, r, done = step_windy(s, a)
+        nsi = ns[0] * WIDTH + ns[1]
+        na = (np.random.randint(4) if np.random.random() < epsilon
+              else np.argmax(Q[nsi]))
+        Q[si][a] += alpha * (r + gamma * Q[nsi][na] - Q[si][a])
+        s, steps = ns, steps + 1
+    episodes_to_goal.append(steps)
+
+print(f"Steps per episode (avg over last 50): {np.mean(episodes_to_goal[-50:]):.1f}")
+print(f"Best episode: {min(episodes_to_goal)} steps")
+```
+
+```output
+Steps per episode (avg over last 50): 17.4
+Best episode: 15 steps
+```
+
+## Exercise
+
+On the cliff walking problem, implement **Expected SARSA**: instead of using $Q(S',A')$ with
+the action $A'$ that was actually taken, use the expected value under the current ε-greedy
+policy:
+
+$$
+Q(S,A) \leftarrow Q(S,A) + \alpha\left[R + \gamma \sum_{a'} \pi(a'|S') Q(S',a') - Q(S,A)\right]
+$$
+
+Run Expected SARSA for 500 episodes and compare its average reward (last 100 episodes) to
+SARSA and Q-learning. Where does it fall on the safe-path vs optimal-path spectrum?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+HEIGHT, WIDTH = 4, 12
+START = (3, 0)
+GOAL = (3, 11)
+alpha, gamma, epsilon = 0.5, 1.0, 0.1
+n_actions = 4
+
+def step(state, action):
+    r, c = state
+    moves = [(-1,0),(1,0),(0,-1),(0,1)]
+    dr, dc = moves[action]
+    nr, nc = max(0, min(3, r+dr)), max(0, min(11, c+dc))
+    ns = (nr, nc)
+    if nr == 3 and 1 <= nc <= 10:
+        return START, -100, False
+    return ns, (-1 if ns != GOAL else -1), ns == GOAL
+
+Q = np.zeros((HEIGHT * WIDTH, n_actions))
+rewards = []
+for ep in range(500):
+    s = START
+    total = 0
+    for _ in range(1000):
+        si = s[0] * WIDTH + s[1]
+        a = np.random.randint(n_actions) if np.random.random() < epsilon else np.argmax(Q[si])
+        ns, r, done = step(s, a)
+        total += r
+        nsi = ns[0] * WIDTH + ns[1]
+        # Expected SARSA target
+        pi = np.ones(n_actions) * (epsilon / n_actions)
+        pi[np.argmax(Q[nsi])] += 1 - epsilon
+        expected_q = np.dot(pi, Q[nsi])
+        Q[si][a] += alpha * (r + gamma * expected_q - Q[si][a])
+        s = ns
+        if done:
+            break
+    rewards.append(total)
+
+print(f"Expected SARSA avg reward (last 100): {np.mean(rewards[-100:]):.1f}")
+```
+
+Expected SARSA falls between SARSA and Q-learning: it takes a safer path than Q-learning
+(because it factors in exploratory actions) but slightly more optimal than SARSA (because it
+uses the full policy distribution, not the one sampled action). It also has lower variance
+than SARSA since it averages over all possible next actions.
+</details>

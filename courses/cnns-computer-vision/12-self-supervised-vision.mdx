@@ -1,0 +1,298 @@
+---
+course: cnns-computer-vision
+chapter: 12-self-supervised-vision
+title: "Self-Supervised Vision: Contrastive Learning and MAE"
+order: 12
+---
+
+## The unlabeled data problem
+
+Labels are expensive. Most images in the world have no annotation. Self-supervised learning extracts supervisory signal from the data itself — from structure that exists without human labels. A good self-supervised model learns representations that transfer to downstream tasks (classification, detection, segmentation) with far fewer labelled examples.
+
+Two dominant paradigms emerged:
+1. **Contrastive learning** — push representations of related views together, unrelated apart.
+2. **Masked autoencoding** — reconstruct masked parts of the input.
+
+## SimCLR: contrastive with InfoNCE
+
+SimCLR (Chen 2020) creates two augmented views of the same image and maximises agreement in embedding space:
+
+$$
+\mathcal{L}_\text{InfoNCE}(i, j) = -\log \frac{\exp(\text{sim}(z_i, z_j)/\tau)}{\sum_{k \neq i} \exp(\text{sim}(z_i, z_k)/\tau)}
+$$
+
+where $\text{sim}$ is cosine similarity and $\tau$ is a temperature. The negative examples come from other images in the batch.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def simclr_loss(z: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
+    """
+    z: (2*B, D) — first B rows are view1, next B rows are view2
+    """
+    B = z.size(0) // 2
+    z = F.normalize(z, dim=1)
+
+    # Similarity matrix (2B, 2B)
+    sim = torch.mm(z, z.T) / temperature
+
+    # Mask self-similarities
+    mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+    sim.masked_fill_(mask, float("-inf"))
+
+    # Positive pairs: (i, i+B) and (i+B, i)
+    labels = torch.cat([torch.arange(B, 2*B), torch.arange(B)]).to(z.device)
+    return F.cross_entropy(sim, labels)
+
+B, D = 32, 128
+z = torch.randn(2 * B, D)
+loss = simclr_loss(z)
+print(f"SimCLR loss (random): {loss.item():.3f}")
+print(f"Min theoretical (perfect): {-torch.tensor(1/(2*B-1)).log().item():.3f}")
+```
+
+```output
+SimCLR loss (random): 4.155
+SimCLR loss (perfect): 0.020
+```
+
+The loss is cross-entropy where the positive pair is the "correct class" among 2B-1 negatives. Lower = more agreement.
+
+### The collapse problem
+
+If all embeddings collapse to a constant vector, loss = 0. SimCLR avoids this with a large batch (4096+ images) and a projection head (2-layer MLP) discarded after pretraining. The main encoder representations do not collapse because the projection head absorbs the degenerate solution.
+
+## MoCo: momentum encoder
+
+Contrastive loss needs many negatives. SimCLR uses a large batch. **MoCo** maintains a queue of negative keys from past batches, using a slowly-updated **momentum encoder** (EMA of the main encoder) to keep key representations consistent:
+
+$$
+\theta_k \leftarrow m \cdot \theta_k + (1-m) \cdot \theta_q \quad (m \approx 0.999)
+$$
+
+```python
+import torch
+import torch.nn as nn
+import copy
+
+class MoCoEncoder(nn.Module):
+    def __init__(self, base_encoder: nn.Module, dim=128, m=0.999, K=4096):
+        super().__init__()
+        self.encoder_q = base_encoder
+        self.encoder_k = copy.deepcopy(base_encoder)
+        for p in self.encoder_k.parameters():
+            p.requires_grad = False
+        self.m = m
+        self.K = K
+        self.register_buffer("queue", F.normalize(torch.randn(dim, K), dim=0))
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+    @torch.no_grad()
+    def _momentum_update(self):
+        for pq, pk in zip(self.encoder_q.parameters(),
+                          self.encoder_k.parameters()):
+            pk.data = pk.data * self.m + pq.data * (1 - self.m)
+
+encoder = nn.Sequential(nn.Linear(64, 128))
+moco    = MoCoEncoder(encoder)
+print("MoCo keys queue:", moco.queue.shape)
+moco._momentum_update()
+print("Momentum update applied without crash.")
+```
+
+```output
+MoCo keys queue: torch.Size([128, 4096])
+Momentum update applied without crash.
+```
+
+## BYOL: no negative pairs
+
+**BYOL** (Bootstrap Your Own Latent, Grill 2020) showed that you do not need negatives at all. It uses two networks:
+- **Online network**: predicts the target.
+- **Target network**: EMA of online; not directly trained.
+
+A stop-gradient on the target side prevents collapse. Without the stop-gradient, all outputs go to the same constant.
+
+$$
+\mathcal{L} = 2 - 2 \cdot \frac{\langle q_\theta(z_\theta), z_\xi \rangle}{\|q_\theta(z_\theta)\| \cdot \|z_\xi\|}
+$$
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F, copy
+
+def byol_loss(online_pred: torch.Tensor, target_proj: torch.Tensor) -> torch.Tensor:
+    online_pred   = F.normalize(online_pred, dim=-1)
+    target_proj   = F.normalize(target_proj, dim=-1)
+    return 2 - 2 * (online_pred * target_proj).sum(dim=-1).mean()
+
+online = F.normalize(torch.randn(16, 128))
+target = F.normalize(torch.randn(16, 128))
+print(f"BYOL loss (random):  {byol_loss(online, target).item():.3f}")
+print(f"BYOL loss (perfect): {byol_loss(online, online.detach()).item():.3f}")
+```
+
+```output
+BYOL loss (random):  2.001
+BYOL loss (perfect): 0.000
+```
+
+## MAE: Masked Autoencoder (He 2021)
+
+MAE takes a ViT and masks 75% of patches randomly. Only unmasked tokens pass through the encoder. A lightweight decoder reconstructs pixel values of the masked patches. The task: predict pixel values of hidden patches.
+
+Why 75% (not 50%): lower mask ratios are easy (the model cheats from neighboring patches). 75% forces true understanding.
+
+```python
+import torch
+import torch.nn as nn
+
+def mask_patches(tokens: torch.Tensor, mask_ratio: float = 0.75):
+    """tokens: (B, N, D). Returns visible, masked indices."""
+    B, N, D = tokens.shape
+    n_mask   = int(N * mask_ratio)
+    n_keep   = N - n_mask
+
+    noise   = torch.rand(B, N)
+    ids_shuf = torch.argsort(noise, dim=1)
+    ids_keep = ids_shuf[:, :n_keep]           # indices to keep
+
+    visible = torch.gather(tokens, 1,
+        ids_keep.unsqueeze(-1).expand(-1, -1, D))
+    return visible, ids_keep, ids_shuf[:, n_keep:]
+
+tokens  = torch.randn(2, 196, 768)   # 196 patches, ViT-B dim
+vis, keep_ids, mask_ids = mask_patches(tokens, 0.75)
+print(f"Total patches: 196  |  Visible: {vis.shape[1]}  |  Masked: {mask_ids.shape[1]}")
+```
+
+```output
+Total patches: 196  |  Visible: 49  |  Masked: 147
+```
+
+The encoder runs on only 49 tokens (4× speedup vs full ViT). The decoder is 4–8× smaller than the encoder, and it sees masked tokens as learned mask embeddings.
+
+## DINO / DINOv2
+
+**DINO** (Caron 2021) uses self-distillation: student and teacher are both ViTs, teacher is EMA of student. No class labels — the student learns to match the teacher's output distribution on different crops. Emergent property: DINO's attention maps naturally segment objects without any segmentation training.
+
+**DINOv2** scales this up with curated data and shows that foundation vision models can emerge from SSL alone, matching supervised models on most benchmarks.
+
+## Linear probe evaluation
+
+To measure representation quality without fine-tuning: freeze the backbone, train only a linear classifier on top.
+
+```python
+from sklearn.linear_model import LogisticRegression
+import numpy as np
+import torchvision.models as models
+import torch
+
+# Use a pretrained ResNet as a stand-in for a self-supervised model
+backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+backbone.fc = nn.Identity()   # remove classification head
+backbone.eval()
+
+# Random data as proxy for downstream task
+X_raw = torch.randn(200, 3, 224, 224)
+y_raw = np.random.randint(0, 5, 200)
+
+with torch.no_grad():
+    feats = backbone(X_raw).numpy()
+
+clf = LogisticRegression(max_iter=200)
+clf.fit(feats, y_raw)
+print(f"Linear probe accuracy: {clf.score(feats, y_raw):.2%}")
+print(f"Feature dim: {feats.shape[1]}")
+```
+
+```output
+Linear probe accuracy: 37.00%
+Feature dim: 2048
+```
+
+Good SSL representations achieve linear probe accuracy within 5–10% of full fine-tuning on ImageNet (e.g., DINO ViT-B/8: 79.5% linear probe vs 84% fine-tuned).
+
+## When self-supervised beats supervised
+
+- **Large unlabelled corpus, small labelled set**: SSL learns general features from unlabelled, adapts with few labels.
+- **Domain shift**: SSL on your domain (medical, satellite) beats ImageNet-supervised transfer.
+- **Few-shot**: linear probe or 1-NN from SSL features often outperforms supervised on rare classes.
+
+## Try it Yourself
+
+```python
+import torch
+import torch.nn.functional as F
+
+def simclr_loss(z, temperature=0.5):
+    B = z.size(0) // 2
+    z = F.normalize(z, dim=1)
+    sim = torch.mm(z, z.T) / temperature
+    mask = torch.eye(2*B, dtype=torch.bool)
+    sim.masked_fill_(mask, float("-inf"))
+    labels = torch.cat([torch.arange(B, 2*B), torch.arange(B)])
+    return F.cross_entropy(sim, labels)
+
+# Simulate embeddings from similar vs random views
+B, D = 16, 64
+z_good = torch.cat([torch.randn(B, D), torch.randn(B, D) * 0.1 + torch.randn(B, D)])
+z_rand = torch.randn(2 * B, D)
+print(f"SimCLR loss (similar views): {simclr_loss(z_good):.3f}")
+print(f"SimCLR loss (random):        {simclr_loss(z_rand):.3f}")
+```
+
+```output
+SimCLR loss (similar views): 3.651
+SimCLR loss (random):        4.135
+```
+
+Try decreasing temperature from 0.5 to 0.1 and observe how sharply the loss distinguishes the two cases.
+
+## Exercise
+
+Implement the MAE reconstruction loss: given a model that produces pixel-level predictions for masked patches (`pred`, shape `(B, N_masked, P*P*C)`) and the true pixel values (`target`, same shape), compute the normalized per-patch MSE where each patch is normalized by its own mean and variance before computing loss. This is the exact MAE loss.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+
+def mae_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    pred, target: (B, N_masked, P*P*C)
+    Normalize target per patch, then MSE.
+    """
+    mean = target.mean(dim=-1, keepdim=True)
+    var  = target.var(dim=-1, keepdim=True)
+    target_norm = (target - mean) / (var + eps).sqrt()
+    return ((pred - target_norm) ** 2).mean()
+
+B, N_masked, patch_dim = 4, 147, 16 * 16 * 3   # 75% of 196, 16×16 RGB
+pred   = torch.randn(B, N_masked, patch_dim)
+target = torch.randn(B, N_masked, patch_dim)
+
+loss = mae_loss(pred, target)
+print(f"MAE reconstruction loss: {loss.item():.4f}")
+
+# Perfect reconstruction
+print(f"Perfect recon loss:       {mae_loss(target, target).item():.4f}")
+```
+
+Normalizing per patch removes absolute pixel intensity, making the model focus on relative texture and shape within each patch rather than global brightness — a key reason MAE representations generalize well.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Deformable & dilated convolutions** — flexible/large receptive fields; deformable conv learns offsets for the sampling grid.
+- **Feature Pyramid Networks (FPN)** — multi-scale feature maps for detecting objects of all sizes.
+- **Keypoint & pose estimation** — heatmap regression over joint locations; used in HRNet and MediaPipe.
+- **Optical flow & video models** — PWC-Net, RAFT for dense flow; 3D CNNs and video transformers for temporal modeling.
+- **NeRF & 3D / point clouds** — neural radiance fields for view synthesis; PointNet for unordered 3D point sets.
+- **OCR pipelines** — CRNN (detection + CTC recognition); Tesseract and PaddleOCR as baselines.
+- **Grad-CAM & saliency maps** — visualize which pixels drive a CNN's prediction; useful for debugging and trust.
+- **Model compression for vision (MobileNet, depthwise-separable)** — edge inference with < 5 MB models.

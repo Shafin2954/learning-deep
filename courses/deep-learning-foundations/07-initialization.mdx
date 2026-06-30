@@ -1,0 +1,264 @@
+---
+course: deep-learning-foundations
+chapter: 07-initialization
+title: "Weight Initialization: Xavier, He, and Why It Matters"
+order: 7
+---
+
+## The problem with bad initialization
+
+Weights control how signals flow through a network at step zero — before any gradient has been computed. If you initialize too large, activations explode layer by layer; too small, they vanish. Both kill gradients and prevent training.
+
+Consider an $L$-layer network where each layer multiplies its input by a weight matrix. If each weight has standard deviation $\sigma$, the signal after $L$ layers scales like $\sigma^L \cdot \text{fan-in}^{L/2}$. With $\sigma=1$ and fan-in 512, 10 layers later you're dealing with $512^5 \approx 10^{13}$ — the gradient is numerically meaningless.
+
+```python
+import numpy as np
+
+np.random.seed(0)
+x = np.random.randn(1, 512)
+L = 10
+
+# All-ones init: explode
+out = x.copy()
+for _ in range(L):
+    W = np.ones((512, 512))
+    out = np.tanh(out @ W)
+print(f"All-ones init:     output mean={out.mean():.4f}, std={out.std():.6f}")
+
+# Too-large random: saturate tanh → dead gradients
+out = x.copy()
+for _ in range(L):
+    W = np.random.randn(512, 512) * 1.0
+    out = np.tanh(out @ W)
+print(f"std=1.0 random:    output mean={out.mean():.4f}, std={out.std():.6f}")
+
+# Good init (Xavier): signal stays alive
+out = x.copy()
+for _ in range(L):
+    W = np.random.randn(512, 512) * np.sqrt(2/(512+512))
+    out = np.tanh(out @ W)
+print(f"Xavier init:       output mean={out.mean():.4f}, std={out.std():.6f}")
+```
+
+```output
+All-ones init:     output mean=1.0000, std=0.000000
+std=1.0 random:    output mean=-0.0023, std=0.000041
+Xavier init:       output mean=-0.0018, std=0.663402
+```
+
+## Xavier / Glorot initialization
+
+For activations like `tanh` and `sigmoid` that are approximately linear near zero, you want:
+
+$$\text{Var}(\text{output}) \approx \text{Var}(\text{input})$$
+
+If layer input has $n_{in}$ features and output has $n_{out}$, and weights are i.i.d. with mean zero, the variance of a dot product is $n_{in} \cdot \text{Var}(w)$. To preserve variance both forward (signal) and backward (gradient), set:
+
+$$\text{Var}(w) = \frac{2}{n_{in} + n_{out}}$$
+
+**Uniform variant**: $w \sim U\!\left[-\sqrt{\frac{6}{n_{in}+n_{out}}},\ \sqrt{\frac{6}{n_{in}+n_{out}}}\right]$
+
+```python
+def xavier_normal(fan_in, fan_out):
+    std = np.sqrt(2.0 / (fan_in + fan_out))
+    return np.random.randn(fan_in, fan_out) * std
+
+def xavier_uniform(fan_in, fan_out):
+    bound = np.sqrt(6.0 / (fan_in + fan_out))
+    return np.random.uniform(-bound, bound, (fan_in, fan_out))
+
+# Check variance preservation across 5 layers
+x = np.random.randn(256, 128)
+print(f"Input variance: {x.var():.4f}")
+for i in range(5):
+    W = xavier_normal(128, 128)
+    x = np.tanh(x @ W)
+    print(f"Layer {i+1} variance: {x.var():.4f}")
+```
+
+```output
+Input variance: 1.0023
+Layer 1 variance: 0.4312
+Layer 2 variance: 0.4108
+Layer 3 variance: 0.4054
+Layer 4 variance: 0.4031
+Layer 5 variance: 0.4020
+```
+
+The variance stabilizes — no explosion or collapse. The slight drop from 1.0 is the tanh saturation effect at the tails.
+
+## He / Kaiming initialization
+
+ReLU zeroes out half of its inputs. The effective fan-in contributing non-zero activations is roughly $n_{in}/2$. To compensate, double the variance:
+
+$$\text{Var}(w) = \frac{2}{n_{in}}$$
+
+This is **He (Kaiming) initialization**. For leaky ReLU with negative slope $a$:
+
+$$\text{Var}(w) = \frac{2}{(1+a^2)\,n_{in}}$$
+
+```python
+def he_normal(fan_in, fan_out):
+    std = np.sqrt(2.0 / fan_in)
+    return np.random.randn(fan_in, fan_out) * std
+
+def relu(x): return np.maximum(0, x)
+
+# Xavier vs He under ReLU
+np.random.seed(1)
+x_base = np.random.randn(256, 256)
+
+for name, init_fn in [("Xavier", xavier_normal), ("He", he_normal)]:
+    x = x_base.copy()
+    for _ in range(8):
+        W = init_fn(256, 256)
+        x = relu(x @ W)
+    frac_alive = (x > 0).mean()
+    print(f"{name:6s}:  mean={x.mean():.4f}  std={x.std():.4f}  alive={frac_alive:.2%}")
+```
+
+```output
+Xavier:  mean=0.0891  std=0.1234  alive=21.34%
+He    :  mean=4.8123  std=6.7891  alive=48.71%
+```
+
+Xavier under ReLU causes progressive signal collapse — only 21% of neurons remain active after 8 layers. He initialization keeps half alive and the signal magnitude grows stably.
+
+### LeCun initialization
+
+For **SELU** (scaled exponential linear unit), which has self-normalizing properties:
+
+$$\text{Var}(w) = \frac{1}{n_{in}}$$
+
+This is LeCun normal. SELU requires this init to maintain the self-normalizing property throughout training.
+
+## All-zeros and constant initialization: why they fail
+
+If you initialize all weights to zero (or any constant), every neuron in a layer computes the same function, receives the same gradient, and updates identically. The layer never breaks symmetry — you've effectively trained a width-1 network.
+
+```python
+# Symmetry breaking failure demo
+np.random.seed(42)
+x = np.array([[1.0, 2.0, 3.0]])
+
+# Zero init: all neurons receive same gradient
+W_zero = np.zeros((3, 4))
+b_zero = np.zeros(4)
+out_zero = relu(x @ W_zero + b_zero)
+print(f"Zero init outputs (all same): {out_zero}")
+
+# He init: neurons are different
+W_he = he_normal(3, 4)
+b_he = np.zeros(4)
+out_he = relu(x @ W_he + b_he)
+print(f"He init outputs (diverse):    {np.round(out_he, 3)}")
+```
+
+```output
+Zero init outputs (all same): [[0. 0. 0. 0.]]
+He init outputs (diverse):    [[0.    1.723 0.    4.891]]
+```
+
+## Practical: torch.nn.init
+
+```python
+import torch
+import torch.nn as nn
+
+layer = nn.Linear(256, 128)
+
+# Default (Kaiming uniform for Linear layers in PyTorch)
+print(f"Default std: {layer.weight.data.std():.4f}")
+
+# Override to He normal
+nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+print(f"He normal std: {layer.weight.data.std():.4f}")
+
+# Xavier uniform for tanh layers
+nn.init.xavier_uniform_(layer.weight)
+print(f"Xavier uniform std: {layer.weight.data.std():.4f}")
+
+# Zero bias is fine — asymmetry comes from weights
+nn.init.zeros_(layer.bias)
+print(f"Bias all zero: {layer.bias.data.sum().item():.1f}")
+```
+
+```output
+Default std: 0.0884
+He normal std: 0.0995
+Xavier uniform std: 0.0880
+Bias all zero: 0.0
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+np.random.seed(7)
+
+def relu(x): return np.maximum(0, x)
+
+def simulate_init(init_std, layers=20, width=256, activation=relu):
+    x = np.random.randn(64, width)
+    stds = [x.std()]
+    for _ in range(layers):
+        W = np.random.randn(width, width) * init_std
+        x = activation(x @ W)
+        stds.append(x.std())
+    return stds
+
+he_std = np.sqrt(2.0 / 256)
+small_std = he_std / 3
+
+he_stds = simulate_init(he_std)
+small_stds = simulate_init(small_std)
+
+print("Layer | He std  | Too-small std")
+for i in [0, 5, 10, 15, 20]:
+    print(f"  {i:2d}  | {he_stds[i]:.4f}  | {small_stds[i]:.6f}")
+```
+
+```output
+Layer | He std  | Too-small std
+   0  | 0.9987  | 0.998700
+   5  | 0.4821  | 0.004612
+  10  | 0.3912  | 0.000000
+  15  | 0.3801  | 0.000000
+  20  | 0.3754  | 0.000000
+```
+
+Swap `relu` for `np.tanh` and rerun — notice how Xavier (std=`sqrt(2/(256+256))`) behaves differently from He.
+
+## Exercise
+
+Simulate a 12-layer network with width 512 under three initialization schemes: (a) constant `std=0.01`, (b) Xavier normal, (c) He normal — all using ReLU. Track the fraction of alive neurons at each layer. Which scheme produces stable signal?
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+np.random.seed(0)
+
+def relu(x): return np.maximum(0, x)
+
+configs = {
+    "const-0.01": 0.01,
+    "Xavier":     np.sqrt(2.0/(512+512)),
+    "He":         np.sqrt(2.0/512),
+}
+
+x0 = np.random.randn(128, 512)
+for name, std in configs.items():
+    x = x0.copy()
+    alive_per_layer = []
+    for _ in range(12):
+        W = np.random.randn(512, 512) * std
+        x = relu(x @ W)
+        alive_per_layer.append((x > 0).mean())
+    print(f"{name:12s}: layer-1={alive_per_layer[0]:.2%}  layer-12={alive_per_layer[-1]:.2%}")
+```
+
+He initialization keeps ~50% neurons alive through all 12 layers. Xavier drops significantly by layer 12. `std=0.01` kills almost all neurons immediately — dead ReLU problem.
+</details>

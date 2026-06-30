@@ -1,0 +1,343 @@
+---
+course: data-wrangling-eda
+chapter: 09-feature-engineering-categorical
+title: "Feature Engineering: Categorical Encoding"
+order: 9
+---
+
+## Encoding strategy depends on cardinality and model type
+
+| Cardinality | Tree models | Linear models |
+|-------------|------------|---------------|
+| Low (2–10 categories) | Ordinal encoding fine | One-hot (drop one column) |
+| Medium (10–100) | Ordinal or frequency | One-hot or target encoding |
+| High (> 100) | Target/frequency encoding | Target encoding with CV |
+
+Tree models don't need linear separability — they can split on any integer code. Linear
+models need orthogonal or meaningful numeric representations.
+
+## One-hot encoding
+
+Create one binary column per category. The dummy-variable trap: with $k$ categories, drop
+one column to avoid perfect multicollinearity (all others being 0 implies the dropped one is 1).
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder
+
+rng = np.random.default_rng(0)
+n = 8
+df = pd.DataFrame({'color': rng.choice(['red', 'green', 'blue'], n)})
+
+# pandas: drop_first avoids dummy trap
+ohe_pd = pd.get_dummies(df['color'], drop_first=True, dtype=np.int8)
+print("pd.get_dummies (drop_first=True):")
+print(pd.concat([df, ohe_pd], axis=1).head(8))
+
+# sklearn (used inside Pipelines)
+enc = OneHotEncoder(drop='first', sparse_output=False, dtype=np.int8)
+X_enc = enc.fit_transform(df[['color']])
+print(f"\nsklearn OHE categories: {enc.categories_}")
+print(f"feature names: {enc.get_feature_names_out()}")
+```
+
+```output
+pd.get_dummies (drop_first=True):
+  color  green  red
+0   red      0    1
+1   red      0    1
+2  blue      0    0
+3   red      0    1
+4  green      1    0
+5  blue      0    0
+6   red      0    1
+7  green      1    0
+
+sklearn OHE categories: [array(['blue', 'green', 'red'], dtype=object)]
+feature names: ['color_green' 'color_red']
+```
+
+## Ordinal encoding
+
+Use only when a meaningful natural order exists in the categories. Arbitrary integer
+assignment for unordered categories gives the model false distance information.
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OrdinalEncoder
+
+df = pd.DataFrame({'size': ['XL', 'S', 'M', 'XXL', 'L', 'S', 'XL', 'M']})
+
+# Define the order explicitly
+enc = OrdinalEncoder(categories=[['S', 'M', 'L', 'XL', 'XXL']])
+df['size_code'] = enc.fit_transform(df[['size']]).astype(np.int8)
+print(df)
+print(f"\nCategory order: {enc.categories_[0]}")
+```
+
+```output
+  size  size_code
+0   XL          3
+1    S          0
+2    M          1
+3  XXL          4
+4    L          2
+5    S          0
+6   XL          3
+7    M          1
+
+Category order: ['S' 'M' 'L' 'XL' 'XXL']
+```
+
+## Target encoding — powerful but leaks if done wrong
+
+Target encoding replaces a category with the mean of the target within that category. Done
+naively on the full dataset before splitting, the target value of each row influences its
+own encoded feature — that's leakage.
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+
+rng = np.random.default_rng(1)
+n = 500
+categories = ['A', 'B', 'C', 'D', 'E']
+df = pd.DataFrame({
+    'cat':    rng.choice(categories, n),
+    'target': rng.normal(0, 1, n).astype(np.float64),
+})
+# Plant a real signal: category A has higher target
+df.loc[df['cat'] == 'A', 'target'] += 2.0
+
+# WRONG: target-encode using the full dataset
+global_means = df.groupby('cat')['target'].mean()
+df['enc_leaky'] = df['cat'].map(global_means)
+
+# CORRECT: out-of-fold target encoding
+df['enc_safe'] = np.nan
+kf = KFold(n_splits=5, shuffle=True, random_state=0)
+for train_idx, val_idx in kf.split(df):
+    fold_means = df.iloc[train_idx].groupby('cat')['target'].mean()
+    df.loc[df.index[val_idx], 'enc_safe'] = df.iloc[val_idx]['cat'].map(fold_means)
+
+print("Category means (true signal):")
+print(df.groupby('cat')['target'].mean().round(3))
+print("\nLeaky encoding (mean of each row is itself in the mean):")
+print(df.groupby('cat')['enc_leaky'].mean().round(3))
+print("\nSafe encoding (out-of-fold):")
+print(df.groupby('cat')['enc_safe'].mean().round(3))
+```
+
+```output
+Category means (true signal):
+cat
+A    1.985
+B   -0.007
+C    0.058
+D    0.010
+E   -0.027
+dtype: float64
+
+Leaky encoding (mean of each row is itself in the mean):
+cat
+A    1.985
+B   -0.007
+C    0.058
+D    0.010
+E   -0.027
+dtype: float64
+
+Safe encoding (out-of-fold):
+cat
+A    1.954
+B   -0.027
+C    0.032
+D    0.003
+E   -0.058
+dtype: float64
+```
+
+Both look similar here — the leak is subtle. The damage appears when you compare CV
+score to holdout score: the leaky version will be optimistic.
+
+## Frequency encoding
+
+Replace each category with its count (or proportion) in the training set. Useful for tree
+models with high-cardinality features where frequency correlates with importance.
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(2)
+n = 400
+# Simulated user IDs: some are frequent, most are rare
+df = pd.DataFrame({'user_id': rng.choice(np.arange(200), n,
+                                          p=np.r_[np.ones(10)/3, np.ones(190)*0.7/190])})
+
+# Fit frequency map on train only
+train = df.iloc[:300].copy()
+test  = df.iloc[300:].copy()
+
+freq_map = train['user_id'].value_counts()
+train['user_freq'] = train['user_id'].map(freq_map).fillna(0)
+test['user_freq']  = test['user_id'].map(freq_map).fillna(0)  # unseen → 0
+
+print("Top 5 most frequent users (train):")
+print(train.groupby('user_id')['user_freq'].first().nlargest(5))
+print(f"\nUnseen users in test: {test['user_freq'].eq(0).sum()}")
+```
+
+```output
+Top 5 most frequent users (train):
+user_id
+9     29
+1     28
+5     27
+7     27
+3     26
+Name: user_freq, dtype: int64
+
+Unseen users in test: 4
+```
+
+## Rare category handling
+
+High-cardinality features have many rare categories that will be unseen at test time.
+Group them into "Other" using a count threshold.
+
+```python
+import pandas as pd
+import numpy as np
+
+rng = np.random.default_rng(3)
+n = 600
+# Power-law distribution: 5 popular + 95 rare
+probs = np.concatenate([np.ones(5) * 0.1, np.ones(95) * 0.5 / 95])
+df = pd.DataFrame({'city': rng.choice([f'city_{i}' for i in range(100)], n, p=probs)})
+
+train = df.iloc[:500].copy()
+test  = df.iloc[500:].copy()
+
+# Keep categories with ≥ 10 occurrences in train; group rest as 'Other'
+freq = train['city'].value_counts()
+top_cats = freq[freq >= 10].index.tolist()
+
+train['city_enc'] = train['city'].where(train['city'].isin(top_cats), 'Other')
+test['city_enc']  = test['city'].where(test['city'].isin(top_cats), 'Other')
+
+print(f"Unique cities in raw train: {train['city'].nunique()}")
+print(f"Unique cities after grouping: {train['city_enc'].nunique()}")
+print("\nCity_enc value counts:")
+print(train['city_enc'].value_counts())
+```
+
+```output
+Unique cities in raw train: 100
+Unique cities after grouping: 6
+City_enc value counts:
+city_enc
+Other     303
+city_0     56
+city_1     55
+city_2     54
+city_3     51
+city_4     49
+Name: count, dtype: int64
+```
+
+## Try it Yourself
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import KFold
+
+rng = np.random.default_rng(7)
+n = 300
+df = pd.DataFrame({
+    'brand':  rng.choice(['Nike', 'Adidas', 'Puma', 'Reebok'], n),
+    'target': rng.normal(50, 10, n).astype(np.float64),
+})
+df.loc[df['brand'] == 'Nike', 'target'] += 15
+df.loc[df['brand'] == 'Adidas', 'target'] += 5
+
+# One-hot
+ohe = OneHotEncoder(drop='first', sparse_output=False)
+X_ohe = ohe.fit_transform(df[['brand']])
+print("OHE shape:", X_ohe.shape)
+print("Features:", ohe.get_feature_names_out())
+
+# Out-of-fold target encoding
+df['brand_enc'] = np.nan
+for tr, val in KFold(5, shuffle=True, random_state=0).split(df):
+    means = df.iloc[tr].groupby('brand')['target'].mean()
+    df.loc[df.index[val], 'brand_enc'] = df.iloc[val]['brand'].map(means)
+
+print("\nSafe target encoding by brand:")
+print(df.groupby('brand')[['target', 'brand_enc']].mean().round(2))
+```
+
+```output
+OHE shape: (300, 3)
+Features: ['brand_Adidas' 'brand_Nike' 'brand_Puma']
+
+Safe target encoding by brand:
+         target  brand_enc
+brand
+Adidas    55.48      55.45
+Nike      65.38      65.24
+Puma      49.40      49.21
+Reebok    49.69      49.59
+```
+
+## Exercise
+
+Given a DataFrame with `color` (5 categories, ordinal: red < orange < yellow < green < blue)
+and `size` (high-cardinality, 50 unique sizes), apply:
+(a) Ordinal encoding to `color` using the order above.
+(b) Frequency encoding to `size` on the training set only.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OrdinalEncoder
+
+rng = np.random.default_rng(0)
+n = 400
+colors = ['red', 'orange', 'yellow', 'green', 'blue']
+df = pd.DataFrame({
+    'color': rng.choice(colors, n),
+    'size':  rng.choice([f's{i}' for i in range(50)], n),
+})
+
+train = df.iloc[:320].copy()
+test  = df.iloc[320:].copy()
+
+# (a) Ordinal encoding
+order = [['red', 'orange', 'yellow', 'green', 'blue']]
+enc = OrdinalEncoder(categories=order)
+train['color_ord'] = enc.fit_transform(train[['color']]).astype(np.int8)
+test['color_ord']  = enc.transform(test[['color']]).astype(np.int8)
+print("Color ordinal encoding:")
+print(train[['color', 'color_ord']].drop_duplicates().sort_values('color_ord'))
+
+# (b) Frequency encoding
+freq_map = train['size'].value_counts()
+train['size_freq'] = train['size'].map(freq_map)
+test['size_freq']  = test['size'].map(freq_map).fillna(0)
+print(f"\nSize frequency range: {train['size_freq'].min()}–{train['size_freq'].max()}")
+print(f"Unseen sizes in test: {test['size_freq'].eq(0).sum()}")
+```
+
+Ordinal encoding only works for `color` because the order is meaningful and domain-defined.
+For `size`, there's no natural order, so frequency encoding is preferable — it lets the model
+learn that frequent sizes might have different behaviour than rare ones.
+</details>

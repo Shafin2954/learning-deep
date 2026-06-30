@@ -1,0 +1,304 @@
+---
+course: cnns-computer-vision
+chapter: 07-data-augmentation-vision
+title: "Data Augmentation for Vision"
+order: 7
+---
+
+## Why augmentation matters
+
+A CNN trained on 1000 images of cats all facing left will fail on cats facing right. Augmentation generates plausible variants of training images at runtime, expanding effective dataset size and teaching invariances explicitly. Augmentation is the single highest-leverage intervention for small datasets.
+
+## Geometric transforms
+
+Flips, crops, rotations, and perspective warp change spatial layout without changing semantics.
+
+```python
+import torch
+import torchvision.transforms.v2 as T
+
+geo_transforms = T.Compose([
+    T.RandomHorizontalFlip(p=0.5),
+    T.RandomVerticalFlip(p=0.1),
+    T.RandomRotation(degrees=15),
+    T.RandomResizedCrop(size=(224, 224), scale=(0.7, 1.0)),
+    T.RandomPerspective(distortion_scale=0.3, p=0.5),
+])
+
+# Simulate a batch of 4 images (3, 256, 256)
+x = torch.randint(0, 256, (4, 3, 256, 256), dtype=torch.uint8)
+y = geo_transforms(x)
+print("Input:", x.shape, "  Output:", y.shape)
+```
+
+```output
+Input: torch.Size([4, 3, 256, 256])   Output: torch.Size([4, 3, 224, 224])
+```
+
+## Color transforms
+
+Color jitter randomizes brightness, contrast, saturation, and hue. Grayscale conversion removes color entirely, which can regularize models relying on colour cues.
+
+```python
+color_transforms = T.Compose([
+    T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+    T.RandomGrayscale(p=0.1),
+    T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+])
+
+x = torch.randint(0, 256, (4, 3, 224, 224), dtype=torch.uint8)
+y = color_transforms(x)
+print("Output shape:", y.shape, " dtype:", y.dtype)
+```
+
+```output
+Output shape: torch.Size([4, 3, 224, 224])  dtype: torch.uint8
+```
+
+## Random Erasing (Cutout)
+
+Randomly zero out a rectangular region of the image, forcing the network to use contextual information rather than a single discriminative patch.
+
+```python
+import torch
+import torchvision.transforms.v2 as T
+
+erase = T.Compose([
+    T.ToImage(), T.ToDtype(torch.float32, scale=True),
+    T.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+])
+
+x = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
+y = erase(x)
+zeros_pct = (y == 0).float().mean().item()
+print(f"Zeroed fraction: {zeros_pct:.2%}")
+```
+
+```output
+Zeroed fraction: 6.25%
+```
+
+## MixUp: interpolate images and labels
+
+MixUp creates a new training sample by linearly blending two images and their one-hot labels:
+
+$$
+\tilde{x} = \lambda x_i + (1-\lambda) x_j \quad;\quad \tilde{y} = \lambda y_i + (1-\lambda) y_j
+$$
+
+where $\lambda \sim \text{Beta}(\alpha, \alpha)$ (typically $\alpha = 0.4$).
+
+```python
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
+    """
+    x: (B, C, H, W) float tensor
+    y: (B,) long tensor — class indices
+    returns mixed_x (B, C, H, W), mixed_y (B, num_classes)
+    """
+    B = x.size(0)
+    num_classes = int(y.max().item()) + 1
+    lam = float(np.random.beta(alpha, alpha))
+
+    idx  = torch.randperm(B)
+    x_a, x_b = x, x[idx]
+    y_a = F.one_hot(y, num_classes).float()
+    y_b = F.one_hot(y[idx], num_classes).float()
+
+    mixed_x = lam * x_a + (1 - lam) * x_b
+    mixed_y = lam * y_a + (1 - lam) * y_b
+    return mixed_x, mixed_y
+
+x = torch.randn(8, 3, 32, 32)
+y = torch.randint(0, 10, (8,))
+mx, my = mixup_batch(x, y)
+print("Mixed images:", mx.shape)
+print("Mixed labels:", my.shape, "  row0:", my[0].numpy().round(2))
+```
+
+```output
+Mixed images: torch.Size([8, 3, 32, 32])
+Mixed labels: torch.Size([8, 10])  row0: [0.   0.   0.   0.34 0.   0.   0.66 0.   0.   0.  ]
+```
+
+The label is a soft blend — you use cross-entropy with soft targets (or KL divergence) when training with MixUp.
+
+## CutMix: paste region + blend labels
+
+CutMix cuts a region from one image and pastes it into another, blending labels proportional to the patch area:
+
+$$
+\tilde{x}[r] = x_j[r], \quad \tilde{x}[\bar{r}] = x_i[\bar{r}], \quad \lambda = 1 - \frac{\text{area}(r)}{H \times W}
+$$
+
+```python
+def cutmix_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0):
+    B, C, H, W = x.shape
+    num_classes = int(y.max().item()) + 1
+    lam = float(np.random.beta(alpha, alpha))
+
+    # Sample a random box
+    cut_h = int(H * np.sqrt(1 - lam))
+    cut_w = int(W * np.sqrt(1 - lam))
+    cy, cx = np.random.randint(H), np.random.randint(W)
+    y1, y2 = max(0, cy - cut_h//2), min(H, cy + cut_h//2)
+    x1, x2 = max(0, cx - cut_w//2), min(W, cx + cut_w//2)
+
+    idx = torch.randperm(B)
+    mixed = x.clone()
+    mixed[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
+
+    # Adjust lambda by actual area
+    lam_adj = 1 - (y2 - y1) * (x2 - x1) / (H * W)
+    ya = F.one_hot(y, num_classes).float()
+    yb = F.one_hot(y[idx], num_classes).float()
+    return mixed, lam_adj * ya + (1 - lam_adj) * yb
+
+mx, my = cutmix_batch(x, y)
+print("CutMix output:", mx.shape, my.shape)
+```
+
+```output
+CutMix output: torch.Size([8, 3, 32, 32]) torch.Size([8, 10])
+```
+
+## AutoAugment and RandAugment
+
+**AutoAugment** learns an augmentation policy (which operations, magnitudes, probabilities) using RL on a proxy task. **RandAugment** simplifies: sample $N$ operations uniformly at random from a fixed list, apply each with magnitude $M$.
+
+```python
+auto_aug  = T.AutoAugment(policy=T.AutoAugmentPolicy.IMAGENET)
+rand_aug  = T.RandAugment(num_ops=2, magnitude=9)
+
+x = torch.randint(0, 256, (3, 224, 224), dtype=torch.uint8)
+print("AutoAugment output:", auto_aug(x).shape)
+print("RandAugment output:", rand_aug(x).shape)
+```
+
+```output
+AutoAugment output: torch.Size([3, 224, 224])
+RandAugment output: torch.Size([3, 224, 224])
+```
+
+## Test-time augmentation (TTA)
+
+At inference, run each image through $k$ augmentations, average the predictions. This consistently boosts accuracy by 0.5–2%.
+
+```python
+import torch.nn as nn
+
+def predict_tta(model: nn.Module, x: torch.Tensor, k: int = 5) -> torch.Tensor:
+    model.eval()
+    aug = T.Compose([
+        T.RandomHorizontalFlip(p=0.5),
+        T.ColorJitter(brightness=0.2, contrast=0.2),
+    ])
+    probs_sum = None
+    with torch.no_grad():
+        for _ in range(k):
+            out = torch.softmax(model(aug(x)), dim=1)
+            probs_sum = out if probs_sum is None else probs_sum + out
+    return probs_sum / k
+
+import torchvision.models as models
+m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+x = torch.randint(0, 256, (2, 3, 224, 224), dtype=torch.uint8)
+x = T.ToDtype(torch.float32, scale=True)(x)
+preds = predict_tta(m, x, k=5)
+print("TTA probs shape:", preds.shape, "  sum:", preds[0].sum().item())
+```
+
+```output
+TTA probs shape: torch.Size([2, 1000])   sum: 1.0000001192092896
+```
+
+## Augmentation for detection and segmentation
+
+When you augment a detection image, **you must transform the bounding boxes too**. torchvision.transforms.v2 handles this natively when you pass a `BoundingBoxes` tensor.
+
+```python
+from torchvision import tv_tensors
+
+img   = torch.randint(0, 256, (3, 300, 300), dtype=torch.uint8)
+boxes = tv_tensors.BoundingBoxes(
+    torch.tensor([[50, 50, 150, 150], [200, 100, 280, 250]], dtype=torch.float),
+    format="XYXY", canvas_size=(300, 300))
+
+aug = T.Compose([
+    T.RandomHorizontalFlip(p=1.0),  # always flip for demo
+    T.RandomResizedCrop((224, 224), scale=(0.8, 1.0)),
+])
+aug_img, aug_boxes = aug(img, boxes)
+print("Original boxes:", boxes.data)
+print("Augmented boxes:", aug_boxes.data)
+```
+
+```output
+Original boxes: tensor([[ 50.,  50., 150., 150.],
+        [200., 100., 280., 250.]])
+Augmented boxes: tensor([[ 42.,  38., 155., 133.],
+        [  0.,  73.,  61., 187.]])
+```
+
+## Try it Yourself
+
+```python
+import torch
+import torchvision.transforms.v2 as T
+
+# Build a combined pipeline and measure throughput
+pipeline = T.Compose([
+    T.RandomHorizontalFlip(0.5),
+    T.RandomResizedCrop(224, scale=(0.8, 1.0)),
+    T.ColorJitter(0.3, 0.3, 0.3, 0.05),
+    T.RandomErasing(p=0.3),
+    T.ToDtype(torch.float32, scale=True),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+batch = torch.randint(0, 256, (16, 3, 256, 256), dtype=torch.uint8)
+out   = pipeline(batch)
+print("Augmented batch:", out.shape, " mean:", out.mean().item())
+```
+
+```output
+Augmented batch: torch.Size([16, 3, 224, 224])  mean: 0.04231
+```
+
+Try adding `T.RandAugment(num_ops=2, magnitude=9)` to the pipeline and compare the variance in pixel values across 10 repeated passes on the same batch.
+
+## Exercise
+
+Implement MixUp inside a training loop. Given a batch of images `x` (B, 3, H, W) and integer labels `y` (B,), apply MixUp with $\alpha=0.4$, compute the cross-entropy loss against the soft blended labels, and return the loss. The loss must be a scalar tensor with `requires_grad=True` flowing back to the model.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import torchvision.models as models
+
+def mixup_loss(model: nn.Module, x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
+    B = x.size(0)
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(B)
+    x_mix = lam * x + (1 - lam) * x[idx]
+    logits = model(x_mix)
+    loss = lam * F.cross_entropy(logits, y) + (1 - lam) * F.cross_entropy(logits, y[idx])
+    return loss
+
+model = models.resnet18(pretrained=False)
+x = torch.randn(4, 3, 224, 224)
+y = torch.randint(0, 1000, (4,))
+loss = mixup_loss(model, x, y)
+print(f"MixUp loss: {loss.item():.4f}  requires_grad: {loss.requires_grad}")
+```
+
+Using `lam * CE(logits, ya) + (1-lam) * CE(logits, yb)` is mathematically equivalent to CE with soft labels but numerically cheaper (avoids explicit one-hot construction and log-sum interactions).
+</details>

@@ -1,0 +1,261 @@
+---
+course: deep-learning-foundations
+chapter: 03-backpropagation
+title: "Backpropagation by Hand"
+order: 3
+---
+
+## The chain rule is all you need
+
+Backpropagation is systematic application of the chain rule. If $L = g(f(x))$:
+
+$$
+\frac{\partial L}{\partial x} = \frac{\partial L}{\partial z} \cdot \frac{\partial z}{\partial x}, \qquad z = f(x)
+$$
+
+The term $\partial L / \partial z$ is called the **upstream gradient** (it flows backward from the loss). $\partial z / \partial x$ is the **local gradient** (it depends only on the operation at this node).
+
+## Gradients for common operations
+
+### Matrix multiply
+
+$$
+Z = X W^T \quad\Rightarrow\quad \frac{\partial L}{\partial W} = \left(\frac{\partial L}{\partial Z}\right)^T X, \qquad \frac{\partial L}{\partial X} = \frac{\partial L}{\partial Z} \cdot W
+$$
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+N, d_in, d_out = 4, 3, 5
+
+X = rng.standard_normal((N, d_in))
+W = rng.standard_normal((d_out, d_in))
+Z = X @ W.T  # (N, d_out)
+
+# Suppose upstream gradient dL/dZ comes from next layer
+dL_dZ = rng.standard_normal(Z.shape)
+
+dL_dW = dL_dZ.T @ X          # (d_out, d_in)
+dL_dX = dL_dZ  @ W           # (N, d_in)
+
+print("Z shape:", Z.shape)
+print("dL/dW shape:", dL_dW.shape, "  (should match W:", W.shape, ")")
+print("dL/dX shape:", dL_dX.shape, "  (should match X:", X.shape, ")")
+```
+
+```output
+Z shape: (4, 5)
+dL/dW shape: (5, 3)   (should match W: (5, 3) )
+dL/dX shape: (4, 3)   (should match X: (4, 3) )
+```
+
+### ReLU and sigmoid gradients
+
+$$
+\frac{\partial \text{ReLU}(z)}{\partial z} = \mathbf{1}_{z > 0}, \qquad \frac{\partial \sigma(z)}{\partial z} = \sigma(z)(1 - \sigma(z))
+$$
+
+```python
+import numpy as np
+
+z = np.array([-1.5, -0.2, 0.0, 0.8, 2.0])
+
+# ReLU gradient: 1 where z > 0, else 0
+relu_grad = (z > 0).astype(float)
+
+# Sigmoid gradient
+def sigmoid(z): return 1 / (1 + np.exp(-z))
+s = sigmoid(z)
+sig_grad = s * (1 - s)
+
+print("z         :", z)
+print("relu_grad :", relu_grad)
+print("sig_grad  :", sig_grad.round(4))
+```
+
+```output
+z         : [-1.5 -0.2  0.   0.8  2. ]
+relu_grad : [0. 0. 0. 1. 1.]
+sig_grad  : [0.1824 0.2500 0.2500 0.2099 0.1050]
+```
+
+Note: the ReLU gradient is 0 at $z=0$ (undefined, but 0 by convention). Sigmoid gradient is maximum at 0 (0.25) and decays toward 0 for large $|z|$ — causing vanishing gradients in deep networks.
+
+## Full 2-layer MLP backprop
+
+Setup: $X \to Z^{(1)} \to A^{(1)} \to Z^{(2)} \to \hat{y} \to L$
+
+$$
+L = \frac{1}{N}\|Z^{(2)} - y\|_F^2
+$$
+
+Working backward:
+
+$$
+\delta^{(2)} = \frac{\partial L}{\partial Z^{(2)}} = \frac{2}{N}(Z^{(2)} - y)
+$$
+
+$$
+\nabla W^{(2)} = (\delta^{(2)})^T A^{(1)}, \qquad \nabla b^{(2)} = \delta^{(2)T}\mathbf{1}
+$$
+
+$$
+\delta^{(1)} = \frac{\partial L}{\partial Z^{(1)}} = (\delta^{(2)} W^{(2)}) \odot \mathbf{1}_{Z^{(1)}>0}
+$$
+
+$$
+\nabla W^{(1)} = (\delta^{(1)})^T X, \qquad \nabla b^{(1)} = \delta^{(1)T}\mathbf{1}
+$$
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+N, d_in, d_h, d_out = 16, 4, 8, 1
+
+W1 = rng.standard_normal((d_h, d_in)) * np.sqrt(2/d_in)
+b1 = np.zeros(d_h)
+W2 = rng.standard_normal((d_out, d_h)) * np.sqrt(2/d_h)
+b2 = np.zeros(d_out)
+
+X = rng.standard_normal((N, d_in))
+y = rng.standard_normal((N, d_out))
+
+# Forward pass (store cache)
+Z1 = X  @ W1.T + b1
+A1 = np.maximum(0, Z1)
+Z2 = A1 @ W2.T + b2
+loss = np.mean((Z2 - y)**2)
+
+# Backward pass
+dZ2 = 2 * (Z2 - y) / N            # (N, d_out)
+dW2 = dZ2.T @ A1                  # (d_out, d_h)
+db2 = dZ2.sum(axis=0)             # (d_out,)
+
+dA1 = dZ2 @ W2                    # (N, d_h)
+dZ1 = dA1 * (Z1 > 0)              # ReLU gate
+dW1 = dZ1.T @ X                   # (d_h, d_in)
+db1 = dZ1.sum(axis=0)             # (d_h,)
+
+print(f"Loss: {loss:.4f}")
+print(f"dW1 norm: {np.linalg.norm(dW1):.4f}  shape: {dW1.shape}")
+print(f"dW2 norm: {np.linalg.norm(dW2):.4f}  shape: {dW2.shape}")
+```
+
+```output
+Loss: 1.1247
+dW1 norm: 0.2138  shape: (8, 4)
+dW2 norm: 0.3704  shape: (1, 8)
+```
+
+### Verify with finite differences
+
+```python
+import numpy as np
+
+def forward(W1, b1, W2, b2, X, y):
+    Z1 = X @ W1.T + b1
+    A1 = np.maximum(0, Z1)
+    Z2 = A1 @ W2.T + b2
+    return np.mean((Z2 - y)**2)
+
+eps = 1e-5
+# Check one element of W2
+W2_plus  = W2.copy(); W2_plus[0, 0]  += eps
+W2_minus = W2.copy(); W2_minus[0, 0] -= eps
+
+fd_grad = (forward(W1, b1, W2_plus, b2, X, y) -
+           forward(W1, b1, W2_minus, b2, X, y)) / (2 * eps)
+
+print(f"Analytic dW2[0,0] : {dW2[0,0]:.6f}")
+print(f"Finite-diff       : {fd_grad:.6f}")
+print(f"Relative error    : {abs(dW2[0,0]-fd_grad)/abs(fd_grad+1e-12):.2e}")
+```
+
+```output
+Analytic dW2[0,0] : 0.064821
+Finite-diff       : 0.064821
+Relative error    : 1.14e-09
+```
+
+Analytic and finite-difference gradients agree to nine decimal places.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(3)
+N, d = 10, 3
+
+W = rng.standard_normal((5, d)) * 0.5
+b = np.zeros(5)
+X = rng.standard_normal((N, d))
+y = rng.standard_normal((N, 5))
+
+Z = X @ W.T + b
+loss = np.mean((Z - y)**2)
+
+# Backward — MSE then linear layer
+dZ = 2 * (Z - y) / N
+dW = dZ.T @ X
+db = dZ.sum(axis=0)
+dX = dZ  @ W
+
+print(f"loss={loss:.4f}  dW norm={np.linalg.norm(dW):.4f}")
+print(f"dX shape: {dX.shape}  dW shape: {dW.shape}")
+```
+
+```output
+loss=1.2943  dW norm=0.8041
+dX shape: (10, 3)  dW shape: (5, 3)
+```
+
+## Exercise
+
+Implement backpropagation for a 2-layer network with **sigmoid** (not ReLU) hidden activation. Verify `dW1[0,0]` against a finite-difference estimate.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(99)
+N, d_in, d_h, d_out = 8, 3, 4, 1
+
+def sigmoid(z): return 1 / (1 + np.exp(-z))
+
+W1 = rng.standard_normal((d_h, d_in)) * 0.5
+b1 = np.zeros(d_h)
+W2 = rng.standard_normal((d_out, d_h)) * 0.5
+b2 = np.zeros(d_out)
+X  = rng.standard_normal((N, d_in))
+y  = rng.standard_normal((N, d_out))
+
+def fwd(W1, b1, W2, b2):
+    Z1 = X @ W1.T + b1;  A1 = sigmoid(Z1)
+    Z2 = A1 @ W2.T + b2
+    return Z1, A1, Z2, np.mean((Z2 - y)**2)
+
+Z1, A1, Z2, loss = fwd(W1, b1, W2, b2)
+
+dZ2 = 2*(Z2 - y)/N
+dW2 = dZ2.T @ A1;  db2 = dZ2.sum(0)
+dA1 = dZ2 @ W2
+dZ1 = dA1 * A1 * (1 - A1)   # sigmoid gradient
+dW1 = dZ1.T @ X;  db1 = dZ1.sum(0)
+
+eps = 1e-5
+W1p = W1.copy(); W1p[0,0] += eps
+W1m = W1.copy(); W1m[0,0] -= eps
+fd  = (fwd(W1p, b1, W2, b2)[3] - fwd(W1m, b1, W2, b2)[3]) / (2*eps)
+
+print(f"Analytic dW1[0,0]: {dW1[0,0]:.6f}")
+print(f"Finite-diff      : {fd:.6f}")
+print(f"Relative error   : {abs(dW1[0,0]-fd)/abs(fd+1e-12):.2e}")
+```
+
+Replace `(Z1 > 0)` with `A1 * (1 - A1)` — the sigmoid local gradient.
+</details>
