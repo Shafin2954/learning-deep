@@ -6,6 +6,7 @@ import { Inter } from 'next/font/google';
 import { Noto_Sans_Bengali } from 'next/font/google';
 import ProgressProvider from '@/components/ProgressProvider';
 import NotebookStoreProvider from '@/components/NotebookStore';
+import NotesStoreProvider from '@/components/NotesStore';
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
 const noto = Noto_Sans_Bengali({
@@ -29,7 +30,9 @@ export default function RootLayout({
     <html lang="en" className={`${inter.variable} ${noto.variable}`}>
       <body>
         <ProgressProvider>
-          <NotebookStoreProvider>{children}</NotebookStoreProvider>
+          <NotebookStoreProvider>
+            <NotesStoreProvider>{children}</NotesStoreProvider>
+          </NotebookStoreProvider>
         </ProgressProvider>
       </body>
     </html>

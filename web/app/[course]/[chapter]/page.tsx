@@ -10,6 +10,7 @@ import Markdown from '@/components/Markdown';
 import MarkCompleteButton from '@/components/MarkCompleteButton';
 import NotebookPanel from '@/components/NotebookPanel';
 import ChapterClient from '@/components/ChapterClient';
+import NotesWidget from '@/components/NotesWidget';
 import type { Metadata } from 'next';
 
 interface Props {
@@ -132,6 +133,9 @@ export default async function ChapterPage({ params }: Props) {
       <ChapterClient>
         <NotebookPanel sessionId={`${course}/${chapter}`} />
       </ChapterClient>
+
+      {/* ── Floating per-chapter notes popup ─────────────────────────────── */}
+      <NotesWidget sessionId={`${course}/${chapter}`} />
     </div>
   );
 }
