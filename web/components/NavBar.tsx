@@ -111,6 +111,13 @@ export default async function NavBar({ activeCourse }: NavBarProps) {
           >
             Glossary
           </Link>
+
+          <Link
+            href="/setup"
+            className={`nav-tab${activeCourse === 'setup' ? ' active' : ''}`}
+          >
+            Setup
+          </Link>
         </nav>
 
         <Search searchIndex={searchIndex} />

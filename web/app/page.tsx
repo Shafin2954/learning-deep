@@ -122,6 +122,22 @@ export default function Home() {
           </p>
         </section>
 
+        {/* Get started — local runner setup */}
+        <section className="home-courses">
+          <h2 className="home-section-heading">Get started</h2>
+          <div className="courses-grid">
+            <Link href="/setup" className="course-card setup-card">
+              <div className="course-card-badge">Setup</div>
+              <h3 className="course-card-title">Run code locally</h3>
+              <p className="course-card-tagline">
+                Pick your device and environment, download one script, and run it. Starts the
+                local kernel on your machine — no git clone needed.
+              </p>
+              <span className="course-card-cta">Generate setup script →</span>
+            </Link>
+          </div>
+        </section>
+
         {/* Courses grouped by PLAN.md navigation groups */}
         {COURSE_GROUPS.filter(g => g.courses.length > 0).map(g => {
           const cardsInGroup = g.courses.filter(c => HOME_COURSES[c.id]);
