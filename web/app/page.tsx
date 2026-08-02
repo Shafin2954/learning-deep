@@ -95,6 +95,11 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 12,
     badge: 'Ch 1 – 12',
   },
+  'system-design': {
+    tagline: '30 chapters: consistent hashing, caching, Bloom filters, storage engines, replication, sharding, transactions, CAP, Raft, rate limiting, resilience, ML systems, and six case studies.',
+    chapters: 31,
+    badge: 'Ch 1 – 31',
+  },
 };
 
 export default function Home() {

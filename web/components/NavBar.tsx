@@ -57,7 +57,7 @@ export const COURSE_GROUPS = [
     courses: [
       // { id: 'eval-tuning',    name: 'Eval & Tuning' },    // coming soon
       // { id: 'competition-ml', name: 'Competition ML' },   // coming soon
-      // { id: 'system-design',  name: 'System Design' },    // coming soon
+      { id: 'system-design',  name: 'System Design' },
       // { id: 'mlops',          name: 'MLOps' },            // coming soon
     ],
   },

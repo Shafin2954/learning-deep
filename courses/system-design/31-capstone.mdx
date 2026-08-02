@@ -1,0 +1,131 @@
+---
+course: system-design
+chapter: 31-capstone
+title: "Capstone: A Sharded, Cached, Rate-Limited Service"
+order: 31
+---
+
+## The project
+
+Build a working key-value service that contains, from scratch, the machinery this course spent
+thirty chapters explaining: consistent-hashing sharding, replication with quorum reads and
+writes, an LRU cache with stampede protection, a token-bucket rate limiter, a Bloom filter
+guarding the store, and a client with retries, backoff, jitter, and a circuit breaker. Then load
+test it, break it deliberately, and write the design document that explains every number you
+chose. Finally, design one large system entirely on paper, at the same level of rigour, without
+writing any of its code.
+
+The service is the proof that you can build the primitives. The design document is the proof
+that you know what they cost.
+
+## Hard constraints (no vibe coding)
+
+- **No AI assistance of any kind.** Not for the code, not for the design document, not for
+  debugging. If you get stuck, re-read the chapter.
+- You MAY NOT use a library that implements the primitive you are being asked to build. No
+  `redis`, `memcached`, `hashring`, `pybloom`, `ratelimit`, `pybreaker`, `tenacity`, or
+  `backoff` for the core implementations.
+- You MAY use the standard library (`hashlib`, `bisect`, `threading`, `asyncio`, `socket`,
+  `sqlite3`, `http.server`), plus a web framework (FastAPI/Flask) and a load-testing tool of
+  your choice for the harness only.
+- You MAY use `redis` or a real database **only** as a comparison baseline in the benchmark
+  section, clearly labelled as such — never as part of the implementation being graded.
+- The nodes must be real processes communicating over a real transport (HTTP, or TCP sockets).
+  A single-process simulation with function calls does not count.
+- Every number in the design document must come from a measurement or from an
+  explicitly-stated back-of-envelope calculation. No adjectives without numbers.
+
+## What it must contain (and the chapter each tests)
+
+1. **A consistent-hash ring with virtual nodes** (ch. 4). Support `add_node`, `remove_node`,
+   `get_node(key)`. Demonstrate that adding the $n$-th node moves approximately $1/n$ of keys and
+   that load spread stays within 15% of even with 128+ virtual nodes per physical node.
+2. **A replicated store with tunable quorums** (ch. 13, 16). Each key is stored on `N=3` nodes;
+   `W` and `R` are per-request parameters. Show a stale read with `W=1, R=1` and its absence with
+   `W=2, R=2`, and implement read repair.
+3. **An LRU cache with TTL, jitter, single-flight, and stale-while-revalidate** (ch. 5, 6).
+   Measure the hit rate on a Zipf workload and demonstrate that a hot-key expiry produces one
+   origin fetch, not hundreds.
+4. **A Bloom filter** (ch. 7) in front of the store, sized for a stated false-positive target.
+   Report measured versus theoretical false-positive rate on at least 100,000 probes.
+5. **A token-bucket rate limiter** (ch. 20), per API key, with correct `429` responses carrying
+   `Retry-After` and `RateLimit-*` headers, and weighted costs for expensive endpoints.
+6. **A resilient client** (ch. 21, 22): timeouts, retries only on retryable errors, exponential
+   backoff with full jitter, a retry budget, a circuit breaker with half-open probes, and a
+   propagated deadline.
+7. **Bounded queues and load shedding** (ch. 22): a bounded request queue with priority shedding
+   under overload, and a documented degradation order.
+8. **Observability** (ch. 23): RED metrics per endpoint, a latency histogram (not pre-computed
+   percentiles), structured logs with a request id, and one SLO with an error budget and a
+   burn-rate alert rule.
+9. **A load test and a failure test** (ch. 2, 19, 22). Measure throughput and p50/p99/p99.9 at
+   several concurrency levels; then, while under load: kill one node, partition one node, make
+   one node slow (add 2 s of latency), and fill the cache with a scan. Record what happened to
+   availability, latency, and correctness in each case.
+10. **A design document** covering: requirements as numbers, the API, the data model and key
+    design, the sharding and replication scheme, the consistency model you chose and what it
+    means for a client (ch. 16), the failure modes and degradation behaviour, capacity planning,
+    and an explicit list of what you did **not** build and why.
+11. **A paper design of one large system** (ch. 30) — pick one you have not built: a ride-hailing
+    dispatcher, a flash-sale ticketing system, a multi-region collaborative editor, a metrics
+    backend, or your own RAG or e-invoicing product. Same document structure as item 10, plus a
+    section on the two hardest trade-offs and how you resolved them.
+
+## Acceptance criteria
+
+- **Sharding.** Adding a 5th node to a 4-node ring moves between 15% and 25% of 100,000 keys
+  (ideal 20%), and the busiest node holds no more than 1.15x the mean.
+- **Quorums.** With `N=3, W=2, R=2`, no stale read occurs in 10,000 read-after-write trials while
+  one node is partitioned. With `W=1, R=1` you can demonstrate at least one stale read and
+  explain the exact interleaving that produced it.
+- **Cache.** Hit rate above 80% on a Zipf($\alpha \approx 1.0$) workload with a cache holding 5%
+  of the keyspace. A synchronized expiry of one hot key under 500 concurrent readers results in
+  exactly one origin fetch.
+- **Bloom filter.** Measured false-positive rate within 20% (relative) of the theoretical value
+  for your chosen $m$ and $k$; zero false negatives across all probes.
+- **Rate limiter.** Sustained rate within 5% of the configured limit over a 60-second run; bursts
+  up to the configured capacity are admitted; every rejection carries a `Retry-After` that, if
+  honoured, results in a successful retry.
+- **Resilience.** With one node made 2 s slow, p99 for requests that do not touch that node
+  degrades by less than 20% (this is the bulkhead working), and the circuit breaker opens within
+  10 seconds and recovers within 30 seconds of the node's recovery.
+- **Load test.** A throughput/latency table at concurrency 1, 8, 64, and 256, with p50, p99, and
+  p99.9 for each, plus the saturation point identified and explained.
+- **Correctness under failure.** No acknowledged write is lost in any of the four failure tests.
+  If your design permits loss, you must state exactly which writes and why, before running the
+  test.
+- **Design document.** Every architectural decision has a "because" clause citing a number.
+  A reader who has not seen your code can predict its behaviour under a 10x traffic increase.
+
+## Skills checklist (tick before you claim done)
+
+- [ ] I can turn a one-line product brief into requirements, an API, a data model, and a scale plan (ch. 1).
+- [ ] I can estimate QPS, bandwidth, storage, and a latency budget without a calculator (ch. 2).
+- [ ] I can explain what an L4 balancer cannot do that an L7 balancer can, and why (ch. 3).
+- [ ] I can implement consistent hashing with virtual nodes and predict how many keys move (ch. 4).
+- [ ] I can implement LRU and LFU in $O(1)$ and say which workload breaks each (ch. 5).
+- [ ] I can prevent a cache stampede three different ways and say when each applies (ch. 6).
+- [ ] I can size a Bloom filter for a target error rate and explain the space/error trade (ch. 7).
+- [ ] I can choose between a queue and a log, and design idempotent consumers (ch. 8).
+- [ ] I can design a cache key and predict the hit-rate cost of a `Vary` header (ch. 9).
+- [ ] I can pick a data store from access patterns and design a partition/sort key (ch. 10).
+- [ ] I can explain B-tree versus LSM in terms of write, read, and space amplification (ch. 11).
+- [ ] I can read a query plan and design the composite index that fixes it (ch. 12).
+- [ ] I can explain replication lag anomalies and the routing fix for each (ch. 13).
+- [ ] I can shard a dataset, rebalance it, and handle a hot key (ch. 14).
+- [ ] I can name the anomaly each isolation level permits and design around write skew (ch. 15).
+- [ ] I can state CAP precisely and choose a consistency model per feature (ch. 16).
+- [ ] I can explain why a majority quorum makes split brain impossible (ch. 17).
+- [ ] I can design an event-time stream job with watermarks and late data (ch. 18).
+- [ ] I can make a service stateless and size a fleet for peak plus one AZ failure (ch. 19).
+- [ ] I can implement a token bucket and deploy it correctly in a distributed system (ch. 20).
+- [ ] I can make any write idempotent and configure retries that do not amplify (ch. 21).
+- [ ] I can stop a cascading failure with timeouts, bulkheads, breakers, and shedding (ch. 22).
+- [ ] I can define SLIs and SLOs and write a burn-rate alert (ch. 23).
+- [ ] I can choose batch, streaming, or online inference from the input space and freshness (ch. 24).
+- [ ] I can build point-in-time correct training data and detect training/serving skew (ch. 25).
+- [ ] I can roll out a model with shadow mode, canary stages, gates, and instant rollback (ch. 26).
+- [ ] I can design a RAG pipeline and diagnose whether a bad answer was retrieval or generation (ch. 27).
+- [ ] I can design idempotent, partitioned pipelines with quality gates and backfills (ch. 28).
+- [ ] I can distinguish data drift from concept drift and design monitoring for both (ch. 29).
+- [ ] I can run a design review that finds the gaps before they become incidents (ch. 30).
