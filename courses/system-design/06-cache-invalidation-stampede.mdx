@@ -1,0 +1,343 @@
+---
+course: system-design
+chapter: 06-cache-invalidation-stampede
+title: "Cache Invalidation and Stampede Protection"
+order: 6
+---
+
+## Three ways to invalidate, and their failure modes
+
+A cached value is a claim about the past. Invalidation is how you retract it, and there are
+only three mechanisms:
+
+- **TTL** — the value expires on a timer. Simple, always correct *eventually*, and it
+  guarantees a stale window equal to the TTL.
+- **Explicit delete on write** — the writer removes the key. Fresh immediately, but every
+  writer must know every key that derives from the data it touched.
+- **Versioned keys** — the key embeds a version (`user:7:v12`); a write bumps the version and
+  old entries are never read again. No delete needed, at the cost of garbage.
+
+```python
+class Cache:
+    def __init__(self): self.store, self.origin_loads = {}, 0
+    def get(self, k, now): 
+        v = self.store.get(k)
+        return None if v is None or v[1] <= now else v[0]
+    def set(self, k, v, now, ttl): self.store[k] = (v, now + ttl)
+    def delete(self, k): self.store.pop(k, None)
+
+c, now = Cache(), 0
+c.set("user:7", {"name": "alice"}, now, ttl=60)
+print("t=0   ", c.get("user:7", 0))
+print("t=59  ", c.get("user:7", 59))
+print("t=60  ", c.get("user:7", 60), "<- expired, stale window was 60s")
+
+c.set("user:7", {"name": "alice"}, 0, ttl=60)
+c.delete("user:7")                                   # writer invalidates
+print("after explicit delete:", c.get("user:7", 1))
+
+version = {"user:7": 12}
+vkey = lambda uid: f"user:{uid}:v{version[f'user:{uid}']}"
+c.set(vkey(7), {"name": "alice"}, 0, ttl=3600)
+version["user:7"] += 1                               # a write bumps the version
+print("versioned read after write:", c.get(vkey(7), 1), "<- old entry is unreachable")
+```
+
+```output
+t=0    {'name': 'alice'}
+t=59   {'name': 'alice'}
+t=60   None <- expired, stale window was 60s
+after explicit delete: None
+versioned read after write: None <- old entry is unreachable
+```
+
+Versioned keys are the trick that makes invalidation composable: a change to one row can
+invalidate every derived cache entry (rendered HTML, a feed page, an aggregate) by bumping a
+single version counter that all their keys embed.
+
+### The two hard cases
+
+**Cross-key derivation.** If `feed:user:9` is built from 200 posts, which write invalidates
+it? Explicit deletion needs a reverse index from post to feed. TTL sidesteps it by accepting
+staleness. Most systems use short TTLs for derived data and explicit deletion for primary
+entities.
+
+**Multi-node caches.** Deleting on one node does nothing to the copy in another process's
+memory. Either use a shared cache, or publish invalidations over a channel every process
+subscribes to (ch. 8) — and accept the window between publish and apply.
+
+## The stampede: what happens the instant a hot key expires
+
+One popular key expires. Every in-flight request misses at once, and all of them hit the
+database with the same query. This is the **cache stampede** (thundering herd), and it
+happens at exactly the worst moment: peak traffic on the hottest key.
+
+```python
+def naive_burst(qps, rebuild_s, ttl=60, window=300):
+    """One hot key, no protection. Every request arriving during a rebuild misses."""
+    misses_per_expiry = max(1, int(qps * rebuild_s))   # arrivals inside the rebuild window
+    expiries = window / ttl
+    return int(misses_per_expiry * expiries)
+
+for qps, rebuild_s in [(100, 0.05), (1_000, 0.2), (50_000, 0.2), (50_000, 2.0)]:
+    n = naive_burst(qps, rebuild_s)
+    print(f"{qps:6,} qps, {rebuild_s:4.2f}s rebuild -> {n:7,} origin queries in 5 min "
+          f"({n // 5:6,}/min), arriving in {int(300/60)} bursts")
+```
+
+```output
+   100 qps, 0.05s rebuild ->      25 origin queries in 5 min (     5/min), arriving in 5 bursts
+ 1,000 qps, 0.20s rebuild ->   1,000 origin queries in 5 min (   200/min), arriving in 5 bursts
+50,000 qps, 0.20s rebuild ->  50,000 origin queries in 5 min (10,000/min), arriving in 5 bursts
+50,000 qps, 2.00s rebuild -> 500,000 origin queries in 5 min (100,000/min), arriving in 5 bursts
+```
+
+The total is bad; the *shape* is worse. Every one of those queries lands within a couple of
+hundred milliseconds of the others, so the database sees 10,000 identical queries at once
+instead of a steady trickle — and a slow rebuild multiplies the damage linearly.
+
+## Correlated expiry is the real killer
+
+If you warm 10,000 keys at once with the same TTL, they all expire at once.
+
+```python
+import random
+random.seed(0)
+
+def expiry_histogram(ttl, jitter_frac, n=10_000, bucket=5):
+    """When do keys expire, if they were all created at t=0?"""
+    from collections import Counter
+    exp = [ttl + random.uniform(0, ttl * jitter_frac) for _ in range(n)]
+    hist = Counter(int(e // bucket) * bucket for e in exp)
+    return hist
+
+for frac in (0.0, 0.1, 0.5):
+    hist = expiry_histogram(300, frac)
+    worst = max(hist.values())
+    print(f"jitter {frac:4.0%}: expiries land in {len(hist):3} buckets of 5s, "
+          f"worst bucket = {worst:5} keys ({worst/10_000:5.1%} of the cache)")
+```
+
+```output
+jitter   0%: expiries land in   1 buckets of 5s, worst bucket = 10000 keys (100.0% of the cache)
+jitter  10%: expiries land in   6 buckets of 5s, worst bucket =  1704 keys (17.0% of the cache)
+jitter  50%: expiries land in  30 buckets of 5s, worst bucket =   391 keys ( 3.9% of the cache)
+```
+
+Ten percent jitter turns a single 10,000-query spike into a smear of a few hundred per
+bucket. This is the cheapest fix in the chapter: `ttl = base + random(0, 0.1 * base)`, one
+line, and it removes the correlation that makes stampedes catastrophic.
+
+## Single-flight: one rebuild per key, everyone else waits
+
+Jitter spreads *different* keys. It does nothing for one hot key with 500 concurrent
+requests. For that you need mutual exclusion on the rebuild.
+
+```python
+class SingleFlight:
+    """Coalesce concurrent rebuilds of the same key. One caller computes, the rest reuse."""
+    def __init__(self): self.inflight, self.calls, self.coalesced = {}, 0, 0
+
+    def do(self, key, fn, waiters):
+        # waiters = how many callers arrive while the rebuild is in progress
+        self.calls += 1
+        value = fn()                       # exactly one real computation
+        self.coalesced += waiters
+        return [value] * (waiters + 1)     # everyone gets the same result
+
+sf = SingleFlight()
+db_queries = 0
+def load_from_db():
+    global db_queries
+    db_queries += 1
+    return {"post": "hello"}
+
+for burst in (500, 300, 900):              # three separate stampedes
+    sf.do("post:42", load_from_db, waiters=burst - 1)
+
+print(f"stampedes: 3, total callers: 1700")
+print(f"db queries: {db_queries}, coalesced callers: {sf.coalesced}")
+print(f"origin load reduction: {1 - db_queries/1700:.2%}")
+```
+
+```output
+stampedes: 3, total callers: 1700
+db queries: 3, coalesced callers: 1697
+origin load reduction: 99.82%
+```
+
+In a real service this is a per-key lock (or a `Future` map): the first miss starts the
+rebuild and stores a promise; every subsequent miss finds the promise and awaits it. Go calls
+it `singleflight`, Python's `asyncio` does it with a `dict[str, Task]`, and Redis-based
+versions take a short-lived lock key with `SET NX PX`.
+
+### Serve-stale-while-revalidate
+
+Better still: never make anyone wait. Keep two timestamps per entry — *soft* expiry and
+*hard* expiry. Past the soft expiry, return the stale value immediately **and** trigger one
+background refresh. Only past the hard expiry do readers block.
+
+```python
+class SWRCache:
+    def __init__(self, soft, hard):
+        self.soft, self.hard, self.entry = soft, hard, None
+        self.served_stale = self.blocked = self.refreshes = 0
+
+    def get(self, now, rebuild):
+        if self.entry is None or now - self.entry[1] > self.hard:
+            self.blocked += 1; self.refreshes += 1
+            self.entry = (rebuild(), now)
+        elif now - self.entry[1] > self.soft:
+            self.served_stale += 1; self.refreshes += 1
+            self.entry = (rebuild(), now)      # refresh happens off the request path
+        return self.entry[0]
+
+c = SWRCache(soft=30, hard=120)
+for t in (0, 10, 31, 32, 200):
+    c.get(t, lambda: f"value@{t}")
+    print(f"t={t:3}  blocked={c.blocked} served_stale={c.served_stale} refreshes={c.refreshes}")
+```
+
+```output
+t=  0  blocked=1 served_stale=0 refreshes=1
+t= 10  blocked=1 served_stale=0 refreshes=1
+t= 31  blocked=1 served_stale=1 refreshes=2
+t= 32  blocked=1 served_stale=1 refreshes=2
+t=200  blocked=2 served_stale=1 refreshes=3
+```
+
+One blocking rebuild at t=0, one at t=200 (past the hard limit), and a refresh at t=31 that
+nobody waited for. `Cache-Control: stale-while-revalidate` puts exactly this behaviour in the
+CDN (ch. 9).
+
+## Cache penetration and negative caching
+
+A stampede is many requests for a key that *exists*. **Penetration** is many requests for a
+key that does not: every lookup misses the cache, misses the database, and caches nothing —
+so an attacker (or a broken client) can send your entire read volume to the database with
+random IDs.
+
+```python
+db_hits = 0
+cache = {}
+NEG = object()                     # sentinel meaning "known absent"
+
+def get_user(uid, negative_cache=False):
+    global db_hits
+    v = cache.get(uid)
+    if v is NEG: return None
+    if v is not None: return v
+    db_hits += 1
+    row = {"id": uid} if uid < 100 else None      # only ids < 100 exist
+    if row is not None:
+        cache[uid] = row
+    elif negative_cache:
+        cache[uid] = NEG                          # short TTL in production!
+    return row
+
+random.seed(3)
+missing = [random.randrange(1000, 1100) for _ in range(5000)]
+for uid in missing: get_user(uid)
+print(f"no negative cache: {db_hits} db lookups for {len(set(missing))} distinct missing ids")
+
+db_hits, cache = 0, {}
+for uid in missing: get_user(uid, negative_cache=True)
+print(f"with negative cache: {db_hits} db lookups")
+```
+
+```output
+no negative cache: 5000 db lookups for 100 distinct missing ids
+with negative cache: 100 db lookups
+```
+
+Negative caching collapses repeated misses, but it cannot help when the ids are *never*
+repeated — a random-id attack defeats it. For that you need a membership filter in front of
+the cache, which is exactly what ch. 7 builds.
+
+## Try it Yourself
+
+```python
+def origin_load(qps, ttl, rebuild_s, keys=1, single_flight=False):
+    """Origin queries per second caused by expiry, for `keys` equally hot keys."""
+    per_key = qps / keys
+    if single_flight:
+        origin = keys / ttl                            # one rebuild per key per TTL
+    else:                                              # everyone arriving mid-rebuild misses
+        origin = keys / ttl * max(1.0, per_key * rebuild_s)
+    print(f"{keys:>7,} keys | per-key {per_key:9,.1f} qps | "
+          f"single_flight={single_flight!s:5} -> origin {origin:10.2f} qps")
+
+origin_load(50_000, ttl=60, rebuild_s=0.2)
+origin_load(50_000, ttl=60, rebuild_s=0.2, keys=1_000)
+origin_load(50_000, ttl=60, rebuild_s=0.2, keys=100_000)
+origin_load(50_000, ttl=60, rebuild_s=0.2, single_flight=True)
+origin_load(50_000, ttl=60, rebuild_s=0.2, keys=1_000, single_flight=True)
+```
+
+```output
+      1 keys | per-key  50,000.0 qps | single_flight=False -> origin     166.67 qps
+  1,000 keys | per-key      50.0 qps | single_flight=False -> origin     166.67 qps
+100,000 keys | per-key       0.5 qps | single_flight=False -> origin    1666.67 qps
+      1 keys | per-key  50,000.0 qps | single_flight=True  -> origin       0.02 qps
+  1,000 keys | per-key      50.0 qps | single_flight=True  -> origin      16.67 qps
+```
+
+Two regimes. When a key is hot enough that requests keep arriving during its rebuild,
+unprotected origin load is $\text{qps} \times t_{\text{rebuild}} / \text{ttl}$ — the number of
+keys does not appear, which is why "spread it over more keys" is not a fix. When keys are
+quiet (the 100,000-key line), the load is instead the unavoidable floor of
+$\text{keys} / \text{ttl}$: every key must be rebuilt once per TTL no matter what. Single-flight
+moves you onto that floor and keeps you there. Try `rebuild_s=2.0` for a slow query and note
+that the single-flight rows do not move at all.
+
+## Exercise
+
+Implement **probabilistic early expiration** (the XFetch algorithm). Each cache entry stores
+the time its last rebuild took, $\delta$. On every read at time $t$ with expiry $e$, recompute
+the value early if
+
+$$
+t - \delta \beta \ln(u) \ge e, \qquad u \sim \mathrm{Uniform}(0, 1)
+$$
+
+with $\beta \approx 1$. Show that with a single hot key at 1,000 qps, XFetch produces roughly
+one rebuild per TTL with no coordination and no client ever blocking on an expired entry.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import math, random
+
+def xfetch_sim(qps=1000, ttl=60, delta=0.3, beta=1.0, horizon=600, seed=0):
+    rng = random.Random(seed)
+    expiry, rebuilds, blocked = -1.0, 0, 0
+    step = 1.0 / qps
+    t = 0.0
+    while t < horizon:
+        if t >= expiry:                                   # hard miss: client blocks
+            blocked += 1; rebuilds += 1; expiry = t + ttl
+        elif t - delta * beta * math.log(rng.random()) >= expiry:
+            rebuilds += 1; expiry = t + ttl               # early, off the request path
+        t += step
+    return rebuilds, blocked
+
+for beta in (0.0, 1.0, 3.0):
+    r, b = xfetch_sim(beta=beta)
+    print(f"beta={beta:4.1f}  rebuilds {r:3} (ideal {600//60})  blocking misses {b}")
+```
+
+```output
+beta= 0.0  rebuilds  10 (ideal 10)  blocking misses 10
+beta= 1.0  rebuilds  11 (ideal 10)  blocking misses 1
+beta= 3.0  rebuilds  12 (ideal 10)  blocking misses 1
+```
+
+The insight: the term $-\delta\beta\ln(u)$ is an exponential random variable with mean
+$\delta\beta$, so a request is likely to refresh early only when it lands within roughly one
+*rebuild duration* of expiry — and the more requests arrive per second, the more certain it is
+that **someone** refreshes first. With $\beta = 0$ you get the naive behaviour (every miss
+blocks); with $\beta = 1$ nobody blocks after the first load, at the price of a few extra
+rebuilds. Expensive keys (large $\delta$) start refreshing earlier automatically, which is the
+elegant part: the algorithm needs no lock, no coordination, and no configuration per key.
+</details>
