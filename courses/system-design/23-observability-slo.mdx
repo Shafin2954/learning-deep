@@ -1,0 +1,404 @@
+---
+course: system-design
+chapter: 23-observability-slo
+title: "Observability: Logs, Metrics, Traces, and SLOs"
+order: 23
+---
+
+## Three signals, three jobs
+
+They are not interchangeable, and using the wrong one is why debugging takes hours:
+
+- **Metrics** — cheap, aggregated numbers over time. Answer *is something wrong, and since when?*
+- **Logs** — discrete events with detail. Answer *what exactly happened to this request?*
+- **Traces** — one request's path across services with timings. Answer *where did the time go?*
+
+```python
+signals = [
+    ("metric", "http_requests_total{status='500'} = 412", "cheap: bytes per minute",
+     "no per-request detail"),
+    ("log",    "'order 8821 failed: card declined'",      "costly: bytes per event",
+     "expensive to search at scale"),
+    ("trace",  "req abc: gateway 3ms -> auth 12ms -> db 240ms", "sampled: 0.1-1% of requests",
+     "needs propagation through every hop"),
+]
+for kind, example, cost, limit in signals:
+    print(f"{kind:7} {example:48}\n{'':7} cost: {cost:34} limit: {limit}")
+```
+
+```output
+metric  http_requests_total{status='500'} = 412         
+        cost: cheap: bytes per minute            limit: no per-request detail
+log     'order 8821 failed: card declined'              
+        cost: costly: bytes per event            limit: expensive to search at scale
+trace   req abc: gateway 3ms -> auth 12ms -> db 240ms   
+        cost: sampled: 0.1-1% of requests        limit: needs propagation through every hop
+```
+
+The workflow that follows: a metric alerts you, a trace localizes the slow hop, and logs from
+that service tell you why. Skipping straight to logs is what makes an incident take an hour.
+
+## Metrics: RED for services, USE for resources
+
+```python
+def red(service, requests, errors, latencies):
+    latencies = sorted(latencies)
+    p = lambda q: latencies[int(len(latencies) * q)]
+    print(f"{service}: Rate {requests/60:6.1f} rps | Errors {errors/requests:6.2%} | "
+          f"Duration p50 {p(0.5):3} ms p99 {p(0.99):4} ms")
+
+import random
+random.seed(0)
+lat = [int(random.lognormvariate(3.0, 0.6)) for _ in range(6000)]
+red("checkout-api", requests=6000, errors=37, latencies=lat)
+
+def use(resource, utilization, saturation, errors):
+    verdict = "SATURATED" if saturation > 0 else "healthy" if utilization < 0.8 else "hot"
+    print(f"{resource:12} Utilization {utilization:5.0%} | Saturation {saturation:4} queued | "
+          f"Errors {errors:3} | {verdict}")
+
+print()
+use("cpu",        0.62, 0, 0)
+use("db pool",    0.95, 41, 0)
+use("disk",       0.40, 0, 2)
+```
+
+```output
+checkout-api: Rate  100.0 rps | Errors  0.62% | Duration p50  20 ms p99   80 ms
+
+cpu          Utilization   62% | Saturation    0 queued | Errors   0 | healthy
+db pool      Utilization   95% | Saturation   41 queued | Errors   0 | SATURATED
+disk         Utilization   40% | Saturation    0 queued | Errors   2 | healthy
+```
+
+**RED** (rate, errors, duration) describes what users experience; **USE** (utilization,
+saturation, errors) describes what resources are doing. A dashboard with both answers "is it
+broken?" and "why?" in one screen — and the saturation column is the leading indicator, because
+queues grow before latency does.
+
+### The percentile trap
+
+You cannot average percentiles. A p99 computed per instance and then averaged is not the p99 of
+the fleet, and the error is not small.
+
+```python
+instances = {
+    "app-1": [10] * 990 + [500] * 10,      # 1% slow
+    "app-2": [10] * 999 + [800] * 1,       # 0.1% very slow
+    "app-3": [10] * 900 + [300] * 100,     # 10% slow
+}
+def pct(xs, q):
+    xs = sorted(xs); return xs[int(len(xs) * q)]
+
+per_instance = [pct(v, 0.99) for v in instances.values()]
+combined = pct([x for v in instances.values() for x in v], 0.99)
+print(f"per-instance p99s: {per_instance} -> their average = {sum(per_instance)/3:.0f} ms")
+print(f"true fleet p99 (all samples pooled)      = {combined} ms")
+print("the average of p99s is not the p99 of the average — you need histograms")
+```
+
+```output
+per-instance p99s: [500, 10, 300] -> their average = 270 ms
+true fleet p99 (all samples pooled)      = 300 ms
+the average of p99s is not the p99 of the average — you need histograms
+```
+
+The fix is to export **histograms** (bucket counts), not pre-computed percentiles. Buckets add
+across instances, so the aggregate percentile can be computed correctly at query time — this is
+what Prometheus `histogram_quantile` and OpenTelemetry's explicit-bucket histograms are for.
+
+### Cardinality is the metric killer
+
+```python
+def series_count(labels):
+    n = 1
+    for name, card in labels:
+        n *= card
+    return n
+
+base = [("service", 20), ("endpoint", 30), ("status", 6), ("method", 4)]
+print(f"{'labels beyond the base four':34}{'time series':>18}")
+for extra in ([], [("region", 5)], [("region", 5), ("customer_id", 5_000)],
+              [("region", 5), ("customer_id", 5_000), ("user_id", 2_000_000)]):
+    added = ", ".join(n for n, _ in extra) or "(none)"
+    print(f"{added:34}{series_count(base + extra):>18,}")
+print("\nrule: labels must be bounded sets. user_id, request_id, and URLs with ids")
+print("belong in logs and traces, never in metric labels.")
+```
+
+```output
+labels beyond the base four              time series
+(none)                                        14,400
+region                                        72,000
+region, customer_id                      360,000,000
+region, customer_id, user_id      720,000,000,000,000
+
+rule: labels must be bounded sets. user_id, request_id, and URLs with ids
+belong in logs and traces, never in metric labels.
+```
+
+Every unique label combination is a separate time series with its own memory and index entry.
+One unbounded label turns a 14,000-series service into a billion-series outage of your
+monitoring system — which then fails at exactly the moment you need it.
+
+## Traces: propagation is the whole trick
+
+A trace is a tree of spans sharing a trace id. The id must be created at the edge and passed
+through **every** hop, including queues (ch. 8) — a trace that stops at the queue boundary hides
+the half of your latency that lives in async work.
+
+```python
+class Span:
+    def __init__(self, trace_id, name, parent=None, start=0, end=0):
+        self.trace_id, self.name, self.parent = trace_id, name, parent
+        self.start, self.end = start, end
+    @property
+    def duration(self): return self.end - self.start
+
+spans = [
+    Span("t1", "GET /checkout",   None,        0, 312),
+    Span("t1", "auth.verify",     "GET /checkout", 2, 14),
+    Span("t1", "cart.load",       "GET /checkout", 15, 48),
+    Span("t1", "pricing.quote",   "GET /checkout", 48, 292),
+    Span("t1", "  tax-service",   "pricing.quote", 55, 285),
+    Span("t1", "payment.reserve", "GET /checkout", 292, 310),
+]
+root = spans[0]
+for s in spans:
+    depth = 0 if s.parent is None else (2 if s.name.startswith("  ") else 1)
+    bar = " " * int(s.start / 312 * 40) + "#" * max(1, int(s.duration / 312 * 40))
+    print(f"{'  ' * depth}{s.name.strip():16} {s.duration:4} ms {bar}")
+print(f"\ncritical path: tax-service is {285-55} ms of the {root.duration} ms request "
+      f"({(285-55)/root.duration:.0%})")
+```
+
+```output
+GET /checkout     312 ms ########################################
+  auth.verify        12 ms #
+  cart.load          33 ms  ####
+  pricing.quote     244 ms       ###############################
+    tax-service       230 ms        #############################
+  payment.reserve    18 ms                                      ##
+
+critical path: tax-service is 230 ms of the 312 ms request (74%)
+```
+
+That picture is what a trace buys you: not "checkout is slow" but "74% of checkout is one
+downstream call inside pricing". Sampling makes it affordable — 1% head sampling for volume,
+plus **tail sampling** that keeps every trace that errored or exceeded a latency threshold, so
+the interesting ones are never the ones you dropped.
+
+### Structured logs, correlated by trace id
+
+```python
+import json
+
+def log(level, msg, **fields):
+    return json.dumps({"level": level, "msg": msg, **fields}, sort_keys=True)
+
+print(log("info",  "order created", trace_id="t1", order_id=8821, user_id="u_42", amount=4999))
+print(log("error", "card declined", trace_id="t1", order_id=8821, code="insufficient_funds"))
+print("\ngrep-able free text loses: 'Order 8821 failed for u_42 (declined)'")
+print("structured logs let you query: level=error AND code=insufficient_funds")
+print("and the trace_id joins these lines to the span tree above.")
+```
+
+```output
+{"amount": 4999, "level": "info", "msg": "order created", "order_id": 8821, "trace_id": "t1", "user_id": "u_42"}
+{"code": "insufficient_funds", "level": "error", "msg": "card declined", "order_id": 8821, "trace_id": "t1"}
+
+grep-able free text loses: 'Order 8821 failed for u_42 (declined)'
+structured logs let you query: level=error AND code=insufficient_funds
+and the trace_id joins these lines to the span tree above.
+```
+
+## SLIs, SLOs, and error budgets
+
+An **SLI** is a measurement of user-visible behaviour. An **SLO** is a target for it over a
+window. The difference between the SLO and 100% is your **error budget** — a currency you spend
+on deploys, experiments, and risk.
+
+```python
+def error_budget(slo, window_days=30, rps=1000):
+    total = rps * 86_400 * window_days
+    allowed = total * (1 - slo)
+    minutes = (1 - slo) * window_days * 24 * 60
+    print(f"SLO {slo:7.4%} -> budget {allowed:12,.0f} failed requests / "
+          f"{minutes:8.1f} minutes of full downtime per {window_days} days")
+
+for slo in (0.99, 0.995, 0.999, 0.9999):
+    error_budget(slo)
+```
+
+```output
+SLO 99.0000% -> budget   25,920,000 failed requests /    432.0 minutes of full downtime per 30 days
+SLO 99.5000% -> budget   12,960,000 failed requests /    216.0 minutes of full downtime per 30 days
+SLO 99.9000% -> budget    2,592,000 failed requests /     43.2 minutes of full downtime per 30 days
+SLO 99.9900% -> budget      259,200 failed requests /      4.3 minutes of full downtime per 30 days
+```
+
+Three nines is 43 minutes a month; four nines is 4. That difference is the whole argument for
+picking an SLO you can actually meet: **an SLO you always miss is a lie, and an SLO you never
+come close to missing is set too low** — it means you are over-investing in reliability instead
+of features.
+
+```python
+def burn_rate(slo, window_hours, observed_error_rate, budget_days=30):
+    budget = 1 - slo
+    rate = observed_error_rate / budget
+    exhausted_in_h = (budget_days * 24) / rate if rate > 0 else float("inf")
+    urgency = ("PAGE someone now" if rate >= 14.4 else
+               "page during business hours" if rate >= 6 else
+               "ticket" if rate >= 1 else "no action")
+    print(f"error rate {observed_error_rate:6.2%} over {window_hours:2}h -> burn rate "
+          f"{rate:6.1f}x | budget gone in {exhausted_in_h:7.1f}h | {urgency}")
+
+for err in (0.0005, 0.002, 0.01, 0.05):
+    burn_rate(0.999, 1, err)
+```
+
+```output
+error rate  0.05% over  1h -> burn rate    0.5x | budget gone in  1440.0h | no action
+error rate  0.20% over  1h -> burn rate    2.0x | budget gone in   360.0h | ticket
+error rate  1.00% over  1h -> burn rate   10.0x | budget gone in    72.0h | page during business hours
+error rate  5.00% over  1h -> burn rate   50.0x | budget gone in    14.4h | PAGE someone now
+```
+
+**Burn-rate alerting** is the modern replacement for threshold alerting: page when the budget is
+being consumed fast enough to matter, not when a number crosses a line. A 14.4x burn rate over
+one hour means 2% of a 30-day budget is gone in an hour — worth waking someone. A 1.5x burn is a
+ticket, not a page. This is what stops alert fatigue, which is the actual failure mode of most
+monitoring setups.
+
+## Try it Yourself
+
+```python
+def alert_quality(threshold_ms, latencies, incidents):
+    """Threshold alerting: every choice trades false pages against missed incidents."""
+    fired = sum(1 for l in latencies if l > threshold_ms)
+    caught = sum(1 for i in incidents if i > threshold_ms)
+    print(f"threshold {threshold_ms:4} ms -> {fired:5} alerts from {len(latencies):,} samples "
+          f"| caught {caught}/{len(incidents)} real incidents "
+          f"| false pages {max(0, fired - caught):5}")
+
+random.seed(1)
+incidents = [900, 1200, 2000]                    # three genuine slow periods
+
+print("tight distribution — a clean gap between normal and broken:")
+normal = [int(random.lognormvariate(3.0, 0.5)) for _ in range(10_000)]
+for th in (40, 150, 1000):
+    alert_quality(th, normal + incidents, incidents)
+
+print("\nheavy-tailed distribution — normal traffic overlaps the incidents:")
+noisy = [int(random.lognormvariate(3.0, 1.4)) for _ in range(10_000)]
+for th in (40, 150, 400, 1000):
+    alert_quality(th, noisy + incidents, incidents)
+```
+
+```output
+tight distribution — a clean gap between normal and broken:
+threshold   40 ms ->   746 alerts from 10,003 samples | caught 3/3 real incidents | false pages   743
+threshold  150 ms ->     3 alerts from 10,003 samples | caught 3/3 real incidents | false pages     0
+threshold 1000 ms ->     2 alerts from 10,003 samples | caught 2/3 real incidents | false pages     0
+
+heavy-tailed distribution — normal traffic overlaps the incidents:
+threshold   40 ms ->  3092 alerts from 10,003 samples | caught 3/3 real incidents | false pages  3089
+threshold  150 ms ->   773 alerts from 10,003 samples | caught 3/3 real incidents | false pages   770
+threshold  400 ms ->   163 alerts from 10,003 samples | caught 3/3 real incidents | false pages   160
+threshold 1000 ms ->    27 alerts from 10,003 samples | caught 2/3 real incidents | false pages    25
+```
+
+When normal traffic is tightly distributed, a threshold works perfectly — 150 ms catches all
+three incidents and pages nobody else. Real latency is not tight: with a heavy tail, every
+threshold is either noisy or blind, and the value that catches all three incidents also pages
+hundreds of times for ordinary slow requests. That is the argument for alerting on **burn rate
+over a window** rather than on instantaneous values, and for keeping the number of paging alerts
+small enough that every page is worth a human waking up.
+
+## Exercise
+
+Design the observability for the checkout service traced above. Specify: the four SLIs you
+would measure and exactly how (numerator and denominator), an SLO for each with a justification,
+the burn-rate alerts you would configure, the metric labels you would allow (and which you would
+forbid), and what you would log at each level. Then write code that computes the SLO compliance
+and remaining error budget from a batch of request records.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import random
+random.seed(7)
+
+SLOS = {                     # SLI name -> (target, how it is measured)
+    "availability": (0.999,  "non-5xx responses / all responses"),
+    "latency":      (0.99,   "requests under 300 ms / all requests"),
+    "correctness":  (0.9999, "orders with a matching payment record / all orders"),
+    "freshness":    (0.99,   "order events visible downstream within 60 s / all orders"),
+}
+
+def evaluate(records, window_days=30):
+    n = len(records)
+    sli = {
+        "availability": sum(r["status"] < 500 for r in records) / n,
+        "latency":      sum(r["ms"] < 300 for r in records) / n,
+        "correctness":  sum(r["reconciled"] for r in records) / n,
+        "freshness":    sum(r["propagated_s"] < 60 for r in records) / n,
+    }
+    print(f"{'SLI':14}{'measured':>10}{'target':>10}{'budget used':>14}  verdict")
+    for name, value in sli.items():
+        target, _ = SLOS[name]
+        used = (1 - value) / (1 - target)
+        print(f"{name:14}{value:>10.4%}{target:>10.4%}{used:>13.0%}  "
+              f"{'MET' if value >= target else 'MISSED'}")
+        if used > 1:
+            print(f"{'':14}budget exhausted: freeze risky deploys until it recovers")
+        elif used > 0.5:
+            print(f"{'':14}over half the budget spent — slow down, add tests")
+    return sli
+
+records = [{"status": 500 if random.random() < 0.0008 else 200,
+            "ms": int(random.lognormvariate(4.6, 0.55)),
+            "reconciled": random.random() > 0.00005,
+            "propagated_s": random.expovariate(1 / 15)} for _ in range(200_000)]
+evaluate(records)
+
+print("\nallowed metric labels : service, endpoint, method, status_class, region")
+print("forbidden as labels   : user_id, order_id, trace_id, full URL path (unbounded)")
+print("log levels            : ERROR = user-visible failure with trace_id + order_id;")
+print("                        WARN = degraded fallback taken; INFO = state transitions;")
+print("                        DEBUG = off in production, on per-request via a sampling flag")
+print("burn-rate alerts      : page at 14.4x over 1h (2% of budget), "
+      "ticket at 6x over 6h, ticket at 1x over 3d")
+```
+
+```output
+SLI             measured    target   budget used  verdict
+availability    99.9180%  99.9000%          82%  MET
+              over half the budget spent — slow down, add tests
+latency         97.7770%  99.0000%         222%  MISSED
+              budget exhausted: freeze risky deploys until it recovers
+correctness     99.9945%  99.9900%          55%  MET
+              over half the budget spent — slow down, add tests
+freshness       98.1430%  99.0000%         186%  MISSED
+              budget exhausted: freeze risky deploys until it recovers
+
+allowed metric labels : service, endpoint, method, status_class, region
+forbidden as labels   : user_id, order_id, trace_id, full URL path (unbounded)
+log levels            : ERROR = user-visible failure with trace_id + order_id;
+                        WARN = degraded fallback taken; INFO = state transitions;
+                        DEBUG = off in production, on per-request via a sampling flag
+burn-rate alerts      : page at 14.4x over 1h (2% of budget), ticket at 6x over 6h, ticket at 1x over 3d
+```
+
+The insight: the four SLIs are deliberately different *kinds* of correct. Availability and
+latency are what a user feels immediately; **correctness** (does every order have a payment?) and
+**freshness** (did the event reach the warehouse in time?) are the ones that fail silently — no
+500s, no slow requests, just wrong data discovered a week later by finance. A service whose only
+SLIs are availability and latency is measuring what is easy rather than what matters. Note the
+targets differ by two orders of magnitude, and deliberately: 99.9% availability is a business
+decision about downtime cost, while 99.99% correctness is a decision about how many
+unreconciled payments a human can chase per month. The error budget then makes the trade-off
+explicit and unarguable — when it is exhausted, feature velocity yields to reliability work, and
+when it is barely touched, you are being too careful.
+</details>
