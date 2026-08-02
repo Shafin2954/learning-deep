@@ -1,0 +1,393 @@
+---
+course: system-design
+chapter: 18-batch-stream-cdc
+title: "Batch Processing, Stream Processing, and CDC"
+order: 18
+---
+
+## Bounded versus unbounded, and everything follows
+
+A **batch** job reads a finite input, runs to completion, and produces output. A **stream** job
+reads an input that never ends, so it must produce answers *before* it has seen everything. That
+single difference generates every other distinction.
+
+| | Batch | Stream |
+|---|---|---|
+| Input | bounded (yesterday's files) | unbounded (a log, forever) |
+| Output | complete, once | incremental, continuously |
+| Failure | rerun the job | replay from a checkpoint offset |
+| Correctness | trivially deterministic | depends on time handling and late data |
+| Latency | minutes to hours | milliseconds to seconds |
+| Reprocessing | rerun over old input | replay the log from offset 0 (ch. 8) |
+
+```python
+from collections import Counter, defaultdict
+
+logs = ["GET /home 200", "GET /api 500", "GET /home 200",
+        "POST /api 201", "GET /api 500", "GET /missing 404"]
+
+def batch(lines):
+    """MapReduce in miniature: map to pairs, group by key, reduce each group."""
+    mapped = [(line.split()[2], 1) for line in lines]          # map
+    grouped = defaultdict(list)
+    for k, v in mapped:
+        grouped[k].append(v)                                   # shuffle
+    return {k: sum(vs) for k, vs in grouped.items()}           # reduce
+
+print("batch result over the whole file:", batch(logs))
+
+state = Counter()
+for i, line in enumerate(logs):                                 # stream: answer as you go
+    state[line.split()[2]] += 1
+    if i in (2, 5):
+        print(f"stream state after {i+1} records:", dict(state))
+```
+
+```output
+batch result over the whole file: {'200': 2, '500': 2, '201': 1, '404': 1}
+stream state after 3 records: {'200': 2, '500': 1}
+stream state after 6 records: {'200': 2, '500': 2, '201': 1, '404': 1}
+```
+
+The batch job knew the answer once; the stream job had an answer at every instant, each of them
+correct for the prefix it had seen. Nothing else about MapReduce matters as much as that shuffle
+step: **grouping by key is the expensive part**, because it moves data across the network.
+
+## Event time versus processing time
+
+Every stream has two clocks: when the event *happened* and when your system *saw* it. They
+diverge because of mobile buffering, retries, queue backlogs, and network partitions.
+
+```python
+events = [                          # (event_time, processing_time, user)
+    (10, 11, "alice"), (12, 13, "bob"), (15, 16, "carol"),
+    (11, 25, "dan"),                # phone was offline: 14 seconds late
+    (18, 19, "erin"),
+]
+
+def window(events, size, clock):
+    idx = 0 if clock == "event" else 1
+    buckets = defaultdict(list)
+    for e in events:
+        buckets[e[idx] // size * size].append(e[2])
+    return dict(sorted(buckets.items()))
+
+print("by EVENT time     :", window(events, 10, "event"))
+print("by PROCESSING time:", window(events, 10, "processing"))
+```
+
+```output
+by EVENT time     : {10: ['alice', 'bob', 'carol', 'dan', 'erin']}
+by PROCESSING time: {10: ['alice', 'bob', 'carol', 'erin'], 20: ['dan']}
+```
+
+Dan's event belongs to the 10–19 window by event time and lands in the 20–29 window by
+processing time. Aggregating on processing time is easy and produces numbers that are *wrong in
+a way nobody can reconstruct later* — the same input replayed at a different speed gives
+different results. Aggregate on **event time**, always, and deal with lateness explicitly.
+
+## Windows: tumbling, hopping, session
+
+```python
+def tumbling(ts, size):        return ts // size * size
+def hopping(ts, size, slide):
+    first = ((ts - size) // slide + 1) * slide          # earliest window still covering ts
+    return list(range(first, ts + 1, slide))
+
+print("tumbling(size=60):  event at t=125 ->", tumbling(125, 60))
+print("hopping(size=60, slide=30): event at t=125 ->", hopping(125, 60, 30))
+
+def sessions(times, gap):
+    """Sessions close after `gap` seconds of inactivity: window length is data-driven."""
+    out, cur = [], []
+    for t in sorted(times):
+        if cur and t - cur[-1] > gap:
+            out.append((cur[0], cur[-1])); cur = []
+        cur.append(t)
+    if cur: out.append((cur[0], cur[-1]))
+    return out
+
+clicks = [1, 3, 5, 40, 42, 43, 200]
+print("sessions(gap=30):", sessions(clicks, 30))
+```
+
+```output
+tumbling(size=60):  event at t=125 -> 120
+hopping(size=60, slide=30): event at t=125 -> [90, 120]
+sessions(gap=30): [(1, 5), (40, 43), (200, 200)]
+```
+
+Tumbling windows are disjoint and cheap. Hopping (sliding) windows overlap, so each event lands
+in several windows and state grows by the overlap factor. Session windows have no fixed size at
+all — they are defined by gaps in the data, which is what makes them the right tool for "how
+long was this user active" and the wrong tool for a fixed-capacity buffer.
+
+## Watermarks: deciding when a window is done
+
+A **watermark** is an assertion: "I believe I have seen every event with event time earlier than
+$W$." It is a heuristic, and it forces the central trade-off of stream processing — wait longer
+for correctness, or emit sooner for freshness.
+
+```python
+class WindowedCount:
+    def __init__(self, size, allowed_lateness=0):
+        self.size, self.lateness = size, allowed_lateness
+        self.windows, self.emitted, self.dropped = defaultdict(int), {}, []
+
+    def process(self, event_time, watermark):
+        w = event_time // self.size * self.size
+        if w in self.emitted:                                  # the window already fired
+            if w + self.size + self.lateness < watermark:
+                self.dropped.append(event_time)
+                return f"DROPPED: window {w} closed for good"
+            self.windows[w] += 1
+            self.emitted[w] = self.windows[w]
+            return f"LATE update: window {w} corrected to {self.windows[w]}"
+        self.windows[w] += 1
+        return f"buffered in window {w}"
+
+    def advance(self, watermark):
+        out = []
+        for w in sorted(self.windows):
+            if w + self.size <= watermark and w not in self.emitted:
+                self.emitted[w] = self.windows[w]
+                out.append(f"EMIT window {w}: count={self.windows[w]}")
+        return out
+
+wc = WindowedCount(size=10, allowed_lateness=5)
+for et, wm in [(3, 3), (7, 7), (12, 12), (5, 13), (23, 23), (6, 30)]:
+    print(f"event t={et:2} watermark={wm:2} -> {wc.process(et, wm)}")
+    for line in wc.advance(wm):
+        print(f"                           {line}")
+print("dropped events:", wc.dropped)
+```
+
+```output
+event t= 3 watermark= 3 -> buffered in window 0
+event t= 7 watermark= 7 -> buffered in window 0
+event t=12 watermark=12 -> buffered in window 10
+                           EMIT window 0: count=2
+event t= 5 watermark=13 -> LATE update: window 0 corrected to 3
+event t=23 watermark=23 -> buffered in window 20
+                           EMIT window 10: count=1
+event t= 6 watermark=30 -> DROPPED: window 0 closed for good
+                           EMIT window 20: count=1
+dropped events: [6]
+```
+
+Three outcomes, and every stream framework gives you the same three: on time, late but within
+the allowed lateness (so the window is corrected and the downstream consumer must handle an
+update), or too late (dropped, and counted in a metric you should alert on). A stream job that
+never reports dropped events is not correct — it is silent.
+
+## Change data capture: the database as a stream
+
+CDC turns a database's replication log into an event stream. The write-ahead log already
+records every committed change in order (ch. 11, 13); CDC just publishes it.
+
+```python
+class WAL:
+    """A minimal write-ahead log with an LSN, the way Postgres logical decoding sees it."""
+    def __init__(self): self.entries, self.lsn = [], 0
+    def write(self, table, op, key, value=None):
+        self.lsn += 1
+        self.entries.append({"lsn": self.lsn, "table": table, "op": op,
+                             "key": key, "value": value})
+        return self.lsn
+
+wal = WAL()
+wal.write("orders", "INSERT", 1, {"total": 50, "status": "paid"})
+wal.write("orders", "INSERT", 2, {"total": 20, "status": "pending"})
+wal.write("orders", "UPDATE", 1, {"total": 50, "status": "refunded"})
+wal.write("orders", "DELETE", 2)
+
+def build_view(entries, from_lsn=0):
+    """A consumer replays the log to build any derived view it likes."""
+    view = {}
+    for e in entries:
+        if e["lsn"] <= from_lsn: continue
+        if e["op"] == "DELETE": view.pop(e["key"], None)
+        else: view[e["key"]] = e["value"]
+    return view
+
+view = build_view(wal.entries)
+print("materialized view from LSN 0:", view)
+revenue = Counter()
+for row in view.values():
+    revenue[row["status"]] += row["total"]
+print("revenue by status:", dict(revenue))
+```
+
+```output
+materialized view from LSN 0: {1: {'total': 50, 'status': 'refunded'}}
+revenue by status: {'refunded': 50}
+```
+
+This is the pattern behind Debezium, Postgres logical replication, MySQL binlog readers, and
+DynamoDB Streams — and it is how you keep a search index, a cache, or a data warehouse in sync
+without dual writes. Compare it with the outbox pattern (ch. 8): the outbox makes the event an
+explicit part of your schema; CDC derives events from the data itself. **CDC never misses a
+write** — nothing can change the table without passing through the log.
+
+### Log compaction keeps a changelog bounded
+
+```python
+def compact(entries):
+    """Keep only the latest entry per key: the log becomes a snapshot you can replay."""
+    latest = {}
+    for e in entries:
+        latest[e["key"]] = e
+    return [e for e in latest.values() if e["op"] != "DELETE"]
+
+print(f"raw log: {len(wal.entries)} entries")
+kept = compact(wal.entries)
+print(f"compacted: {len(kept)} entries -> {[(e['key'], e['op']) for e in kept]}")
+print("a new consumer replays the compacted log and reaches the same state, faster")
+```
+
+```output
+raw log: 4 entries
+compacted: 1 entries -> [(1, 'UPDATE')]
+a new consumer replays the compacted log and reaches the same state, faster
+```
+
+Kafka's compacted topics work exactly like this, and they are what makes a changelog usable as
+a *table*: the log is the source of truth, and the current state is a fold over it. That duality
+— **stream/table**, a table is a stream's fold and a stream is a table's diff — is the central
+idea in Kafka Streams, Flink, and Materialize.
+
+## Exactly-once, again
+
+A stream job that crashes mid-window must not double-count on restart. Three mechanisms in
+production use:
+
+```python
+def restart_behaviour(strategy, checkpointed_offset, processed_offset, sink_state):
+    if strategy == "at-least-once":
+        replayed = processed_offset - checkpointed_offset
+        return f"replays {replayed} records -> sink double-counts unless it is idempotent"
+    if strategy == "idempotent sink":
+        return "replays records, but writes are keyed upserts -> final state is correct"
+    if strategy == "transactional":
+        return "offset and output commit atomically -> no replay visible downstream"
+
+for s in ("at-least-once", "idempotent sink", "transactional"):
+    print(f"{s:18} {restart_behaviour(s, 1000, 1450, {})}")
+```
+
+```output
+at-least-once      replays 450 records -> sink double-counts unless it is idempotent
+idempotent sink    replays records, but writes are keyed upserts -> final state is correct
+transactional      offset and output commit atomically -> no replay visible downstream
+```
+
+The practical answer is the middle one, for the reason ch. 8 gave: end-to-end exactly-once
+requires the *sink* to participate, and most sinks (an HTTP API, an email, a third-party
+service) cannot. Make the effect idempotent and the delivery guarantee stops mattering.
+
+## Try it Yourself
+
+```python
+def lateness_tradeoff(allowed_lateness, delays, window=60):
+    """How much data is captured, and how long results are delayed?"""
+    captured = sum(1 for d in delays if d <= allowed_lateness)
+    print(f"allowed lateness {allowed_lateness:4}s -> captures {captured/len(delays):6.1%} "
+          f"of events | results published {window + allowed_lateness:4}s after the window opens")
+
+import random
+random.seed(0)
+# most events arrive fast; a heavy tail from offline mobile clients
+delays = [random.expovariate(1/3) if random.random() < 0.95 else random.uniform(60, 900)
+          for _ in range(20_000)]
+
+for lateness in (0, 5, 30, 300, 900):
+    lateness_tradeoff(lateness, delays)
+```
+
+```output
+allowed lateness    0s -> captures   0.0% of events | results published   60s after the window opens
+allowed lateness    5s -> captures  77.1% of events | results published   65s after the window opens
+allowed lateness   30s -> captures  94.9% of events | results published   90s after the window opens
+allowed lateness  300s -> captures  96.4% of events | results published  360s after the window opens
+allowed lateness  900s -> captures 100.0% of events | results published  960s after the window opens
+```
+
+Five seconds of allowed lateness captures most events; capturing the last few percent costs
+fifteen minutes of delay on *every* window. The usual resolution is two pipelines over the same
+log: a fast one for dashboards that accepts approximation, and a slow daily batch that
+recomputes the authoritative numbers — the reason "lambda architecture" exists, and the reason
+people keep trying to escape it.
+
+## Exercise
+
+Build a CDC consumer that maintains a **materialized aggregate** — revenue per status — from the
+WAL above, updating incrementally rather than recomputing. Handle `INSERT`, `UPDATE`, and
+`DELETE` correctly (an `UPDATE` must subtract the old value from its old group and add the new
+value to its new group), and verify against a full recomputation after every event.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class IncrementalAggregate:
+    def __init__(self):
+        self.rows = {}                       # key -> last known row (needed for UPDATE/DELETE)
+        self.revenue = Counter()             # status -> revenue
+
+    def apply(self, e):
+        old = self.rows.get(e["key"])
+        if old is not None:                  # retract the old contribution
+            self.revenue[old["status"]] -= old["total"]
+            if self.revenue[old["status"]] == 0:
+                del self.revenue[old["status"]]
+        if e["op"] == "DELETE":
+            self.rows.pop(e["key"], None)
+        else:                                # add the new contribution
+            self.rows[e["key"]] = e["value"]
+            self.revenue[e["value"]["status"]] += e["value"]["total"]
+
+def recompute(entries):
+    view, rev = {}, Counter()
+    for e in entries:
+        if e["op"] == "DELETE": view.pop(e["key"], None)
+        else: view[e["key"]] = e["value"]
+    for row in view.values():
+        rev[row["status"]] += row["total"]
+    return rev
+
+wal2 = WAL()
+ops = [("INSERT", 1, {"total": 50, "status": "paid"}),
+       ("INSERT", 2, {"total": 20, "status": "pending"}),
+       ("UPDATE", 2, {"total": 20, "status": "paid"}),        # status change: moves groups
+       ("UPDATE", 1, {"total": 80, "status": "paid"}),        # amount change: same group
+       ("DELETE", 2, None),
+       ("INSERT", 3, {"total": 15, "status": "refunded"})]
+
+agg = IncrementalAggregate()
+for op, key, value in ops:
+    wal2.write("orders", op, key, value)
+    agg.apply(wal2.entries[-1])
+    truth = recompute(wal2.entries)
+    match = dict(agg.revenue) == dict(truth)
+    print(f"{op:6} key={key} -> incremental {dict(agg.revenue)} "
+          f"{'==' if match else '!='} recomputed {dict(truth)}")
+```
+
+```output
+INSERT key=1 -> incremental {'paid': 50} == recomputed {'paid': 50}
+INSERT key=2 -> incremental {'paid': 50, 'pending': 20} == recomputed {'paid': 50, 'pending': 20}
+UPDATE key=2 -> incremental {'paid': 70} == recomputed {'paid': 70}
+UPDATE key=1 -> incremental {'paid': 100} == recomputed {'paid': 100}
+DELETE key=2 -> incremental {'paid': 80} == recomputed {'paid': 80}
+INSERT key=3 -> incremental {'paid': 80, 'refunded': 15} == recomputed {'paid': 80, 'refunded': 15}
+```
+
+The insight: an incremental aggregate is only correct if every update is a **retract-then-add**
+pair, which means the consumer must know the *previous* row. That is why CDC formats carry a
+`before` image (Debezium's `before`/`after` envelope) — without it, a downstream aggregate cannot
+undo the old contribution and slowly drifts from the truth. Two consequences for design: the
+consumer needs its own keyed state (a local RocksDB in Flink, a compacted topic in Kafka
+Streams), and that state must be checkpointed with the input offset so a restart resumes both
+together (ch. 26 makes the same argument for model state). This retract-and-add discipline is
+exactly what materialized-view engines like Materialize and Flink SQL automate for you.
+</details>
