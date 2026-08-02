@@ -1,0 +1,319 @@
+---
+course: system-design
+chapter: 02-back-of-envelope
+title: "Back-of-Envelope Estimation and Latency Numbers"
+order: 2
+---
+
+## The numbers every designer knows cold
+
+Latency is physics plus queueing. These orders of magnitude have been stable for a decade —
+the absolute values drift, the *ratios* do not.
+
+```python
+latency_ns = {
+    "L1 cache reference":            1,
+    "branch mispredict":             3,
+    "L2 cache reference":            4,
+    "mutex lock/unlock":             17,
+    "main memory reference":         100,
+    "compress 1 KB (snappy)":        2_000,
+    "read 1 MB sequentially (RAM)":  50_000,
+    "SSD random read":               16_000,
+    "read 1 MB from SSD":            200_000,
+    "round trip within datacenter":  500_000,
+    "disk (HDD) seek":               2_000_000,
+    "read 1 MB from HDD":            5_000_000,
+    "round trip CA to Netherlands":  150_000_000,
+}
+for name, ns in latency_ns.items():
+    print(f"{name:32} {ns:>12,} ns = {ns/1e6:9.3f} ms")
+```
+
+```output
+L1 cache reference                          1 ns =     0.000 ms
+branch mispredict                           3 ns =     0.000 ms
+L2 cache reference                          4 ns =     0.000 ms
+mutex lock/unlock                          17 ns =     0.000 ms
+main memory reference                     100 ns =     0.000 ms
+compress 1 KB (snappy)                  2,000 ns =     0.002 ms
+read 1 MB sequentially (RAM)           50,000 ns =     0.050 ms
+SSD random read                        16,000 ns =     0.016 ms
+read 1 MB from SSD                    200,000 ns =     0.200 ms
+round trip within datacenter          500,000 ns =     0.500 ms
+disk (HDD) seek                     2,000,000 ns =     2.000 ms
+read 1 MB from HDD                  5,000,000 ns =     5.000 ms
+round trip CA to Netherlands      150,000,000 ns =   150.000 ms
+```
+
+Three cliffs matter more than the rest: **memory is ~100x an L1 hit**, **SSD is ~150x
+memory**, and **a cross-continent round trip is ~300x a datacenter round trip**. Every
+architecture decision is about which cliff you fall down, and how often.
+
+## Units: use powers of ten for capacity, powers of two for memory
+
+```python
+for exp, name in [(3, "KB"), (6, "MB"), (9, "GB"), (12, "TB"), (15, "PB")]:
+    print(f"10^{exp:<2} = 1 {name:2}   |  2^{exp*10//3:<2} = {2**(exp*10//3)/10**exp:6.3f} {name}")
+```
+
+```output
+10^3  = 1 KB   |  2^10 =  1.024 KB
+10^6  = 1 MB   |  2^20 =  1.049 MB
+10^9  = 1 GB   |  2^30 =  1.074 GB
+10^12 = 1 TB   |  2^40 =  1.100 TB
+10^15 = 1 PB   |  2^50 =  1.126 PB
+```
+
+A "1 TB" disk holds $10^{12}$ bytes; your OS reports 0.909 TiB. Nobody's estimate ever
+failed because of this 10% — but writing the exponent down keeps you from slipping a
+thousandfold, which does kill estimates.
+
+## The three budgets: QPS, bytes, and storage
+
+Every capacity estimate is one of these three, and each has one formula.
+
+```python
+DAU, req_per_user_day, resp_kb = 10e6, 30, 40
+
+qps      = DAU * req_per_user_day / 86_400
+peak_qps = qps * 3
+egress   = peak_qps * resp_kb * 1024 * 8 / 1e9      # Gbit/s on the wire
+
+print(f"avg qps      {qps:12,.0f}")
+print(f"peak qps     {peak_qps:12,.0f}")
+print(f"peak egress  {egress:12.2f} Gbit/s")
+print(f"servers @ 2k qps each: {peak_qps / 2000:.0f} (+1 for headroom)")
+```
+
+```output
+avg qps             3,472
+peak qps           10,417
+peak egress          3.41 Gbit/s
+servers @ 2k qps each: 5 (+1 for headroom)
+```
+
+Ten thousand peak QPS at 40 KB per response is 3.4 Gbit/s of egress — enough that CDN
+offload (ch. 9) stops being an optimization and becomes the design.
+
+### Storage grows; bandwidth does not accumulate
+
+Bandwidth is a rate you must sustain. Storage is that rate integrated over the retention
+window, and it is the number that surprises people three years in.
+
+```python
+events_per_sec, event_bytes = 5_000, 250
+per_day = events_per_sec * 86_400 * event_bytes
+
+for years in (1, 3, 5):
+    raw = per_day * 365 * years
+    print(f"{years}y raw {raw/1e12:7.1f} TB | +3x replication {raw*3/1e12:7.1f} TB"
+          f" | compressed 5:1, replicated {raw*3/5/1e12:6.1f} TB")
+```
+
+```output
+1y raw    39.4 TB | +3x replication   118.3 TB | compressed 5:1, replicated   23.7 TB
+3y raw   118.3 TB | +3x replication   354.8 TB | compressed 5:1, replicated   71.0 TB
+5y raw   197.1 TB | +3x replication   591.3 TB | compressed 5:1, replicated  118.3 TB
+```
+
+Columnar compression at 5:1 on event data is realistic (ch. 18) and it is the difference
+between a rack and a shelf.
+
+## Latency budgets: p99, not the average
+
+A user-facing request has a budget. You spend it on hops, and the sum must fit under the
+target *at the tail*, not on average.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+# A realistic service latency: mostly fast, with a fat tail (lognormal).
+lat = rng.lognormal(mean=np.log(20), sigma=0.7, size=200_000)
+for q in (50, 90, 99, 99.9):
+    print(f"p{q:<5} {np.percentile(lat, q):7.1f} ms")
+print(f"mean  {lat.mean():7.1f} ms   <- hides the tail")
+```
+
+```output
+p50       20.0 ms
+p90       49.0 ms
+p99      102.3 ms
+p99.9    175.5 ms
+mean     25.6 ms   <- hides the tail
+```
+
+The mean sits near p60. Reporting the mean latency of a service is close to reporting
+nothing: it is the p99 that decides whether a page feels broken.
+
+### Fan-out amplifies the tail
+
+If one request fans out to $n$ backends and waits for all of them, the chance of hitting at
+least one slow backend is
+
+$$
+P(\text{slow request}) = 1 - (1 - p)^{n}
+$$
+
+where $p$ is a single backend's probability of being slow.
+
+```python
+p = 0.01                       # each backend is slow 1% of the time
+for n in (1, 10, 50, 100):
+    print(f"fan-out {n:3}: P(at least one slow) = {1 - (1 - p)**n:6.1%}")
+```
+
+```output
+fan-out   1: P(at least one slow) =   1.0%
+fan-out  10: P(at least one slow) =   9.6%
+fan-out  50: P(at least one slow) =  39.5%
+fan-out 100: P(at least one slow) =  63.4%
+```
+
+At a fan-out of 100, a backend that is slow 1% of the time makes *most* requests slow. This
+is why large fan-out services need hedged requests, timeouts with partial results, and
+per-backend p99 targets far tighter than the user-facing one.
+
+## What a cache actually buys you
+
+Expected latency under a cache is the hit-rate-weighted mix of the two paths:
+
+$$
+\mathbb{E}[\text{latency}] = h \cdot t_{\text{hit}} + (1 - h) \cdot (t_{\text{hit}} + t_{\text{miss}})
+$$
+
+```python
+t_hit, t_miss = 1.0, 30.0          # ms: memcached hit vs a database read
+for h in (0.0, 0.5, 0.8, 0.95, 0.99):
+    eff = t_hit + (1 - h) * t_miss
+    print(f"hit rate {h:5.0%} -> {eff:6.2f} ms   db load {1-h:5.0%}")
+```
+
+```output
+hit rate    0% ->  31.00 ms   db load  100%
+hit rate   50% ->  16.00 ms   db load   50%
+hit rate   80% ->   7.00 ms   db load   20%
+hit rate   95% ->   2.50 ms   db load    5%
+hit rate   99% ->   1.30 ms   db load    1%
+```
+
+Going from 80% to 95% hit rate cuts database load by 4x — the *load* reduction, not the
+latency reduction, is usually why you cache (ch. 5).
+
+## Availability arithmetic
+
+Series dependencies multiply. If a request needs three services that are each three-nines
+available, the path is worse than any single one.
+
+```python
+def uptime(a, n_series=1, n_parallel=1):
+    """Availability of n_parallel redundant copies, chained n_series deep."""
+    one = 1 - (1 - a) ** n_parallel
+    return one ** n_series
+
+for label, val in [
+    ("single service       ", uptime(0.999)),
+    ("3 services in series ", uptime(0.999, n_series=3)),
+    ("2 redundant copies   ", uptime(0.999, n_parallel=2)),
+    ("3 series, 2 copies   ", uptime(0.999, n_series=3, n_parallel=2)),
+]:
+    print(f"{label} {val:.6f}  -> {(1-val)*365*24*60:8.1f} min/year down")
+```
+
+```output
+single service        0.999000  ->    525.6 min/year down
+3 services in series  0.997003  ->   1575.2 min/year down
+2 redundant copies    0.999999  ->      0.5 min/year down
+3 series, 2 copies    0.999997  ->      1.6 min/year down
+```
+
+Redundancy inside each hop beats reducing the number of hops, and both beat hoping.
+
+## Try it Yourself
+
+```python
+def budget(target_p99_ms, hops):
+    """Split a p99 budget across hops and flag the ones that do not fit."""
+    spent = sum(ms for _, ms in hops)
+    print(f"target p99 {target_p99_ms} ms | planned {spent} ms | "
+          f"{'FITS' if spent <= target_p99_ms else 'OVER BUDGET'} ({target_p99_ms - spent:+} ms)")
+    for name, ms in sorted(hops, key=lambda x: -x[1]):
+        bar = "#" * int(ms / max(1, spent) * 40)
+        print(f"  {name:22} {ms:4} ms {bar}")
+
+budget(200, [
+    ("TLS + CDN edge",        20),
+    ("LB -> app server",       5),
+    ("auth check (cache)",     2),
+    ("feed query (db)",       60),
+    ("hydrate posts (cache)", 15),
+    ("ranking model",         70),
+    ("serialize + gzip",      10),
+])
+```
+
+```output
+target p99 200 ms | planned 182 ms | FITS (+18 ms)
+  ranking model            70 ms ###############
+  feed query (db)          60 ms #############
+  TLS + CDN edge           20 ms ####
+  hydrate posts (cache)    15 ms ###
+  serialize + gzip         10 ms ##
+  LB -> app server          5 ms #
+  auth check (cache)        2 ms 
+```
+
+Cut the ranking model to 30 ms, or add a hop, and see the verdict flip. A budget you can run
+is worth ten budgets you argued about.
+
+## Exercise
+
+A video platform stores 500 hours of new video per hour of wall-clock time. Each hour of
+video is encoded at five bitrates: 8, 4, 2, 1, and 0.5 Mbit/s. Videos are kept forever.
+Playback averages 2 Mbit/s per concurrent viewer, and peak concurrency is 3 million viewers.
+
+Estimate: (a) storage added per day across all five renditions, (b) storage after five years,
+(c) peak egress bandwidth in Tbit/s, and (d) what fraction of that egress must be served by a
+CDN if your origin datacenter has 200 Gbit/s of uplink.
+
+<details>
+<summary>Solution</summary>
+
+```python
+hours_per_hour = 500
+bitrates_mbps = [8, 4, 2, 1, 0.5]
+total_mbps = sum(bitrates_mbps)
+
+# (a) one hour of source video -> total_mbps * 3600 s of bits, across renditions
+bytes_per_video_hour = total_mbps * 1e6 * 3600 / 8
+per_day = bytes_per_video_hour * hours_per_hour * 24
+print(f"(a) storage/day      {per_day/1e12:8.1f} TB")
+
+# (b) five years
+five_year = per_day * 365 * 5
+print(f"(b) 5-year storage   {five_year/1e15:8.2f} PB (single copy)")
+print(f"    with 1.5x erasure-coded durability: {five_year*1.5/1e15:.2f} PB")
+
+# (c) peak egress
+peak = 3e6 * 2e6 / 1e12
+print(f"(c) peak egress      {peak:8.2f} Tbit/s")
+
+# (d) origin can carry 200 Gbit/s
+origin = 200e9 / 1e12
+print(f"(d) origin capacity  {origin:8.2f} Tbit/s -> CDN must serve {1 - origin/peak:.3%}")
+```
+
+```output
+(a) storage/day          83.7 TB
+(b) 5-year storage     152.75 PB (single copy)
+    with 1.5x erasure-coded durability: 229.13 PB
+(c) peak egress          6.00 Tbit/s
+(d) origin capacity      0.20 Tbit/s -> CDN must serve 96.667%
+```
+
+The insight: storage is large but boring — it grows linearly and you buy disks. Bandwidth is
+the real constraint. At 6 Tbit/s peak, your origin can serve 3% of traffic, so the CDN is not
+an add-on: the origin exists only to fill CDN caches (ch. 9), and every design decision about
+cache keys, segment size, and TTLs is a bandwidth decision.
+</details>

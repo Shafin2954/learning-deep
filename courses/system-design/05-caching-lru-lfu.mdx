@@ -1,0 +1,404 @@
+---
+course: system-design
+chapter: 05-caching-lru-lfu
+title: "Caching: Where, What, and Eviction Policies"
+order: 5
+---
+
+## Every layer of the stack is already a cache
+
+Before adding a cache, know which ones you already have. A request passes through five or six
+of them, each with a different invalidation story:
+
+| Layer | Lives | Invalidated by | Hit latency |
+|---|---|---|---|
+| browser cache | client | `Cache-Control: max-age` | ~0 |
+| CDN edge | edge PoP | TTL + purge API | 10–50 ms |
+| reverse proxy | your datacenter | TTL, keyed by URL | 1–5 ms |
+| application cache | in-process | manual, per-process | microseconds |
+| distributed cache | Redis/memcached pool | manual, shared | 0.5–2 ms |
+| database buffer pool | database node | automatic (LRU pages) | ~0.1 ms |
+
+The rule: **cache as close to the client as the correctness of the data allows.** A public
+image can live in the browser for a year. A bank balance cannot live anywhere for a second.
+Everything else is a negotiation between staleness and load.
+
+## Cache-aside is the default pattern
+
+The application owns the cache: read it, miss, load from the source, populate, return.
+
+```python
+class DB:
+    def __init__(self, rows): self.rows, self.reads = dict(rows), 0
+    def get(self, k):
+        self.reads += 1
+        return self.rows.get(k)
+
+db = DB({f"user:{i}": {"id": i, "name": f"u{i}"} for i in range(1000)})
+cache = {}
+
+def get_user(uid):
+    key = f"user:{uid}"
+    if key in cache:                    # 1. look aside
+        return cache[key], "HIT"
+    val = db.get(key)                   # 2. miss -> source of truth
+    if val is not None:
+        cache[key] = val                # 3. populate
+    return val, "MISS"
+
+for uid in (7, 7, 42, 7):
+    val, status = get_user(uid)
+    print(f"get_user({uid}) -> {status}  {val}")
+print(f"db reads: {db.reads}")
+```
+
+```output
+get_user(7) -> MISS  {'id': 7, 'name': 'u7'}
+get_user(7) -> HIT  {'id': 7, 'name': 'u7'}
+get_user(42) -> MISS  {'id': 42, 'name': 'u42'}
+get_user(7) -> HIT  {'id': 7, 'name': 'u7'}
+db reads: 2
+```
+
+Two of the four requests never touched the database. Two properties come free: the cache can be
+empty at any time (correctness never depends on it), and the application decides what a cache
+key means.
+
+### The four write policies
+
+- **Write-around** — write the database only; the cache fills on the next read. Simple, costs
+  one cold read after every write.
+- **Write-through** — write cache and database synchronously. No stale window, slower writes,
+  and you cache data nobody may ever read.
+- **Write-back** — write the cache, flush to the database later. Fastest writes, and the only
+  policy that can lose committed data.
+- **Write-invalidate** — write the database, then delete the cache key. The safe default.
+
+Delete, do not update. Two concurrent writers that each *update* the cache can commit to the
+database in one order and to the cache in the other, leaving the cache permanently wrong.
+Deletion is idempotent and order-free, so the worst case is an extra miss.
+
+## LRU from scratch
+
+Least-recently-used evicts the item untouched for the longest time. The classic
+implementation is a hash map into a doubly linked list: $O(1)$ get, $O(1)$ put.
+
+```python
+class Node:
+    __slots__ = ("k", "v", "prev", "next")
+    def __init__(self, k=None, v=None):
+        self.k, self.v, self.prev, self.next = k, v, None, None
+
+class LRU:
+    def __init__(self, cap):
+        self.cap, self.map = cap, {}
+        self.head, self.tail = Node(), Node()      # sentinels: head=MRU side
+        self.head.next, self.tail.prev = self.tail, self.head
+        self.hits = self.misses = self.evictions = 0
+
+    def _unlink(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _push_front(self, n):
+        n.next, n.prev = self.head.next, self.head
+        self.head.next.prev = n
+        self.head.next = n
+
+    def get(self, k):
+        n = self.map.get(k)
+        if n is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self._unlink(n); self._push_front(n)        # touch = move to front
+        return n.v
+
+    def put(self, k, v):
+        n = self.map.get(k)
+        if n:
+            n.v = v; self._unlink(n); self._push_front(n); return
+        if len(self.map) >= self.cap:
+            lru = self.tail.prev                    # the node nearest the tail
+            self._unlink(lru); del self.map[lru.k]
+            self.evictions += 1
+        n = Node(k, v); self.map[k] = n; self._push_front(n)
+
+    def keys_mru_first(self):
+        out, n = [], self.head.next
+        while n is not self.tail:
+            out.append(n.k); n = n.next
+        return out
+c = LRU(3)
+for k in "abc": c.put(k, k.upper())
+print("after a,b,c:", c.keys_mru_first())
+c.get("a")
+print("after get(a):", c.keys_mru_first())
+c.put("d", "D")                                     # evicts b, the LRU
+print("after put(d):", c.keys_mru_first(), f"evictions={c.evictions}")
+print("get(b) ->", c.get("b"))
+```
+
+```output
+after a,b,c: ['c', 'b', 'a']
+after get(a): ['a', 'c', 'b']
+after put(d): ['d', 'a', 'c'] evictions=1
+get(b) -> None
+```
+
+`b` was the oldest untouched key, so it went. Note what LRU assumes: **recency predicts
+reuse**. That holds for most web workloads and fails badly for scans.
+
+## LFU from scratch
+
+Least-frequently-used evicts by count instead of recency. The $O(1)$ version keeps a bucket
+per frequency and a pointer to the minimum frequency in use.
+
+```python
+from collections import defaultdict, OrderedDict
+
+class LFU:
+    def __init__(self, cap):
+        self.cap = cap
+        self.vals, self.freq = {}, {}
+        self.buckets = defaultdict(OrderedDict)     # freq -> keys, LRU order within
+        self.minf = 0
+        self.hits = self.misses = self.evictions = 0
+
+    def _bump(self, k):
+        f = self.freq[k]
+        del self.buckets[f][k]
+        if not self.buckets[f]:
+            del self.buckets[f]
+            if self.minf == f: self.minf += 1
+        self.freq[k] = f + 1
+        self.buckets[f + 1][k] = None
+
+    def get(self, k):
+        if k not in self.vals:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self._bump(k)
+        return self.vals[k]
+
+    def put(self, k, v):
+        if self.cap == 0: return
+        if k in self.vals:
+            self.vals[k] = v; self._bump(k); return
+        if len(self.vals) >= self.cap:
+            victim, _ = self.buckets[self.minf].popitem(last=False)   # LRU within min freq
+            if not self.buckets[self.minf]: del self.buckets[self.minf]
+            del self.vals[victim], self.freq[victim]
+            self.evictions += 1
+        self.vals[k], self.freq[k], self.minf = v, 1, 1
+        self.buckets[1][k] = None
+
+c = LFU(3)
+for k in "abc": c.put(k, k.upper())
+for _ in range(5): c.get("a")
+c.get("b")
+c.put("d", "D")               # evicts c: freq 1, and least recently used at that freq
+print("freqs:", {k: c.freq[k] for k in sorted(c.freq)}, "| get(c) ->", c.get("c"))
+```
+
+```output
+freqs: {'a': 6, 'b': 2, 'd': 1} | get(c) -> None
+```
+
+LFU protects a hot key forever, which is both its strength and its bug: yesterday's viral
+post keeps a slot long after nobody wants it. Production LFU implementations age counters
+(halve every N operations) to forget.
+
+## Which policy wins depends on the workload
+
+Real key popularity is Zipf-distributed: the $r$-th most popular key gets traffic proportional
+to $1/r^{\alpha}$. Under Zipf both policies do well; under a scan, LRU collapses.
+
+```python
+import random
+random.seed(1)
+
+def zipf_keys(n_keys, n_req, alpha=1.0):
+    weights = [1 / (r ** alpha) for r in range(1, n_keys + 1)]
+    return random.choices(range(n_keys), weights=weights, k=n_req)
+
+def run(cache, workload, backing):
+    for k in workload:
+        if cache.get(k) is None:
+            cache.put(k, backing(k))
+    return cache.hits / (cache.hits + cache.misses)
+
+work = zipf_keys(10_000, 100_000, alpha=1.0)
+for cap in (100, 500, 2000):
+    hl = run(LRU(cap), work, lambda k: k)
+    hf = run(LFU(cap), work, lambda k: k)
+    print(f"cap {cap:5}  LRU {hl:6.1%}   LFU {hf:6.1%}")
+```
+
+```output
+cap   100  LRU  39.1%   LFU  49.8%
+cap   500  LRU  58.7%   LFU  65.7%
+cap  2000  LRU  76.2%   LFU  79.1%
+```
+
+A cache holding 5% of the keyspace absorbs most of the traffic — that is the Zipf tax working
+in your favour, and it is why "cache the top N" is such a durable strategy.
+
+### The scan that destroys an LRU
+
+```python
+hot = list(range(50))
+scan = list(range(1000, 6000))                # a one-time analytics sweep
+
+def phases(cls, cap=100):
+    random.seed(1)
+    c = cls(cap)
+    def play(ws):
+        m0 = c.misses
+        for k in ws:
+            if c.get(k) is None: c.put(k, k)
+        return c.misses - m0
+    def resident():
+        live = c.map if hasattr(c, "map") else c.vals
+        return sum(k in live for k in hot)
+
+    play([random.choice(hot) for _ in range(3000)])           # 1. warm up on hot keys
+    before = resident()
+    play(scan)                                                # 2. the analytics sweep
+    after = resident()
+    misses = play([random.choice(hot) for _ in range(3000)])  # 3. back to normal traffic
+    print(f"{cls.__name__:4}: hot keys resident {before}/50 before the scan, {after}/50 after; "
+          f"{misses} misses in the 3000 requests that follow")
+
+phases(LRU)
+phases(LFU)
+```
+
+```output
+LRU : hot keys resident 50/50 before the scan, 0/50 after; 50 misses in the 3000 requests that follow
+LFU : hot keys resident 50/50 before the scan, 50/50 after; 0 misses in the 3000 requests that follow
+```
+
+The scan touches each key once and evicts **every** hot key from the LRU, so normal traffic
+pays fifty fresh misses afterwards — a clump of database reads arriving together. LFU keeps
+all fifty, because a single touch never beats a count in the hundreds. This is why real
+caches are **hybrids**: segmented LRU, ARC, or TinyLFU (a frequency sketch guarding an LRU)
+get LRU's recency behaviour with LFU's scan resistance.
+
+## Sizing a cache: the hit-rate curve flattens
+
+```python
+work = zipf_keys(20_000, 200_000, alpha=1.2)
+prev = 0.0
+for cap in (200, 400, 800, 1600, 3200, 6400):
+    h = run(LRU(cap), work, lambda k: k)
+    print(f"cap {cap:5} ({cap/20_000:5.1%} of keyspace)  hit {h:6.1%}   gain over previous {h-prev:+6.1%}")
+    prev = h
+```
+
+```output
+cap   200 ( 1.0% of keyspace)  hit  70.5%   gain over previous +70.5%
+cap   400 ( 2.0% of keyspace)  hit  76.6%   gain over previous  +6.1%
+cap   800 ( 4.0% of keyspace)  hit  81.9%   gain over previous  +5.3%
+cap  1600 ( 8.0% of keyspace)  hit  86.5%   gain over previous  +4.6%
+cap  3200 (16.0% of keyspace)  hit  90.4%   gain over previous  +3.9%
+cap  6400 (32.0% of keyspace)  hit  93.3%   gain over previous  +2.9%
+```
+
+The first 1% of the keyspace buys most of the hit rate; every doubling after that buys less
+than the one before. You size a cache by finding where the curve flattens, not by picking a
+round number of gigabytes — the last 2% of hit rate is almost never worth the RAM.
+
+## Try it Yourself
+
+```python
+class TTLCache(LRU):
+    """LRU plus per-key expiry, using a logical clock so results are reproducible."""
+    def __init__(self, cap, ttl):
+        super().__init__(cap)
+        self.ttl, self.now, self.expiry = ttl, 0, {}
+    def tick(self, n=1): self.now += n
+    def get(self, k):
+        if k in self.expiry and self.expiry[k] <= self.now:
+            self.misses += 1
+            return None                      # expired: treat as a miss, leave lazily
+        return super().get(k)
+    def put(self, k, v):
+        self.expiry[k] = self.now + self.ttl
+        super().put(k, v)
+
+c = TTLCache(cap=10, ttl=5)
+c.put("session:1", "alice")
+for t in range(8):
+    v = c.get("session:1")
+    print(f"t={c.now}  get -> {v!r}")
+    c.tick()
+print(f"hits={c.hits} misses={c.misses}")
+```
+
+```output
+t=0  get -> 'alice'
+t=1  get -> 'alice'
+t=2  get -> 'alice'
+t=3  get -> 'alice'
+t=4  get -> 'alice'
+t=5  get -> None
+t=6  get -> None
+t=7  get -> None
+hits=5 misses=3
+```
+
+Raise `ttl` to 20 and the key survives the whole loop. Lazy expiry (checking on read) costs
+nothing until access; the alternative — a sweeper thread — is what you add when memory
+pressure matters more than CPU.
+
+## Exercise
+
+Implement **TinyLFU-style admission control** on top of the `LRU` class: keep a frequency
+counter for every key ever seen (a plain dict is fine here), and on eviction, only admit the
+new key if its historical frequency is at least that of the candidate victim. Otherwise, keep
+the victim and discard the new item. Measure it against plain LRU on the hot-keys-plus-scan
+workload above.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class TinyLFU(LRU):
+    def __init__(self, cap):
+        super().__init__(cap)
+        self.sketch = defaultdict(int)       # real TinyLFU uses a count-min sketch + aging
+        self.rejected = 0
+
+    def get(self, k):
+        self.sketch[k] += 1
+        return super().get(k)
+
+    def put(self, k, v):
+        if k not in self.map and len(self.map) >= self.cap:
+            victim = self.tail.prev.k
+            if self.sketch[k] < self.sketch[victim]:
+                self.rejected += 1           # door policy: do not admit
+                return
+        super().put(k, v)
+
+phases(LRU)
+phases(TinyLFU)
+c = TinyLFU(100)
+for k in [random.choice(hot) for _ in range(3000)] + scan:
+    if c.get(k) is None: c.put(k, k)
+print(f"TinyLFU rejected {c.rejected} of the {len(scan)} scan keys at the door")
+```
+
+```output
+LRU : hot keys resident 50/50 before the scan, 0/50 after; 50 misses in the 3000 requests that follow
+TinyLFU: hot keys resident 50/50 before the scan, 50/50 after; 0 misses in the 3000 requests that follow
+TinyLFU rejected 4950 of the 5000 scan keys at the door
+```
+
+The insight: eviction policy answers "who leaves?", but **admission policy answers "who gets
+in?"** — and the second question is the one that makes a cache scan-resistant. A key seen once
+never displaces a key seen sixty times, so the analytics sweep streams past the cache instead
+of through it. Production implementations (Caffeine, Redis `allkeys-lfu`) use a count-min
+sketch with periodic halving so the counters stay small and forget old popularity.
+</details>
