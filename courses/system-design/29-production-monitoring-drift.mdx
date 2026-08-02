@@ -1,0 +1,384 @@
+---
+course: system-design
+chapter: 29-production-monitoring-drift
+title: "Production Monitoring: Drift, Feedback Loops, and Decay"
+order: 29
+---
+
+## An ML system fails without failing
+
+The service returns 200s, latency is flat, no alert fires, and the model has been quietly wrong
+for six weeks. That is the failure mode this chapter exists for, and it needs monitoring at four
+levels, each answering a different question and available at a different time.
+
+| Level | Signal | Available | Detects |
+|---|---|---|---|
+| Operational | latency, errors, saturation (ch. 23) | instantly | the service is broken |
+| Input | feature distributions, null rates, schema | instantly | upstream data changed |
+| Output | prediction distribution, score histogram | instantly | the model's behaviour changed |
+| Outcome | accuracy, AUC, business metric | after labels arrive | the model is actually wrong |
+
+```python
+lag = [("fraud: chargeback", 45, "days"), ("churn: subscription lapse", 30, "days"),
+       ("click-through", 5, "minutes"), ("delivery ETA", 2, "hours"),
+       ("credit default", 180, "days")]
+for name, n, unit in lag:
+    print(f"{name:28} label arrives ~{n:4} {unit:8} -> "
+          f"{'input/output monitoring is ALL you have in the meantime' if unit == 'days' else 'outcome monitoring is nearly real-time'}")
+```
+
+```output
+fraud: chargeback            label arrives ~  45 days     -> input/output monitoring is ALL you have in the meantime
+churn: subscription lapse    label arrives ~  30 days     -> input/output monitoring is ALL you have in the meantime
+click-through                label arrives ~   5 minutes  -> outcome monitoring is nearly real-time
+delivery ETA                 label arrives ~   2 hours    -> outcome monitoring is nearly real-time
+credit default               label arrives ~ 180 days     -> input/output monitoring is ALL you have in the meantime
+```
+
+Label lag is why input and output monitoring exist. For a credit model you will not know this
+quarter's accuracy until next year — so the only early warning is that **the inputs stopped
+looking like the training data**, or that **the outputs stopped looking like yesterday's**.
+
+## Detecting drift: PSI and the KS statistic
+
+**Population stability index** compares two distributions bucket by bucket:
+
+$$
+\mathrm{PSI} = \sum_{i} (p_i - q_i) \ln \frac{p_i}{q_i}
+$$
+
+with $p_i$ the reference share and $q_i$ the current share in bucket $i$.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+def psi(reference, current, bins=10):
+    edges = np.quantile(reference, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    p = np.histogram(reference, edges)[0] / len(reference) + 1e-6
+    q = np.histogram(current, edges)[0] / len(current) + 1e-6
+    return float(np.sum((p - q) * np.log(p / q)))
+
+ref = rng.normal(0, 1, 50_000)
+cases = {
+    "identical":        rng.normal(0, 1, 50_000),
+    "small shift":      rng.normal(0.1, 1, 50_000),
+    "moderate shift":   rng.normal(0.3, 1, 50_000),
+    "large shift":      rng.normal(0.8, 1, 50_000),
+    "variance change":  rng.normal(0, 1.6, 50_000),
+}
+for name, cur in cases.items():
+    v = psi(ref, cur)
+    verdict = "stable" if v < 0.1 else "investigate" if v < 0.25 else "ACT: significant drift"
+    print(f"{name:17} PSI {v:6.4f}  {verdict}")
+```
+
+```output
+identical         PSI 0.0004  stable
+small shift       PSI 0.0095  stable
+moderate shift    PSI 0.0877  stable
+large shift       PSI 0.6021  ACT: significant drift
+variance change   PSI 0.2495  investigate
+```
+
+The conventional thresholds — under 0.1 stable, 0.1–0.25 worth investigating, above 0.25 act —
+are rules of thumb, not laws, and they are sensitive to bucket count and sample size. Calibrate
+them on your own data by measuring PSI between two windows you know are equivalent.
+
+```python
+def ks(a, b):
+    """Kolmogorov-Smirnov: the largest gap between two empirical CDFs."""
+    x = np.sort(np.concatenate([a, b]))
+    ca = np.searchsorted(np.sort(a), x, side="right") / len(a)
+    cb = np.searchsorted(np.sort(b), x, side="right") / len(b)
+    d = float(np.max(np.abs(ca - cb)))
+    crit = 1.36 * np.sqrt(1 / len(a) + 1 / len(b))       # ~5% significance
+    return d, crit
+
+for name, cur in cases.items():
+    d, crit = ks(ref, cur)
+    print(f"{name:17} KS {d:6.4f} (critical {crit:.4f}) "
+          f"{'different' if d > crit else 'not distinguishable'}")
+```
+
+```output
+identical         KS 0.0050 (critical 0.0086) not distinguishable
+small shift       KS 0.0430 (critical 0.0086) different
+moderate shift    KS 0.1202 (critical 0.0086) different
+large shift       KS 0.3090 (critical 0.0086) different
+variance change   KS 0.1125 (critical 0.0086) different
+```
+
+At 50,000 samples per window, the KS test calls a 0.1-sigma shift "different" — statistically
+correct and operationally useless. **Every drift test becomes significant at large n**, which is
+why you monitor the *magnitude* (PSI, or the shift in mean measured in standard deviations) and
+alert on business impact, not on a p-value.
+
+### Categorical features drift too
+
+```python
+from collections import Counter
+
+def categorical_psi(ref_counts, cur_counts):
+    keys = set(ref_counts) | set(cur_counts)
+    nr, nc = sum(ref_counts.values()), sum(cur_counts.values())
+    total = 0.0
+    for k in keys:
+        p = ref_counts.get(k, 0) / nr + 1e-6
+        q = cur_counts.get(k, 0) / nc + 1e-6
+        total += (p - q) * np.log(p / q)
+    return total
+
+ref_device = Counter({"ios": 5000, "android": 4000, "web": 1000})
+for label, cur in [("same mix", Counter({"ios": 500, "android": 400, "web": 100})),
+                   ("app release shifts mix", Counter({"ios": 300, "android": 650, "web": 50})),
+                   ("NEW CATEGORY appears", Counter({"ios": 400, "android": 300, "web": 100,
+                                                     "kiosk": 200}))]:
+    print(f"{label:24} PSI {categorical_psi(ref_device, cur):6.4f}")
+```
+
+```output
+same mix                 PSI 0.0000
+app release shifts mix   PSI 0.2582
+NEW CATEGORY appears     PSI 2.4923
+```
+
+The third row is the one that breaks models silently: an unseen category is usually encoded as
+"unknown" or dropped to zero, and the model has no learned behaviour for it. A **new category
+alert** is separate from a drift alert and should be treated as a schema violation (ch. 28).
+
+## Concept drift is different from data drift
+
+- **Data drift**: $P(X)$ changes. The inputs look different. Detectable immediately.
+- **Concept drift**: $P(Y \mid X)$ changes. The same input now implies a different outcome. Only
+  detectable once labels arrive.
+
+```python
+n = 4_000
+x = rng.normal(size=n)
+
+def outcome(x, regime):
+    """The relationship itself changes: fraud patterns adapt to your defences."""
+    w = 1.2 if regime == "before" else -0.4          # the same feature now means something else
+    return (w * x + rng.normal(scale=0.4, size=len(x)) > 0).astype(int)
+
+y_before, y_after = outcome(x, "before"), outcome(x, "after")
+model = lambda x: 1.2 * x                            # trained in the "before" regime
+
+def acc(pred, y): return ((pred > 0).astype(int) == y).mean()
+print(f"input distribution unchanged: PSI {psi(x, x):.4f}")
+print(f"accuracy in the old regime  : {acc(model(x), y_before):.3f}")
+print(f"accuracy in the new regime  : {acc(model(x), y_after):.3f}  <- no input drift at all")
+```
+
+```output
+input distribution unchanged: PSI 0.0000
+accuracy in the old regime  : 0.896
+accuracy in the new regime  : 0.244  <- no input drift at all
+```
+
+Nothing about the inputs changed, and the model became worse than a coin flip. This is why input
+monitoring alone is insufficient, and why the **outcome** level of the table above cannot be
+skipped even when labels are slow — a delayed signal is not the same as no signal.
+
+## Feedback loops: the model changes the world it measures
+
+```python
+def feedback_loop(rounds=6, base_ctr=0.05, boost=0.35, shown_share=0.3):
+    """Items the model shows get clicks; clicks train the model to show them more."""
+    items = {"A": base_ctr, "B": base_ctr, "C": base_ctr}
+    ranked = "A"                                     # A wins the first round by noise
+    for r in range(rounds):
+        for k in items:
+            observed = items[k] * (1 + boost * (k == ranked))   # only the shown item gets clicks
+            items[k] = 0.7 * items[k] + 0.3 * observed
+        ranked = max(items, key=items.get)
+        print(f"round {r}: estimated CTR " +
+              " ".join(f"{k}={v:.4f}" for k, v in items.items()) + f" | top={ranked}")
+    print("A's advantage came from exposure, not quality — the log cannot tell you which")
+
+feedback_loop()
+```
+
+```output
+round 0: estimated CTR A=0.0552 B=0.0500 C=0.0500 | top=A
+round 1: estimated CTR A=0.0611 B=0.0500 C=0.0500 | top=A
+round 2: estimated CTR A=0.0675 B=0.0500 C=0.0500 | top=A
+round 3: estimated CTR A=0.0745 B=0.0500 C=0.0500 | top=A
+round 4: estimated CTR A=0.0824 B=0.0500 C=0.0500 | top=A
+round 5: estimated CTR A=0.0910 B=0.0500 C=0.0500 | top=A
+A's advantage came from exposure, not quality — the log cannot tell you which
+```
+
+Three named consequences. **Exposure bias**: you only observe outcomes for items you showed, so
+the training data is a biased sample of your own past decisions. **Runaway concentration**: a
+small early advantage compounds until one item takes everything. **Self-fulfilling metrics**: the
+model's offline score improves while user experience narrows.
+
+The standard defences are all forms of deliberately breaking the loop: keep a **random holdout**
+(a small share of traffic served without the model, so you retain an unbiased sample), add
+**exploration** (epsilon-greedy or Thompson sampling on the ranking), and log **propensities** —
+the probability with which each item was shown — so later training can reweight by inverse
+propensity and estimate what would have happened under a different policy.
+
+```python
+def ips_estimate(logged, new_policy_prob):
+    """Inverse propensity scoring: what would the NEW policy have earned?"""
+    total = sum(r["reward"] * new_policy_prob(r["action"]) / r["propensity"] for r in logged)
+    return total / len(logged)
+
+logged = [{"action": "A", "reward": 1, "propensity": 0.9},
+          {"action": "A", "reward": 0, "propensity": 0.9},
+          {"action": "B", "reward": 1, "propensity": 0.05},
+          {"action": "C", "reward": 0, "propensity": 0.05}]
+naive = sum(r["reward"] for r in logged) / len(logged)
+print(f"naive logged reward       {naive:.3f}")
+print(f"IPS estimate for 'always B' {ips_estimate(logged, lambda a: 1.0 if a == 'B' else 0.0):.3f}")
+print("B looked rare in the log, but it was rare because the old policy hid it")
+```
+
+```output
+naive logged reward       0.500
+IPS estimate for 'always B' 5.000
+B looked rare in the log, but it was rare because the old policy hid it
+```
+
+## Retraining: on a schedule, or on a trigger
+
+```python
+def retrain_policy(drift_psi, accuracy_drop, days_since, labels_available):
+    reasons = []
+    if drift_psi > 0.25:              reasons.append(f"input drift PSI {drift_psi:.2f}")
+    if accuracy_drop > 0.03:          reasons.append(f"accuracy down {accuracy_drop:.1%}")
+    if days_since > 30:               reasons.append(f"{days_since} days since last training")
+    if not labels_available and reasons:
+        return f"WAIT: {'; '.join(reasons)} — but no fresh labels yet; consider a rollback"
+    return "; ".join(reasons) and f"RETRAIN: {'; '.join(reasons)}" or "no action"
+
+print(retrain_policy(0.05, 0.005, 12, True))
+print(retrain_policy(0.31, 0.010, 12, True))
+print(retrain_policy(0.31, 0.010, 12, False))
+print(retrain_policy(0.08, 0.045, 40, True))
+```
+
+```output
+no action
+RETRAIN: input drift PSI 0.31
+WAIT: input drift PSI 0.31 — but no fresh labels yet; consider a rollback
+RETRAIN: accuracy down 4.5%; 40 days since last training
+```
+
+Scheduled retraining is the safe default because it is *testable*: the pipeline runs every week
+whether or not anything drifted, so it never rots. Triggered retraining reacts faster but can
+amplify a bad day into a bad model — which is why every trigger must still pass the rollout gates
+from ch. 26. And note the third line: retraining without fresh labels is not possible, so the
+only lever left during a fast drift event is a **rollback to a simpler, more robust model** or a
+rules-based fallback.
+
+## Try it Yourself
+
+```python
+def decay_curve(months, monthly_drift=0.02, retrain_every=None):
+    auc, log = 0.90, []
+    for m in range(1, months + 1):
+        auc -= monthly_drift * (1 + 0.1 * m)                 # decay accelerates as drift compounds
+        if retrain_every and m % retrain_every == 0:
+            auc = min(0.90, auc + 0.9 * (0.90 - auc))        # retraining recovers most, not all
+        log.append(round(auc, 3))
+    label = f"retrain every {retrain_every} mo" if retrain_every else "never retrained"
+    print(f"{label:20} {log} -> final {log[-1]:.3f}")
+
+for policy in (None, 6, 3, 1):
+    decay_curve(12, retrain_every=policy)
+```
+
+```output
+never retrained      [0.878, 0.854, 0.828, 0.8, 0.77, 0.738, 0.704, 0.668, 0.63, 0.59, 0.548, 0.504] -> final 0.504
+retrain every 6 mo   [0.878, 0.854, 0.828, 0.8, 0.77, 0.884, 0.85, 0.814, 0.776, 0.736, 0.694, 0.875] -> final 0.875
+retrain every 3 mo   [0.878, 0.854, 0.893, 0.865, 0.835, 0.89, 0.856, 0.82, 0.888, 0.848, 0.806, 0.886] -> final 0.886
+retrain every 1 mo   [0.898, 0.897, 0.897, 0.897, 0.897, 0.896, 0.896, 0.896, 0.896, 0.896, 0.895, 0.895] -> final 0.895
+```
+
+Monthly retraining holds the metric nearly flat; never retraining loses a third of the model's
+value in a year. Raise `monthly_drift` to 0.05 (a fast-moving domain like fraud or ad targeting)
+and watch how quickly the "never" row becomes worse than useless.
+
+## Exercise
+
+Build a monitoring harness for a deployed fraud model that reports, per day: input drift per
+feature (PSI), output drift (prediction distribution), and outcome metrics on the labels that
+have arrived so far, with a 45-day label lag. Simulate 120 days in which a feature pipeline
+breaks on day 60 (one feature becomes constant) and a genuine concept shift starts on day 90.
+Show which monitor catches which, and when.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+rng = np.random.default_rng(5)
+
+DAYS, N = 120, 3_000
+ref_f1 = rng.normal(0, 1, 20_000)
+ref_f2 = rng.gamma(2.0, 1.0, 20_000)
+w = np.array([1.1, 0.5])
+
+rows = []
+for day in range(DAYS):
+    f1 = rng.normal(0, 1, N)
+    f2 = rng.gamma(2.0, 1.0, N)
+    if day >= 60:
+        f2 = np.zeros(N)                        # pipeline break: the feature arrives as 0
+    coef = w if day < 90 else np.array([-0.3, 0.5])    # concept shift: the relationship changes
+    label = (np.column_stack([f1, f2]) @ coef + rng.normal(scale=0.6, size=N) > 2.0).astype(int)
+    score = np.column_stack([f1, f2]) @ w              # the deployed model never changes
+    rows.append({"day": day, "f1": f1, "f2": f2, "score": score, "label": label})
+
+ref_score = rows[0]["score"]
+print(f"{'day':>4}{'PSI f1':>9}{'PSI f2':>9}{'PSI score':>11}{'acc (45d lag)':>15}  alerts")
+for day in (30, 59, 60, 62, 89, 95, 110):
+    r = rows[day]
+    p1, p2, ps = psi(ref_f1, r["f1"]), psi(ref_f2, r["f2"]), psi(ref_score, r["score"])
+    labelled_day = day - 45                            # only old labels are available today
+    acc = (((rows[labelled_day]["score"] > 2.0).astype(int) ==
+            rows[labelled_day]["label"]).mean() if labelled_day >= 0 else float("nan"))
+    alerts = []
+    if p1 > 0.25: alerts.append("INPUT f1")
+    if p2 > 0.25: alerts.append("INPUT f2")
+    if ps > 0.25: alerts.append("OUTPUT")
+    if labelled_day >= 0 and acc < 0.85: alerts.append("OUTCOME")
+    print(f"{day:>4}{p1:>9.3f}{p2:>9.3f}{ps:>11.3f}{acc:>15.3f}  {', '.join(alerts) or '-'}")
+
+print("\nday  60: f2 arrives as zeros -> INPUT and OUTPUT fire the same day")
+print("day  90: concept shifts, inputs unchanged -> no input alert at all")
+print("day 135: the day-90 labels finally arrive -> OUTCOME would fire, 45 days late")
+```
+
+```output
+ day   PSI f1   PSI f2  PSI score  acc (45d lag)  alerts
+  30    0.002    0.003      0.007            nan  -
+  59    0.002    0.003      0.004          0.888  -
+  60    0.004   12.434      0.694          0.898  INPUT f2, OUTPUT
+  62    0.003   12.434      0.666          0.899  INPUT f2, OUTPUT
+  89    0.003   12.434      0.757          0.895  INPUT f2, OUTPUT
+  95    0.004   12.434      0.691          0.895  INPUT f2, OUTPUT
+ 110    0.009   12.434      0.758          0.968  INPUT f2, OUTPUT
+
+day  60: f2 arrives as zeros -> INPUT and OUTPUT fire the same day
+day  90: concept shifts, inputs unchanged -> no input alert at all
+day 135: the day-90 labels finally arrive -> OUTCOME would fire, 45 days late
+```
+
+The insight: the two failures are visible to different monitors, and only one of them is visible
+quickly. The broken pipeline changes $P(X)$, so PSI on `f2` and on the score both spike **the same
+day** — that is the failure you can catch before it costs anything, and it is a data engineering
+bug, not a modelling one (ch. 28's volume and distribution gates should have stopped it upstream).
+The concept shift changes $P(Y \mid X)$ with the inputs untouched, so every fast monitor stays
+green and the only evidence is accuracy on labels that will not exist for six weeks. That
+asymmetry drives three practical decisions: alert on input and output drift because they are
+cheap and immediate; **never treat green input monitors as evidence the model is working**; and
+build proxy signals with shorter lag where you can — manual review overturn rates, customer
+complaints, the fraction of predictions near the decision threshold — because a noisy signal
+today beats a clean one after the quarter closes.
+</details>
