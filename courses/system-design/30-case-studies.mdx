@@ -1,0 +1,418 @@
+---
+course: system-design
+chapter: 30-case-studies
+title: "Case Studies: Six Designs End to End"
+order: 30
+---
+
+## The method, compressed
+
+Every design below runs the same four passes from ch. 1 — requirements, API, data, scale — and
+each decision cites the number that forced it. Read them as worked examples of the method, not
+as templates to memorize.
+
+```python
+def brief(name, writes_day, reads_day, row_bytes, peak=3.0):
+    print(f"{name:20} r:w {reads_day/writes_day:8.3f}:1 | peak {writes_day/86400*peak:8,.0f} w/s "
+          f"{reads_day/86400*peak:9,.0f} r/s | {writes_day*365*row_bytes/1e12:6.2f} TB/yr raw")
+
+brief("URL shortener",   3_300_000, 167_000_000,   500)
+brief("News feed",         400_000,  16_000_000,   404)
+brief("Chat",           20_000_000,  22_500_000, 1_200)
+brief("Job scraper",     5_000_000,      20_000, 2_000)
+brief("Vector search",      50_000,   6_000_000, 4_000)
+brief("E-invoicing",       600_000,     100_000, 8_000)
+```
+
+```output
+URL shortener        r:w   50.606:1 | peak      115 w/s     5,799 r/s |   0.60 TB/yr raw
+News feed            r:w   40.000:1 | peak       14 w/s       556 r/s |   0.06 TB/yr raw
+Chat                 r:w    1.125:1 | peak      694 w/s       781 r/s |   8.76 TB/yr raw
+Job scraper          r:w    0.004:1 | peak      174 w/s         1 r/s |   3.65 TB/yr raw
+Vector search        r:w  120.000:1 | peak        2 w/s       208 r/s |   0.07 TB/yr raw
+E-invoicing          r:w    0.167:1 | peak       21 w/s         3 r/s |   1.75 TB/yr raw
+```
+
+Six systems, six completely different shapes — and the shape is what picks the architecture. A
+50:1 read ratio and a 0.004:1 ratio are not the same problem at different sizes; they are
+different problems, and the ratio alone already rules architectures in and out.
+
+## Design 1: URL shortener
+
+**Requirements.** 100M new links/month, 50 reads per link, links never expire, 7-character codes,
+redirect p99 under 50 ms globally.
+
+**API.** `POST /v1/links {url, custom_alias?}` and `GET /{code}` returning a 301/302.
+
+**Data.** One table, `code` as primary key, `(owner_id, created_at)` index for listings (ch. 12).
+9 TB over five years replicated, so partition by `code` hash (ch. 14).
+
+**Scale.** The redirect path is pure cache: a code is immutable once created, so a CDN or edge KV
+holds it forever (ch. 9), and a Redis layer absorbs whatever misses (ch. 5).
+
+```python
+import hashlib, math
+
+ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def encode_counter(n):
+    """Strategy A: a global counter in base62 — dense, sequential, and guessable."""
+    s = ""
+    while n:
+        n, r = divmod(n, 62)
+        s = ALPHABET[r] + s
+    return s or "0"
+
+def encode_hash(url, salt=0, length=7):
+    """Strategy B: hash the URL — stateless, but needs collision handling."""
+    h = int(hashlib.sha256(f"{url}#{salt}".encode()).hexdigest(), 16)
+    return "".join(ALPHABET[(h >> (6 * i)) % 62] for i in range(length))
+
+print("counter 1            ->", encode_counter(1))
+print("counter 1,000,000,000->", encode_counter(1_000_000_000))
+print("hash of a URL        ->", encode_hash("https://example.com/a/very/long/path"))
+
+space = 62 ** 7
+print(f"\n7-char code space: {space:,}")
+print(f"first collision expected after ~{math.sqrt(math.pi/2 * space):,.0f} random codes")
+for stored in (1e6, 1e9, 6e9):
+    print(f"{stored:>13,.0f} codes stored -> P(a NEW random code collides) "
+          f"{stored/space:8.4%} -> {1/(1 - stored/space) - 1:.4%} extra inserts from retries")
+```
+
+```output
+counter 1            -> 1
+counter 1,000,000,000-> 15FTGg
+hash of a URL        -> yKSWQdZ
+
+7-char code space: 3,521,614,606,208
+first collision expected after ~2,351,965 random codes
+    1,000,000 codes stored -> P(a NEW random code collides)  0.0000% -> 0.0000% extra inserts from retries
+1,000,000,000 codes stored -> P(a NEW random code collides)  0.0284% -> 0.0284% extra inserts from retries
+6,000,000,000 codes stored -> P(a NEW random code collides)  0.1704% -> 0.1707% extra inserts from retries
+```
+
+The trade is worth stating plainly: a **counter** never collides but leaks volume and needs a
+distributed sequence (a Redis `INCR`, or ranges handed out per node to avoid a hot key, ch. 14).
+A **hash** is stateless and unguessable, but collisions are not hypothetical: the birthday bound
+says the first one appears after roughly 2 million random codes, long before your billionth link.
+What saves the design is that the *per-insert* probability stays tiny — 0.17% at six billion
+stored codes — so a unique constraint plus a retry with a new salt costs a fraction of a percent
+of extra writes. Either way, custom aliases go through the same uniqueness check, which is the one
+place this design needs linearizability (ch. 16).
+
+## Design 2: news feed
+
+**Requirements.** 2M DAU, 40:1 read:write, feed p99 under 200 ms, celebrity accounts with tens of
+millions of followers.
+
+**The crux** is fan-out (ch. 8): write into every follower's inbox, or merge at read time?
+
+```python
+def hybrid_feed(followers, threshold=100_000, publish_ms=0.2, merge_ms=1.5):
+    if followers <= threshold:
+        cost = followers * publish_ms / 1000
+        return f"fan-out on WRITE: {followers:>11,} inserts, {cost:8.1f} s of queued work"
+    return (f"fan-out on READ : {followers:>11,} followers merge at read time "
+            f"({merge_ms} ms per feed open)")
+
+for f in (150, 20_000, 99_000, 5_000_000, 80_000_000):
+    print(hybrid_feed(f))
+
+print("\nreading a feed = merge(precomputed inbox, celebrity posts fetched live)")
+print("the threshold is a tuning knob, not a law: raise it while write capacity allows")
+```
+
+```output
+fan-out on WRITE:         150 inserts,      0.0 s of queued work
+fan-out on WRITE:      20,000 inserts,      4.0 s of queued work
+fan-out on WRITE:      99,000 inserts,     19.8 s of queued work
+fan-out on READ :   5,000,000 followers merge at read time (1.5 ms per feed open)
+fan-out on READ :  80,000,000 followers merge at read time (1.5 ms per feed open)
+
+reading a feed = merge(precomputed inbox, celebrity posts fetched live)
+the threshold is a tuning knob, not a law: raise it while write capacity allows
+```
+
+Everything else follows: the inbox is a capped list per user in a wide-column store keyed
+`(user_id, created_at desc)` (ch. 10), ranking runs online over the merged candidate set
+(ch. 24), and the whole path is cursor-paginated (ch. 1). Deletes and privacy changes are the
+hard part — an inbox row must be filtered at read time against current visibility, because
+rewriting 80 million inbox rows to unpublish one post is not viable.
+
+## Design 3: chat
+
+**Requirements.** 500k DAU, 40 messages sent and 45 received per user per day, delivery within a
+second, message history forever, ordering within a conversation, offline devices catch up.
+
+```python
+class Conversation:
+    """Ordering comes from a per-conversation sequence number, not from clocks (ch. 13)."""
+    def __init__(self, cid): self.cid, self.seq, self.log = cid, 0, []
+    def send(self, sender, body, client_msg_id):
+        for m in self.log:
+            if m["client_msg_id"] == client_msg_id:       # idempotent send (ch. 21)
+                return m, "duplicate ignored"
+        self.seq += 1
+        msg = {"seq": self.seq, "sender": sender, "body": body,
+               "client_msg_id": client_msg_id}
+        self.log.append(msg)
+        return msg, "accepted"
+    def since(self, seq):                                  # a device catches up by cursor
+        return [m for m in self.log if m["seq"] > seq]
+
+c = Conversation("c1")
+print(c.send("alice", "hi", "cid-1")[1])
+print(c.send("alice", "hi", "cid-1")[1], "<- the client retried after a timeout")
+c.send("bob", "hello", "cid-2"); c.send("alice", "how are you", "cid-3")
+print("device was offline at seq=1, catching up:",
+      [(m["seq"], m["body"]) for m in c.since(1)])
+```
+
+```output
+accepted
+duplicate ignored <- the client retried after a timeout
+device was offline at seq=1, catching up: [(2, 'hello'), (3, 'how are you')]
+```
+
+The system-design content is in what surrounds that: WebSocket connections are genuinely
+stateful (ch. 19), so a **connection registry** maps `user -> instance` and a message for an
+offline user goes to a queue plus a push notification. Little's law sizes the fleet — 500k DAU at
+20-minute sessions is roughly 240,000 concurrent connections, a memory and file-descriptor
+problem, not a CPU one (ch. 3). Group chats fan out per member, and the same
+celebrity problem appears in large groups.
+
+## Design 4: a job-scraper pipeline
+
+**Requirements.** Crawl thousands of job boards on a schedule, be polite to each host, deduplicate
+postings that appear on several sites, survive site outages, and never lose a day of data.
+
+```python
+import time, hashlib
+from collections import defaultdict
+
+class PoliteScheduler:
+    """Per-host token bucket (ch. 20) + dedup filter (ch. 7) + retry policy (ch. 21)."""
+    def __init__(self, per_host_rps=0.5):
+        self.rps, self.next_ok = per_host_rps, defaultdict(float)
+        self.seen = set()
+    def may_fetch(self, host, now):
+        if now < self.next_ok[host]:
+            return False, self.next_ok[host] - now
+        self.next_ok[host] = now + 1 / self.rps
+        return True, 0.0
+    def fingerprint(self, posting):
+        norm = f"{posting['title'].lower().strip()}|{posting['company'].lower().strip()}"
+        return hashlib.md5(norm.encode()).hexdigest()[:12]
+    def accept(self, posting):
+        fp = self.fingerprint(posting)
+        if fp in self.seen:
+            return "duplicate across sources"
+        self.seen.add(fp)
+        return "new posting"
+
+s = PoliteScheduler(per_host_rps=0.5)
+for t in (0.0, 0.5, 2.0):
+    ok, wait = s.may_fetch("jobs.example.com", t)
+    print(f"t={t:4.1f} fetch allowed={ok}" + ("" if ok else f", wait {wait:.1f}s"))
+
+for p in [{"title": "Senior ML Engineer", "company": "Acme"},
+          {"title": "senior ml engineer ", "company": " ACME"},
+          {"title": "Data Engineer", "company": "Acme"}]:
+    print(f"{p['title']!r:24} -> {s.accept(p)}")
+```
+
+```output
+t= 0.0 fetch allowed=True
+t= 0.5 fetch allowed=False, wait 1.5s
+t= 2.0 fetch allowed=True
+'Senior ML Engineer'     -> new posting
+'senior ml engineer '    -> duplicate across sources
+'Data Engineer'          -> new posting
+```
+
+The architecture is a batch pipeline (ch. 28): a frontier queue of URLs, workers with per-host
+rate limits, raw HTML written immutably to object storage (ch. 9) so parsing can be re-run
+without re-crawling, a parse step into a partitioned table, and dedup by fingerprint. Two rules
+carry most of the reliability: **store the raw artifact** (parsers break far more often than
+crawlers), and **partition by crawl date** so a failed day is one rerun, not a full re-crawl.
+
+## Design 5: a vector-search service
+
+**Requirements.** 200k users, 30 searches per user per day, a 50M-chunk corpus at 768 dimensions,
+p99 under 150 ms, filtered by tenant and permissions.
+
+```python
+def vector_capacity(n_vectors, dim, shards, replicas, ram_gb_per_node=64, ef=128):
+    raw_gb = n_vectors * dim * 4 / 1e9
+    index_gb = raw_gb * 1.6                                # HNSW graph overhead (ch. 27)
+    per_shard = index_gb / shards
+    nodes = shards * replicas
+    print(f"{n_vectors:>12,} vectors | index {index_gb:7.1f} GB | {shards:3} shards x "
+          f"{replicas} replicas = {nodes:3} nodes | {per_shard:6.1f} GB/shard "
+          f"{'FITS' if per_shard < ram_gb_per_node * 0.7 else 'TOO BIG: add shards'}")
+
+for shards in (1, 4, 16):
+    vector_capacity(50_000_000, 768, shards, replicas=2)
+
+print()
+for shards in (4, 16, 64):
+    p_slow = 1 - (1 - 0.01) ** shards                       # scatter-gather tail (ch. 14)
+    print(f"{shards:3} shards -> P(query hits a p99-slow shard) {p_slow:6.1%}")
+```
+
+```output
+  50,000,000 vectors | index   245.8 GB |   1 shards x 2 replicas =   2 nodes |  245.8 GB/shard TOO BIG: add shards
+  50,000,000 vectors | index   245.8 GB |   4 shards x 2 replicas =   8 nodes |   61.4 GB/shard TOO BIG: add shards
+  50,000,000 vectors | index   245.8 GB |  16 shards x 2 replicas =  32 nodes |   15.4 GB/shard FITS
+
+  4 shards -> P(query hits a p99-slow shard)   3.9%
+ 16 shards -> P(query hits a p99-slow shard)  14.9%
+ 64 shards -> P(query hits a p99-slow shard)  47.4%
+```
+
+Sharding is forced by memory, and then the tail is forced by sharding: every query fans out to
+all shards, so the p99 of the *slowest* shard is the p99 of the service. That argues for the
+fewest shards that fit, plus request hedging. Two more decisions carry the design: filters must
+be applied **inside** the ANN search (ch. 27) or a tenant with few documents gets nothing back,
+and the index is rebuilt offline and swapped atomically, because HNSW handles deletes badly.
+
+## Design 6: a compliance e-invoicing SaaS backend
+
+**Requirements.** Submit every invoice to a government clearance API within seconds, never
+submit twice, never lose one, keep an immutable audit trail for years, and survive the regulator
+being down.
+
+```python
+class InvoiceSubmission:
+    """The reliability pattern: outbox (ch. 8) + idempotency key (ch. 21) + audit log."""
+    def __init__(self):
+        self.invoices, self.outbox, self.audit, self.cleared = {}, [], [], {}
+
+    def create(self, invoice_id, payload):
+        # one transaction writes the invoice AND the event
+        self.invoices[invoice_id] = payload
+        self.outbox.append({"invoice_id": invoice_id, "state": "pending", "attempts": 0})
+        self.audit.append(("created", invoice_id, payload["hash"]))
+        return "committed"
+
+    def relay(self, regulator_up=True, max_attempts=5):
+        for e in self.outbox:
+            if e["state"] != "pending":
+                continue
+            e["attempts"] += 1
+            if not regulator_up:
+                if e["attempts"] >= max_attempts:
+                    e["state"] = "manual-review"
+                    self.audit.append(("escalated", e["invoice_id"], e["attempts"]))
+                continue
+            key = f"{e['invoice_id']}"                       # idempotency key = invoice id
+            if key not in self.cleared:                      # the regulator dedupes on it too
+                self.cleared[key] = f"UUID-{len(self.cleared)+1}"
+            e["state"] = "cleared"
+            self.audit.append(("cleared", e["invoice_id"], self.cleared[key]))
+
+svc = InvoiceSubmission()
+svc.create("INV-1001", {"hash": "sha256:aa11"})
+svc.create("INV-1002", {"hash": "sha256:bb22"})
+svc.relay(regulator_up=False)
+print("regulator down  ->", [(e["invoice_id"], e["state"], e["attempts"]) for e in svc.outbox])
+svc.relay(regulator_up=True)
+svc.relay(regulator_up=True)                                 # a duplicate relay pass
+print("after recovery  ->", [(e["invoice_id"], e["state"]) for e in svc.outbox])
+print("clearance ids   ->", svc.cleared)
+print("audit trail     ->", svc.audit)
+```
+
+```output
+regulator down  -> [('INV-1001', 'pending', 1), ('INV-1002', 'pending', 1)]
+after recovery  -> [('INV-1001', 'cleared'), ('INV-1002', 'cleared')]
+clearance ids   -> {'INV-1001': 'UUID-1', 'INV-1002': 'UUID-2'}
+audit trail     -> [('created', 'INV-1001', 'sha256:aa11'), ('created', 'INV-1002', 'sha256:bb22'), ('cleared', 'INV-1001', 'UUID-1'), ('cleared', 'INV-1002', 'UUID-2')]
+```
+
+The regulator being down must never block the customer's checkout, so submission is asynchronous
+with a queue and a visible per-invoice state machine (`pending`, `cleared`, `failed`,
+`manual-review`). Three requirements shape the rest: the **audit log is append-only** and hash-chained
+so it can be proven untampered; **cryptographic signing keys** live in a KMS or HSM, never in the
+application; and the **data model is multi-tenant with row-level isolation**, because "which
+customer's invoices can this query see?" is a compliance question, not a performance one.
+
+## Try it Yourself
+
+```python
+def design_review(system):
+    checks = [
+        ("numbers before boxes",     system.get("qps") and system.get("storage_tb")),
+        ("read:write ratio stated",  system.get("read_write_ratio") is not None),
+        ("single points of failure", not system.get("spof", True)),
+        ("data fits without sharding or a shard key is chosen",
+         system.get("storage_tb", 0) < 2 or system.get("shard_key")),
+        ("cache invalidation defined", system.get("invalidation") is not None),
+        ("idempotency for writes",   system.get("idempotent_writes", False)),
+        ("what happens when X is down", bool(system.get("degradation"))),
+        ("SLO and error budget",     system.get("slo") is not None),
+    ]
+    for name, ok in checks:
+        print(f"  {'PASS' if ok else 'GAP '} {name}")
+    print(f"  -> {sum(1 for _, ok in checks if not ok)} gap(s) to close before building")
+
+design_review({"qps": 5_000, "storage_tb": 9, "read_write_ratio": 50, "spof": False,
+               "shard_key": "hash(code)", "invalidation": "immutable, no invalidation",
+               "idempotent_writes": True, "degradation": "serve from cache, queue writes",
+               "slo": 0.999})
+print()
+design_review({"qps": 5_000, "storage_tb": 40, "read_write_ratio": 3})
+```
+
+```output
+  PASS numbers before boxes
+  PASS read:write ratio stated
+  PASS single points of failure
+  PASS data fits without sharding or a shard key is chosen
+  PASS cache invalidation defined
+  PASS idempotency for writes
+  PASS what happens when X is down
+  PASS SLO and error budget
+  -> 0 gap(s) to close before building
+
+  PASS numbers before boxes
+  PASS read:write ratio stated
+  GAP  single points of failure
+  GAP  data fits without sharding or a shard key is chosen
+  GAP  cache invalidation defined
+  GAP  idempotency for writes
+  GAP  what happens when X is down
+  GAP  SLO and error budget
+  -> 6 gap(s) to close before building
+```
+
+Run your own design through it. The checklist is deliberately boring — every gap it finds is one
+of the failure modes from an earlier chapter, and closing them is most of what separates a
+drawing from a design.
+
+## Exercise
+
+Pick one system you have not designed here — a ride-hailing dispatcher, a ticketing system with
+a flash sale, a multi-region document editor, or a metrics backend — and write the full design
+document: requirements as numbers, the API, the data model with keys and partitioning, the scale
+decisions with the number that forced each one, the failure modes and degradation behaviour, and
+the SLOs. Then run it through `design_review` and close every gap.
+
+Constrain yourself the way a real review would: state what you would build **first** (the smallest
+thing that serves real traffic), what you would add at 10x, and what you would not build at all
+until someone asks. A design that cannot say what to leave out is not finished.
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily, but
+you'll stop being surprised when you meet them.
+
+- **Vector clocks & CRDTs** — track causality between concurrent writes, or use data types whose merge is mathematically defined (counters, sets, sequences) so conflicts cannot happen (ch. 13, 16).
+- **Two-phase / three-phase commit & sagas** — coordinator-driven atomic commit across systems, its blocking failure mode, and the compensating-transaction escape hatch you actually use (ch. 15).
+- **Gossip & membership protocols** — SWIM-style failure detection: how a cluster agrees on who is alive without a central registry (ch. 13, 17).
+- **Quorum math (R+W>N) & read repair** — tuning consistency against availability per query, and the anti-entropy that makes "eventual" actually arrive (ch. 13).
+- **Bulk data formats (Parquet/Arrow/Avro) & columnar warehouses** — column layout, encoding, predicate pushdown, and why analytics storage looks nothing like OLTP storage (ch. 11, 18).
+- **Lambda vs Kappa architecture** — batch and stream side by side versus stream-only with replay; the reason the debate exists is reprocessing (ch. 18).
+- **Multi-region, consistency, and clock skew (Spanner/TrueTime)** — bounded-uncertainty clocks, commit waits, and what it costs to be linearizable across continents (ch. 16, 17).
+- **Idempotency keys & exactly-once semantics** — why exactly-once is a property of the *effect*, not the delivery, and how transactional outboxes and dedup tables approximate it (ch. 8, 21).
