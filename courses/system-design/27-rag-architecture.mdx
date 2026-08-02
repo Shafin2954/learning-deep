@@ -1,0 +1,427 @@
+---
+course: system-design
+chapter: 27-rag-architecture
+title: "RAG System Architecture, End to End"
+order: 27
+---
+
+## Two pipelines, not one
+
+A RAG system is an **ingest** pipeline that runs offline and a **query** pipeline that runs per
+request. They share exactly one thing — the embedding model — and confusing them is the source
+of most RAG failures.
+
+```
+ingest:  source -> extract -> chunk -> embed -> index -> (metadata store)
+query:   question -> embed -> retrieve -> rerank -> assemble prompt -> generate -> cite
+```
+
+| Pipeline | Stage | What it does | When | Budget |
+|---|---|---|---|---|
+| ingest | extract | PDF/HTML/DB to text | offline | hours |
+| ingest | chunk | split with overlap | offline | minutes |
+| ingest | embed | text to vectors | offline | GPU-bound |
+| ingest | index | write to a vector store | offline | minutes |
+| query | embed | the question to a vector | online | 5–20 ms |
+| query | retrieve | top-k by similarity | online | 10–50 ms |
+| query | rerank | cross-encoder over k docs | online | 50–200 ms |
+| query | generate | LLM with the context | online | 0.5–5 s |
+
+The generation step dominates the latency budget, which has one design consequence: **everything
+before it must be fast and must be right**, because you cannot afford a second attempt inside a
+user-facing request.
+
+## Chunking is a retrieval decision, not a text decision
+
+The chunk is the unit that gets retrieved, so its size decides what the model can see and how
+precise the match is. Too large and the embedding averages away the specific fact; too small and
+the answer is split across chunks that each look irrelevant.
+
+```python
+def chunk(text, size, overlap):
+    words = text.split()
+    step = max(1, size - overlap)
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), step)
+            if words[i:i + size]]
+
+text = ("The refund window is 30 days from delivery. " * 3 +
+        "Items marked final sale cannot be returned. " * 3 +
+        "Refunds go to the original payment method within 5 business days. " * 3)
+
+for size, overlap in [(20, 0), (60, 15), (200, 40)]:
+    cs = chunk(text, size, overlap)
+    print(f"size {size:3} overlap {overlap:2} -> {len(cs):3} chunks | "
+          f"first chunk: {cs[0][:58]}...")
+```
+
+```output
+size  20 overlap  0 ->   4 chunks | first chunk: The refund window is 30 days from delivery. The refund win...
+size  60 overlap 15 ->   2 chunks | first chunk: The refund window is 30 days from delivery. The refund win...
+size 200 overlap 40 ->   1 chunks | first chunk: The refund window is 30 days from delivery. The refund win...
+```
+
+Overlap exists so a fact that straddles a boundary survives in at least one chunk. The costs are
+storage and duplicate retrievals — 25% overlap is the usual compromise. Three rules that matter
+more than the numbers: **respect structure** (split on headings and paragraphs, never mid-sentence),
+**keep metadata on every chunk** (source, section, timestamp, permissions), and **store the
+surrounding context** so you can expand a matched chunk to its neighbours at generation time.
+
+## Retrieval: dense, sparse, and why you want both
+
+```python
+import numpy as np, math, hashlib
+from collections import Counter
+
+corpus = [
+    "the refund window is 30 days from delivery",
+    "items marked final sale cannot be returned",
+    "refunds are issued to the original payment method",
+    "error code E4021 means the payment gateway timed out",
+    "shipping to remote areas takes 5 extra business days",
+]
+query = "what does error E4021 mean"
+
+def bm25(query, corpus, k1=1.5, b=0.75):
+    """Sparse lexical retrieval: exact terms, rare terms weighted higher."""
+    docs = [d.split() for d in corpus]
+    avgdl = sum(len(d) for d in docs) / len(docs)
+    df = Counter(t for d in docs for t in set(d))
+    scores = []
+    for d in docs:
+        tf = Counter(d)
+        s = 0.0
+        for t in query.split():
+            if t not in tf: continue
+            idf = math.log((len(docs) - df[t] + 0.5) / (df[t] + 0.5) + 1)
+            s += idf * tf[t] * (k1 + 1) / (tf[t] + k1 * (1 - b + b * len(d) / avgdl))
+        scores.append(s)
+    return np.array(scores)
+
+# A stand-in embedder: words map to CONCEPTS, so paraphrases land near each other.
+CONCEPT = {"refund": "money-back", "refunds": "money-back", "money": "money-back",
+           "back": "money-back", "returned": "money-back", "return": "money-back",
+           "payment": "money-back", "card": "money-back",
+           "days": "duration", "window": "duration", "long": "duration",
+           "error": "failure", "timed": "failure", "declined": "failure"}
+
+def fake_embed(text, dim=64):
+    v = np.zeros(dim)
+    for w in text.lower().split():
+        token = CONCEPT.get(w, w)                       # unknown words keep their identity
+        v[int(hashlib.md5(token.encode()).hexdigest(), 16) % dim] += 1.0
+    return v / (np.linalg.norm(v) + 1e-9)
+
+for q in ("what does error E4021 mean", "how do I get my money back"):
+    dense = np.array([fake_embed(d) @ fake_embed(q) for d in corpus])
+    sparse = bm25(q.lower(), corpus)
+    print(f"query: {q!r}")
+    for i, d in enumerate(corpus):
+        print(f"   dense {dense[i]:5.3f} | bm25 {sparse[i]:5.2f} | {d[:50]}")
+```
+
+```output
+query: 'what does error E4021 mean'
+   dense 0.000 | bm25  0.00 | the refund window is 30 days from delivery
+   dense 0.000 | bm25  0.00 | items marked final sale cannot be returned
+   dense 0.000 | bm25  0.00 | refunds are issued to the original payment method
+   dense 0.405 | bm25  1.33 | error code E4021 means the payment gateway timed o
+   dense 0.000 | bm25  0.00 | shipping to remote areas takes 5 extra business da
+query: 'how do I get my money back'
+   dense 0.316 | bm25  0.00 | the refund window is 30 days from delivery
+   dense 0.252 | bm25  0.00 | items marked final sale cannot be returned
+   dense 0.527 | bm25  0.00 | refunds are issued to the original payment method
+   dense 0.201 | bm25  0.00 | error code E4021 means the payment gateway timed o
+   dense 0.000 | bm25  0.00 | shipping to remote areas takes 5 extra business da
+```
+
+BM25 finds `E4021` because it is a rare exact token; a dense model finds "how do I get my money
+back" matching "refund window" with no shared words. Neither alone is enough, which is why
+production systems run **hybrid retrieval** and fuse the two rankings.
+
+```python
+def rrf(rankings, k=60):
+    """Reciprocal rank fusion: combine rankings without calibrating their scores."""
+    scores = Counter()
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] += 1 / (k + rank)
+    return [doc for doc, _ in scores.most_common()]
+
+for query in ("what does error E4021 mean", "how do I get my money back"):
+    dense  = np.array([fake_embed(d) @ fake_embed(query) for d in corpus])
+    sparse = bm25(query.lower(), corpus)
+    dense_rank  = [int(i) for i in np.argsort(-dense) if dense[i] > 0]
+    sparse_rank = [int(i) for i in np.argsort(-sparse) if sparse[i] > 0]   # drop non-matches
+    fused = rrf([dense_rank, sparse_rank])
+    print(f"query {query!r}")
+    print(f"   dense {dense_rank} | bm25 {sparse_rank} | fused {fused}")
+    print(f"   top fused: {corpus[fused[0]]}")
+```
+
+```output
+query 'what does error E4021 mean'
+   dense [3] | bm25 [3] | fused [3]
+   top fused: error code E4021 means the payment gateway timed out
+query 'how do I get my money back'
+   dense [2, 0, 1, 3] | bm25 [] | fused [2, 0, 1, 3]
+   top fused: refunds are issued to the original payment method
+```
+
+Reciprocal rank fusion needs no score normalization — it uses only positions, so a BM25 score of
+9.1 and a cosine of 0.83 combine without tuning. That property is why it survives model changes
+that break every hand-tuned weighted sum. Note the filter on both rankings: a retriever that
+matched nothing still produces an ordering, and feeding those arbitrary positions into the fusion
+actively damages the result. **Fuse rankings, but only over documents that actually matched.**
+
+### Rerank: cheap recall, expensive precision
+
+```python
+def two_stage(n_docs, k_retrieve, k_rerank, ann_ms_per_1k=8, rerank_ms_per_doc=6):
+    ann, rerank = n_docs / 1000 * ann_ms_per_1k, k_rerank * rerank_ms_per_doc
+    print(f"corpus {n_docs:>11,} | ANN top-{k_retrieve} {ann:7.1f} ms + rerank {k_rerank} "
+          f"{rerank:5.1f} ms = {ann + rerank:7.1f} ms | rerank-everything: "
+          f"{n_docs * rerank_ms_per_doc / 1000:9,.0f} s")
+
+for n in (10_000, 1_000_000, 100_000_000):
+    two_stage(n, k_retrieve=100, k_rerank=20)
+```
+
+```output
+corpus      10,000 | ANN top-100    80.0 ms + rerank 20 120.0 ms =   200.0 ms | rerank-everything:        60 s
+corpus   1,000,000 | ANN top-100  8000.0 ms + rerank 20 120.0 ms =  8120.0 ms | rerank-everything:     6,000 s
+corpus 100,000,000 | ANN top-100 800000.0 ms + rerank 20 120.0 ms = 800120.0 ms | rerank-everything:   600,000 s
+```
+
+This is the same two-stage pattern as recommendation ranking (ch. 24): a cheap approximate
+retriever maximizes **recall** over millions of documents, then an expensive cross-encoder
+maximizes **precision** over twenty. Running the cross-encoder on the whole corpus is not slow —
+it is impossible.
+
+## The vector index is an approximate one
+
+```python
+def ann_tradeoff(n, dim, ef_values):
+    flat_mb = n * dim * 4 / 1e6                  # graph links add roughly 50-70% on top
+    print(f"{n:,} vectors x {dim} dims: flat {flat_mb:,.0f} MB | HNSW ~{flat_mb*1.6:,.0f} MB")
+    for ef in ef_values:
+        print(f"   ef_search {ef:4} -> recall@10 ~{min(0.999, 1 - 0.5 ** (ef/24)):6.1%} "
+              f"| ~{0.05 * ef ** 0.75:6.2f} ms/query")
+
+ann_tradeoff(5_000_000, 768, [16, 64, 256, 512])
+```
+
+```output
+5,000,000 vectors x 768 dims: flat 15,360 MB | HNSW ~24,576 MB
+   ef_search   16 -> recall@10 ~ 37.0% | ~  0.40 ms/query
+   ef_search   64 -> recall@10 ~ 84.3% | ~  1.13 ms/query
+   ef_search  256 -> recall@10 ~ 99.9% | ~  3.20 ms/query
+   ef_search  512 -> recall@10 ~ 99.9% | ~  5.38 ms/query
+```
+
+Approximate nearest neighbour search trades recall for latency through one knob, and **the recall
+you lose here is invisible downstream**: the LLM cannot cite a document the retriever never
+returned. Measure `recall@k` against an exact search on a sample before choosing the setting, and
+re-measure after any index rebuild.
+
+Three more index decisions worth naming: **filtering** (permission and tenant filters must be
+applied *inside* the ANN search, not after, or you get fewer results than you asked for),
+**updates** (HNSW handles inserts well and deletes badly — plan for periodic rebuilds), and
+**dimensionality** (768 to 1536 is typical; halving dimensions halves memory and usually costs a
+little recall).
+
+## Assembling the prompt is a budget problem
+
+```python
+def assemble(chunks, window, per_chunk=180, system=350, question=40, answer=500):
+    room = window - (system + question + answer)
+    print(f"window {window:>7,} | overhead {system+question+answer:>5,} | "
+          f"room {room:>7,} tokens -> {min(room // per_chunk, chunks)} of {chunks} chunks fit")
+
+for window in (4_096, 16_384, 128_000):
+    assemble(chunks=40, window=window)
+```
+
+```output
+window   4,096 | overhead   890 | room   3,206 tokens -> 17 of 40 chunks fit
+window  16,384 | overhead   890 | room  15,494 tokens -> 40 of 40 chunks fit
+window 128,000 | overhead   890 | room 127,110 tokens -> 40 of 40 chunks fit
+```
+
+More context is not free and not always better: cost and latency grow with tokens, and models
+attend unevenly across a long window — the "lost in the middle" effect means a fact buried at
+position 30 is often ignored. The practical rules: **put the best chunks first and last**,
+**deduplicate near-identical chunks**, and **give every chunk a citable id** so the model can
+reference it and you can verify the reference.
+
+```python
+def build_prompt(question, chunks):
+    ctx = "\n".join(f"[{i+1}] {c}" for i, c in enumerate(chunks))
+    return (f"Answer using ONLY the context. Cite sources as [n]. If the context does "
+            f"not contain the answer, say you do not know.\n\nCONTEXT:\n{ctx}\n\n"
+            f"QUESTION: {question}\nANSWER:")
+
+print(build_prompt("what does error E4021 mean?",
+                   ["error code E4021 means the payment gateway timed out",
+                    "refunds are issued to the original payment method"]))
+```
+
+```output
+Answer using ONLY the context. Cite sources as [n]. If the context does not contain the answer, say you do not know.
+
+CONTEXT:
+[1] error code E4021 means the payment gateway timed out
+[2] refunds are issued to the original payment method
+
+QUESTION: what does error E4021 mean?
+ANSWER:
+```
+
+Two instructions carry most of the weight: *only* the context (which turns a hallucination into a
+retrieval bug you can measure), and *say you do not know* (which gives the model a legal way out
+instead of inventing one).
+
+## Evaluating the pipeline, stage by stage
+
+```python
+def evaluate(gold, retrieved, answer_supported, answer_correct):
+    hit = any(g in retrieved for g in gold)
+    recall = len(set(gold) & set(retrieved)) / len(gold)
+    print(f"hit@k {hit} | recall {recall:.0%} | grounded {answer_supported} | "
+          f"correct {answer_correct}")
+    if not hit:
+        print("-> diagnosis: RETRIEVAL failure. A better prompt cannot fix this.")
+    elif not answer_supported:
+        print("-> diagnosis: GENERATION failure (hallucination) despite good context.")
+    elif not answer_correct:
+        print("-> diagnosis: the source documents themselves are wrong or outdated.")
+
+evaluate(["doc4"], ["doc1", "doc2"], answer_supported=True, answer_correct=False)
+evaluate(["doc4"], ["doc4", "doc2"], answer_supported=False, answer_correct=False)
+```
+
+```output
+hit@k False | recall 0% | grounded True | correct False
+-> diagnosis: RETRIEVAL failure. A better prompt cannot fix this.
+hit@k True | recall 100% | grounded False | correct False
+-> diagnosis: GENERATION failure (hallucination) despite good context.
+```
+
+The reason to measure retrieval and generation separately: they fail differently and are fixed
+differently. Aggregate "the answer was wrong" tells you nothing about which half to work on, and
+teams routinely spend weeks on prompts when the retriever never returned the document.
+
+## Try it Yourself
+
+```python
+def rag_cost(qps, k_chunks, chunk_tokens=180, answer_tokens=400,
+             input_per_m=0.25, output_per_m=1.25, rerank_per_1k=0.05):
+    in_tok = k_chunks * chunk_tokens + 400
+    monthly_q = qps * 2.6e6
+    cost = (monthly_q * in_tok / 1e6 * input_per_m
+            + monthly_q * answer_tokens / 1e6 * output_per_m
+            + monthly_q / 1000 * rerank_per_1k)
+    print(f"{qps:>5} qps | k={k_chunks:<3} | {in_tok:>6,} input tokens/query | "
+          f"${cost:>12,.0f}/month | ${cost/monthly_q*1000:6.3f} per 1k queries")
+
+for k in (3, 10, 30):
+    rag_cost(10, k)
+for qps in (1, 100):
+    rag_cost(qps, 10)
+```
+
+```output
+   10 qps | k=3   |    940 input tokens/query | $      20,410/month | $ 0.785 per 1k queries
+   10 qps | k=10  |  2,200 input tokens/query | $      28,600/month | $ 1.100 per 1k queries
+   10 qps | k=30  |  5,800 input tokens/query | $      52,000/month | $ 2.000 per 1k queries
+    1 qps | k=10  |  2,200 input tokens/query | $       2,860/month | $ 1.100 per 1k queries
+  100 qps | k=10  |  2,200 input tokens/query | $     286,000/month | $ 1.100 per 1k queries
+```
+
+Tripling `k` roughly triples input tokens and therefore cost — which is the argument for reranking
+down to a handful of chunks rather than stuffing thirty. Change `input_per_m` to a larger model's
+price and see how quickly the retrieval quality work pays for itself.
+
+## Exercise
+
+Build a small end-to-end RAG evaluation harness: given a corpus, a set of questions with known
+answer-bearing documents, and two retrieval configurations (dense only, and hybrid with RRF),
+report `recall@k` and MRR for each, then compute how the choice changes the number of chunks you
+must send to the model to reach 90% recall.
+
+<details>
+<summary>Solution</summary>
+
+```python
+corpus = [
+    "the refund window is 30 days from delivery",
+    "items marked final sale cannot be returned",
+    "refunds are issued to the original payment method within 5 business days",
+    "error code E4021 means the payment gateway timed out",
+    "error code E5510 means the card issuer declined the transaction",
+    "shipping to remote areas takes 5 extra business days",
+    "you can change your delivery address before the item ships",
+    "gift cards are non-refundable under any circumstance",
+]
+questions = [
+    ("what does error E4021 mean", [3]),
+    ("how long do I have to send something back", [0]),
+    ("can I get money back for a gift card", [7]),
+    ("when will the refund reach my card", [2]),
+]
+
+def dense_scores(q):  return np.array([fake_embed(d) @ fake_embed(q) for d in corpus])
+def sparse_scores(q): return bm25(q, corpus)
+
+def evaluate_config(name, rank_fn, k=3):
+    recalls, rr = [], []
+    for q, gold in questions:
+        ranked = rank_fn(q)[:k]
+        recalls.append(len(set(ranked) & set(gold)) / len(gold))
+        hit = next((i + 1 for i, d in enumerate(ranked) if d in gold), None)
+        rr.append(1 / hit if hit else 0.0)
+    print(f"{name:16} recall@{k} {np.mean(recalls):5.0%} | MRR {np.mean(rr):5.3f}")
+    return np.mean(recalls)
+
+dense_only = lambda q: list(np.argsort(-dense_scores(q)))
+hybrid = lambda q: rrf([list(np.argsort(-dense_scores(q))), list(np.argsort(-sparse_scores(q)))])
+
+for k in (1, 3, 5):
+    print(f"--- k = {k} ---")
+    evaluate_config("dense only", dense_only, k)
+    evaluate_config("hybrid + RRF", hybrid, k)
+
+print("\nchunks needed to reach 90% recall:")
+for name, fn in [("dense only", dense_only), ("hybrid + RRF", hybrid)]:
+    need = next((k for k in range(1, len(corpus) + 1)
+                 if np.mean([len(set(fn(q)[:k]) & set(g)) / len(g) for q, g in questions]) >= 0.9),
+                None)
+    print(f"  {name:14} k = {need}")
+```
+
+```output
+--- k = 1 ---
+dense only       recall@1   50% | MRR 0.500
+hybrid + RRF     recall@1   25% | MRR 0.250
+--- k = 3 ---
+dense only       recall@3   75% | MRR 0.625
+hybrid + RRF     recall@3  100% | MRR 0.542
+--- k = 5 ---
+dense only       recall@5   75% | MRR 0.625
+hybrid + RRF     recall@5  100% | MRR 0.542
+
+chunks needed to reach 90% recall:
+  dense only     k = 6
+  hybrid + RRF   k = 3
+```
+
+The insight: the retrieval configuration sets a **ceiling** on everything downstream, and the
+cheapest way to raise answer quality is usually to raise recall at small `k` rather than to send
+more chunks. Note what the `k` needed for 90% recall controls — it is the input-token bill, the
+latency of the rerank stage, and how much irrelevant text the model must ignore. A hybrid
+retriever that halves the `k` you need is not a marginal improvement; it is
+a different cost structure — here it is `k=3` against `k=6`. Two caveats this toy harness makes visible by omission: the fake
+embedder here matches on shared tokens, so it understates what a real dense model contributes on
+paraphrases, and four questions cannot distinguish configurations reliably — a real evaluation
+set needs hundreds of questions with known gold documents, which is the single most valuable
+artifact a RAG team can build and the one most often skipped.
+</details>
