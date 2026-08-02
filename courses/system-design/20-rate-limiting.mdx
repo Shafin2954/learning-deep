@@ -1,0 +1,407 @@
+---
+course: system-design
+chapter: 20-rate-limiting
+title: "Rate Limiting: Token Bucket and Leaky Bucket"
+order: 20
+---
+
+## Rate limiting is capacity protection, not punishment
+
+A limiter answers one question — *may this request proceed right now?* — and it exists because
+every downstream component has a ceiling (ch. 19). Without one, a traffic spike, a retry storm
+(ch. 21), or one badly written client consumes the capacity of everyone else.
+
+Four things you must decide before choosing an algorithm:
+
+- **The key.** Per user, per API key, per IP, per endpoint, or a combination. Per IP alone
+  punishes shared NAT; per user alone lets an unauthenticated flood through.
+- **The limit.** Requests per second, and how much burst you tolerate above it.
+- **The response.** `429 Too Many Requests` with a `Retry-After` header — never a silent drop,
+  which turns into client retries.
+- **What is exempt.** Health checks, payments, and anything whose failure costs more than the
+  overload.
+
+```python
+def decide(key_type, request):
+    keys = {"ip": request["ip"], "user": request.get("user"), "api_key": request.get("api_key")}
+    key = keys.get(key_type)
+    return f"{key_type:8} -> bucket key {key!r}"
+
+req = {"ip": "203.0.113.9", "user": "u_42", "api_key": None, "path": "/v1/search"}
+for k in ("ip", "user", "api_key"):
+    print(decide(k, req))
+print("composite:", f"{req['user'] or req['ip']}:{req['path']}",
+      "<- per-user AND per-endpoint, falling back to IP when anonymous")
+```
+
+```output
+ip       -> bucket key '203.0.113.9'
+user     -> bucket key 'u_42'
+api_key  -> bucket key None
+composite: u_42:/v1/search <- per-user AND per-endpoint, falling back to IP when anonymous
+```
+
+## Token bucket: the one to reach for
+
+A bucket holds up to `capacity` tokens and refills at `rate` tokens per second. A request takes
+one token; if none are available, it is rejected. This gives you a **sustained rate with a
+bounded burst**, which is what almost every real API wants.
+
+```python
+class TokenBucket:
+    def __init__(self, rate, capacity):
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self.last = float(capacity), 0.0
+
+    def allow(self, now, cost=1):
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= cost:
+            self.tokens -= cost
+            return True, self.tokens
+        # how long until enough tokens exist? that is the Retry-After value
+        return False, (cost - self.tokens) / self.rate
+
+tb = TokenBucket(rate=2, capacity=5)          # 2 rps sustained, burst of 5
+timeline = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 3.0]
+for t in timeline:
+    ok, info = tb.allow(t)
+    print(f"t={t:4.1f} {'ALLOW' if ok else 'DENY '} "
+          + (f"tokens left {info:4.2f}" if ok else f"retry after {info:4.2f}s"))
+```
+
+```output
+t= 0.0 ALLOW tokens left 4.00
+t= 0.0 ALLOW tokens left 3.00
+t= 0.0 ALLOW tokens left 2.00
+t= 0.0 ALLOW tokens left 1.00
+t= 0.0 ALLOW tokens left 0.00
+t= 0.0 DENY  retry after 0.50s
+t= 1.0 ALLOW tokens left 1.00
+t= 3.0 ALLOW tokens left 4.00
+```
+
+Five requests at $t=0$ pass instantly — that is the burst — and the sixth is denied with an exact
+`Retry-After`. By $t=3$ the bucket has refilled. Two properties make this the default choice:
+**burst tolerance** (users are bursty; a strict limiter feels broken) and a **cheap
+representation**: two numbers per key, updated lazily on access, so a million keys cost a few
+tens of megabytes.
+
+### Weighted costs: not all requests are equal
+
+```python
+tb = TokenBucket(rate=10, capacity=20)
+costs = {"GET /v1/users/{id}": 1, "GET /v1/search": 5, "POST /v1/export": 15}
+for path, cost in costs.items():
+    ok, info = tb.allow(0.0, cost=cost)
+    print(f"{path:22} cost {cost:2} -> {'ALLOW' if ok else 'DENY '} "
+          + (f"tokens left {info:5.2f}" if ok else f"retry after {info:5.2f}s"))
+```
+
+```output
+GET /v1/users/{id}     cost  1 -> ALLOW tokens left 19.00
+GET /v1/search         cost  5 -> ALLOW tokens left 14.00
+POST /v1/export        cost 15 -> DENY  retry after  0.10s
+```
+
+Charging by cost is how you protect the expensive endpoint without throttling the cheap one.
+GitHub, Stripe, and Shopify all publish per-endpoint costs against a shared bucket for exactly
+this reason.
+
+## Leaky bucket: shaping instead of limiting
+
+A leaky bucket is a queue that drains at a fixed rate. Requests enter the queue (dropped if it
+is full) and leave at a constant pace — so the **output** is perfectly smooth, whatever the
+input looks like.
+
+```python
+from collections import deque
+
+class LeakyBucket:
+    def __init__(self, rate, size):
+        self.rate, self.size, self.q, self.last = rate, size, deque(), 0.0
+
+    def offer(self, now, item):
+        leaked = int((now - self.last) * self.rate)
+        for _ in range(min(leaked, len(self.q))):
+            self.q.popleft()
+        self.last = now
+        if len(self.q) >= self.size:
+            return f"DROP {item} (queue full at {self.size})"
+        self.q.append(item)
+        wait = (len(self.q) - 1) / self.rate
+        return f"QUEUE {item} -> sends in {wait:.2f}s (depth {len(self.q)})"
+
+lb = LeakyBucket(rate=2, size=4)
+for i in range(6):
+    print(lb.offer(0.0, f"req{i}"))
+print(lb.offer(2.0, "req6"), "<- two seconds later, 4 have drained")
+```
+
+```output
+QUEUE req0 -> sends in 0.00s (depth 1)
+QUEUE req1 -> sends in 0.50s (depth 2)
+QUEUE req2 -> sends in 1.00s (depth 3)
+QUEUE req3 -> sends in 1.50s (depth 4)
+DROP req4 (queue full at 4)
+DROP req5 (queue full at 4)
+QUEUE req6 -> sends in 0.00s (depth 1) <- two seconds later, 4 have drained
+```
+
+The difference from a token bucket in one line: **a token bucket lets a burst through; a leaky
+bucket flattens it into a steady stream.** Use the leaky bucket when the thing you are protecting
+cannot absorb bursts at all — a legacy SOAP endpoint, an SMS gateway with a hard per-second
+contract, a payment processor.
+
+## Fixed window, sliding log, sliding window counter
+
+```python
+from collections import defaultdict
+
+class FixedWindow:
+    def __init__(self, limit, window): self.limit, self.window, self.counts = limit, window, defaultdict(int)
+    def allow(self, now, key="k"):
+        w = int(now // self.window)
+        self.counts[(key, w)] += 1
+        return self.counts[(key, w)] <= self.limit
+
+class SlidingLog:
+    def __init__(self, limit, window): self.limit, self.window, self.log = limit, window, []
+    def allow(self, now, key="k"):
+        self.log = [t for t in self.log if t > now - self.window]     # exact, but O(n) memory
+        if len(self.log) < self.limit:
+            self.log.append(now); return True
+        return False
+
+class SlidingCounter:
+    """Two fixed windows, interpolated: the standard production compromise."""
+    def __init__(self, limit, window):
+        self.limit, self.window, self.counts = limit, window, defaultdict(int)
+    def allow(self, now, key="k"):
+        w = int(now // self.window)
+        elapsed = (now % self.window) / self.window
+        estimate = self.counts[(key, w - 1)] * (1 - elapsed) + self.counts[(key, w)]
+        if estimate < self.limit:
+            self.counts[(key, w)] += 1; return True
+        return False
+
+# The classic fixed-window failure: 100 requests at the end of one window,
+# 100 more at the start of the next = 200 in a two-second span.
+for name, limiter in [("fixed window", FixedWindow(100, 60)),
+                      ("sliding log", SlidingLog(100, 60)),
+                      ("sliding counter", SlidingCounter(100, 60))]:
+    allowed_edge = sum(limiter.allow(59.5 + i * 0.001) for i in range(100))
+    allowed_next = sum(limiter.allow(60.1 + i * 0.001) for i in range(100))
+    print(f"{name:16} allowed {allowed_edge:3} at t=59.5s and {allowed_next:3} at t=60.1s "
+          f"-> {allowed_edge + allowed_next:3} in a 0.7s span (limit is 100/60s)")
+```
+
+```output
+fixed window     allowed 100 at t=59.5s and 100 at t=60.1s -> 200 in a 0.7s span (limit is 100/60s)
+sliding log      allowed 100 at t=59.5s and   0 at t=60.1s -> 100 in a 0.7s span (limit is 100/60s)
+sliding counter  allowed 100 at t=59.5s and   1 at t=60.1s -> 101 in a 0.7s span (limit is 100/60s)
+```
+
+The fixed window admits twice the limit across a boundary — a real outage cause, and the reason
+nobody serious ships it. The sliding log is exact and stores a timestamp per request, which is
+unaffordable at scale. The **sliding window counter** costs two integers per key and is within a
+few percent of exact, which is why it is what Cloudflare and most gateways actually run.
+
+## Distributed rate limiting
+
+Ten gateway instances each enforcing "100 rps" allow 1,000 rps. There are three ways out, and
+they differ in how much coordination they buy.
+
+```python
+def distributed(strategy, nodes, global_limit, actual_traffic_share):
+    if strategy == "local only":
+        return (f"each node allows {global_limit}/{1} -> up to {nodes * global_limit} globally",
+                "no coordination, wrong answer")
+    if strategy == "static split":
+        per_node = global_limit / nodes
+        effective = per_node / max(actual_traffic_share)      # the hot node throttles early
+        return (f"each node allows {per_node:.0f} -> global {global_limit} only if traffic is even",
+                f"with skew, effective global limit is {effective * nodes:.0f}")
+    if strategy == "central store":
+        return (f"one atomic INCR per request in Redis -> exactly {global_limit}",
+                "one network round trip on every request; the store is now critical")
+    if strategy == "local + async sync":
+        return (f"nodes enforce locally and reconcile every ~1s -> approximately {global_limit}",
+                "brief overshoot after a spike; no per-request coordination")
+
+for s in ("local only", "static split", "central store", "local + async sync"):
+    how, cost = distributed(s, nodes=10, global_limit=1000, actual_traffic_share=[0.4, 0.1])
+    print(f"{s:20} {how}\n{'':20} cost: {cost}")
+```
+
+```output
+local only           each node allows 1000/1 -> up to 10000 globally
+                     cost: no coordination, wrong answer
+static split         each node allows 100 -> global 1000 only if traffic is even
+                     cost: with skew, effective global limit is 2500
+central store        one atomic INCR per request in Redis -> exactly 1000
+                     cost: one network round trip on every request; the store is now critical
+local + async sync   nodes enforce locally and reconcile every ~1s -> approximately 1000
+                     cost: brief overshoot after a spike; no per-request coordination
+```
+
+The production answer is usually the last one: enforce locally for speed, sync counters
+asynchronously for accuracy, and accept a brief overshoot. Reach for the central store only when
+the limit is contractual — a paid API quota, a regulatory cap — and remember that you have just
+put a Redis round trip on the critical path of every request (ch. 2).
+
+## Telling the client what happened
+
+```python
+def response(allowed, limit, remaining, reset_s, retry_after=None):
+    headers = {
+        "RateLimit-Limit": limit,
+        "RateLimit-Remaining": max(0, int(remaining)),
+        "RateLimit-Reset": reset_s,
+    }
+    if not allowed:
+        headers["Retry-After"] = f"{retry_after:.0f}"
+    status = 200 if allowed else 429
+    return status, headers
+
+print(response(True, 100, 87, 42))
+print(response(False, 100, 0, 12, retry_after=12))
+print("\nA 429 with Retry-After is a contract: it tells a well-built client exactly when to")
+print("come back, which is the difference between backpressure and a retry storm (ch. 21).")
+```
+
+```output
+(200, {'RateLimit-Limit': 100, 'RateLimit-Remaining': 87, 'RateLimit-Reset': 42})
+(429, {'RateLimit-Limit': 100, 'RateLimit-Remaining': 0, 'RateLimit-Reset': 12, 'Retry-After': '12'})
+
+A 429 with Retry-After is a contract: it tells a well-built client exactly when to
+come back, which is the difference between backpressure and a retry storm (ch. 21).
+```
+
+Two failure modes to avoid. **Returning 500 instead of 429** tells the client's retry logic that
+your service is broken, and most retry policies treat 5xx as retryable and 429 as
+wait-and-retry — so the wrong status code causes the storm you are trying to prevent. And
+**limiting without telling anyone** produces support tickets about "random failures" that take
+weeks to diagnose.
+
+## Try it Yourself
+
+```python
+def burst_profile(rate, capacity, arrivals):
+    """How many of a burst get through, and how long until the rest can?"""
+    tb = TokenBucket(rate, capacity)
+    allowed = sum(1 for t in arrivals if tb.allow(t)[0])
+    print(f"rate {rate:3}/s capacity {capacity:3} -> {allowed:3}/{len(arrivals)} of a "
+          f"{len(arrivals)}-request burst allowed; the rest wait "
+          f"{(len(arrivals) - allowed) / rate:5.1f}s")
+
+burst = [0.0] * 50 + [0.5] * 50          # 100 requests in half a second
+for rate, cap in [(10, 10), (10, 50), (50, 50), (10, 100)]:
+    burst_profile(rate, cap, burst)
+```
+
+```output
+rate  10/s capacity  10 ->  15/100 of a 100-request burst allowed; the rest wait   8.5s
+rate  10/s capacity  50 ->  55/100 of a 100-request burst allowed; the rest wait   4.5s
+rate  50/s capacity  50 ->  75/100 of a 100-request burst allowed; the rest wait   0.5s
+rate  10/s capacity 100 -> 100/100 of a 100-request burst allowed; the rest wait   0.0s
+```
+
+Capacity controls the burst; rate controls the sustained load. Set capacity equal to rate and a
+client that sends its daily work in one batch is punished; set it to 10x rate and a single
+client can monopolize your service for ten seconds. The usual answer is capacity of about 2–5
+seconds' worth of rate — enough for a page load, not enough to hurt.
+
+## Exercise
+
+Implement a **hierarchical rate limiter**: each request must pass three buckets in order — a
+per-user limit, a per-organization limit, and a global limit protecting the backend. Rejection at
+any level returns the appropriate `Retry-After`, and tokens must not be consumed from a bucket if
+a later bucket rejects the request (otherwise a user is charged for a request that never ran).
+
+<details>
+<summary>Solution</summary>
+
+```python
+class Hierarchical:
+    def __init__(self):
+        self.buckets = {}
+        self.limits = {"user": (5, 10), "org": (20, 40), "global": (100, 200)}
+
+    def _bucket(self, level, key):
+        k = (level, key)
+        if k not in self.buckets:
+            rate, cap = self.limits[level]
+            self.buckets[k] = TokenBucket(rate, cap)
+        return self.buckets[k]
+
+    def allow(self, now, user, org):
+        levels = [("user", user), ("org", org), ("global", "-")]
+        # Phase 1: check every level WITHOUT consuming (peek at available tokens).
+        for level, key in levels:
+            b = self._bucket(level, key)
+            available = min(b.capacity, b.tokens + (now - b.last) * b.rate)
+            if available < 1:
+                return False, level, (1 - available) / b.rate
+        # Phase 2: every level said yes, so charge them all.
+        for level, key in levels:
+            self._bucket(level, key).allow(now)
+        return True, None, 0.0
+
+h = Hierarchical()
+print("one user bursting alone:")
+for i in range(12):
+    ok, level, retry = h.allow(0.0, "u1", "acme")
+    if not ok:
+        print(f"  request {i:2}: 429 at the {level} level, retry after {retry:.2f}s")
+        break
+    print(f"  request {i:2}: allowed")
+
+print("\na second user in the same org still gets through:")
+ok, level, retry = h.allow(0.0, "u2", "acme")
+print(f"  u2: {'allowed' if ok else f'429 at {level}'}")
+
+print("\nfilling the org bucket with many users:")
+denied_at = None
+for i in range(3, 40):
+    ok, level, retry = h.allow(0.0, f"u{i}", "acme")
+    if not ok:
+        denied_at = (i, level, retry); break
+print(f"  denied at user u{denied_at[0]} by the {denied_at[1]} bucket "
+      f"(retry after {denied_at[2]:.2f}s)")
+print(f"  tokens: user={h._bucket('user','u2').tokens:.0f} "
+      f"org={h._bucket('org','acme').tokens:.0f} "
+      f"global={h._bucket('global','-').tokens:.0f}")
+```
+
+```output
+one user bursting alone:
+  request  0: allowed
+  request  1: allowed
+  request  2: allowed
+  request  3: allowed
+  request  4: allowed
+  request  5: allowed
+  request  6: allowed
+  request  7: allowed
+  request  8: allowed
+  request  9: allowed
+  request 10: 429 at the user level, retry after 0.20s
+
+a second user in the same org still gets through:
+  u2: allowed
+
+filling the org bucket with many users:
+  denied at user u32 by the org bucket (retry after 0.05s)
+  tokens: user=9 org=0 global=160
+```
+
+The insight: the two-phase check-then-charge is what keeps the accounting honest. A naive
+implementation consumes a user token, then discovers the org bucket is empty, and the user has
+now been billed for a request that returned 429 — so a user behind a saturated org drains their
+own quota without ever being served. The same pattern appears in any layered admission control
+(connection pools, semaphores, quota systems). Note also which level rejected: returning that in
+the response (or at least logging it) is what lets a customer distinguish "you are sending too
+fast" from "your organization is over its plan" from "we are shedding load" — three different
+problems with three different fixes.
+</details>
