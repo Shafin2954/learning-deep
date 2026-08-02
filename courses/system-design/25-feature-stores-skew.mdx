@@ -1,0 +1,338 @@
+---
+course: system-design
+chapter: 25-feature-stores-skew
+title: "Feature Stores and Training/Serving Skew"
+order: 25
+---
+
+## The defining failure: the model sees different features in production
+
+A model is a function of its features. If the features computed at training time differ — in
+value, in timing, or in code — from the ones computed at serving time, the model is being asked
+a question it was never trained on. Offline metrics look fine; production quietly underperforms.
+
+Three distinct kinds of skew, with three distinct fixes:
+
+- **Code skew** — the training pipeline computes `avg_order_value` in SQL and the serving path
+  recomputes it in Python, slightly differently. Fix: one definition, one implementation.
+- **Time-travel skew (leakage)** — training used information that did not exist at prediction
+  time. Fix: point-in-time correct joins.
+- **Distribution skew** — the live data has drifted away from the training data. Fix: monitoring
+  and retraining (ch. 29).
+
+```python
+def avg_order_value_training(orders):          # written by the data scientist, in the warehouse
+    return sum(o["total"] for o in orders) / len(orders)
+
+def avg_order_value_serving(orders):           # written by the backend engineer, months later
+    paid = [o for o in orders if o["status"] == "paid"]        # a "reasonable" difference
+    return sum(o["total"] for o in paid) / max(1, len(paid))
+
+orders = [{"total": 50, "status": "paid"}, {"total": 20, "status": "paid"},
+          {"total": 200, "status": "refunded"}]
+t, s = avg_order_value_training(orders), avg_order_value_serving(orders)
+print(f"training value {t:6.2f} | serving value {s:6.2f} | relative gap {abs(t-s)/t:.0%}")
+print("the model was fit on one of these and is being asked about the other")
+```
+
+```output
+training value  90.00 | serving value  35.00 | relative gap 61%
+the model was fit on one of these and is being asked about the other
+```
+
+Nobody wrote a bug. Two reasonable people wrote two reasonable definitions, and the model pays.
+This is the single most common way an ML system fails silently, and it is an **architecture**
+problem: the same feature must be computed by the same code for both paths.
+
+## Point-in-time correctness
+
+Training rows must contain only what was knowable **at the label's timestamp**. A naive join
+against the current state of a table leaks the future into the past.
+
+```python
+from bisect import bisect_right
+
+# Feature history: (entity, timestamp, value) — an append-only log of feature values.
+history = [("u1", 10, 2), ("u1", 40, 5), ("u1", 90, 11),
+           ("u2", 20, 1), ("u2", 70, 4)]
+labels = [("u1", 50, 0), ("u1", 100, 1), ("u2", 60, 0)]      # (entity, event_time, label)
+
+def naive_join(entity):
+    """The bug: take the value as it is TODAY."""
+    return max(v for e, t, v in history if e == entity)
+
+def as_of_join(entity, at):
+    """Correct: the newest value strictly before the label's timestamp."""
+    rows = sorted((t, v) for e, t, v in history if e == entity and t < at)
+    return rows[-1][1] if rows else None
+
+print(f"{'label':22}{'naive':>8}{'as-of':>8}  leaked?")
+for e, ts, y in labels:
+    n, a = naive_join(e), as_of_join(e, ts)
+    print(f"{e} @ t={ts:<3} label={y:<3}{n:>8}{a:>8}  {'YES' if n != a else 'no'}")
+```
+
+```output
+label                    naive   as-of  leaked?
+u1 @ t=50  label=0        11       5  YES
+u1 @ t=100 label=1        11      11  no
+u2 @ t=60  label=0         4       1  YES
+```
+
+The naive join gives every training row the *final* feature value — which, for a churn or fraud
+label, often encodes the outcome itself. Models trained this way score beautifully offline and
+collapse in production, because at prediction time the future value does not exist.
+
+### Label leakage has a signature you can detect
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+n = 4_000
+y = rng.integers(0, 2, n)
+honest = rng.normal(size=n) + 0.4 * y            # a genuinely useful feature
+leaked = y * 1.0 + rng.normal(scale=0.01, size=n)  # computed after the outcome
+
+def auc(scores, labels):
+    order = np.argsort(scores)
+    ranks = np.empty(n); ranks[order] = np.arange(1, n + 1)
+    pos, neg = labels.sum(), n - labels.sum()
+    return (ranks[labels == 1].sum() - pos * (pos + 1) / 2) / (pos * neg)
+
+print(f"honest feature AUC {auc(honest, y):.3f}")
+print(f"leaked feature AUC {auc(leaked, y):.3f}  <- 'too good' is the tell")
+print("rule: any single feature above ~0.95 AUC is leakage until proven otherwise")
+```
+
+```output
+honest feature AUC 0.629
+leaked feature AUC 1.000  <- 'too good' is the tell
+rule: any single feature above ~0.95 AUC is leakage until proven otherwise
+```
+
+## What a feature store actually is
+
+Two stores plus one definition, and the definition is the point:
+
+- **Offline store** — the full history, keyed by `(entity, timestamp)`, used to build training
+  sets with as-of joins. Usually a warehouse or Parquet on object storage (ch. 9, 18).
+- **Online store** — the *latest* value per entity, keyed by `entity`, served in single-digit
+  milliseconds. Usually Redis, DynamoDB, or Cassandra (ch. 10).
+- **Feature definitions** — one piece of code that both paths run, plus metadata: owner, entity,
+  freshness target, TTL.
+
+```python
+class FeatureStore:
+    def __init__(self):
+        self.offline = []        # (feature, entity, timestamp, value): the full history
+        self.online = {}         # (feature, entity) -> (timestamp, value): the latest only
+        self.definitions = {}
+
+    def define(self, name, entity, freshness_s, fn):
+        self.definitions[name] = {"entity": entity, "freshness_s": freshness_s, "fn": fn}
+
+    def write(self, name, entity, ts, raw):
+        value = self.definitions[name]["fn"](raw)       # ONE implementation, both paths
+        self.offline.append((name, entity, ts, value))
+        cur = self.online.get((name, entity))
+        if cur is None or ts >= cur[0]:
+            self.online[(name, entity)] = (ts, value)
+
+    def get_online(self, name, entity, now, default=None):
+        cur = self.online.get((name, entity))
+        if cur is None:
+            return default, "missing"
+        age = now - cur[0]
+        stale = age > self.definitions[name]["freshness_s"]
+        return cur[1], f"{'STALE' if stale else 'fresh'} (age {age}s)"
+
+    def get_historical(self, name, entity, at):
+        rows = sorted(t for f, e, t, _ in self.offline if f == name and e == entity and t < at)
+        if not rows:
+            return None
+        return next(v for f, e, t, v in self.offline if f == name and e == entity and t == rows[-1])
+
+fs = FeatureStore()
+fs.define("orders_7d", entity="user", freshness_s=3600, fn=lambda raw: len(raw["orders"]))
+for ts, k in [(100, 2), (400, 5), (900, 6)]:
+    fs.write("orders_7d", "u1", ts, {"orders": list(range(k))})
+
+print("serving now (t=1000):", fs.get_online("orders_7d", "u1", now=1000))
+print("serving later (t=9000):", fs.get_online("orders_7d", "u1", now=9000))
+print("training row at t=500 sees:", fs.get_historical("orders_7d", "u1", at=500))
+print("training row at t=950 sees:", fs.get_historical("orders_7d", "u1", at=950))
+```
+
+```output
+serving now (t=1000): (6, 'fresh (age 100s)')
+serving later (t=9000): (6, 'STALE (age 8100s)')
+training row at t=500 sees: 5
+training row at t=950 sees: 6
+```
+
+The same `fn` produced both the historical rows and the online value — that is the property the
+whole architecture exists to guarantee. Everything else (the two stores, the registry, the
+materialization jobs) is infrastructure in service of it.
+
+### Freshness is a per-feature SLO
+
+```python
+features = [
+    ("user_country",        "changes yearly",        86_400, 3_600),
+    ("orders_7d",           "changes daily",          3_600,   900),
+    ("cart_value_now",      "changes per click",         10,     2),
+    ("device_risk_score",   "computed on the event",     60,   120),   # missing its target
+]
+print(f"{'feature':22}{'volatility':24}{'target':>9}{'actual':>9}  status")
+for name, why, target, actual in features:
+    print(f"{name:22}{why:24}{target:>9}{actual:>9}  "
+          f"{'ok' if actual <= target else 'VIOLATED: retrain or fix the pipeline'}")
+```
+
+```output
+feature               volatility                 target   actual  status
+user_country          changes yearly              86400     3600  ok
+orders_7d             changes daily                3600      900  ok
+cart_value_now        changes per click              10        2  ok
+device_risk_score     computed on the event          60      120  VIOLATED: retrain or fix the pipeline
+```
+
+A stale feature is not a neutral failure — it is a *wrong input* the model trusts completely.
+`cart_value_now` two seconds late is fine; `device_risk_score` two minutes late during a fraud
+attack is the difference between blocking and paying.
+
+## Serving-time failures and defaults
+
+```python
+def serve(fs, entity, now, model_w):
+    names = ["orders_7d", "avg_basket", "days_since_signup"]
+    values, notes = [], []
+    for n in names:
+        if n not in fs.definitions:
+            values.append(None); notes.append(f"{n}: undefined"); continue
+        v, status = fs.get_online(n, entity, now)
+        values.append(v); notes.append(f"{n}: {status}")
+    filled = [v if v is not None else 0.0 for v in values]
+    missing = sum(v is None for v in values)
+    score = sum(w * v for w, v in zip(model_w, filled))
+    return score, missing, notes
+
+fs.define("avg_basket", "user", 3600, lambda raw: raw["avg"])
+score, missing, notes = serve(fs, "u1", now=1000, model_w=[0.3, 0.5, -0.1])
+print("\n".join(notes))
+print(f"score {score:.2f} computed with {missing} missing feature(s) filled as 0.0")
+print("zero is a VALUE to the model, not an absence — 'days since signup = 0' means brand new")
+```
+
+```output
+orders_7d: fresh (age 100s)
+avg_basket: missing
+days_since_signup: undefined
+score 1.80 computed with 2 missing feature(s) filled as 0.0
+zero is a VALUE to the model, not an absence — 'days since signup = 0' means brand new
+```
+
+Two rules. **Impute the way training imputed**, with the same statistic, computed from the
+training data and shipped alongside the model. And **count missing features as a metric**: a
+sudden rise means an upstream pipeline broke, and it will show up as a silent quality drop long
+before anyone notices in the business numbers.
+
+## Try it Yourself
+
+```python
+def parity_check(fs, name, entity, ts_list, tolerance=1e-9):
+    """The test every feature store needs in CI: does the online value match the offline one?"""
+    failures = 0
+    for ts in ts_list:
+        offline = fs.get_historical(name, entity, at=ts + 1)
+        online_at_ts = None
+        rows = [(t, v) for f, e, t, v in fs.offline if f == name and e == entity and t <= ts]
+        if rows:
+            online_at_ts = max(rows)[1]
+        ok = offline is not None and online_at_ts is not None and \
+             abs(offline - online_at_ts) <= tolerance
+        failures += not ok
+        print(f"t={ts:5} offline={offline!s:>6} online={online_at_ts!s:>6} "
+              f"{'match' if ok else 'MISMATCH'}")
+    print(f"{'PARITY OK' if failures == 0 else f'{failures} MISMATCHES — block the deploy'}")
+
+parity_check(fs, "orders_7d", "u1", [150, 500, 950])
+```
+
+```output
+t=  150 offline=     2 online=     2 match
+t=  500 offline=     5 online=     5 match
+t=  950 offline=     6 online=     6 match
+PARITY OK
+```
+
+Now break it deliberately: change the online write to use `len(raw["orders"]) + 1` and rerun.
+A parity test in CI is the cheapest insurance in an ML system — it catches code skew before a
+model ever sees production traffic.
+
+## Exercise
+
+Build the training-set generator: given a list of labels `(entity, event_time, y)` and several
+feature histories, produce a point-in-time correct feature matrix. Then produce the *naive*
+version that joins against current values, train the same simple model on both, and show that
+the leaky version scores far better offline while being useless at serving time (evaluate both
+on point-in-time correct rows).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+rng = np.random.default_rng(1)
+
+N = 4_000
+honest = rng.normal(size=N)                                  # known at event time
+tickets_before = rng.poisson(1.0, size=N).astype(float)      # support tickets so far
+logit = 0.9 * honest + 0.4 * tickets_before - 0.5
+y = (rng.random(N) < 1 / (1 + np.exp(-logit))).astype(int)   # churn label
+
+# The leak: churners keep filing tickets AFTER the label date, so the value as of
+# today encodes the outcome. A naive join picks up exactly that.
+tickets_now = tickets_before + y * rng.poisson(6.0, size=N)
+
+X_pit  = np.column_stack([honest, tickets_before])           # as-of join
+X_leak = np.column_stack([honest, tickets_now])              # naive join
+
+def fit(X, y):
+    return np.linalg.lstsq(np.column_stack([X, np.ones(len(X))]), y - y.mean(), rcond=None)[0]
+
+def score(w, X):
+    return np.column_stack([X, np.ones(len(X))]) @ w
+
+def auc(s, lab):
+    n = len(lab); order = np.argsort(s)
+    ranks = np.empty(n); ranks[order] = np.arange(1, n + 1)
+    pos, neg = lab.sum(), n - lab.sum()
+    return (ranks[lab == 1].sum() - pos * (pos + 1) / 2) / (pos * neg)
+
+train, test = slice(0, 2_800), slice(2_800, None)
+for name, Xtr in [("point-in-time", X_pit), ("naive (leaky)", X_leak)]:
+    w = fit(Xtr[train], y[train])
+    offline = auc(score(w, Xtr[test]), y[test])          # what the notebook reports
+    serving = auc(score(w, X_pit[test]), y[test])        # what production can actually feed it
+    print(f"{name:16} offline AUC {offline:.3f} | serving AUC {serving:.3f} | "
+          f"gap {offline - serving:+.3f} | weights {np.round(w, 3)}")
+```
+
+```output
+point-in-time    offline AUC 0.742 | serving AUC 0.742 | gap +0.000 | weights [ 0.183  0.084 -0.084]
+naive (leaky)    offline AUC 0.996 | serving AUC 0.708 | gap +0.288 | weights [ 0.068  0.107 -0.426]
+```
+
+The insight: the leaky model reports a near-perfect 0.996 offline and is the *worse* model in
+production — 0.708 against the honest model's 0.742 — because it learned to lean on ticket
+counts that only exist after the outcome. The gap between the two columns is exactly the
+disappointment that shows up after launch — and no amount of
+cross-validation catches it, because the leak is present in every fold. Only two things do:
+building training sets with as-of joins by construction (which is what the offline store's
+`(entity, timestamp)` key is *for*), and treating any feature whose single-variable AUC is
+suspiciously high as guilty until proven innocent. Note also that the point-in-time join is not
+free — it is a range join over a history table, which is why feature stores materialize
+`(entity, timestamp)` snapshots rather than recomputing joins for every training run.
+</details>
