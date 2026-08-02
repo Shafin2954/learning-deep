@@ -1,0 +1,386 @@
+---
+course: system-design
+chapter: 26-model-registry-canary
+title: "Model Registry, Versioning, and Safe Rollout"
+order: 26
+---
+
+## A model version is more than a weights file
+
+Reproducing a prediction from six months ago requires everything that produced it. A registry
+entry that stores only the weights is a liability, because the one question you will be asked
+during an incident — *why did the model say that?* — becomes unanswerable.
+
+```python
+import hashlib, json
+
+def register(name, version, artifacts):
+    entry = {"name": name, "version": version, **artifacts}
+    entry["fingerprint"] = hashlib.sha256(
+        json.dumps(entry, sort_keys=True).encode()).hexdigest()[:12]
+    return entry
+
+entry = register("fraud-scorer", "v7", {
+    "weights_uri":   "s3://models/fraud/v7/model.bin",
+    "code_commit":   "9f3ac21",
+    "training_data": "warehouse://events?snapshot=2026-05-01",
+    "feature_defs":  ["orders_7d@v3", "device_risk@v2", "geo_mismatch@v1"],
+    "preprocessing": "sha256:4e2a...",     # the encoder/imputer, versioned with the model
+    "metrics":       {"auc": 0.912, "recall@1%fpr": 0.44},
+    "trained_at":    "2026-05-02T04:11:00Z",
+    "approved_by":   "risk-team",
+})
+for k, v in entry.items():
+    print(f"{k:15} {v}")
+```
+
+```output
+name            fraud-scorer
+version         v7
+weights_uri     s3://models/fraud/v7/model.bin
+code_commit     9f3ac21
+training_data   warehouse://events?snapshot=2026-05-01
+feature_defs    ['orders_7d@v3', 'device_risk@v2', 'geo_mismatch@v1']
+preprocessing   sha256:4e2a...
+metrics         {'auc': 0.912, 'recall@1%fpr': 0.44}
+trained_at      2026-05-02T04:11:00Z
+approved_by     risk-team
+fingerprint     1036212fd379
+```
+
+Four of those fields are the ones teams forget. **`feature_defs` with versions** — a feature
+definition changing under a frozen model is the same failure as changing the model (ch. 25).
+**`preprocessing`** must be versioned *with* the weights, because an imputer fitted on different
+data is a different model. **`training_data` as a snapshot**, not "the users table". And
+**`approved_by`**, because a model that decides who gets a loan needs a human on the record.
+
+### Semantic versioning for models
+
+```python
+changes = [
+    ("retrained on newer data, same features/code", "minor", "shadow, then canary"),
+    ("added a feature",                             "major", "full canary + a holdout"),
+    ("changed the preprocessing scaler",            "major", "same as a new model"),
+    ("threshold tuned for a new precision target",  "minor", "canary, watch business metrics"),
+    ("bug fix in a feature definition",             "major", "backfill training data, retrain"),
+]
+for what, bump, rollout in changes:
+    print(f"{what:44} {bump:6} -> {rollout}")
+```
+
+```output
+retrained on newer data, same features/code  minor  -> shadow, then canary
+added a feature                              major  -> full canary + a holdout
+changed the preprocessing scaler             major  -> same as a new model
+threshold tuned for a new precision target   minor  -> canary, watch business metrics
+bug fix in a feature definition              major  -> backfill training data, retrain
+```
+
+The useful distinction is **what a consumer must re-verify**: minor means the input contract is
+unchanged, major means it is not. Anything that changes the feature schema is major even when
+the metric improved, because every caller and every monitor keyed on that schema must be
+checked.
+
+## Shadow mode: run it, do not use it
+
+The new model receives real production traffic, computes real predictions, and its output is
+**discarded** — logged for comparison, never returned. This is how you measure a model on live
+data without risking a single user.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+n = 20_000
+x = rng.normal(size=(n, 3))
+truth = (x @ np.array([1.2, -0.7, 0.4]) + rng.normal(scale=0.5, size=n) > 0).astype(int)
+
+def model_v6(x): return x @ np.array([1.0, -0.5, 0.2])
+def model_v7(x): return x @ np.array([1.3, -0.8, 0.5])          # the candidate
+
+live, shadow = model_v6(x), model_v7(x)
+agree = ((live > 0) == (shadow > 0)).mean()
+acc_live = ((live > 0) == truth).mean()
+acc_shadow = ((shadow > 0) == truth).mean()
+
+print(f"agreement between v6 and v7: {agree:.1%}")
+print(f"accuracy  v6 {acc_live:.3f} | v7 {acc_shadow:.3f} (measured on live traffic, "
+      f"no user affected)")
+flips = np.where((live > 0) != (shadow > 0))[0][:5]
+print(f"disagreement examples (indices): {flips.tolist()}")
+```
+
+```output
+agreement between v6 and v7: 94.8%
+accuracy  v6 0.889 | v7 0.894 (measured on live traffic, no user affected)
+disagreement examples (indices): [48, 52, 54, 92, 119]
+```
+
+Shadow mode answers three questions no offline evaluation can: does the candidate survive real
+traffic shapes, does it meet its latency budget under real load (ch. 24), and *where* does it
+disagree with the incumbent? The disagreement set is the most valuable artifact — a few hundred
+flipped cases reviewed by a human find problems that aggregate metrics hide.
+
+The cost is real: you are running two models for every request, so shadow mode doubles inference
+spend, and any **side effects must be suppressed** — a shadow model must not send emails, write
+features back, or increment counters.
+
+## Canary: give it a small share of real decisions
+
+```python
+def canary_plan(stages, error_rate_v6, error_rate_v7, traffic=100_000):
+    print(f"{'traffic to v7':>15}{'v7 decisions':>15}{'extra errors':>15}  gate")
+    for share in stages:
+        decisions = int(traffic * share)
+        extra = decisions * (error_rate_v7 - error_rate_v6)
+        gate = ("auto-rollback" if extra > 0 else "promote if metrics hold")
+        print(f"{share:>14.0%}{decisions:>16,}{extra:>15,.0f}  {gate}")
+
+canary_plan([0.01, 0.05, 0.25, 0.50, 1.00], error_rate_v6=0.020, error_rate_v7=0.017)
+print()
+canary_plan([0.01, 0.05], error_rate_v6=0.020, error_rate_v7=0.035)
+```
+
+```output
+  traffic to v7   v7 decisions   extra errors  gate
+            1%           1,000             -3  promote if metrics hold
+            5%           5,000            -15  promote if metrics hold
+           25%          25,000            -75  promote if metrics hold
+           50%          50,000           -150  promote if metrics hold
+          100%         100,000           -300  promote if metrics hold
+
+  traffic to v7   v7 decisions   extra errors  gate
+            1%           1,000             15  auto-rollback
+            5%           5,000             75  auto-rollback
+```
+
+The 1% stage exists to bound the blast radius: if the candidate is catastrophically wrong, 1,000
+decisions are affected instead of 100,000. Each stage needs a **defined dwell time** (long enough
+to observe the metric you care about — hours for latency, days for conversion) and an **automatic
+rollback rule**, because a canary nobody watches is just a slow deploy.
+
+### How long must a canary run to detect a regression?
+
+```python
+import math
+
+def sample_size(baseline, min_detectable_effect, alpha=0.05, power=0.8):
+    """Two-proportion test, roughly: how many samples per arm?"""
+    p1, p2 = baseline, baseline * (1 + min_detectable_effect)
+    pbar = (p1 + p2) / 2
+    z_a, z_b = 1.96, 0.84
+    n = (z_a * math.sqrt(2 * pbar * (1 - pbar)) + z_b *
+         math.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2 / (p2 - p1) ** 2
+    return math.ceil(n)
+
+for effect in (0.50, 0.20, 0.05, 0.01):
+    n = sample_size(0.02, effect)
+    for share, rps in [(0.01, 500), (0.10, 500)]:
+        hours = n / (rps * share * 3600)
+        print(f"detect a {effect:5.0%} change in a 2% error rate: {n:>10,} samples/arm | "
+              f"at {share:4.0%} of {rps} rps -> {hours:8.1f} hours")
+```
+
+```output
+detect a   50% change in a 2% error rate:      3,821 samples/arm | at   1% of 500 rps ->      0.2 hours
+detect a   50% change in a 2% error rate:      3,821 samples/arm | at  10% of 500 rps ->      0.0 hours
+detect a   20% change in a 2% error rate:     21,085 samples/arm | at   1% of 500 rps ->      1.2 hours
+detect a   20% change in a 2% error rate:     21,085 samples/arm | at  10% of 500 rps ->      0.1 hours
+detect a    5% change in a 2% error rate:    314,850 samples/arm | at   1% of 500 rps ->     17.5 hours
+detect a    5% change in a 2% error rate:    314,850 samples/arm | at  10% of 500 rps ->      1.7 hours
+detect a    1% change in a 2% error rate:  7,720,827 samples/arm | at   1% of 500 rps ->    428.9 hours
+detect a    1% change in a 2% error rate:  7,720,827 samples/arm | at  10% of 500 rps ->     42.9 hours
+```
+
+Two lessons. Detecting small effects takes an enormous amount of traffic — a 1% relative change
+in a 2% error rate needs nearly 8 million samples per arm, which at a 1% canary is more than two
+weeks of continuous traffic. And **the canary
+share drives the duration**: you cannot both minimize exposure and get a fast answer. In practice
+you gate the canary on *large* regressions (which appear quickly) and measure small effects with
+a proper A/B test at a larger share.
+
+## Rollback must be the cheapest operation you have
+
+```python
+def rollback_time(strategy, model_gb=2, network_gbps=1, instances=40, warmup_s=45):
+    if strategy == "redeploy from scratch":
+        t = model_gb * 8 / network_gbps + warmup_s + 120        # rebuild image, roll instances
+    elif strategy == "swap the pointer, model already loaded":
+        t = 1
+    elif strategy == "flip traffic weight at the router":
+        t = 0.2
+    print(f"{strategy:44} {t:7.1f} s to restore the previous model")
+
+for s in ("redeploy from scratch", "swap the pointer, model already loaded",
+          "flip traffic weight at the router"):
+    rollback_time(s)
+```
+
+```output
+redeploy from scratch                          181.0 s to restore the previous model
+swap the pointer, model already loaded           1.0 s to restore the previous model
+flip traffic weight at the router                0.2 s to restore the previous model
+```
+
+Keep the previous version **loaded in memory** on the same instances and route by weight. Then a
+rollback is a config change, not a deploy — and the difference between 3 minutes and 200
+milliseconds is the difference between an incident and a blip.
+
+## The prediction log is the backbone
+
+```python
+def prediction_record(request_id, model, features, score, decision, latency_ms):
+    return {
+        "request_id": request_id, "model_version": model["version"],
+        "model_fingerprint": model["fingerprint"], "feature_values": features,
+        "feature_versions": model["feature_defs"], "score": round(score, 4),
+        "decision": decision, "latency_ms": latency_ms, "ts": "2026-05-03T10:00:01Z",
+    }
+
+rec = prediction_record("req_88213", entry, {"orders_7d": 4, "device_risk": 0.81,
+                                             "geo_mismatch": 1}, 0.7321, "review", 23.4)
+for k, v in rec.items():
+    print(f"{k:18} {v}")
+```
+
+```output
+request_id         req_88213
+model_version      v7
+model_fingerprint  1036212fd379
+feature_values     {'orders_7d': 4, 'device_risk': 0.81, 'geo_mismatch': 1}
+feature_versions   ['orders_7d@v3', 'device_risk@v2', 'geo_mismatch@v1']
+score              0.7321
+decision           review
+latency_ms         23.4
+ts                 2026-05-03T10:00:01Z
+```
+
+That single record enables four things that are impossible without it: **debugging** (why did the
+model say that?), **monitoring** (ch. 29 compares these distributions over time), **training data**
+(joined with outcomes later, it becomes the next training set), and **auditing** (regulators ask
+for exactly this). Log it for every prediction, including shadow ones, and treat it as a
+first-class data product rather than a debug line.
+
+## Try it Yourself
+
+```python
+def rollout_gate(candidate, incumbent, min_samples=5_000):
+    """An automated promote/hold/rollback decision from canary metrics."""
+    checks = [
+        ("samples",   candidate["n"] >= min_samples,              f"{candidate['n']:,}"),
+        ("error rate", candidate["errors"] <= incumbent["errors"] * 1.05,
+         f"{candidate['errors']:.3%} vs {incumbent['errors']:.3%}"),
+        ("p99 latency", candidate["p99"] <= incumbent["p99"] * 1.20,
+         f"{candidate['p99']} ms vs {incumbent['p99']} ms"),
+        ("business metric", candidate["conversion"] >= incumbent["conversion"] * 0.99,
+         f"{candidate['conversion']:.2%} vs {incumbent['conversion']:.2%}"),
+        ("prediction drift", abs(candidate["mean_score"] - incumbent["mean_score"]) < 0.05,
+         f"{candidate['mean_score']:.3f} vs {incumbent['mean_score']:.3f}"),
+    ]
+    failed = [name for name, ok, _ in checks if not ok]
+    for name, ok, detail in checks:
+        print(f"  {'PASS' if ok else 'FAIL'} {name:18} {detail}")
+    print(f"  -> {'PROMOTE to the next stage' if not failed else 'ROLLBACK: ' + ', '.join(failed)}")
+
+incumbent = {"n": 500_000, "errors": 0.020, "p99": 40, "conversion": 0.0310, "mean_score": 0.412}
+print("candidate A:")
+rollout_gate({"n": 20_000, "errors": 0.018, "p99": 44, "conversion": 0.0315,
+              "mean_score": 0.430}, incumbent)
+print("candidate B:")
+rollout_gate({"n": 20_000, "errors": 0.019, "p99": 61, "conversion": 0.0290,
+              "mean_score": 0.480}, incumbent)
+```
+
+```output
+candidate A:
+  PASS samples            20,000
+  PASS error rate         1.800% vs 2.000%
+  PASS p99 latency        44 ms vs 40 ms
+  PASS business metric    3.15% vs 3.10%
+  PASS prediction drift   0.430 vs 0.412
+  -> PROMOTE to the next stage
+candidate B:
+  PASS samples            20,000
+  PASS error rate         1.900% vs 2.000%
+  FAIL p99 latency        61 ms vs 40 ms
+  FAIL business metric    2.90% vs 3.10%
+  FAIL prediction drift   0.480 vs 0.412
+  -> ROLLBACK: p99 latency, business metric, prediction drift
+```
+
+Candidate B has a *better* error rate and still fails — on latency, on conversion, and on
+prediction drift. Add your own gate (fairness across a segment, cost per prediction) and decide
+which ones should block automatically versus page a human.
+
+## Exercise
+
+Design the full rollout procedure for replacing a credit-decision model. Specify the stages
+(shadow, canary percentages, dwell times), the metrics gating each stage, the automatic rollback
+triggers, what is logged, and how you would keep the old model available. Then write code that
+simulates the procedure against a candidate that is better on average but much worse for one
+customer segment, and show which gate catches it.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import numpy as np
+rng = np.random.default_rng(3)
+
+N = 200_000
+segment = rng.choice(["mass", "thin-file"], size=N, p=[0.92, 0.08])   # 8% minority segment
+risk = rng.normal(size=N) + (segment == "thin-file") * 0.3
+default = (rng.random(N) < 1 / (1 + np.exp(-(risk - 1.2)))).astype(int)
+
+def approve_v6(r): return r < 0.9
+def approve_v7(r, seg):                       # better overall, harsh on thin-file applicants
+    return np.where(seg == "thin-file", r < 0.1, r < 1.1)
+
+def metrics(mask_approved, label, seg):
+    approved = mask_approved.mean()
+    bad_rate = label[mask_approved].mean() if mask_approved.any() else 0.0
+    by_seg = {s: mask_approved[seg == s].mean() for s in ("mass", "thin-file")}
+    return approved, bad_rate, by_seg
+
+STAGES = [("shadow", 0.00), ("canary 1%", 0.01), ("canary 5%", 0.05),
+          ("canary 25%", 0.25), ("full", 1.00)]
+
+for stage, share in STAGES:
+    k = max(2_000, int(N * share)) if share else N        # shadow sees everything, decides nothing
+    idx = np.arange(k)
+    s, r, y = segment[idx], risk[idx], default[idx]
+    a6, bad6, seg6 = metrics(approve_v6(r), y, s)
+    a7, bad7, seg7 = metrics(approve_v7(r, s), y, s)
+    parity = seg7["thin-file"] / max(1e-9, seg7["mass"])
+    parity6 = seg6["thin-file"] / max(1e-9, seg6["mass"])
+    gates = {
+        "approval rate within 10%": abs(a7 - a6) / a6 < 0.10,
+        "default rate not worse":   bad7 <= bad6 * 1.05,
+        "segment parity within 20%": abs(parity - parity6) / parity6 < 0.20,
+    }
+    verdict = "PROMOTE" if all(gates.values()) else \
+              "ROLLBACK: " + ", ".join(g for g, ok in gates.items() if not ok)
+    decided = "no user affected" if share == 0 else f"{int(N*share):,} real decisions"
+    print(f"{stage:11} ({decided:>22}) approve v6 {a6:5.1%} v7 {a7:5.1%} | "
+          f"bad rate {bad6:5.2%} -> {bad7:5.2%} | parity {parity6:4.2f} -> {parity:4.2f}")
+    print(f"{'':11} {verdict}")
+    if verdict != "PROMOTE":
+        break
+```
+
+```output
+shadow      (      no user affected) approve v6 80.8% v7 82.8% | bad rate 20.42% -> 21.39% | parity 0.88 -> 0.48
+            ROLLBACK: segment parity within 20%
+```
+
+The insight: the candidate looks fine on the metrics everyone looks at — it approves two points
+more applicants and its default rate stays inside the 5% tolerance — and it is unshippable, because it achieves that by rejecting
+almost every thin-file applicant. **Aggregate metrics cannot see a segment**, which is why the
+gate list must include per-segment checks chosen *before* the rollout, and why the shadow stage
+matters: it catches this at zero cost to real applicants, before any percentage of traffic is
+exposed. Two operational details make the rest of it work: the prediction log carries the segment
+label (so the gate is computable at all), and the previous model stays loaded so the rollback is
+a weight flip rather than a deploy. For a credit model there is a third: the rollout decision and
+its evidence are themselves an audit artifact, which is why `approved_by` was in the registry
+entry at the top of this chapter.
+</details>
