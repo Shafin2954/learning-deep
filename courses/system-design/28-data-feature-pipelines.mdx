@@ -1,0 +1,426 @@
+---
+course: system-design
+chapter: 28-data-feature-pipelines
+title: "Data and Feature Pipelines: Orchestration in Practice"
+order: 28
+---
+
+## A pipeline is a DAG with a schedule and a contract
+
+Every orchestrator — Airflow, Dagster, Prefect, n8n, a pile of cron jobs — is the same three
+ideas: **tasks** with dependencies, a **trigger** (time or event), and **state** (what ran, when,
+with what result). The engineering is in the guarantees around those, not in the DAG drawing.
+
+```python
+from collections import defaultdict, deque
+
+class DAG:
+    def __init__(self, name): self.name, self.deps, self.tasks = name, defaultdict(set), {}
+    def task(self, name, fn, after=()):
+        self.tasks[name] = fn
+        self.deps[name] |= set(after)
+    def order(self):
+        indeg = {t: len(self.deps[t]) for t in self.tasks}
+        q = deque(sorted(t for t, d in indeg.items() if d == 0))
+        out = []
+        while q:
+            t = q.popleft(); out.append(t)
+            for other in sorted(self.tasks):
+                if t in self.deps[other]:
+                    indeg[other] -= 1
+                    if indeg[other] == 0: q.append(other)
+        if len(out) != len(self.tasks):
+            raise ValueError("cycle in the DAG")
+        return out
+
+dag = DAG("daily_features")
+dag.task("extract_orders", lambda ctx: ctx.update(orders=1_000))
+dag.task("extract_users",  lambda ctx: ctx.update(users=200))
+dag.task("validate",       lambda ctx: ctx.update(valid=True), after=["extract_orders", "extract_users"])
+dag.task("build_features", lambda ctx: ctx.update(features=42),  after=["validate"])
+dag.task("materialize",    lambda ctx: ctx.update(written=True), after=["build_features"])
+dag.task("train",          lambda ctx: ctx.update(model="v8"),   after=["build_features"])
+
+print("topological order:", dag.order())
+ctx = {}
+for t in dag.order():
+    dag.tasks[t](ctx)
+print("context after run:", ctx)
+```
+
+```output
+topological order: ['extract_orders', 'extract_users', 'validate', 'build_features', 'materialize', 'train']
+context after run: {'orders': 1000, 'users': 200, 'valid': True, 'features': 42, 'written': True, 'model': 'v8'}
+```
+
+Note what the graph buys you beyond ordering: **parallelism** (the two extracts are independent),
+**partial reruns** (a failed `train` does not re-extract), and **a place to attach checks**. The
+`validate` node exists because a pipeline that propagates bad data is worse than one that stops.
+
+## Idempotent, partitioned tasks — the only design that survives
+
+Every task should be a pure function of `(inputs, partition)` that can be rerun without changing
+the result. In practice that means: write to a partition, never append to a global table.
+
+```python
+warehouse = {}
+
+def bad_task(rows):                      # appends: rerunning duplicates everything
+    warehouse.setdefault("orders", []).extend(rows)
+
+def good_task(date, rows):               # overwrites one partition: rerunning is safe
+    warehouse[f"orders/dt={date}"] = list(rows)
+
+bad_task([1, 2, 3]); bad_task([1, 2, 3])
+good_task("2026-05-01", [1, 2, 3]); good_task("2026-05-01", [1, 2, 3])
+print("append-style rows:", len(warehouse["orders"]), "<- ran twice, doubled")
+print("partition-style rows:", len(warehouse["orders/dt=2026-05-01"]), "<- ran twice, correct")
+```
+
+```output
+append-style rows: 6 <- ran twice, doubled
+partition-style rows: 3 <- ran twice, correct
+```
+
+That one property makes everything else possible: **backfills** (rerun 2024-01-01 through
+2024-12-31 in any order), **retries** (ch. 21), and **catch-up after an outage** without a human
+reasoning about what already ran.
+
+```python
+def backfill(start, end, concurrency, task_minutes=6):
+    from datetime import date, timedelta
+    d0 = date.fromisoformat(start); d1 = date.fromisoformat(end)
+    days = (d1 - d0).days + 1
+    wall = days / concurrency * task_minutes
+    print(f"backfill {start}..{end} = {days:4} partitions | concurrency {concurrency:3} -> "
+          f"{wall/60:6.1f} hours of wall clock")
+
+for c in (1, 8, 32):
+    backfill("2025-01-01", "2025-12-31", c)
+print("\nconcurrency is bounded by the SOURCE, not by your cluster:")
+print("32 parallel backfill tasks hammering the production database is an outage")
+```
+
+```output
+backfill 2025-01-01..2025-12-31 =  365 partitions | concurrency   1 ->   36.5 hours of wall clock
+backfill 2025-01-01..2025-12-31 =  365 partitions | concurrency   8 ->    4.6 hours of wall clock
+backfill 2025-01-01..2025-12-31 =  365 partitions | concurrency  32 ->    1.1 hours of wall clock
+
+concurrency is bounded by the SOURCE, not by your cluster:
+32 parallel backfill tasks hammering the production database is an outage
+```
+
+Backfill concurrency is where teams cause their own incidents. The rule: backfills read from a
+replica or a snapshot (ch. 13), run at a rate limit (ch. 20), and are never allowed to compete
+with the live pipeline for the same resources.
+
+## Scheduling: time triggers, data triggers, and the difference
+
+```python
+triggers = [
+    ("cron: 0 3 * * *", "run at 03:00 UTC", "simple; runs even if the input never arrived"),
+    ("sensor / poke",   "wait until the file exists", "correct; wastes a worker while waiting"),
+    ("event-driven",    "run when the upstream emits", "best latency; needs an event bus (ch. 8)"),
+    ("data-aware",      "run when the upstream ASSET updates", "Dagster/Airflow datasets: DAGs compose"),
+]
+for how, when, note in triggers:
+    print(f"{how:20}{when:38}{note}")
+```
+
+```output
+cron: 0 3 * * *     run at 03:00 UTC                      simple; runs even if the input never arrived
+sensor / poke       wait until the file exists            correct; wastes a worker while waiting
+event-driven        run when the upstream emits           best latency; needs an event bus (ch. 8)
+data-aware          run when the upstream ASSET updates   Dagster/Airflow datasets: DAGs compose
+```
+
+Time-based scheduling is a bet that the data arrived. It fails silently: the job runs at 03:00,
+finds yesterday's file missing, computes an empty result, and writes a partition of zeros that
+looks like a real answer. **A schedule is not a dependency** — if a task needs data, it must check
+for the data, not for the clock.
+
+```python
+def freshness_gate(partition, expected_rows, actual_rows, max_age_h, actual_age_h):
+    checks = {
+        "partition exists":  actual_rows is not None,
+        "row count within 20% of expectation":
+            actual_rows is not None and abs(actual_rows - expected_rows) / expected_rows < 0.2,
+        "upstream fresh enough": actual_age_h <= max_age_h,
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    print(f"{partition}: {'PROCEED' if not failed else 'HALT — ' + '; '.join(failed)}")
+
+freshness_gate("orders/dt=2026-05-01", 1_000_000, 1_020_000, 6, 2)
+freshness_gate("orders/dt=2026-05-02", 1_000_000,    40_000, 6, 2)
+freshness_gate("orders/dt=2026-05-03", 1_000_000,      None, 6, 30)
+```
+
+```output
+orders/dt=2026-05-01: PROCEED
+orders/dt=2026-05-02: HALT — row count within 20% of expectation
+orders/dt=2026-05-03: HALT — partition exists; row count within 20% of expectation; upstream fresh enough
+```
+
+A gate that halts is doing its job: an empty or half-written partition propagates into features,
+into the online store, and into the model, and by the time anyone notices, three days of
+predictions were made from it.
+
+## Data quality checks belong inside the DAG
+
+```python
+def quality_report(rows, rules):
+    failures = []
+    for name, fn, severity in rules:
+        bad = [r for r in rows if not fn(r)]
+        if bad:
+            failures.append((name, len(bad), severity))
+    for name, n, severity in failures:
+        print(f"{severity:7} {name:34} {n} row(s)")
+    blocking = [f for f in failures if f[2] == "BLOCK"]
+    print(f"-> {'FAIL the run' if blocking else 'proceed, alert on warnings'}")
+
+rows = [{"id": 1, "total": 50.0, "user": "u1", "ts": "2026-05-01"},
+        {"id": 2, "total": -3.0, "user": "u2", "ts": "2026-05-01"},
+        {"id": 3, "total": 20.0, "user": None, "ts": "2026-05-01"},
+        {"id": 3, "total": 20.0, "user": "u3", "ts": "2026-05-01"}]
+
+seen = set()
+def unique_id(r):
+    dup = r["id"] in seen
+    seen.add(r["id"])
+    return not dup
+
+quality_report(rows, [
+    ("total is non-negative", lambda r: r["total"] >= 0,      "BLOCK"),
+    ("user is not null",      lambda r: r["user"] is not None, "BLOCK"),
+    ("id is unique",          unique_id,                       "BLOCK"),
+    ("total under 10,000",    lambda r: r["total"] < 10_000,   "WARN"),
+])
+```
+
+```output
+BLOCK   total is non-negative              1 row(s)
+BLOCK   user is not null                   1 row(s)
+BLOCK   id is unique                       1 row(s)
+-> FAIL the run
+```
+
+Four categories cover most of what matters: **schema** (types and columns exist), **volume** (row
+count within an expected band), **distribution** (mean and null rate within tolerance, ch. 29),
+and **referential** (every `user_id` exists in `users`). The severity split matters as much as the
+checks: blocking on every anomaly makes people disable the checks, and blocking on none makes
+them pointless.
+
+## Where n8n fits, and where it does not
+
+```python
+tools = [
+    ("n8n / Zapier",  "event-driven glue, webhooks, SaaS APIs, human-in-the-loop",
+     "not for large data volumes or backfills"),
+    ("Airflow",       "scheduled batch DAGs, backfills, mature operators",
+     "heavy; poor at sub-minute latency and dynamic graphs"),
+    ("Dagster",       "asset-centric: declare tables, it derives the DAG and freshness",
+     "younger ecosystem, more opinionated"),
+    ("dbt",           "SQL transformations inside the warehouse, with tests and lineage",
+     "transformation only: it does not move data"),
+    ("Kafka + Flink", "continuous, event-time streaming (ch. 18)",
+     "operationally heavy; overkill for daily aggregates"),
+]
+for name, good, bad in tools:
+    print(f"{name:16} good: {good}\n{'':16} not : {bad}")
+```
+
+```output
+n8n / Zapier     good: event-driven glue, webhooks, SaaS APIs, human-in-the-loop
+                 not : not for large data volumes or backfills
+Airflow          good: scheduled batch DAGs, backfills, mature operators
+                 not : heavy; poor at sub-minute latency and dynamic graphs
+Dagster          good: asset-centric: declare tables, it derives the DAG and freshness
+                 not : younger ecosystem, more opinionated
+dbt              good: SQL transformations inside the warehouse, with tests and lineage
+                 not : transformation only: it does not move data
+Kafka + Flink    good: continuous, event-time streaming (ch. 18)
+                 not : operationally heavy; overkill for daily aggregates
+```
+
+The honest rule: **use the lightest tool that gives you the guarantee you need.** A webhook flow
+that posts a Slack message on a new order does not need Airflow. A nightly feature build with
+backfills, retries, and lineage should not live in a webhook tool — not because n8n is bad, but
+because it does not model partitions, and partitions are what makes reruns safe.
+
+## Lineage: the question you will be asked at 2 a.m.
+
+```python
+lineage = {
+    "model:churn-v8":      ["features:user_7d", "features:tickets_30d"],
+    "features:user_7d":    ["table:orders_daily"],
+    "features:tickets_30d":["table:support_tickets"],
+    "table:orders_daily":  ["source:orders_raw"],
+    "table:support_tickets":["source:zendesk_export"],
+}
+
+def downstream(node, graph):
+    out, stack = [], [node]
+    while stack:
+        cur = stack.pop()
+        for k, deps in graph.items():
+            if cur in deps and k not in out:
+                out.append(k); stack.append(k)
+    return out
+
+print("if source:zendesk_export is broken, what is affected?")
+for node in downstream("source:zendesk_export", lineage):
+    print("   ", node)
+print("\nif model:churn-v8 looks wrong, what should I inspect?")
+print("   ", lineage["model:churn-v8"])
+```
+
+```output
+if source:zendesk_export is broken, what is affected?
+    table:support_tickets
+    features:tickets_30d
+    model:churn-v8
+
+if model:churn-v8 looks wrong, what should I inspect?
+    ['features:user_7d', 'features:tickets_30d']
+```
+
+Lineage turns "something is wrong" into a bounded list. It is also what makes a schema change
+reviewable: before dropping a column, you can enumerate every asset that reads it — which is why
+asset-centric orchestrators and dbt's lineage graph have displaced hand-written DAGs for
+warehouse work.
+
+## Try it Yourself
+
+```python
+def sla_check(dag_tasks, start_hour, sla_hour):
+    """Will the DAG finish before the SLA, and which task is the critical path?"""
+    finish, path = {}, {}
+    for name, dur, deps in dag_tasks:
+        ready = max([finish[d] for d in deps], default=0)
+        finish[name] = ready + dur
+        path[name] = max(deps, key=lambda d: finish[d]) if deps else None
+    total = max(finish.values())
+    end_hour = start_hour + total / 60
+    last = max(finish, key=finish.get)
+    chain = []
+    while last:
+        chain.append(last); last = path[last]
+    print(f"total {total:4.0f} min | starts {start_hour:02.0f}:00 -> finishes "
+          f"{end_hour:05.2f}h | SLA {sla_hour:02.0f}:00 "
+          f"{'MET' if end_hour <= sla_hour else 'MISSED'}")
+    print(f"critical path: {' <- '.join(chain)}")
+
+tasks = [("extract_orders", 40, []), ("extract_users", 15, []),
+         ("validate", 10, ["extract_orders", "extract_users"]),
+         ("build_features", 90, ["validate"]),
+         ("materialize_online", 25, ["build_features"]),
+         ("train", 180, ["build_features"])]
+sla_check(tasks, start_hour=2, sla_hour=8)
+sla_check(tasks, start_hour=5, sla_hour=8)
+```
+
+```output
+total  320 min | starts 02:00 -> finishes 07.33h | SLA 08:00 MET
+critical path: train <- build_features <- validate <- extract_orders
+total  320 min | starts 05:00 -> finishes 10.33h | SLA 08:00 MISSED
+critical path: train <- build_features <- validate <- extract_orders
+```
+
+Shorten `train` to 60 minutes, or start at 02:00 instead of 05:00, and the SLA is met. The
+critical path is the only place where optimization changes the finish time — speeding up
+`extract_users` buys nothing at all.
+
+## Exercise
+
+Design the daily pipeline that feeds the fraud model from ch. 24–26. It must: ingest yesterday's
+transactions, validate them, build point-in-time correct features (ch. 25), materialize the
+online store, retrain weekly, and publish a model to the registry. Specify partitioning, the
+quality gates and their severities, the retry and backfill policy, and the freshness SLA for each
+output. Then write a simulation that runs 14 days with one failed day and one late upstream, and
+report what a correct orchestrator does on each day.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from datetime import date, timedelta
+
+def run_day(day, upstream_ready, source_rows, state, sla_hours=6):
+    """One partition's run. Everything is keyed by dt=<day>, so reruns are safe."""
+    log = []
+    if not upstream_ready:
+        log.append("SENSOR: upstream partition missing -> task stays in 'waiting', no zeros written")
+        state["waiting"].append(day)
+        return log
+    if state["waiting"]:
+        log.append(f"catch-up: also processing {len(state['waiting'])} deferred day(s) "
+                   f"{state['waiting']} (partitions are independent, run them in parallel)")
+        for d in state["waiting"]:
+            state["partitions"][d] = "rebuilt"
+        state["waiting"] = []
+    expected = 1_000_000
+    if source_rows < expected * 0.5:
+        log.append(f"QUALITY BLOCK: {source_rows:,} rows vs {expected:,} expected "
+                   f"-> fail the run, page the owner, do NOT overwrite the online store")
+        state["failed"].append(day)
+        return log
+    state["partitions"][day] = "built"
+    log.append(f"built features/dt={day} ({source_rows:,} rows), materialized online store")
+    if day.weekday() == 6:                                   # weekly retrain on Sundays
+        if state["failed"]:
+            log.append(f"retrain SKIPPED: {len(state['failed'])} failed partition(s) in the "
+                       f"training window — training on a hole is worse than not retraining")
+        else:
+            log.append("retrained on the last 90 partitions -> registered model, shadow mode")
+    return log
+
+state = {"partitions": {}, "waiting": [], "failed": []}
+start = date(2026, 5, 4)
+for i in range(14):
+    day = start + timedelta(days=i)
+    upstream_ready = i != 5                                  # day 5: upstream is late
+    rows = 300_000 if i == 9 else 1_000_000                  # day 9: a truncated export
+    lines = run_day(day, upstream_ready, rows, state)
+    print(f"{day} " + f"\n{'':11}".join(lines))
+
+print(f"\nfinal: {len(state['partitions'])} partitions built, "
+      f"{len(state['failed'])} failed, {len(state['waiting'])} still waiting")
+print("backfill for the failed day: rerun that partition only, after fixing the export")
+```
+
+```output
+2026-05-04 built features/dt=2026-05-04 (1,000,000 rows), materialized online store
+2026-05-05 built features/dt=2026-05-05 (1,000,000 rows), materialized online store
+2026-05-06 built features/dt=2026-05-06 (1,000,000 rows), materialized online store
+2026-05-07 built features/dt=2026-05-07 (1,000,000 rows), materialized online store
+2026-05-08 built features/dt=2026-05-08 (1,000,000 rows), materialized online store
+2026-05-09 SENSOR: upstream partition missing -> task stays in 'waiting', no zeros written
+2026-05-10 catch-up: also processing 1 deferred day(s) [datetime.date(2026, 5, 9)] (partitions are independent, run them in parallel)
+           built features/dt=2026-05-10 (1,000,000 rows), materialized online store
+           retrained on the last 90 partitions -> registered model, shadow mode
+2026-05-11 built features/dt=2026-05-11 (1,000,000 rows), materialized online store
+2026-05-12 built features/dt=2026-05-12 (1,000,000 rows), materialized online store
+2026-05-13 QUALITY BLOCK: 300,000 rows vs 1,000,000 expected -> fail the run, page the owner, do NOT overwrite the online store
+2026-05-14 built features/dt=2026-05-14 (1,000,000 rows), materialized online store
+2026-05-15 built features/dt=2026-05-15 (1,000,000 rows), materialized online store
+2026-05-16 built features/dt=2026-05-16 (1,000,000 rows), materialized online store
+2026-05-17 built features/dt=2026-05-17 (1,000,000 rows), materialized online store
+           retrain SKIPPED: 1 failed partition(s) in the training window — training on a hole is worse than not retraining
+
+final: 13 partitions built, 1 failed, 0 still waiting
+backfill for the failed day: rerun that partition only, after fixing the export
+```
+
+The insight: every behaviour worth having came from **partitioning by date and making tasks
+idempotent**. The late upstream does not produce a partition of zeros — the sensor holds the task
+and the next successful run catches up, in parallel, because partitions do not depend on each
+other. The truncated export fails a volume gate *before* the online store is overwritten, which
+is the difference between "one bad partition to backfill" and "the fraud model served garbage
+features for a day" (ch. 25). And the retrain refuses to run over a window containing a known
+hole — a subtle rule that teams learn the hard way, because a model silently trained on missing
+days looks fine offline and behaves strangely in production. The freshness SLAs make these
+mechanical rather than judgemental: features must be materialized within 6 hours of midnight, the
+online store within 15 minutes of the features being built, and a model must never be more than
+14 days old — each one a monitorable number, each one owned by someone (ch. 23).
+</details>
