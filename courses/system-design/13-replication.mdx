@@ -1,0 +1,417 @@
+---
+course: system-design
+chapter: 13-replication
+title: "Replication: Leaders, Followers, and Quorums"
+order: 13
+---
+
+## Why replicate: three different goals
+
+Copying data to more than one node buys three separate things, and confusing them causes bad
+designs:
+
+- **Durability / fault tolerance** — a node dies, the data survives.
+- **Read scaling** — reads spread across copies (only helps read-heavy workloads, ch. 1).
+- **Latency** — a copy near the user (only helps if the copy can serve the read locally).
+
+Three topologies deliver those: **single leader**, **multi leader**, **leaderless**. Everything
+else is a variation.
+
+| Topology | Writes go to | Buys you | Costs you |
+|---|---|---|---|
+| Single leader | one node | simplicity: no write conflicts, one ordering | the leader is a write bottleneck and a failover problem |
+| Multi leader | several nodes | local writes in each region | conflicts are inevitable and you must resolve them |
+| Leaderless | any $W$ of $N$ nodes | no failover step, tunable consistency | quorum math, read repair, no global ordering |
+
+## Single leader: the default, and its one variable
+
+One node accepts writes and streams a replication log to followers. The only real knob is
+**when the leader tells the client "committed"**.
+
+```python
+class Cluster:
+    def __init__(self, followers=2, mode="async"):
+        self.leader, self.followers = [], [[] for _ in range(followers)]
+        self.mode, self.acked = mode, 0
+
+    def write(self, record, deliver_to=()):
+        self.leader.append(record)
+        for i in deliver_to:                       # which followers received it *before* the ack
+            self.followers[i].append(record)
+        if self.mode == "sync" and len(deliver_to) < len(self.followers):
+            return "BLOCKED: waiting for all followers"
+        if self.mode == "semi-sync" and len(deliver_to) < 1:
+            return "BLOCKED: waiting for one follower"
+        self.acked += 1
+        return "acked"
+
+for mode, delivered in [("async", ()), ("semi-sync", (0,)), ("semi-sync", ()), ("sync", (0,))]:
+    c = Cluster(mode=mode)
+    print(f"{mode:10} delivered to {len(delivered)} follower(s) -> {c.write('x=1', delivered)}")
+```
+
+```output
+async      delivered to 0 follower(s) -> acked
+semi-sync  delivered to 1 follower(s) -> acked
+semi-sync  delivered to 0 follower(s) -> BLOCKED: waiting for one follower
+sync       delivered to 1 follower(s) -> BLOCKED: waiting for all followers
+```
+
+- **Asynchronous**: fastest, and a leader crash loses any write the followers had not received.
+- **Synchronous** (all followers): no data loss, but any slow follower stalls every write —
+  nobody runs this with more than one synchronous replica.
+- **Semi-synchronous**: wait for exactly one follower. Survives one node's loss, costs one
+  round trip. This is the production default (Postgres `synchronous_commit`, MySQL semi-sync).
+
+### Replication lag is where the bugs live
+
+```python
+class LaggingReplica:
+    """A follower that applies the leader's log some seconds behind."""
+    def __init__(self, lag_s): self.lag, self.log = lag_s, []
+    def apply_from(self, leader_log, now):
+        self.log = [(t, r) for t, r in leader_log if t <= now - self.lag]
+    def read(self, key):
+        for t, (k, v) in reversed(self.log):
+            if k == key: return v
+        return None
+
+leader_log = [(0.0, ("profile:7", "old name")), (10.0, ("profile:7", "new name"))]
+for lag in (0.0, 2.0, 15.0):
+    r = LaggingReplica(lag)
+    r.apply_from(leader_log, now=11.0)
+    print(f"follower lag {lag:4.1f}s -> reads {r.read('profile:7')!r}")
+```
+
+```output
+follower lag  0.0s -> reads 'new name'
+follower lag  2.0s -> reads 'old name'
+follower lag 15.0s -> reads None
+```
+
+The user updated their name at t=10 and, one second later, a read routed to the 2-second-lagged
+follower still shows the old one — while the 15-second-lagged follower has not applied even the
+original write and returns nothing at all. Three named anomalies follow, and each has a standard fix:
+
+- **Read-your-writes** — a user must see their own write. Fix: route a user's reads to the leader
+  for a short window after they write, or pin them to a replica known to be caught up.
+- **Monotonic reads** — a user must not see time run backwards. Fix: pin each user to one
+  replica (hash the user id), so they never jump from a fresh replica to a stale one.
+- **Consistent prefix reads** — causally ordered writes must not appear out of order. Fix: keep
+  causally related writes in the same partition, or track causality explicitly.
+
+```python
+import random
+random.seed(1)
+
+replicas = {"r1": LaggingReplica(0.5), "r2": LaggingReplica(5.0)}
+for r in replicas.values():
+    r.apply_from(leader_log, now=11.0)
+
+print("round-robin routing (no pinning):")
+for i in range(4):
+    r = list(replicas.values())[i % 2]
+    print(f"  read {i}: {r.read('profile:7')!r}")
+
+print("pinned by user id (monotonic reads):")
+pinned = replicas["r1"]
+for i in range(4):
+    print(f"  read {i}: {pinned.read('profile:7')!r}")
+```
+
+```output
+round-robin routing (no pinning):
+  read 0: 'new name'
+  read 1: 'old name'
+  read 2: 'new name'
+  read 3: 'old name'
+pinned by user id (monotonic reads):
+  read 0: 'new name'
+  read 1: 'new name'
+  read 2: 'new name'
+  read 3: 'new name'
+```
+
+The unpinned reader watches the name flip back and forth — the same user, the same second,
+alternating answers. Pinning does not make the data fresher; it makes the *story* consistent,
+which is what users actually notice.
+
+## Failover: the dangerous part
+
+When the leader dies you must detect it, elect a new leader (ch. 17), and redirect writes. Each
+step has a failure mode:
+
+```python
+def failover(timeout_s, actual_pause_s, unreplicated_writes, old_leader_returns):
+    detected = actual_pause_s > timeout_s
+    notes = []
+    if not detected:
+        return "no failover: leader recovered inside the timeout"
+    notes.append(f"promoted a follower; {unreplicated_writes} async writes were lost")
+    if old_leader_returns:
+        notes.append("SPLIT BRAIN: old leader still accepts writes until it is fenced")
+    return " | ".join(notes)
+
+print(failover(30, 12, 0, False))
+print(failover(30, 45, 8, False))
+print(failover(30, 45, 8, True))
+```
+
+```output
+no failover: leader recovered inside the timeout
+promoted a follower; 8 async writes were lost
+promoted a follower; 8 async writes were lost | SPLIT BRAIN: old leader still accepts writes until it is fenced
+```
+
+**Split brain** is the worst outcome: two nodes both believe they are leader, both accept
+writes, and the histories diverge irreconcilably. The fix is **fencing** — the new leader gets a
+monotonically increasing epoch number, and the storage layer rejects any write carrying an older
+epoch.
+
+```python
+class FencedStorage:
+    def __init__(self): self.epoch, self.data = 0, {}
+    def write(self, epoch, k, v):
+        if epoch < self.epoch:
+            return f"REJECTED: epoch {epoch} < current {self.epoch}"
+        self.epoch = epoch
+        self.data[k] = v
+        return f"ok (epoch {epoch})"
+
+s = FencedStorage()
+print("old leader, epoch 5:", s.write(5, "x", 1))
+print("new leader, epoch 6:", s.write(6, "x", 2))
+print("old leader again   :", s.write(5, "x", 3), "<- zombie write blocked")
+print("final value        :", s.data)
+```
+
+```output
+old leader, epoch 5: ok (epoch 5)
+new leader, epoch 6: ok (epoch 6)
+old leader again   : REJECTED: epoch 5 < current 6 <- zombie write blocked
+final value        : {'x': 2}
+```
+
+Set the failure-detection timeout too low and you cause failovers during ordinary GC pauses;
+set it too high and you are down for a minute. There is no correct value — only a chosen
+trade-off, which is why "how long is your leader-election timeout?" is a real design question.
+
+## Multi-leader: conflicts become your problem
+
+Accept writes in two regions and the same key can be written concurrently in both. There is no
+global order, so *something* must decide the winner.
+
+```python
+def lww(a, b):                     # last write wins, by timestamp
+    return a if a["ts"] >= b["ts"] else b
+
+def merge_set(a, b):               # CRDT-style: union, no data lost
+    return {"value": sorted(set(a["value"]) | set(b["value"])), "ts": max(a["ts"], b["ts"])}
+
+dhaka  = {"value": ["milk", "eggs"], "ts": 100.0}
+riyadh = {"value": ["milk", "bread"], "ts": 100.5}
+
+print("last write wins ->", lww(dhaka, riyadh))
+print("set union       ->", merge_set(dhaka, riyadh))
+print("LWW silently dropped 'eggs'; the union kept both intents")
+```
+
+```output
+last write wins -> {'value': ['milk', 'bread'], 'ts': 100.5}
+set union       -> {'value': ['bread', 'eggs', 'milk'], 'ts': 100.5}
+LWW silently dropped 'eggs'; the union kept both intents
+```
+
+Last-write-wins is simple and **loses data** whenever two writes are genuinely concurrent.
+Worse, it depends on clocks agreeing across machines, which they do not (clock skew is a real
+distributed-systems hazard). The alternatives: keep both versions as siblings and let the
+application merge (Riak-style), or use a data type whose merge is mathematically defined — a
+CRDT, where union is the merge and conflicts cannot happen.
+
+## Leaderless replication and quorum math
+
+Write to $W$ nodes, read from $R$ nodes, out of $N$ replicas. If
+
+$$
+W + R > N
+$$
+
+then any read set and any write set must overlap in at least one node, so a read sees the
+latest write.
+
+```python
+from itertools import combinations
+
+def overlaps(n, w, r):
+    """Fraction of (write set, read set) pairs that share at least one node."""
+    total = ok = 0
+    for wset in combinations(range(n), w):
+        for rset in combinations(range(n), r):
+            total += 1
+            ok += bool(set(wset) & set(rset))
+    return ok / total
+
+N = 5
+for w, r in [(1, 1), (2, 2), (3, 3), (1, 5), (5, 1), (2, 4)]:
+    guarantee = "guaranteed" if w + r > N else "not guaranteed"
+    print(f"N={N} W={w} R={r} -> W+R={w+r:2} {guarantee:15} "
+          f"overlap in {overlaps(N, w, r):6.1%} of node choices")
+```
+
+```output
+N=5 W=1 R=1 -> W+R= 2 not guaranteed  overlap in  20.0% of node choices
+N=5 W=2 R=2 -> W+R= 4 not guaranteed  overlap in  70.0% of node choices
+N=5 W=3 R=3 -> W+R= 6 guaranteed      overlap in 100.0% of node choices
+N=5 W=1 R=5 -> W+R= 6 guaranteed      overlap in 100.0% of node choices
+N=5 W=5 R=1 -> W+R= 6 guaranteed      overlap in 100.0% of node choices
+N=5 W=2 R=4 -> W+R= 6 guaranteed      overlap in 100.0% of node choices
+```
+
+Note the last case: $W + R = N$ still overlaps most of the time — quorums fail *probabilistically*,
+not always, which is exactly why the bug is so hard to catch in testing. And even with
+$W + R > N$, edge cases remain: concurrent writes with no ordering, a write that succeeded on
+fewer than $W$ nodes and was not rolled back, or a **sloppy quorum** where writes were accepted
+by nodes outside the intended home set.
+
+```python
+def tunable(n, w, r):
+    return (f"N={n} W={w} R={r}: "
+            f"{'strong-ish' if w + r > n else 'eventual':11} | "
+            f"survives {n - w} node loss on write, {n - r} on read | "
+            f"write latency = {w}th fastest, read latency = {r}th fastest")
+
+for cfg in [(3, 3, 1), (3, 1, 3), (3, 2, 2), (3, 1, 1)]:
+    print(tunable(*cfg))
+```
+
+```output
+N=3 W=3 R=1: strong-ish  | survives 0 node loss on write, 2 on read | write latency = 3th fastest, read latency = 1th fastest
+N=3 W=1 R=3: strong-ish  | survives 2 node loss on write, 0 on read | write latency = 1th fastest, read latency = 3th fastest
+N=3 W=2 R=2: strong-ish  | survives 1 node loss on write, 1 on read | write latency = 2th fastest, read latency = 2th fastest
+N=3 W=1 R=1: eventual    | survives 2 node loss on write, 2 on read | write latency = 1th fastest, read latency = 1th fastest
+```
+
+This is Cassandra's and DynamoDB's tuning dial in one table. `W=N, R=1` gives fast reads and
+fragile writes; `W=1, R=N` the reverse; **`W=R=2, N=3` (quorum both ways) is the balanced
+default** everyone actually runs.
+
+### Anti-entropy: read repair and hinted handoff
+
+```python
+replica_values = {"n1": ("v2", 2), "n2": ("v2", 2), "n3": ("v1", 1)}   # n3 missed a write
+
+def read_repair(values, r=2):
+    chosen = sorted(values.items(), key=lambda kv: -kv[1][1])[:r]
+    newest = max(v for _, v in chosen)
+    stale = [node for node, v in values.items() if v[1] < newest[1]]
+    for node in stale:
+        values[node] = newest                       # push the newest value back
+    return newest[0], stale
+
+value, repaired = read_repair(replica_values)
+print(f"read returned {value}; repaired stale replicas: {repaired}")
+print("state after repair:", replica_values)
+```
+
+```output
+read returned v2; repaired stale replicas: ['n3']
+state after repair: {'n1': ('v2', 2), 'n2': ('v2', 2), 'n3': ('v2', 2)}
+```
+
+**Read repair** fixes replicas that are read; **hinted handoff** lets a healthy node hold writes
+destined for a down node and forward them on recovery; and a background **Merkle-tree
+comparison** catches everything neither of those touched. Without at least one anti-entropy
+mechanism, "eventually consistent" has no path to eventual.
+
+## Try it Yourself
+
+```python
+def stale_read_probability(n, w, r, node_stale_prob=0.1, trials=20_000, seed=0):
+    """How often does a read set miss the newest value, given flaky replication?"""
+    import random
+    rng = random.Random(seed)
+    misses = 0
+    for _ in range(trials):
+        fresh = {i for i in range(n) if rng.random() > node_stale_prob}   # who got the write
+        if len(fresh) < w:                                                # write failed anyway
+            continue
+        read_set = rng.sample(range(n), r)
+        if not (set(read_set) & fresh):
+            misses += 1
+    return misses / trials
+
+for n, w, r in [(3, 1, 1), (3, 2, 2), (3, 3, 1), (5, 2, 2), (5, 3, 3)]:
+    p = stale_read_probability(n, w, r)
+    print(f"N={n} W={w} R={r} (W+R{'>' if w+r>n else '<='}N) -> stale read in {p:6.2%} of reads")
+```
+
+```output
+N=3 W=1 R=1 (W+R<=N) -> stale read in  9.93% of reads
+N=3 W=2 R=2 (W+R>N) -> stale read in  0.00% of reads
+N=3 W=3 R=1 (W+R>N) -> stale read in  0.00% of reads
+N=5 W=2 R=2 (W+R<=N) -> stale read in  1.00% of reads
+N=5 W=3 R=3 (W+R>N) -> stale read in  0.00% of reads
+```
+
+Raise `node_stale_prob` to 0.5 (a partitioned or overloaded cluster) and watch the
+non-quorum configurations degrade while the quorum ones hold. That is the whole argument for
+quorums in one experiment.
+
+## Exercise
+
+Implement **version vectors** to detect concurrent writes in a leaderless store. Each replica
+keeps a counter per node; a write carries the version vector it saw. Given two versions,
+determine whether one **happened before** the other (its vector is element-wise less than or
+equal, with at least one strictly less) or whether they are **concurrent** (neither dominates) —
+in which case both must be kept as siblings.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def dominates(a, b):
+    """True if a happened after b: a >= b element-wise and a != b."""
+    nodes = set(a) | set(b)
+    ge = all(a.get(n, 0) >= b.get(n, 0) for n in nodes)
+    return ge and a != b
+
+def compare(a, b):
+    if a == b:            return "identical"
+    if dominates(a, b):   return "a is newer"
+    if dominates(b, a):   return "b is newer"
+    return "CONCURRENT -> keep both as siblings"
+
+cases = [
+    ({"n1": 2, "n2": 1}, {"n1": 1, "n2": 1}),      # a saw everything b saw, plus one
+    ({"n1": 1, "n2": 3}, {"n1": 1, "n2": 3}),      # same version
+    ({"n1": 2, "n2": 1}, {"n1": 1, "n2": 2}),      # each has a write the other lacks
+    ({"n1": 5},          {"n2": 1}),               # writes on different nodes, unaware
+]
+for a, b in cases:
+    print(f"{str(a):22} vs {str(b):22} -> {compare(a, b)}")
+
+# A sibling set: what the client must merge
+siblings = [{"vv": {"n1": 2, "n2": 1}, "cart": ["milk", "eggs"]},
+            {"vv": {"n1": 1, "n2": 2}, "cart": ["milk", "bread"]}]
+merged = sorted({item for s in siblings for item in s["cart"]})
+merged_vv = {n: max(s["vv"].get(n, 0) for s in siblings) for n in {"n1", "n2"}}
+print(f"\nmerged cart {merged} with version vector {merged_vv}")
+```
+
+```output
+{'n1': 2, 'n2': 1}     vs {'n1': 1, 'n2': 1}     -> a is newer
+{'n1': 1, 'n2': 3}     vs {'n1': 1, 'n2': 3}     -> identical
+{'n1': 2, 'n2': 1}     vs {'n1': 1, 'n2': 2}     -> CONCURRENT -> keep both as siblings
+{'n1': 5}              vs {'n2': 1}              -> CONCURRENT -> keep both as siblings
+
+merged cart ['bread', 'eggs', 'milk'] with version vector {'n2': 2, 'n1': 2}
+```
+
+The insight: a single timestamp cannot distinguish "later" from "concurrent", and that
+distinction is the entire difference between safely overwriting and silently losing a write.
+A version vector can, because it records *what each writer had seen* rather than when it wrote.
+The cost is that vectors grow with the number of writers (real systems prune them), and that
+the application must supply a merge function for siblings — the shopping-cart union above is
+Amazon's Dynamo example, and it is why deleting an item from a cart was historically unreliable:
+a union merge can resurrect a removed item unless removals are recorded as tombstones (ch. 11).
+</details>
