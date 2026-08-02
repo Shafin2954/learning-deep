@@ -1,0 +1,367 @@
+---
+course: system-design
+chapter: 12-indexing-query-plans
+title: "Indexing and Query Plans: Why Your Query Is Slow"
+order: 12
+---
+
+## An index is a sorted copy of some columns
+
+That is the whole idea. A B-tree index on `(status)` is the values of `status` sorted, each
+paired with a pointer back to the row. It makes lookups on `status` a tree descent instead of a
+full scan, and it costs you space plus a write on every insert, update, and delete of that
+column.
+
+```python
+import sqlite3, random
+random.seed(0)
+
+db = sqlite3.connect(":memory:")
+db.execute("""CREATE TABLE orders (
+    id INTEGER PRIMARY KEY, user_id INT, status TEXT, country TEXT,
+    total REAL, created_at TEXT)""")
+
+STATUS = ["paid"] * 90 + ["pending"] * 8 + ["refunded"] * 2   # skewed, like real data
+rows = [(i, random.randrange(20_000), random.choice(STATUS),
+         random.choice(["BD", "SA", "US", "DE"]),
+         round(random.uniform(5, 500), 2),
+         f"2026-{random.randrange(1,13):02}-{random.randrange(1,29):02}")
+        for i in range(200_000)]
+db.executemany("INSERT INTO orders VALUES (?,?,?,?,?,?)", rows)
+db.commit()
+
+def plan(sql, params=()):
+    for row in db.execute("EXPLAIN QUERY PLAN " + sql, params):
+        print("   ", row[-1])
+
+print("no index yet:")
+plan("SELECT * FROM orders WHERE user_id = ?", (42,))
+```
+
+```output
+no index yet:
+    SCAN orders
+```
+
+`SCAN orders` means the database reads all 200,000 rows to find the handful that match. It is
+the single most common cause of a slow query, and the plan tells you before any user does.
+
+## The index turns a scan into a seek
+
+```python
+db.execute("CREATE INDEX idx_user ON orders(user_id)")
+print("with idx_user:")
+plan("SELECT * FROM orders WHERE user_id = ?", (42,))
+
+n = db.execute("SELECT COUNT(*) FROM orders WHERE user_id = 42").fetchone()[0]
+print(f"\nrows examined: ~{n} instead of 200,000  ({200_000/max(n,1):,.0f}x less work)")
+```
+
+```output
+with idx_user:
+    SEARCH orders USING INDEX idx_user (user_id=?)
+
+rows examined: ~10 instead of 200,000  (20,000x less work)
+```
+
+`SEARCH ... USING INDEX` is what you want to see. The database descends the index (three or
+four page reads, ch. 11), finds the matching entries, and follows each pointer back to the
+row.
+
+### Selectivity decides whether an index is worth using
+
+An index only pays when it eliminates most rows. Ask for 90% of the table and following
+180,000 row pointers — each a random page read — costs more than reading the table straight
+through.
+
+```python
+db.execute("CREATE INDEX idx_status ON orders(status)")
+db.execute("ANALYZE")                      # collect statistics so the planner can choose
+
+for value in ("refunded", "paid"):
+    cnt = db.execute("SELECT COUNT(*) FROM orders WHERE status = ?", (value,)).fetchone()[0]
+    print(f"status={value:9} matches {cnt:>7,} rows ({cnt/200_000:5.1%})")
+    plan("SELECT * FROM orders WHERE status = ?", (value,))
+```
+
+```output
+status=refunded  matches   3,987 rows ( 2.0%)
+    SEARCH orders USING INDEX idx_status (status=?)
+status=paid      matches 180,090 rows (90.0%)
+    SEARCH orders USING INDEX idx_status (status=?)
+```
+
+SQLite takes the index in both cases — its planner is deliberately simple. Postgres, given the
+same statistics, switches to a sequential scan somewhere around 5–10% selectivity, because its
+cost model prices the random I/O of 180,000 heap fetches against one sequential pass. Two
+lessons that carry to every engine: **an index on a low-cardinality column (a boolean, a status
+with three values) is usually not worth its write cost**, and **the planner's estimate is only as
+good as its statistics** — a table that grew 100x since the last `ANALYZE` gets plans chosen for
+a table that no longer exists.
+
+## Composite indexes: order is everything
+
+A composite index on `(a, b)` is sorted by `a`, then by `b` within each `a`. This is the
+**leftmost prefix rule**: the index serves `WHERE a = ?`, `WHERE a = ? AND b = ?`, and
+`ORDER BY a, b` — but not `WHERE b = ?` alone.
+
+```python
+db.execute("CREATE INDEX idx_country_status ON orders(country, status)")
+
+for sql in [
+    "SELECT * FROM orders WHERE country = 'BD' AND status = 'refunded'",
+    "SELECT * FROM orders WHERE country = 'BD'",
+    "SELECT * FROM orders WHERE status = 'refunded' AND country = 'BD'",
+]:
+    print(sql[:64])
+    plan(sql)
+```
+
+```output
+SELECT * FROM orders WHERE country = 'BD' AND status = 'refunded
+    SEARCH orders USING INDEX idx_country_status (country=? AND status=?)
+SELECT * FROM orders WHERE country = 'BD'
+    SEARCH orders USING INDEX idx_country_status (country=?)
+SELECT * FROM orders WHERE status = 'refunded' AND country = 'BD
+    SEARCH orders USING INDEX idx_country_status (country=? AND status=?)
+```
+
+The third query works too — the planner reorders `AND` terms freely, because `WHERE` is a set
+of conditions, not a sequence. What it cannot do is skip the leading column.
+
+### Equality first, then range, then sort
+
+The rule for column order in a composite index:
+
+1. columns compared with `=`,
+2. then the one column used in a range (`<`, `>`, `BETWEEN`, `LIKE 'x%'`),
+3. then columns needed for `ORDER BY`.
+
+Everything after the range column can no longer be used for seeking — only for filtering.
+
+```python
+db.execute("CREATE INDEX idx_user_created ON orders(user_id, created_at)")
+print("equality + range + order, in index order:")
+plan("SELECT * FROM orders WHERE user_id = 42 AND created_at > '2026-06-01' "
+     "ORDER BY created_at LIMIT 20")
+```
+
+```output
+equality + range + order, in index order:
+    SEARCH orders USING INDEX idx_user_created (user_id=? AND created_at>?)
+```
+
+No `USE TEMP B-TREE FOR ORDER BY` line: the index already delivers rows in the requested order,
+so `LIMIT 20` stops after 20 rows. Without it, the database would sort every matching row
+before returning the first one — the difference between 1 ms and 400 ms on a paginated screen.
+
+## Covering indexes: skip the table entirely
+
+If every column a query needs is in the index, the database never touches the table. Postgres
+calls it an index-only scan; SQLite says `USING COVERING INDEX`.
+
+```python
+db.execute("CREATE INDEX idx_cover ON orders(user_id, status, total)")
+print("query needs only indexed columns:")
+plan("SELECT status, total FROM orders WHERE user_id = 42")
+print("\nquery needs an extra column (country):")
+plan("SELECT status, total, country FROM orders WHERE user_id = 42")
+```
+
+```output
+query needs only indexed columns:
+    SEARCH orders USING COVERING INDEX idx_cover (user_id=?)
+
+query needs an extra column (country):
+    SEARCH orders USING INDEX idx_cover (user_id=?)
+```
+
+A covering index turns two lookups (index, then row) into one. It is the cheapest large win
+available on a hot read path — and the reason to keep an eye on `SELECT *`, which makes
+covering impossible by definition.
+
+## Sargability: the ways you accidentally disable an index
+
+A predicate is **sargable** (search-argument-able) if the database can turn it into a range on
+the index. Wrap the column in a function and it cannot.
+
+```python
+db.execute("CREATE INDEX idx_created ON orders(created_at)")
+db.execute("PRAGMA case_sensitive_like = ON")     # required before SQLite may index a LIKE
+queries = [
+    ("sargable:   created_at >= '2026-06-01'",
+     "SELECT COUNT(*) FROM orders WHERE created_at >= '2026-06-01'"),
+    ("not sargable: substr(created_at,1,4) = '2026'",
+     "SELECT COUNT(*) FROM orders WHERE substr(created_at,1,4) = '2026'"),
+    ("sargable:   prefix LIKE",
+     "SELECT COUNT(*) FROM orders WHERE created_at LIKE '2026-06%'"),
+    ("not sargable: leading wildcard",
+     "SELECT COUNT(*) FROM orders WHERE created_at LIKE '%-06-%'"),
+]
+for label, sql in queries:
+    print(label)
+    plan(sql)
+```
+
+```output
+sargable:   created_at >= '2026-06-01'
+    SEARCH orders USING COVERING INDEX idx_created (created_at>?)
+not sargable: substr(created_at,1,4) = '2026'
+    SCAN orders USING COVERING INDEX idx_created
+sargable:   prefix LIKE
+    SEARCH orders USING COVERING INDEX idx_created (created_at>? AND created_at<?)
+not sargable: leading wildcard
+    SCAN orders USING COVERING INDEX idx_created
+```
+
+A prefix `LIKE` becomes the range `created_at >= '2026-06' AND created_at < '2026-07'` — but
+only once `case_sensitive_like` is on, because a case-insensitive comparison does not match the
+index's collation. That detail generalizes: **an index is usable only if its collation matches
+the comparison**, which is why `WHERE lower(email) = ?` needs an index on `lower(email)`, not on
+`email`.
+
+The fix for a non-sargable predicate is always one of: rewrite it as a range, or build an
+**expression index** on exactly the expression you filter by
+(`CREATE INDEX ... ON orders(substr(created_at,1,4))`). Both work; the rewrite is free.
+
+## Join strategies, and why the planner picks one
+
+```python
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, tier TEXT)")
+db.executemany("INSERT INTO users VALUES (?,?,?)",
+               [(i, f"u{i}", random.choice(["free", "pro"])) for i in range(20_000)])
+db.execute("ANALYZE")
+
+print("small filtered side drives the join:")
+plan("SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE u.id = 42")
+print("\nwhole-table join:")
+plan("SELECT u.tier, COUNT(*) FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.tier")
+```
+
+```output
+small filtered side drives the join:
+    SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
+    SEARCH o USING COVERING INDEX idx_cover (user_id=?)
+
+whole-table join:
+    SCAN u
+    SEARCH o USING COVERING INDEX idx_user (user_id=?)
+    USE TEMP B-TREE FOR GROUP BY
+```
+
+Three algorithms exist and every engine picks among them: **nested loop** (drive from the small
+side, probe an index on the big side — great when one side is tiny), **hash join** (build a hash
+table on the smaller side, stream the larger — great for big unsorted joins), and **merge join**
+(both inputs already sorted, walk them together). SQLite only implements nested loops, which is
+why it insists on an index for the inner side; Postgres will choose among all three based on
+cost estimates.
+
+## The cost of an index
+
+```python
+counts = db.execute("""SELECT COUNT(*) FROM sqlite_master
+                       WHERE type='index' AND tbl_name='orders'""").fetchone()[0]
+print(f"indexes on orders: {counts}")
+print(f"every INSERT now writes 1 row + {counts} index entries")
+print(f"every UPDATE to an indexed column rewrites that index entry too")
+print(f"every index also competes for the same page cache as your data")
+```
+
+```output
+indexes on orders: 6
+every INSERT now writes 1 row + 6 index entries
+every UPDATE to an indexed column rewrites that index entry too
+every index also competes for the same page cache as your data
+```
+
+Indexes are not free lunch — they are a **write tax paid to make reads cheap**. The working rule:
+index what you filter, join, and sort by; drop indexes nothing uses (every database can report
+index usage counters); and prefer one well-ordered composite index over three single-column
+ones, because the composite serves all its prefixes.
+
+## Try it Yourself
+
+```python
+def compare(sql, label):
+    print(f"{label}:")
+    plan(sql)
+    print()
+
+Q = "SELECT * FROM orders WHERE total > 400 ORDER BY created_at LIMIT 10"
+compare(Q, "with only idx_created available")
+db.execute("CREATE INDEX idx_total_created ON orders(total, created_at)")
+compare(Q, "after adding idx_total_created (seek on total, then sort)")
+db.execute("CREATE INDEX idx_created_total ON orders(created_at, total)")
+compare(Q, "after adding idx_created_total (ordered walk, filter as it goes)")
+```
+
+```output
+with only idx_created available:
+    SCAN orders USING INDEX idx_created
+
+after adding idx_total_created (seek on total, then sort):
+    SCAN orders USING INDEX idx_created
+
+after adding idx_created_total (ordered walk, filter as it goes):
+    SCAN orders USING INDEX idx_created_total
+```
+
+The index that looks right — `(total, created_at)`, the range column first — is never chosen.
+Seeking it would return rows in `total` order, so `ORDER BY created_at` would then need a sort
+of every matching row before the first one could be returned. The planner prefers to walk an
+index that is *already* in `created_at` order and throw away the rows failing `total > 400`,
+because `LIMIT 10` lets it stop almost immediately. Change `LIMIT 10` to `LIMIT 20000` and
+reason about which plan should win then: the ordered walk now has to scan most of the table,
+and paying for a sort starts to look cheap.
+
+## Exercise
+
+You have this query on a 50-million-row table, and it takes 8 seconds:
+
+```sql
+SELECT id, total, created_at
+FROM orders
+WHERE country = 'BD' AND status = 'pending' AND created_at >= '2026-01-01'
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+Design the index that makes it fast. State the column order and justify each position, say
+whether it can be covering, and verify with `EXPLAIN QUERY PLAN` that no temporary B-tree is
+used for the sort.
+
+<details>
+<summary>Solution</summary>
+
+```python
+db.execute("""CREATE INDEX idx_answer
+              ON orders(country, status, created_at DESC, id, total)""")
+sql = """SELECT id, total, created_at FROM orders
+         WHERE country='BD' AND status='pending' AND created_at >= '2026-01-01'
+         ORDER BY created_at DESC LIMIT 50"""
+plan(sql)
+rows = db.execute(sql).fetchall()
+print(f"\nrows returned: {len(rows)}, newest first: {rows[0][2]} ... {rows[-1][2]}")
+
+matching = db.execute("""SELECT COUNT(*) FROM orders
+                         WHERE country='BD' AND status='pending'
+                           AND created_at >= '2026-01-01'""").fetchone()[0]
+print(f"rows matching the filter: {matching:,} — the index reads 50 of them, not {matching:,}")
+```
+
+```output
+    SEARCH orders USING COVERING INDEX idx_answer (country=? AND status=? AND created_at>?)
+
+rows returned: 50, newest first: 2026-12-28 ... 2026-12-24
+rows matching the filter: 3,955 — the index reads 50 of them, not 3,955
+```
+
+The reasoning, position by position: `country` and `status` are equality predicates, so they go
+first and narrow the index to one contiguous block. `created_at DESC` comes third because it is
+both the range predicate *and* the sort key — with it in the index, the block is already in the
+requested order, so the engine walks it backwards and stops after 50 rows. `id` and `total` are
+appended for coverage only: they are never seeked on, but including them means the query never
+touches the table. Everything after a range column can only filter, never seek, which is why no
+further column would earn its place here. On 50 million rows this is the difference between
+reading tens of millions of rows and reading fifty.
+</details>
