@@ -1,0 +1,389 @@
+---
+course: mlops
+chapter: 05-pipelines-scheduling
+title: "Pipelines and Scheduling: Airflow, n8n, and What Runs When"
+order: 5
+---
+
+## Two kinds of automation, and they are not interchangeable
+
+Every ML system ends up with both, and choosing wrongly is the source of a great deal of pain:
+
+- **Batch orchestration** (Airflow, Dagster, Prefect): scheduled DAGs over *partitions* of data —
+  yesterday's extract, last month's backfill, a nightly retrain. Cares about idempotency,
+  backfills, lineage, and SLAs.
+- **Event automation** (n8n, Zapier, a webhook worker): a trigger fires, a short chain of API
+  calls runs, someone gets a Slack message. Cares about latency, retries, and connectors.
+
+```python
+tasks = [
+    ("nightly feature build over 400M rows",   "orchestrator", "partitions, backfills, lineage"),
+    ("retrain when drift exceeds a threshold", "orchestrator", "long-running, needs GPU + gates"),
+    ("post the CI gate result to Slack",       "event tool",   "one API call, no state"),
+    ("new row in CRM -> enrich -> upsert",     "event tool",   "webhook latency, no backfill"),
+    ("re-score 12 months after a bug fix",     "orchestrator", "backfill 365 partitions"),
+    ("alert an on-call when p99 breaches",     "event tool",   "seconds matter, payload is tiny"),
+]
+print(f"{'job':42}{'belongs in':14}why")
+for job, where, why in tasks:
+    print(f"{job:42}{where:14}{why}")
+```
+
+```output
+job                                       belongs in    why
+nightly feature build over 400M rows      orchestrator  partitions, backfills, lineage
+retrain when drift exceeds a threshold    orchestrator  long-running, needs GPU + gates
+post the CI gate result to Slack          event tool    one API call, no state
+new row in CRM -> enrich -> upsert        event tool    webhook latency, no backfill
+re-score 12 months after a bug fix        orchestrator  backfill 365 partitions
+alert an on-call when p99 breaches        event tool    seconds matter, payload is tiny
+```
+
+The dividing question is not size, it is **whether the work is defined over a partition you might
+have to recompute**. If yes, you need an orchestrator, because the event tool has nowhere to put
+"rerun 2026-03-14".
+
+## A DAG, and why the shape matters
+
+```python
+from collections import defaultdict, deque
+
+class DAG:
+    def __init__(self): self.deps, self.dur = defaultdict(set), {}
+    def task(self, name, minutes, after=()):
+        self.dur[name] = minutes
+        self.deps[name] |= set(after)
+    def order(self):
+        indeg = {t: len(self.deps[t]) for t in self.dur}
+        q = deque(sorted(t for t, d in indeg.items() if d == 0))
+        out = []
+        while q:
+            t = q.popleft(); out.append(t)
+            for other in sorted(self.dur):
+                if t in self.deps[other]:
+                    indeg[other] -= 1
+                    if not indeg[other]: q.append(other)
+        if len(out) != len(self.dur): raise ValueError("cycle")
+        return out
+    def critical_path(self):
+        finish, parent = {}, {}
+        for t in self.order():
+            ready = max([finish[d] for d in self.deps[t]], default=0)
+            finish[t] = ready + self.dur[t]
+            parent[t] = max(self.deps[t], key=lambda d: finish[d]) if self.deps[t] else None
+        last = max(finish, key=finish.get)
+        chain = []
+        while last: chain.append(last); last = parent[last]
+        return finish[max(finish, key=finish.get)], list(reversed(chain))
+
+dag = DAG()
+dag.task("extract_events", 40)
+dag.task("extract_crm", 12)
+dag.task("validate", 8, after=["extract_events", "extract_crm"])
+dag.task("build_features", 55, after=["validate"])
+dag.task("materialize_online", 18, after=["build_features"])
+dag.task("train", 95, after=["build_features"])
+dag.task("evaluate_and_gate", 20, after=["train"])
+dag.task("register", 3, after=["evaluate_and_gate"])
+
+total, path = dag.critical_path()
+print("run order   :", " -> ".join(dag.order()))
+print(f"makespan    : {total} min")
+print("critical path:", " -> ".join(path))
+print(f"speeding up extract_crm by 10 min saves: 0 min (it is not on the critical path)")
+```
+
+```output
+run order   : extract_crm -> extract_events -> validate -> build_features -> materialize_online -> train -> evaluate_and_gate -> register
+makespan    : 221 min
+critical path: extract_events -> validate -> build_features -> train -> evaluate_and_gate -> register
+speeding up extract_crm by 10 min saves: 0 min (it is not on the critical path)
+```
+
+Two things fall out of the graph immediately: the **makespan** (does this finish before the SLA?)
+and the **critical path** (the only tasks where optimization changes the answer). Everything else
+is slack you can spend on retries.
+
+## Partitions make reruns safe
+
+```python
+warehouse = {}
+
+def build_partition(dt, rows, warehouse):
+    """Idempotent: writing the same partition twice leaves the same state."""
+    warehouse[f"features/dt={dt}"] = {"rows": rows, "built_at": f"{dt}T04:00:00Z"}
+    return f"features/dt={dt} ({rows:,} rows)"
+
+print(build_partition("2026-05-01", 1_000_000, warehouse))
+print(build_partition("2026-05-01", 1_000_000, warehouse), "<- rerun after a failure")
+print("partitions:", list(warehouse))
+
+def backfill(days, concurrency, minutes_each, source_rps_limit=None):
+    wall = days / concurrency * minutes_each
+    note = ""
+    if source_rps_limit and concurrency > source_rps_limit:
+        note = f"  (throttled: source allows {source_rps_limit} concurrent readers)"
+        wall = days / source_rps_limit * minutes_each
+    print(f"{days:4} partitions, concurrency {concurrency:3} -> {wall/60:6.1f} h{note}")
+
+for c in (1, 8, 32):
+    backfill(365, c, minutes_each=6, source_rps_limit=8)
+```
+
+```output
+features/dt=2026-05-01 (1,000,000 rows)
+features/dt=2026-05-01 (1,000,000 rows) <- rerun after a failure
+partitions: ['features/dt=2026-05-01']
+ 365 partitions, concurrency   1 ->   36.5 h
+ 365 partitions, concurrency   8 ->    4.6 h
+ 365 partitions, concurrency  32 ->    4.6 h  (throttled: source allows 8 concurrent readers)
+```
+
+The throttle line is the lesson every team learns once: a 32-way backfill against the production
+database is an outage you caused yourself. Backfills read from a replica or a snapshot, and the
+orchestrator's per-pool concurrency limit is where you enforce it.
+
+## Triggers: time, sensor, and event
+
+```python
+def decide_trigger(job, upstream_arrives, tolerance_min, needs_backfill):
+    if needs_backfill:
+        base = "orchestrator DAG"
+    else:
+        base = "event workflow"
+    if upstream_arrives == "predictable":
+        how = "cron, plus a sensor that fails loudly if the input is missing"
+    elif upstream_arrives == "variable":
+        how = "sensor / dataset trigger — wait for the data, not for the clock"
+    else:
+        how = "event trigger from the upstream system's webhook or queue"
+    return f"{job:28} -> {base:18} {how} (tolerance {tolerance_min} min)"
+
+print(decide_trigger("daily feature build", "predictable", 60, True))
+print(decide_trigger("vendor file ingest", "variable", 240, True))
+print(decide_trigger("scoring on new signup", "event", 1, False))
+```
+
+```output
+daily feature build          -> orchestrator DAG   cron, plus a sensor that fails loudly if the input is missing (tolerance 60 min)
+vendor file ingest           -> orchestrator DAG   sensor / dataset trigger — wait for the data, not for the clock (tolerance 240 min)
+scoring on new signup        -> event workflow     event trigger from the upstream system's webhook or queue (tolerance 1 min)
+```
+
+**A schedule is not a dependency.** A cron job that runs at 03:00 and finds no input does not
+fail — it computes an empty result and writes a partition of zeros that looks real. The sensor
+(Airflow), dataset trigger (Airflow 2.4+), or asset materialization (Dagster) is what turns "it
+is 3 a.m." into "the data I need exists".
+
+```python
+def cron_vs_sensor(arrival_minutes, scheduled_at=180, sensor_timeout=360):
+    for arrival in arrival_minutes:
+        cron = "EMPTY OUTPUT (silently wrong)" if arrival > scheduled_at else "ok"
+        sensor = ("ok, started at data arrival" if arrival <= sensor_timeout
+                  else "FAILED loudly at the sensor timeout")
+        print(f"input arrives at {arrival:>3} min | cron@{scheduled_at}: {cron:28} "
+              f"| sensor: {sensor}")
+
+cron_vs_sensor([90, 200, 400])
+```
+
+```output
+input arrives at  90 min | cron@180: ok                           | sensor: ok, started at data arrival
+input arrives at 200 min | cron@180: EMPTY OUTPUT (silently wrong) | sensor: ok, started at data arrival
+input arrives at 400 min | cron@180: EMPTY OUTPUT (silently wrong) | sensor: FAILED loudly at the sensor timeout
+```
+
+## Retries, SLAs, and alerting on the right thing
+
+```python
+def task_policy(name, retries, delay_min, exponential, timeout_min, sla_min):
+    delays = [delay_min * (2 ** i if exponential else 1) for i in range(retries)]
+    worst = timeout_min * (retries + 1) + sum(delays)
+    print(f"{name:20} retries {retries} | delays {delays} min | "
+          f"worst case {worst:4} min | {'BREACHES' if worst > sla_min else 'fits'} the "
+          f"{sla_min}-min SLA")
+
+task_policy("extract_events", 3, 5, True, timeout_min=45, sla_min=240)
+task_policy("train", 1, 10, False, timeout_min=180, sla_min=240)
+task_policy("train (3 retries)", 3, 10, True, timeout_min=180, sla_min=240)
+```
+
+```output
+extract_events       retries 3 | delays [5, 10, 20] min | worst case  215 min | fits the 240-min SLA
+train                retries 1 | delays [10] min | worst case  370 min | BREACHES the 240-min SLA
+train (3 retries)    retries 3 | delays [10, 20, 40] min | worst case  790 min | BREACHES the 240-min SLA
+```
+
+Retrying a 3-hour training job three times cannot fit in a 4-hour SLA — the policy is
+arithmetic, not preference. Two more rules: **set a task timeout** (an orchestrator's default is
+often "forever", and a hung task holds a worker slot until someone notices), and **alert on the
+SLA, not on the failure**. A task that failed and succeeded on retry is not an incident; a
+pipeline that will not deliver by 08:00 is, and it is knowable long before the deadline.
+
+## Where n8n fits in an ML system
+
+```python
+flows = [
+    ("model promoted", "CI webhook -> n8n -> Slack + Jira ticket + update the model card",
+     "seconds, no state"),
+    ("drift alert", "monitor -> n8n -> page on-call, open an incident, link the dashboard",
+     "seconds, no state"),
+    ("human review", "low-confidence prediction -> n8n -> reviewer queue -> label back to store",
+     "minutes, waits on a human"),
+    ("retrain kickoff", "n8n receives the drift event -> triggers the Airflow DAG via its API",
+     "hands off to the orchestrator immediately"),
+]
+for name, chain, latency in flows:
+    print(f"{name:16} {chain}\n{'':16} ({latency})")
+```
+
+```output
+model promoted   CI webhook -> n8n -> Slack + Jira ticket + update the model card
+                 (seconds, no state)
+drift alert      monitor -> n8n -> page on-call, open an incident, link the dashboard
+                 (seconds, no state)
+human review     low-confidence prediction -> n8n -> reviewer queue -> label back to store
+                 (minutes, waits on a human)
+retrain kickoff  n8n receives the drift event -> triggers the Airflow DAG via its API
+                 (hands off to the orchestrator immediately)
+```
+
+The last pattern is the one that scales: **n8n decides, the orchestrator executes**. Event tools
+are excellent at "something happened, notify and route" and poor at "recompute 90 partitions with
+retries and lineage". Keep the long, stateful, partitioned work in the orchestrator and let the
+event layer be the nervous system that triggers it.
+
+## Try it Yourself
+
+```python
+def schedule_report(dag, start_hour, sla_hour, retry_overhead_min=0):
+    total, path = dag.critical_path()
+    total += retry_overhead_min
+    end = start_hour + total / 60
+    print(f"start {start_hour:02d}:00 | makespan {total:4} min | finish {end:05.2f}h | "
+          f"SLA {sla_hour:02d}:00 {'MET' if end <= sla_hour else 'MISSED'}")
+    print(f"   critical path: {' -> '.join(path)}")
+
+schedule_report(dag, start_hour=2, sla_hour=8)
+schedule_report(dag, start_hour=5, sla_hour=8)
+schedule_report(dag, start_hour=2, sla_hour=8, retry_overhead_min=120)
+
+faster = DAG()
+for name, minutes, after in [("extract_events", 40, ()), ("extract_crm", 12, ()),
+                             ("validate", 8, ("extract_events", "extract_crm")),
+                             ("build_features", 55, ("validate",)),
+                             ("materialize_online", 18, ("build_features",)),
+                             ("train", 45, ("build_features",)),          # halved
+                             ("evaluate_and_gate", 20, ("train",)),
+                             ("register", 3, ("evaluate_and_gate",))]:
+    faster.task(name, minutes, after)
+schedule_report(faster, start_hour=5, sla_hour=8)
+```
+
+```output
+start 02:00 | makespan  221 min | finish 05.68h | SLA 08:00 MET
+   critical path: extract_events -> validate -> build_features -> train -> evaluate_and_gate -> register
+start 05:00 | makespan  221 min | finish 08.68h | SLA 08:00 MISSED
+   critical path: extract_events -> validate -> build_features -> train -> evaluate_and_gate -> register
+start 02:00 | makespan  341 min | finish 07.68h | SLA 08:00 MET
+   critical path: extract_events -> validate -> build_features -> train -> evaluate_and_gate -> register
+start 05:00 | makespan  171 min | finish 07.85h | SLA 08:00 MET
+   critical path: extract_events -> validate -> build_features -> train -> evaluate_and_gate -> register
+```
+
+Halving `train` — the longest task on the critical path — is what moves the finish time. Halve
+`extract_crm` instead and nothing changes at all. Before optimizing a pipeline, compute the
+critical path; before adding retries, check they fit inside the SLA.
+
+## Exercise
+
+Build a small orchestrator that runs a DAG over date partitions with: per-task retries with
+exponential backoff, a per-task timeout, a concurrency pool shared across tasks, sensors that
+wait for upstream data, and an SLA check that alerts when the run will miss its deadline. Then
+simulate seven days in which one upstream is late on day 3, one task fails twice before
+succeeding on day 5, and the pool is saturated on day 6 — and report what a correct orchestrator
+does on each day.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def run_day(day, dag, upstream_ready_min, failures, pool_free, sla_min=360,
+            max_retries=2, base_delay=5, pool_needed=2):
+    log, clock = [], 0
+
+    # 1. sensor: wait for data, do not compute on nothing
+    if upstream_ready_min is None:
+        log.append("SENSOR TIMEOUT: upstream never arrived -> task marked failed, "
+                   "no partition written, alert raised")
+        return log, None
+    if upstream_ready_min > 0:
+        clock += upstream_ready_min
+        log.append(f"sensor waited {upstream_ready_min} min for the upstream partition")
+
+    # 2. concurrency pool: queue rather than overwhelm the source
+    if pool_free < pool_needed:
+        wait = 30
+        clock += wait
+        log.append(f"pool has {pool_free}/{pool_needed} slots -> queued {wait} min")
+
+    # 3. run the DAG, retrying failures with exponential backoff
+    makespan, path = dag.critical_path()
+    for task, n_fail in failures.items():
+        for attempt in range(min(n_fail, max_retries + 1)):
+            delay = base_delay * (2 ** attempt)
+            clock += dag.dur[task] + delay
+            log.append(f"{task} attempt {attempt + 1} failed -> retry in {delay} min")
+        if n_fail > max_retries:
+            log.append(f"{task} exhausted {max_retries} retries -> RUN FAILED, page the owner")
+            return log, None
+        log.append(f"{task} succeeded on attempt {min(n_fail, max_retries) + 1}")
+    clock += makespan
+
+    # 4. SLA check
+    verdict = "within SLA" if clock <= sla_min else f"SLA BREACH by {clock - sla_min} min"
+    log.append(f"finished in {clock} min ({verdict}) -> partition written")
+    return log, clock
+
+schedule = [
+    ("2026-05-01", 0,    {},                 4),
+    ("2026-05-02", 0,    {},                 4),
+    ("2026-05-03", 150,  {},                 4),      # upstream late
+    ("2026-05-04", 0,    {},                 4),
+    ("2026-05-05", 0,    {"build_features": 2}, 4),   # two failures, then success
+    ("2026-05-06", 0,    {},                 1),      # pool saturated
+    ("2026-05-07", None, {},                 4),      # upstream never arrives
+]
+
+for day, ready, failures, pool in schedule:
+    log, clock = run_day(day, dag, ready, failures, pool)
+    print(f"{day}: " + f"\n{'':12}".join(log))
+```
+
+```output
+2026-05-01: finished in 221 min (within SLA) -> partition written
+2026-05-02: finished in 221 min (within SLA) -> partition written
+2026-05-03: sensor waited 150 min for the upstream partition
+            finished in 371 min (SLA BREACH by 11 min) -> partition written
+2026-05-04: finished in 221 min (within SLA) -> partition written
+2026-05-05: build_features attempt 1 failed -> retry in 5 min
+            build_features attempt 2 failed -> retry in 10 min
+            build_features succeeded on attempt 3
+            finished in 346 min (within SLA) -> partition written
+2026-05-06: pool has 1/2 slots -> queued 30 min
+            finished in 251 min (within SLA) -> partition written
+2026-05-07: SENSOR TIMEOUT: upstream never arrived -> task marked failed, no partition written, alert raised
+```
+
+The insight: every branch above is a *decision the orchestrator makes for you*, and each one is a
+place teams accidentally do the wrong thing. The sensor converts "no data" into a failed task
+instead of an empty partition — the difference between one alert and a week of silently wrong
+features (ch. 4's data validation is the second line of defence for exactly this). The retry
+policy is bounded and its worst case is checked against the SLA, so a flaky task does not turn
+into an unbounded run. The pool limit means a backfill cannot take down the source system it
+reads from. And the SLA check fires on the *prediction* that the run will be late, not on the
+eventual failure, which is what lets someone act while there is still time. Note what is
+deliberately absent: none of this cares whether the day's work is one file or four hundred
+million rows — partitioned, idempotent tasks make both the same problem, and that is the property
+worth protecting when someone proposes a "quick script" that appends to a table.
+</details>
