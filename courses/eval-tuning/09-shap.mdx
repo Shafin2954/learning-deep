@@ -1,0 +1,436 @@
+---
+course: eval-tuning
+chapter: 09-shap
+title: "SHAP: Theory and Reading the Plots"
+order: 9
+---
+
+## The question SHAP answers
+
+Permutation importance (ch. 8) tells you what a model relies on *overall*. SHAP answers a
+narrower, harder question: **for this one prediction, how much did each feature contribute, and
+in which direction?** The answer has to add up — that constraint is what makes it useful.
+
+```python
+import numpy as np
+import pandas as pd
+import itertools, math
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 3_000
+age = rng.integers(20, 70, n)
+income = rng.normal(60, 20, n).round(1)
+debt = rng.uniform(0, 1, n).round(3)                      # debt-to-income ratio
+late = rng.poisson(0.6, n)
+logit = -3 + 0.05 * (age - 45) - 0.03 * (income - 60) + 2.5 * debt + 0.8 * late
+y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)   # loan default
+
+df = pd.DataFrame({"age": age, "income": income, "debt": debt, "late_payments": late})
+Xtr, Xte, ytr, yte = train_test_split(df, y, test_size=0.3, random_state=0)
+model = RandomForestClassifier(n_estimators=200, min_samples_leaf=10,
+                               random_state=0).fit(Xtr, ytr)
+background = Xtr.sample(100, random_state=0)
+base_rate = float(model.predict_proba(background)[:, 1].mean())
+row = Xte.iloc[0]
+pred = float(model.predict_proba(Xte.iloc[[0]])[:, 1][0])
+print(f"average predicted default on the background: {base_rate:.4f}")
+print("this applicant: " + ", ".join(f"{c}={row[c]:g}" for c in df.columns))
+print(f"predicted default: {pred:.4f}  (to explain: {pred - base_rate:+.4f})")
+```
+
+```output
+average predicted default on the background: 0.2621
+this applicant: age=55, income=66.7, debt=0.073, late_payments=1
+predicted default: 0.1074  (to explain: -0.1547)
+```
+
+The number to decompose is $-0.155$: this applicant is that much safer than average, and SHAP
+splits it across the four features.
+
+## Shapley values, from the game
+
+Treat the features as players in a cooperative game whose payoff is the model's output. Define the
+value of a coalition $S$ as the prediction when only those features are set to the applicant's
+values and the rest are drawn from the background:
+
+$$
+v(S) = \mathbb{E}_{X_{-S}}\!\left[\,f(x_S, X_{-S})\,\right], \qquad v(\varnothing) = \mathbb{E}[f(X)]
+$$
+
+The Shapley value of feature $j$ is its average marginal contribution over every ordering in which
+the coalition could have formed:
+
+$$
+\phi_j = \sum_{S \subseteq F \setminus \{j\}}
+\frac{|S|!\,(|F| - |S| - 1)!}{|F|!}\,\bigl[v(S \cup \{j\}) - v(S)\bigr]
+$$
+
+This is the *unique* attribution satisfying four axioms: **efficiency** (the parts sum to the
+whole), **symmetry** (equal contributions get equal credit), **dummy** (a feature that never
+changes $v$ gets zero), and **additivity** (attributions of a sum of models add). Everything else
+in this chapter is an approximation to this formula.
+
+```python
+def v(S, x):
+    """Value of a coalition: fix the features in S to x, average out the rest."""
+    Z = background.copy()
+    for c in S:
+        Z[c] = x[c]
+    return float(model.predict_proba(Z)[:, 1].mean())
+
+def exact_shapley(x, cols):
+    k = len(cols)
+    phi = {}
+    for c in cols:
+        rest = [q for q in cols if q != c]
+        total = 0.0
+        for r in range(len(rest) + 1):
+            w = math.factorial(r) * math.factorial(k - r - 1) / math.factorial(k)
+            for S in itertools.combinations(rest, r):
+                total += w * (v(list(S) + [c], x) - v(list(S), x))
+        phi[c] = total
+    return phi
+
+phi = exact_shapley(row, list(df.columns))
+for c, val in sorted(phi.items(), key=lambda kv: -abs(kv[1])):
+    print(f"{c:14} {val:+.4f}   {row[c]}")
+print(f"\nbase {base_rate:.4f} + sum(phi) {sum(phi.values()):+.4f} = {base_rate + sum(phi.values()):.4f}")
+print(f"model prediction                          = {pred:.4f}")
+```
+
+```output
+debt           -0.1782   0.073
+late_payments  +0.0238   1.0
+income         -0.0224   66.7
+age            +0.0221   55.0
+
+base 0.2621 + sum(phi) -0.1547 = 0.1074
+model prediction                          = 0.1074
+```
+
+That last pair of lines is the **efficiency axiom**, checked numerically. Any explanation method
+whose parts do not sum to the prediction is telling you a story, not decomposing a number.
+
+The cost is $2^k$ coalitions — fine for 4 features, impossible for 40. That is the entire reason
+KernelSHAP (sampled coalitions fitted with a weighted linear regression) and TreeSHAP (an exact
+$O(TLD^2)$ algorithm that exploits tree structure) exist.
+
+## TreeSHAP gives the same answer in milliseconds
+
+```python
+import shap, contextlib, io
+
+explainer = shap.TreeExplainer(model, data=background, model_output="probability")
+
+def shap_pos(X, ex=None):
+    """SHAP values for the positive class. The redirect hides SHAP's progress bar."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        return (ex or explainer)(X).values[:, :, 1]
+
+sv = explainer(Xte.iloc[:1])
+tree_phi = dict(zip(df.columns, sv.values[0][:, 1]))
+print(f"{'feature':14} {'brute force':>12} {'TreeSHAP':>10}")
+for c in df.columns:
+    print(f"{c:14} {phi[c]:>+12.4f} {tree_phi[c]:>+10.4f}")
+print(f"\nTreeSHAP base value: {float(np.array(explainer.expected_value)[1]):.4f}")
+```
+
+```output
+feature         brute force   TreeSHAP
+age                 +0.0221    +0.0220
+income              -0.0224    -0.0224
+debt                -0.1782    -0.1781
+late_payments       +0.0238    +0.0238
+
+TreeSHAP base value: 0.2621
+```
+
+Identical to four decimals, at a fraction of the cost. Two arguments matter and people skip both:
+`data=background` selects the **interventional** value function — the $v(S)$ defined above — and
+`model_output="probability"` gives contributions in probability units instead of log-odds. Without
+`data`, TreeSHAP uses the faster *tree-path-dependent* estimate, which conditions on the tree
+structure rather than intervening, and gives different (not wrong, but differently defined)
+numbers.
+
+## Reading a local explanation
+
+A waterfall plot is this table drawn as arrows from the base value to the prediction. The numbers
+are what matter:
+
+```python
+def waterfall(base, contributions, prediction, x):
+    print(f"{'base value':22} {base:>8.4f}")
+    running = base
+    for c, val in sorted(contributions.items(), key=lambda kv: -abs(kv[1])):
+        running += val
+        bar = ("+" if val > 0 else "-") * max(1, int(round(abs(val) * 60)))
+        print(f"{c + ' = ' + str(x[c]):22} {val:>+8.4f}  {bar:<20} -> {running:.4f}")
+    print(f"{'prediction':22} {prediction:>8.4f}")
+
+waterfall(base_rate, tree_phi, pred, row)
+```
+
+```output
+base value               0.2621
+debt = 0.073            -0.1781  -----------          -> 0.0840
+late_payments = 1.0     +0.0238  +                    -> 0.1078
+income = 66.7           -0.0224  -                    -> 0.0854
+age = 55.0              +0.0220  +                    -> 0.1074
+prediction               0.1074
+```
+
+Read it as a sentence: *this applicant's default risk is 15 points below average almost entirely
+because their debt ratio is 0.073; being 55 and having one late payment push the risk back up, and
+an above-average income pulls it down again, but those three nearly cancel.* That is the shape of
+a defensible answer to "why did the model score me this way?" — and note it is a statement about
+**the model**, not about the world. A feature can earn a large SHAP value because the model leans
+on it as a proxy for something it cannot see.
+
+## Global SHAP is an aggregation, and the aggregation matters
+
+```python
+vals = shap_pos(Xte.iloc[:300])                            # (rows, features) for class 1
+summary = pd.DataFrame({
+    "mean_abs": np.abs(vals).mean(axis=0),                 # the bar chart people show
+    "mean_signed": vals.mean(axis=0),                      # near zero if effects cancel
+    "max_abs": np.abs(vals).max(axis=0),                   # how big can this get for one person?
+}, index=df.columns).sort_values("mean_abs", ascending=False)
+print(summary.round(4).to_string())
+```
+
+```output
+               mean_abs  mean_signed  max_abs
+debt             0.1110      -0.0007   0.2467
+age              0.0894       0.0098   0.2370
+income           0.0768       0.0138   0.2180
+late_payments    0.0689      -0.0010   0.2901
+```
+
+`mean_abs` is the standard "SHAP importance" bar chart. `mean_signed` is near zero for every
+feature — an effect that pushes some rows up and others down averages out, which is why the bar
+chart drops the sign. `max_abs` is the one people never plot and often need: a feature with modest
+average impact can still be the deciding factor for a specific applicant.
+
+### The dependence plot, as numbers
+
+A dependence plot puts the feature value on the x-axis and its SHAP value on the y-axis. Binning
+gives you the same information in text:
+
+```python
+bins = pd.qcut(Xte.iloc[:300]["debt"], 5)
+tab = pd.DataFrame({"debt_bin": bins.astype(str),
+                    "shap_debt": vals[:, list(df.columns).index("debt")]})
+print(tab.groupby("debt_bin", observed=True)["shap_debt"].agg(["mean", "std", "count"]).round(4).to_string())
+```
+
+```output
+                   mean     std  count
+debt_bin                              
+(-0.001, 0.182] -0.1321  0.0339     60
+(0.182, 0.386]  -0.1173  0.0364     60
+(0.386, 0.609]  -0.0130  0.0550     60
+(0.609, 0.791]   0.0916  0.0364     60
+(0.791, 0.999]   0.1674  0.0408     60
+```
+
+Monotone increasing, as the data-generating process says it should be. A dependence plot that is
+*not* monotone where you expect it to be is the fastest way to catch a model that learned a
+spurious kink — and the vertical spread within a bin (the `std` column) is interaction: the same
+debt ratio contributes differently depending on the other features.
+
+```python
+i_debt, i_late = list(df.columns).index("debt"), list(df.columns).index("late_payments")
+sub = pd.DataFrame({"debt": Xte.iloc[:300]["debt"].values,
+                    "late": Xte.iloc[:300]["late_payments"].values,
+                    "shap_debt": vals[:, i_debt]})
+sub["debt_half"] = np.where(sub["debt"] > 0.5, "high debt", "low debt")
+sub["late_any"] = np.where(sub["late"] > 0, "has late pmts", "no late pmts")
+print(sub.pivot_table(index="debt_half", columns="late_any",
+                      values="shap_debt", aggfunc="mean").round(4).to_string())
+```
+
+```output
+late_any   has late pmts  no late pmts
+debt_half                             
+high debt         0.1227        0.1007
+low debt         -0.1168       -0.1053
+```
+
+The contribution of `debt` depends on `late_payments` — that cell-to-cell variation *is* the
+interaction, and it is what the vertical spread in a dependence plot is showing you.
+
+## Where SHAP misleads
+
+```python
+df_c = df.copy()
+df_c["debt_pct"] = (df_c["debt"] * 100).round(1) + rng.normal(0, 0.5, n)   # same thing, rescaled
+Xc_tr, Xc_te, yc_tr, yc_te = train_test_split(df_c, y, test_size=0.3, random_state=0)
+mc = RandomForestClassifier(n_estimators=200, min_samples_leaf=10,
+                            random_state=0).fit(Xc_tr, yc_tr)
+bg_c = Xc_tr.sample(100, random_state=0)
+ex_c = shap.TreeExplainer(mc, data=bg_c, model_output="probability")
+vals_c = shap_pos(Xc_te.iloc[:300], ex_c)
+before = np.abs(vals).mean(axis=0)[list(df.columns).index("debt")]
+after = pd.Series(np.abs(vals_c).mean(axis=0), index=df_c.columns)
+print(f"mean|SHAP| of debt, alone      : {before:.4f}")
+print(f"mean|SHAP| of debt, with a twin: {after['debt']:.4f}")
+print(f"mean|SHAP| of the twin         : {after['debt_pct']:.4f}")
+print(f"the pair together              : {after['debt'] + after['debt_pct']:.4f}")
+```
+
+```output
+mean|SHAP| of debt, alone      : 0.1110
+mean|SHAP| of debt, with a twin: 0.0505
+mean|SHAP| of the twin         : 0.0643
+the pair together              : 0.1148
+```
+
+Shapley values split credit between correlated features exactly as permutation importance did
+(ch. 8) — the symmetry axiom *requires* it, since two columns carrying the same information have
+the same marginal contributions. The pair's total (0.1148) recovers the original single column's
+0.1110, but each half alone now ranks below `age`, so a bar chart sorted by mean-|SHAP| would tell
+you debt is the fourth most important feature in a model where it is the first.
+
+Three more traps worth naming:
+
+- **Off-manifold evaluation.** The interventional $v(S)$ builds rows like *this applicant's debt
+  with a random stranger's income* — combinations that may not exist in reality. The model is
+  being asked about points it never saw.
+- **Log-odds versus probability.** `model_output="raw"` gives additive contributions in log-odds,
+  which are cleaner mathematically but not what a stakeholder means by "how much".
+- **SHAP is not causal.** It attributes the *model's* output, not the effect of changing the
+  feature in the world. Lowering someone's recorded debt does not lower their true risk.
+
+## Try it Yourself
+
+```python
+def explain(i, top=3):
+    x = Xte.iloc[i]
+    contributions = dict(zip(df.columns, explainer(Xte.iloc[[i]]).values[0][:, 1]))
+    p = float(model.predict_proba(Xte.iloc[[i]])[:, 1][0])
+    order = sorted(contributions.items(), key=lambda kv: -abs(kv[1]))[:top]
+    reasons = ", ".join(f"{c}={x[c]} ({val:+.3f})" for c, val in order)
+    print(f"row {i}: risk {p:.3f} vs base {base_rate:.3f} | top {top}: {reasons}")
+
+riskiest = int(np.argmax(model.predict_proba(Xte)[:, 1]))
+safest = int(np.argmin(model.predict_proba(Xte)[:, 1]))
+for i in (riskiest, safest, 3, 7):
+    explain(i)
+```
+
+```output
+row 620: risk 0.933 vs base 0.262 | top 3: late_payments=2.0 (+0.226), age=60.0 (+0.192), debt=0.966 (+0.143)
+row 574: risk 0.000 vs base 0.262 | top 3: debt=0.08 (-0.107), income=77.3 (-0.060), age=40.0 (-0.054)
+row 3: risk 0.116 vs base 0.262 | top 3: debt=0.218 (-0.178), age=34.0 (-0.098), income=35.3 (+0.094)
+row 7: risk 0.233 vs base 0.262 | top 3: age=62.0 (+0.130), income=93.0 (-0.114), debt=0.296 (-0.091)
+```
+
+The same feature appears with opposite signs for different people — that is the whole point of a
+local explanation. Change `top` to 4 and the contributions will sum exactly to the gap between the
+risk and the base value; with `top=3` they do not, which is the honest cost of a short answer.
+
+## Exercise
+
+Adverse-action notices ("we declined you because…") have to be truthful, stable, and short. Build
+a reason-code generator: for the highest-risk applicants, produce the top-3 positive contributors
+with human-readable text, verify that the full attribution reconciles to the prediction, and
+measure how much of the explained gap the top-3 actually covers. Then check the global ranking
+from SHAP against permutation importance and explain any disagreement.
+
+<details>
+<summary>Solution</summary>
+
+```python
+READABLE = {"age": "age", "income": "annual income", "debt": "debt-to-income ratio",
+            "late_payments": "recent late payments"}
+
+def reason_codes(i, k=3):
+    contrib = dict(zip(df.columns, explainer(Xte.iloc[[i]]).values[0][:, 1]))
+    p = float(model.predict_proba(Xte.iloc[[i]])[:, 1][0])
+    gap = p - base_rate
+    pushing_up = {c: v for c, v in contrib.items() if v > 0}
+    top = sorted(pushing_up.items(), key=lambda kv: -kv[1])[:k]
+    covered = sum(v for _, v in top) / sum(abs(v) for v in contrib.values())
+    lines = [f"  - {READABLE[c]} = {Xte.iloc[i][c]:g} ({v:+.3f})" for c, v in top]
+    residual = base_rate + sum(contrib.values()) - p
+    return p, gap, covered, lines, residual
+
+risk = model.predict_proba(Xte)[:, 1]
+for i in np.argsort(-risk)[:3]:
+    p, gap, covered, lines, residual = reason_codes(int(i))
+    print(f"applicant {int(i)}: risk {p:.3f} ({gap:+.3f} vs base), "
+          f"reconciliation residual {residual:.1e}")
+    print("\n".join(lines))
+    print(f"  top-3 covers {covered:.0%} of the total attribution magnitude\n")
+
+shap_rank = pd.Series(np.abs(vals).mean(axis=0), index=df.columns).sort_values(ascending=False)
+
+def permutation_importance(model, X, y, repeats=10, seed=0):
+    from sklearn.metrics import roc_auc_score
+    base = roc_auc_score(y, model.predict_proba(X)[:, 1])
+    r = np.random.default_rng(seed)
+    out = {}
+    for col in X.columns:
+        drops = []
+        for _ in range(repeats):
+            Xp = X.copy()
+            Xp[col] = r.permutation(Xp[col].values)
+            drops.append(base - roc_auc_score(y, model.predict_proba(Xp)[:, 1]))
+        out[col] = float(np.mean(drops))
+    return pd.Series(out).sort_values(ascending=False)
+
+perm_rank = permutation_importance(model, Xte, yte)
+comparison = pd.DataFrame({"mean_abs_shap": shap_rank, "permutation_auc_drop": perm_rank})
+comparison["shap_rank"] = comparison["mean_abs_shap"].rank(ascending=False).astype(int)
+comparison["perm_rank"] = comparison["permutation_auc_drop"].rank(ascending=False).astype(int)
+print(comparison.round(4).to_string())
+```
+
+```output
+applicant 620: risk 0.933 (+0.671 vs base), reconciliation residual 5.1e-06
+  - recent late payments = 2 (+0.226)
+  - age = 60 (+0.192)
+  - debt-to-income ratio = 0.966 (+0.143)
+  top-3 covers 84% of the total attribution magnitude
+
+applicant 44: risk 0.929 (+0.667 vs base), reconciliation residual 5.1e-06
+  - recent late payments = 2 (+0.224)
+  - age = 63 (+0.182)
+  - debt-to-income ratio = 0.872 (+0.156)
+  top-3 covers 84% of the total attribution magnitude
+
+applicant 571: risk 0.925 (+0.663 vs base), reconciliation residual 5.1e-06
+  - debt-to-income ratio = 0.898 (+0.202)
+  - recent late payments = 2 (+0.189)
+  - age = 66 (+0.183)
+  top-3 covers 87% of the total attribution magnitude
+
+               mean_abs_shap  permutation_auc_drop  shap_rank  perm_rank
+debt                  0.1110                0.0989          1          1
+age                   0.0894                0.0763          2          2
+income                0.0768                0.0592          3          3
+late_payments         0.0689                0.0530          4          4
+```
+
+Here the two rankings agree exactly — same order, same top feature — which is the common case on
+clean tabular data with a well-fitted model. Do not treat the agreement as guaranteed, because
+**they measure different things.** Mean-|SHAP| measures how much a feature moves the model's
+*output*; permutation importance measures how much the model's *accuracy* depends on it. A feature
+that swings predictions in both directions but never changes which side of the threshold they land
+on looks important to SHAP and unimportant to permutation; a feature that only matters for a
+handful of rows near the boundary can do the reverse. When they disagree, that gap is the finding
+— pick the one matching your question: output attribution for an explanation, accuracy dependence
+for a keep-or-drop decision.
+
+On the reason codes themselves: reconciliation is the check that keeps you honest — if
+`base + sum(contributions)` does not equal the prediction, the explanation is not an explanation.
+The residual here is 5e-06, floating-point accumulation across 200 trees rather than a modelling
+error; set the tolerance at that scale, not at exact equality, or the check will cry wolf.
+The coverage number is the disclosure you owe the reader: three reasons out of four features
+account for most but not all of the attribution, and a notice that says "the top three reasons
+were…" is truthful in a way that "the reasons were…" is not. In a regulated setting you would also
+pin the background sample and the model version alongside the explanation, because the same
+applicant scored against a different background gets different — equally valid — numbers.
+</details>
