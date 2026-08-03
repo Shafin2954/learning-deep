@@ -1,0 +1,403 @@
+---
+course: eval-tuning
+chapter: 08-feature-importance
+title: "Feature Importance: Permutation, Gain, Drop-Column"
+order: 8
+---
+
+## Three questions people confuse
+
+"Which features matter?" is three different questions with three different answers:
+
+1. **What did this model use?** — gain/impurity importance, a property of the fitted trees.
+2. **What does this model need?** — permutation importance, measured on held-out data.
+3. **What would I lose by not collecting this?** — drop-column importance, which requires refitting.
+
+Only the third is about the *data*; the first two are about a particular fitted model.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(0)
+n = 4_000
+signal = rng.normal(0, 1, n)
+df = pd.DataFrame({
+    "useful_cont": signal + rng.normal(0, 0.5, n),          # real, continuous
+    "useful_bin": (signal > 0).astype(int),                 # real, but only 2 levels
+    "noise_cont": rng.normal(0, 1, n),                      # pure noise, continuous
+    "noise_id": rng.integers(0, n, n),                      # pure noise, high cardinality
+})
+y = (signal + rng.normal(0, 0.8, n) > 0).astype(int)
+Xtr, Xte, ytr, yte = train_test_split(df, y, test_size=0.3, random_state=0)
+rf = RandomForestClassifier(n_estimators=200, min_samples_leaf=5,
+                            random_state=0).fit(Xtr, ytr)
+print(f"test AUC {roc_auc_score(yte, rf.predict_proba(Xte)[:, 1]):.4f}")
+print(f"columns: {list(df.columns)}")
+```
+
+```output
+test AUC 0.8559
+columns: ['useful_cont', 'useful_bin', 'noise_cont', 'noise_id']
+```
+
+Two of those four columns are noise by construction. Watch what each importance method says about
+them.
+
+## Gain (impurity) importance is biased by cardinality
+
+A tree's built-in importance sums the impurity decrease at every split on a feature, weighted by
+the samples reaching it. A feature with many distinct values offers many candidate split points,
+so it wins splits by chance alone — especially deep in the tree where few samples remain.
+
+```python
+gain = pd.Series(rf.feature_importances_, index=df.columns).sort_values(ascending=False)
+for name, v in gain.items():
+    print(f"{name:12} {v:.4f}  {'#' * int(round(v * 60))}")
+```
+
+```output
+useful_cont  0.3838  #######################
+useful_bin   0.3346  ####################
+noise_id     0.1424  #########
+noise_cont   0.1392  ########
+```
+
+Two columns that contain nothing at all take 28% of the importance mass, and the high-cardinality
+one edges ahead of the continuous one. The effect grows with tree depth, because deep nodes hold
+few samples and a feature with thousands of candidate split points can always find one that looks
+good on those samples:
+
+```python
+deep = RandomForestClassifier(n_estimators=200, min_samples_leaf=1,
+                              random_state=0).fit(Xtr, ytr)
+for name, v in pd.Series(deep.feature_importances_, index=df.columns).items():
+    print(f"{name:12} {v:.4f}")
+```
+
+```output
+useful_cont  0.3670
+useful_bin   0.2160
+noise_cont   0.2073
+noise_id     0.2097
+```
+
+Fully grown, the two noise columns draw level with `useful_bin`, a genuinely predictive feature —
+42% of the reported importance goes to columns with no relationship to the target. This is the
+documented cardinality bias of mean-decrease-in-impurity, and it is why `feature_importances_`
+should never be the last word. Gain importance is also computed on the **training** data, so it
+cannot distinguish "this feature helped the model fit" from "this feature helped it generalize".
+
+## Permutation importance asks the model to do without
+
+Shuffle one column in the *held-out* set, breaking its relationship with the target while keeping
+its marginal distribution, and measure how far the score falls:
+
+$$
+I_j = s(\hat{f}, X, y) - \frac{1}{R}\sum_{r=1}^{R} s\!\left(\hat{f}, X^{(j,r)}_{\text{perm}}, y\right)
+$$
+
+where $X^{(j,r)}_{\text{perm}}$ is the data with column $j$ shuffled. No refitting — the same
+fitted model is scored on corrupted inputs.
+
+```python
+def permutation_importance(model, X, y, metric=roc_auc_score, repeats=10, seed=0):
+    base = metric(y, model.predict_proba(X)[:, 1])
+    r = np.random.default_rng(seed)
+    out = {}
+    for col in X.columns:
+        drops = []
+        for _ in range(repeats):
+            Xp = X.copy()
+            Xp[col] = r.permutation(Xp[col].values)
+            drops.append(base - metric(y, model.predict_proba(Xp)[:, 1]))
+        out[col] = (float(np.mean(drops)), float(np.std(drops)))
+    return base, out
+
+base, perm = permutation_importance(rf, Xte, yte)
+print(f"baseline AUC {base:.4f}")
+for col, (m, s) in sorted(perm.items(), key=lambda kv: -kv[1][0]):
+    print(f"{col:12} drop {m:+.4f} +- {s:.4f}")
+```
+
+```output
+baseline AUC 0.8559
+useful_bin   drop +0.1541 +- 0.0092
+useful_cont  drop +0.1041 +- 0.0097
+noise_cont   drop +0.0036 +- 0.0023
+noise_id     drop +0.0022 +- 0.0023
+```
+
+Now the ordering is right: the two real features carry the model, and the two noise columns cost
+nothing to destroy. Read the standard deviations too — an importance smaller than its own spread
+is indistinguishable from zero.
+
+### Train-set permutation importance detects memorisation
+
+```python
+_, perm_tr = permutation_importance(rf, Xtr, ytr)
+print(f"{'feature':12} {'test':>10} {'train':>10}")
+for col in df.columns:
+    print(f"{col:12} {perm[col][0]:>+10.4f} {perm_tr[col][0]:>+10.4f}")
+```
+
+```output
+feature            test      train
+useful_cont     +0.1041    +0.1908
+useful_bin      +0.1541    +0.1807
+noise_cont      +0.0036    +0.0657
+noise_id        +0.0022    +0.0691
+```
+
+`noise_id` is worth nothing on the test set but visibly non-zero on the training set: the forest
+memorised individual rows through it. A feature that is important on train and worthless on test
+is a leak or an overfitting handle — that gap is a diagnostic, not a nuisance.
+
+## Correlated features split the credit
+
+Permutation importance answers "what happens if this column becomes noise *while the others stay
+intact*". If two columns carry the same information, neither is needed.
+
+```python
+df2 = df.copy()
+df2["useful_copy"] = df2["useful_cont"] + rng.normal(0, 0.05, n)   # near-duplicate
+X2tr, X2te, y2tr, y2te = train_test_split(df2, y, test_size=0.3, random_state=0)
+rf2 = RandomForestClassifier(n_estimators=200, min_samples_leaf=5,
+                             random_state=0).fit(X2tr, y2tr)
+_, perm2 = permutation_importance(rf2, X2te, y2te)
+print(f"{'feature':12} {'alone':>9} {'with a twin':>13}")
+for col in df.columns:
+    twin = perm2[col][0]
+    print(f"{col:12} {perm[col][0]:>+9.4f} {twin:>+13.4f}")
+print(f"{'useful_copy':12} {'-':>9} {perm2['useful_copy'][0]:>+13.4f}")
+```
+
+```output
+feature          alone   with a twin
+useful_cont    +0.1041       +0.0266
+useful_bin     +0.1541       +0.1126
+noise_cont     +0.0036       +0.0026
+noise_id       +0.0022       +0.0016
+useful_copy          -       +0.0198
+```
+
+Adding a near-duplicate cuts the measured importance of `useful_cont` from 0.1041 to 0.0266, and
+the copy only picks up 0.0198 — the pair together is now worth less than half what the single
+column was worth, because destroying either one leaves the model the other. Nothing about the
+data changed; one column was added. **Never drop features by ranking permutation importance when
+the candidates are correlated** — you can delete both halves of a pair that is jointly essential,
+and each deletion looks harmless right up until you make the second one.
+
+### Grouped permutation fixes it
+
+Permute correlated columns *together* and the group's true importance reappears.
+
+```python
+def group_importance(model, X, y, groups, repeats=10, seed=0):
+    base = roc_auc_score(y, model.predict_proba(X)[:, 1])
+    r = np.random.default_rng(seed)
+    out = {}
+    for name, cols in groups.items():
+        drops = []
+        for _ in range(repeats):
+            Xp = X.copy()
+            idx = r.permutation(len(Xp))
+            for c in cols:                       # one shared shuffle keeps them aligned
+                Xp[c] = Xp[c].values[idx]
+            drops.append(base - roc_auc_score(y, model.predict_proba(Xp)[:, 1]))
+        out[name] = float(np.mean(drops))
+    return out
+
+groups = {"signal_block": ["useful_cont", "useful_copy"],
+          "binary": ["useful_bin"],
+          "noise_block": ["noise_cont", "noise_id"]}
+for name, v in sorted(group_importance(rf2, X2te, y2te, groups).items(), key=lambda kv: -kv[1]):
+    print(f"{name:14} {v:+.4f}")
+```
+
+```output
+signal_block   +0.1420
+binary         +0.1126
+noise_block    +0.0050
+```
+
+## Drop-column importance is the honest, expensive one
+
+Refit the model without the column and compare. This answers the business question — *should we
+keep collecting this?* — and it is the only one that lets the model compensate by leaning on
+whatever remains.
+
+```python
+def drop_column_importance(X, y, Xv, yv, seed=0):
+    def fit_score(cols):
+        m = RandomForestClassifier(n_estimators=200, min_samples_leaf=5,
+                                   random_state=seed).fit(X[cols], y)
+        return roc_auc_score(yv, m.predict_proba(Xv[cols])[:, 1])
+    full = fit_score(list(X.columns))
+    return full, {c: full - fit_score([k for k in X.columns if k != c]) for c in X.columns}
+
+full, drops = drop_column_importance(X2tr, y2tr, X2te, y2te)
+print(f"all columns AUC {full:.4f}")
+for col, v in sorted(drops.items(), key=lambda kv: -kv[1]):
+    print(f"without {col:12} costs {v:+.4f}")
+```
+
+```output
+all columns AUC 0.8566
+without useful_bin   costs +0.0348
+without noise_cont   costs +0.0068
+without noise_id     costs +0.0042
+without useful_copy  costs +0.0006
+without useful_cont  costs -0.0014
+```
+
+Only one column is genuinely load-bearing: without `useful_bin` the model loses 3.5 points.
+Compare with the permutation table, where `useful_cont` and `useful_copy` measured +0.0266 and
++0.0198 — under refitting they cost +0.0006 and **-0.0014**, because whichever one you remove, the
+refitted model leans on its twin. Read the small numbers as noise, in both directions: dropping
+`noise_cont` appears to cost 0.0068 and dropping `useful_cont` appears to *help* by 0.0014, and
+neither is real. Both are the sampling noise of one train/test split (ch. 5), which is why a
+drop-column table on a small validation set needs repeated splits before you act on it.
+
+The cost is $k+1$ refits. Use it on a shortlist, not on a thousand columns.
+
+## Which to use when
+
+| Question | Method | Cost | Main trap |
+|----------|--------|------|-----------|
+| What did the trees split on? | gain / impurity | free | cardinality bias, train-only |
+| What does this fitted model rely on? | permutation on test | $k \times R$ scorings | splits credit across correlated columns |
+| Do we still need to collect this? | drop-column | $k+1$ refits | slow; single-split noise |
+| Which *block* of features matters? | grouped permutation | cheap | you must define the groups |
+
+## Try it Yourself
+
+```python
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+logit = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1_000)).fit(X2tr, y2tr)
+_, perm_lr = permutation_importance(logit, X2te, y2te)
+coefs = pd.Series(logit[-1].coef_[0], index=X2tr.columns)
+
+print(f"{'feature':12} {'RF perm':>9} {'LR perm':>9} {'LR coef':>9}")
+for col in X2tr.columns:
+    print(f"{col:12} {perm2[col][0]:>+9.4f} {perm_lr[col][0]:>+9.4f} {coefs[col]:>+9.3f}")
+```
+
+```output
+feature        RF perm   LR perm   LR coef
+useful_cont    +0.0266   +0.1238    +0.936
+useful_bin     +0.1126   +0.0762    +0.626
+noise_cont     +0.0026   +0.0003    +0.061
+noise_id       +0.0016   -0.0003    +0.060
+useful_copy    +0.0198   +0.0018    +0.170
+```
+
+Two models, same data, different stories. The forest spread its use of the correlated pair almost
+evenly (+0.0266 and +0.0198); the linear model put nearly all its weight on one twin (coefficient
++0.936 against +0.170) and its permutation importance follows suit (+0.1238 against +0.0018). Same
+information in the data, opposite conclusions about which column to keep. The two models also
+disagree on which single feature matters most — the forest says `useful_bin`, the linear model
+says `useful_cont` — because a binary split is easy for trees and coarse for a linear function.
+Importance is a property of the model you fitted, not of the world. Swap in a
+`GradientBoostingClassifier`, or remove `useful_copy` and re-run, to see how much the ranking moves.
+
+## Exercise
+
+Ranking by importance leaves you guessing where to cut. Build a **null-calibrated** selector: add
+a column of pure noise (a "shadow" feature, as Boruta does), or shuffle the target to build the
+null distribution of importance, then keep only features whose importance exceeds the null by a
+margin. Compare its selection against naive top-k on data where some features are correlated.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def add_shadows(X, n_shadow=10, seed=0):
+    """Shadow features: real columns with their rows shuffled. Meaningless by construction."""
+    r = np.random.default_rng(seed)
+    Xs = X.copy()
+    for i in range(n_shadow):
+        src = X.columns[i % len(X.columns)]
+        Xs[f"shadow_{i}"] = r.permutation(X[src].values)
+    return Xs
+
+Xs_tr = add_shadows(X2tr, seed=0)
+Xs_te = add_shadows(X2te, seed=1)
+model_s = RandomForestClassifier(n_estimators=200, min_samples_leaf=5,
+                                 random_state=0).fit(Xs_tr, y2tr)
+
+_, imp = permutation_importance(model_s, Xs_te, y2te, repeats=10)
+shadow_scores = [imp[c][0] for c in Xs_tr.columns if c.startswith("shadow_")]
+cutoff = max(shadow_scores)                                 # the best a fake feature managed
+print(f"shadow importances: {[f'{v:+.4f}' for v in shadow_scores]}")
+print(f"cutoff (max shadow) = {cutoff:+.4f}\n")
+
+real = {c: imp[c][0] for c in X2tr.columns}
+for c, v in sorted(real.items(), key=lambda kv: -kv[1]):
+    verdict = "KEEP" if v > cutoff else "drop"
+    print(f"{c:12} {v:+.4f}   {verdict}")
+
+top_k = [c for c, _ in sorted(real.items(), key=lambda kv: -kv[1])[:2]]
+kept = [c for c, v in real.items() if v > cutoff]
+print(f"\nnaive top-2 : {top_k}")
+print(f"null-calibrated: {sorted(kept)}")
+
+def auc_with(cols):
+    m = RandomForestClassifier(n_estimators=200, min_samples_leaf=5,
+                               random_state=0).fit(X2tr[cols], y2tr)
+    return roc_auc_score(y2te, m.predict_proba(X2te[cols])[:, 1])
+
+print(f"\nAUC all 5 columns    : {auc_with(list(X2tr.columns)):.4f}")
+print(f"AUC naive top-2      : {auc_with(top_k):.4f}")
+print(f"AUC null-calibrated  : {auc_with(sorted(kept)):.4f}")
+```
+
+```output
+shadow importances: ['+0.0021', '+0.0002', '+0.0016', '+0.0017', '+0.0004', '+0.0013', '-0.0004', '-0.0007', '-0.0004', '+0.0004']
+cutoff (max shadow) = +0.0021
+
+useful_bin   +0.0912   KEEP
+useful_copy  +0.0271   KEEP
+useful_cont  +0.0200   KEEP
+noise_cont   +0.0021   drop
+noise_id     +0.0010   drop
+
+naive top-2 : ['useful_bin', 'useful_copy']
+null-calibrated: ['useful_bin', 'useful_cont', 'useful_copy']
+
+AUC all 5 columns    : 0.8566
+AUC naive top-2      : 0.8377
+AUC null-calibrated  : 0.8476
+```
+
+The shadow features give you a *scale*: any real feature that cannot beat a deliberately
+meaningless column is not evidence of anything. That is the missing piece in every "top-10
+features" chart — a ranking with no zero point, where the tenth feature might be doing nothing at
+all. Here the ten shadows top out at +0.0021, both noise columns land at or below that line, and
+all three real columns clear it. Note how close the call is on `noise_cont`: it ties the cutoff
+exactly. With fewer shadows the cutoff would sit lower and the noise column would survive — the
+cutoff is an estimate of the null's upper tail, so give it enough shadows (and enough permutation
+repeats) to be stable.
+
+Now read the AUCs, which do not flatter the method: keeping all five columns scores 0.8566, the
+null-calibrated three score 0.8476, and naive top-2 scores 0.8377. **Dropping the noise cost a
+point of AUC.** That is the correct result and worth sitting with — with five columns and a
+random forest, useless features are nearly free, since the forest simply stops splitting on them,
+and removing them mostly removes a little beneficial split-level randomness. Feature selection
+earns its keep when there are hundreds of columns (variance, training time, serving latency,
+data-collection cost), not on a five-column table. The selector's job here is to tell you which
+columns are *evidence*, not to promise a better score.
+
+Two caveats this exercise cannot escape. Correlated features still split their credit, so a
+jointly-essential pair can both fall below the cutoff; run the selector on *groups* when you know
+the blocks. And selection is itself a fitting step — it looked at the labels — so the AUC you
+print after selecting is optimistic unless the whole selector runs inside the cross-validation
+folds (ch. 5, pitfall 1). Wrap it in a function, call it per fold, and compare the *procedure*,
+not this single number.
+</details>
