@@ -1,0 +1,411 @@
+---
+course: mlops
+chapter: 08-retraining-triggers
+title: "Retraining Triggers and the Feedback Loop"
+order: 8
+---
+
+## Retraining is a pipeline, not a decision someone remembers to make
+
+Every deployed model decays (ch. 7). The question is not *whether* to retrain but **what fires
+the retrain**, and there are only four answers — each with a failure mode:
+
+| Trigger | Fires when | Fails by |
+|---|---|---|
+| Scheduled | every N days, unconditionally | retraining when nothing changed; wasting compute |
+| Drift-based | input or output PSI crosses a threshold | reacting to a broken pipeline, not a real shift |
+| Performance-based | measured metric drops | needs labels, so it is always late |
+| Data-volume | N new labelled examples exist | ignores whether the new data is *different* |
+
+```python
+import numpy as np
+from collections import defaultdict
+rng = np.random.default_rng(0)
+
+def trigger_decision(days_since, psi, metric_drop, new_labels, labels_fresh,
+                     schedule_days=30, psi_threshold=0.25, metric_threshold=0.03,
+                     min_labels=5_000):
+    reasons = []
+    if days_since >= schedule_days:    reasons.append(f"scheduled ({days_since}d)")
+    if psi > psi_threshold:            reasons.append(f"drift (PSI {psi:.2f})")
+    if metric_drop > metric_threshold: reasons.append(f"metric -{metric_drop:.1%}")
+    if new_labels >= min_labels:       reasons.append(f"{new_labels:,} new labels")
+    if not reasons:
+        return "no action"
+    if not labels_fresh:
+        return f"HOLD: {'; '.join(reasons)} — but no fresh labels; retraining would fit stale truth"
+    return f"RETRAIN: {'; '.join(reasons)}"
+
+print(trigger_decision(days_since=12, psi=0.05, metric_drop=0.004, new_labels=800,  labels_fresh=True))
+print(trigger_decision(days_since=31, psi=0.05, metric_drop=0.004, new_labels=9000, labels_fresh=True))
+print(trigger_decision(days_since=12, psi=0.31, metric_drop=0.004, new_labels=9000, labels_fresh=True))
+print(trigger_decision(days_since=12, psi=0.31, metric_drop=0.010, new_labels=200,  labels_fresh=False))
+```
+
+```output
+no action
+RETRAIN: scheduled (31d); 9,000 new labels
+RETRAIN: drift (PSI 0.31); 9,000 new labels
+HOLD: drift (PSI 0.31) — but no fresh labels; retraining would fit stale truth
+```
+
+The third line is the useful default in most systems — **scheduled retraining with drift as an
+early trigger** — and the fourth is the case people forget: drift you cannot yet measure the
+consequences of, with no fresh labels to learn from. Retraining there fits the model to last
+quarter's truth on this quarter's inputs.
+
+## Labels are the constraint, not compute
+
+```python
+def label_pipeline(volume_per_day, natural_rate, delay_days, manual_per_day, horizon=90):
+    natural = volume_per_day * natural_rate
+    print(f"{volume_per_day:>7,}/day | natural {natural:>7,.0f}/day after {delay_days:>2}d | "
+          f"manual {manual_per_day:>4,}/day | {(natural + manual_per_day) * horizon:>9,.0f} "
+          f"labels in {horizon} days")
+
+label_pipeline(50_000, 0.02, 45, 200)      # fraud: chargebacks are rare and late
+label_pipeline(50_000, 0.95, 0, 0)         # click prediction: the label is immediate
+label_pipeline(2_000, 0.10, 30, 100)       # underwriting: slow, expensive, partly manual
+```
+
+```output
+ 50,000/day | natural   1,000/day after 45d | manual  200/day |   108,000 labels in 90 days
+ 50,000/day | natural  47,500/day after  0d | manual    0/day | 4,275,000 labels in 90 days
+  2,000/day | natural     200/day after 30d | manual  100/day |    27,000 labels in 90 days
+```
+
+Three shapes, three retraining cadences. When labels are immediate and plentiful you can retrain
+daily; when they arrive in 45 days you cannot retrain faster than the label pipeline no matter
+how much GPU you own. **The retraining cadence is set by label availability**, and buying more
+compute does not move it.
+
+### Delayed labels make evaluation windows tricky
+
+```python
+for delay in (0, 7, 45, 180):
+    print(f"today=120, labels delayed {delay:>3}d -> metrics trustworthy only through "
+          f"day {120 - delay:>4} ({delay} days blind)")
+print("\ntraining on partially-labelled recent data biases toward whatever resolves fast:")
+print("fraud caught quickly, churn that happens immediately, claims that settle fast")
+```
+
+```output
+today=120, labels delayed   0d -> metrics trustworthy only through day  120 (0 days blind)
+today=120, labels delayed   7d -> metrics trustworthy only through day  113 (7 days blind)
+today=120, labels delayed  45d -> metrics trustworthy only through day   75 (45 days blind)
+today=120, labels delayed 180d -> metrics trustworthy only through day  -60 (180 days blind)
+
+training on partially-labelled recent data biases toward whatever resolves fast:
+fraud caught quickly, churn that happens immediately, claims that settle fast
+```
+
+That last line is a real and subtle bias. If you include the most recent partially-labelled
+window, your training set over-represents fast-resolving outcomes, and the model learns to
+predict *speed of resolution* as much as the outcome itself. The fix is boring and effective:
+**train only on fully-matured label windows**, and state the maturation period explicitly.
+
+## The feedback loop: your model shapes its own training data
+
+```python
+def feedback_simulation(rounds=8, threshold=0.5, explore=0.0, seed=1):
+    """Rejected applicants never generate an outcome, so the model never learns about them."""
+    r = np.random.default_rng(seed)
+    weight, history = 1.0, []
+    for t in range(rounds):
+        x = r.normal(0, 1, 3_000)                                  # applicant risk signal
+        score = 1 / (1 + np.exp(-(weight * x)))
+        approved = score < threshold
+        if explore:                                                # random exploration
+            approved |= r.random(3_000) < explore
+        outcome = (r.random(3_000) < 1 / (1 + np.exp(-(1.2 * x))))  # true default risk
+        observed = outcome[approved]                                # only approvals get labels
+        observed_range = float(x[approved].std())
+        weight = 0.8 * weight + 0.2 * (1.2 * observed_range)        # refit on what we can see
+        history.append((float(approved.mean()), observed_range, weight))
+    return history
+
+for label, explore in [("no exploration", 0.0), ("5% random approvals", 0.05)]:
+    h = feedback_simulation(explore=explore)
+    print(f"{label}:")
+    for t, (rate, spread, w) in enumerate(h[::3]):
+        print(f"   round {t*3}: approved {rate:5.1%} | observed x spread {spread:.3f} | "
+              f"fitted weight {w:.3f}")
+```
+
+```output
+no exploration:
+   round 0: approved 50.1% | observed x spread 0.602 | fitted weight 0.945
+   round 3: approved 49.0% | observed x spread 0.606 | fitted weight 0.832
+   round 6: approved 49.9% | observed x spread 0.599 | fitted weight 0.774
+5% random approvals:
+   round 0: approved 52.5% | observed x spread 0.700 | fitted weight 0.968
+   round 3: approved 53.5% | observed x spread 0.660 | fitted weight 0.892
+   round 6: approved 53.1% | observed x spread 0.684 | fitted weight 0.859
+```
+
+Without exploration the training data narrows to the population the model already approves, and
+the fitted relationship drifts away from the truth — the model becomes confident about a world it
+constructed. A small random-approval share keeps the distribution wide enough to learn from, and
+it is the cheapest insurance available. The same argument in three other guises: a **holdout
+population** served without the model, **propensity logging** so you can reweight later, and
+**human review queues** that label exactly the cases the model finds hardest.
+
+```python
+def review_queue(scores, capacity, strategy="uncertainty"):
+    """Which predictions should a human label, given limited reviewer capacity?"""
+    if strategy == "random":
+        idx = np.argsort(rng.random(len(scores)))[:capacity]
+    elif strategy == "highest_risk":
+        idx = np.argsort(-scores)[:capacity]
+    else:                                       # uncertainty sampling: nearest the threshold
+        idx = np.argsort(np.abs(scores - 0.5))[:capacity]
+    picked = scores[idx]
+    return picked.mean(), float(np.abs(picked - 0.5).mean())
+
+scores = rng.beta(2, 5, 20_000)
+print(f"{'strategy':16}{'mean score':>12}{'mean |score-0.5|':>19}  what you learn")
+for s, note in [("random", "an unbiased sample of production traffic"),
+                ("highest_risk", "confirms what the model already believes"),
+                ("uncertainty", "the decision boundary, where the model is weakest")]:
+    m, u = review_queue(scores, 500, s)
+    print(f"{s:16}{m:>12.3f}{u:>19.3f}  {note}")
+```
+
+```output
+strategy          mean score   mean |score-0.5|  what you learn
+random                 0.287              0.233  an unbiased sample of production traffic
+highest_risk           0.705              0.205  confirms what the model already believes
+uncertainty            0.500              0.007  the decision boundary, where the model is weakest
+```
+
+Send everything to the highest-risk queue and you buy almost no information: those labels confirm
+predictions the model was already sure about. **Mix uncertainty sampling with a random slice** —
+the first improves the model fastest, the second is the only sample you can compute unbiased
+metrics from.
+
+## The retraining pipeline, gated end to end
+
+```python
+def retrain_pipeline(trigger_reason, labels_available, min_labels, drift_psi,
+                     candidate_auc, baseline_auc, slice_ok, floor=0.65):
+    steps = [f"triggered by: {trigger_reason}"]
+    if labels_available < min_labels:
+        steps.append(f"STOP: only {labels_available:,} labels (need {min_labels:,})")
+        return steps
+    steps.append(f"assemble training set: {labels_available:,} matured labels")
+    steps.append("data validation (ch. 4)")
+    steps.append("train + evaluate")
+    if candidate_auc < floor:
+        steps.append(f"STOP: candidate AUC {candidate_auc:.3f} below floor {floor}")
+        return steps
+    if candidate_auc < baseline_auc * 0.99:
+        steps.append(f"STOP: {candidate_auc:.3f} worse than production {baseline_auc:.3f}")
+        return steps
+    if not slice_ok:
+        steps.append("STOP: a slice regressed (ch. 4)")
+        return steps
+    steps.append(f"gates passed ({candidate_auc:.3f} vs {baseline_auc:.3f})")
+    steps.append("register as staging (ch. 6) -> shadow -> canary -> production")
+    return steps
+
+for label, kwargs in [
+    ("healthy retrain", dict(trigger_reason="scheduled (30d)", labels_available=42_000,
+                             min_labels=10_000, drift_psi=0.08, candidate_auc=0.802,
+                             baseline_auc=0.795, slice_ok=True)),
+    ("not enough labels", dict(trigger_reason="drift (PSI 0.31)", labels_available=3_100,
+                               min_labels=10_000, drift_psi=0.31, candidate_auc=0.0,
+                               baseline_auc=0.795, slice_ok=True)),
+    ("worse than production", dict(trigger_reason="drift (PSI 0.31)", labels_available=42_000,
+                                   min_labels=10_000, drift_psi=0.31, candidate_auc=0.780,
+                                   baseline_auc=0.795, slice_ok=True)),
+]:
+    print(f"{label}:")
+    for step in retrain_pipeline(**kwargs):
+        print(f"   {step}")
+```
+
+```output
+healthy retrain:
+   triggered by: scheduled (30d)
+   assemble training set: 42,000 matured labels
+   data validation (ch. 4)
+   train + evaluate
+   gates passed (0.802 vs 0.795)
+   register as staging (ch. 6) -> shadow -> canary -> production
+not enough labels:
+   triggered by: drift (PSI 0.31)
+   STOP: only 3,100 labels (need 10,000)
+worse than production:
+   triggered by: drift (PSI 0.31)
+   assemble training set: 42,000 matured labels
+   data validation (ch. 4)
+   train + evaluate
+   STOP: 0.780 worse than production 0.795
+```
+
+Note the third case. Drift fired, the retrain ran, and the new model is *worse* — which happens
+when the drift is a data-quality problem rather than a population shift. The gate catching it is
+the reason automated retraining is safe to run at all: **a retrain trigger is a proposal, never a
+promotion**.
+
+## Automatic rollback closes the loop
+
+```python
+def post_deploy_watch(days, baseline, readings, guard=0.02):
+    for day, auc in enumerate(readings, start=1):
+        drop = (baseline - auc) / baseline
+        status = ("ok" if drop <= guard else
+                  "ROLLBACK to the previous version (ch. 6 keeps it loaded)")
+        print(f"day {day}: live AUC {auc:.3f} ({-drop:+.1%} vs baseline) -> {status}")
+        if drop > guard:
+            break
+
+post_deploy_watch(5, baseline=0.795, readings=[0.799, 0.797, 0.762])
+```
+
+```output
+day 1: live AUC 0.799 (+0.5% vs baseline) -> ok
+day 2: live AUC 0.797 (+0.3% vs baseline) -> ok
+day 3: live AUC 0.762 (-4.2% vs baseline) -> ROLLBACK to the previous version (ch. 6 keeps it loaded)
+```
+
+The retraining loop is only complete when it can undo itself. Promotion is not the last step:
+**watch the live metric for a defined window and roll back automatically** if it degrades, because
+the offline gate was measured on a test set and production is not a test set.
+
+## Try it Yourself
+
+```python
+def cadence_cost(retrain_days, compute_cost_per_run, decay_per_day, horizon_days=365):
+    runs = horizon_days // retrain_days
+    avg_staleness = retrain_days / 2
+    avg_quality_loss = decay_per_day * avg_staleness
+    print(f"every {retrain_days:>3} days -> {runs:>3} runs/yr, ${runs * compute_cost_per_run:>7,.0f} "
+          f"compute | average staleness {avg_staleness:>5.1f} d -> "
+          f"{avg_quality_loss:.3%} average AUC lost")
+
+for d in (1, 7, 30, 90, 365):
+    cadence_cost(d, compute_cost_per_run=180, decay_per_day=0.0006)
+```
+
+```output
+every   1 days -> 365 runs/yr, $ 65,700 compute | average staleness   0.5 d -> 0.030% average AUC lost
+every   7 days ->  52 runs/yr, $  9,360 compute | average staleness   3.5 d -> 0.210% average AUC lost
+every  30 days ->  12 runs/yr, $  2,160 compute | average staleness  15.0 d -> 0.900% average AUC lost
+every  90 days ->   4 runs/yr, $    720 compute | average staleness  45.0 d -> 2.700% average AUC lost
+every 365 days ->   1 runs/yr, $    180 compute | average staleness 182.5 d -> 10.950% average AUC lost
+```
+
+There is a cost-optimal cadence and it is rarely "as often as possible": daily retraining costs
+65,000 dollars a year to recover a fraction of a percent that weekly retraining already captured.
+Change `decay_per_day` to 0.003 (a fast-moving fraud domain) and the calculus inverts — which is
+the point: **cadence is an economic decision derived from your decay rate**, not a habit.
+
+## Exercise
+
+Build the complete retraining controller: it reads the monitoring metrics from ch. 7, decides
+whether to trigger, checks label availability and maturity, runs the gated pipeline, promotes
+through shadow and canary, and watches the live metric with automatic rollback. Simulate 180 days
+in which a population shift begins at day 60 and labels arrive with a 30-day delay, and report
+what the controller does and when — including the period where it *knows* something is wrong but
+cannot yet retrain.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def controller(horizon=180, label_delay=30, schedule_days=45, psi_threshold=0.25,
+               min_labels=8_000, labels_per_day=400, shift_starts=60, check_every=7, seed=2):
+    r = np.random.default_rng(seed)
+    events, last_retrain = [], 0
+    deployed_learnt = 0.0            # how much of the shift the LIVE model has learned
+
+    def shift_at(day):               # the population shift as of a given day
+        return max(0.0, (day - shift_starts) * 0.012)
+
+    def auc_of(learnt, day):         # a model that learned `learnt` scored on day's population
+        return 0.800 - (shift_at(day) - learnt) * 0.09
+
+    for day in range(check_every, horizon + 1, check_every):     # the controller runs weekly
+        psi = float(min(1.2, 0.02 + shift_at(day) * 2.2 + r.normal(0, 0.01)))
+        live = auc_of(deployed_learnt, day)
+        measurable = day - label_delay
+        measured = auc_of(deployed_learnt, measurable) if measurable > 0 else None
+
+        reasons = []
+        if psi > psi_threshold:                 reasons.append(f"drift {psi:.2f}")
+        if day - last_retrain >= schedule_days: reasons.append(f"scheduled {day - last_retrain}d")
+        if measured and (0.800 - measured) / 0.800 > 0.03:
+            reasons.append(f"measured -{(0.800 - measured) / 0.800:.1%}")
+        if not reasons:
+            continue
+
+        matured = max(0, measurable) * labels_per_day
+        if matured < min_labels:
+            events.append((day, "HOLD", f"{'; '.join(reasons)} | {matured:,} matured labels "
+                                        f"< {min_labels:,} — nothing to learn from yet"))
+            continue
+
+        candidate_learnt = shift_at(measurable)        # only matured labels teach the shift
+        candidate = auc_of(candidate_learnt, day)
+        if candidate < live * 1.005:
+            events.append((day, "BLOCKED", f"{'; '.join(reasons)} | candidate {candidate:.3f} "
+                                           f"no better than live {live:.3f}"))
+            last_retrain = day
+            continue
+
+        events.append((day, "PROMOTED", f"{'; '.join(reasons)} | {candidate:.3f} replaces "
+                                        f"{live:.3f} | trained on {matured:,} labels, "
+                                        f"still {shift_at(day) - candidate_learnt:.3f} behind"))
+        deployed_learnt, last_retrain = candidate_learnt, day
+
+    for day, kind, detail in events:
+        print(f"day {day:>3} {kind:9} {detail}")
+    counts = {k: sum(1 for _, kk, _ in events if kk == k) for k in ("PROMOTED", "HOLD", "BLOCKED")}
+    print(f"\n{counts}")
+
+controller()
+```
+
+```output
+day  49 HOLD      scheduled 49d | 7,600 matured labels < 8,000 — nothing to learn from yet
+day  56 BLOCKED   scheduled 56d | candidate 0.800 no better than live 0.800
+day  70 BLOCKED   drift 0.28 | candidate 0.789 no better than live 0.789
+day  77 BLOCKED   drift 0.48 | candidate 0.782 no better than live 0.782
+day  84 BLOCKED   drift 0.65 | candidate 0.774 no better than live 0.774
+day  91 BLOCKED   drift 0.84 | candidate 0.768 no better than live 0.767
+day  98 PROMOTED  drift 1.02 | 0.768 replaces 0.759 | trained on 27,200 labels, still 0.360 behind
+day 105 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 30,000 labels, still 0.360 behind
+day 112 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 32,800 labels, still 0.360 behind
+day 119 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 35,600 labels, still 0.360 behind
+day 126 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 38,400 labels, still 0.360 behind
+day 133 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 41,200 labels, still 0.360 behind
+day 140 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 44,000 labels, still 0.360 behind
+day 147 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 46,800 labels, still 0.360 behind
+day 154 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 49,600 labels, still 0.360 behind
+day 161 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 52,400 labels, still 0.360 behind
+day 168 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 55,200 labels, still 0.360 behind
+day 175 PROMOTED  drift 1.20 | 0.768 replaces 0.760 | trained on 58,000 labels, still 0.360 behind
+
+{'PROMOTED': 12, 'HOLD': 1, 'BLOCKED': 5}
+```
+
+The insight: read the three phases in that output. Around day 49 the controller wants to retrain
+on schedule and **cannot** — the matured label count is below the minimum, so it holds and says
+why. From day 70 to 91 the drift alarm is loud and every candidate is **blocked**, because a model
+trained on labels that are 30 days old has not seen the shift either: the trigger fired, the
+pipeline ran, and the gate correctly refused to ship a model that is no better than the one
+serving. Only from day 98 does retraining start winning, and then it wins *every week forever* —
+each promotion recovers about a point of AUC and the next week gives it back, because the
+candidate is permanently one label-delay behind the population.
+
+That steady state is the real lesson. In a shifting domain with delayed labels, retraining does
+not fix the problem; it bounds it. The size of the gap is set by the **label delay**, so the
+interventions that actually shrink it are label-side — pay for faster labels, buy a proxy signal
+that resolves sooner, or add human review on the segment that shifted — not compute-side. And
+when the gap is unacceptable and cannot be closed, the honest options are the non-learning ones
+from ch. 7: tighten the decision threshold, route more cases to humans, or roll back to a model
+that degrades more gracefully. A retraining controller that cannot say "I know, and I cannot fix
+this yet" is worse than none, because it converts a visible problem into a stream of promotions
+that look like progress.
+</details>
