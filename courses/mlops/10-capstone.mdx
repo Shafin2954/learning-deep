@@ -1,0 +1,135 @@
+---
+course: mlops
+chapter: 10-capstone
+title: "Capstone: Productionize a Model End to End"
+order: 10
+---
+
+## The project
+
+Take one model — yours, or a simple one you train for the purpose — and put it into production
+properly: packaged with a schema and a version, served behind an async API with batching,
+containerized with pinned dependencies and resource limits, gated by a CI pipeline that tests
+the data and the model, monitored for quality and drift, and wired to a retraining trigger that
+proposes new candidates without ever promoting one on its own. Then write the lifecycle document
+that explains how a change gets from a commit to production and back out again.
+
+The model does not need to be impressive. The point of this capstone is that **everything around
+the model is real** — a stranger should be able to clone the repository, run one command, send a
+request, break something deliberately, and watch the system notice.
+
+## Hard constraints (no vibe coding)
+
+- **No AI assistance of any kind.** Not for the code, the Dockerfile, the CI configuration, or
+  the lifecycle document.
+- You MAY NOT use a managed platform that hides the parts you are being asked to build:
+  no SageMaker/Vertex/Databricks endpoints, no MLflow server, no Feast, no Evidently, no
+  BentoML/Seldon/KServe. Build the registry, the metrics, and the drift checks yourself — they
+  are a few hundred lines each, and you built most of them in ch. 4–8.
+- You MAY use: a web framework (FastAPI/Flask), an orchestrator (Airflow, Dagster, Prefect, or
+  n8n), Docker and docker-compose, a database (Postgres/SQLite), Redis, scikit-learn or PyTorch,
+  and a load-testing tool.
+- The services must run as **real containers** talking over a real network — a single Python
+  process that imports everything does not count.
+- Every threshold in the system (gate tolerance, drift threshold, alert condition, retrain
+  trigger) must be **in configuration, not in code**, and the lifecycle document must justify
+  each value with a number or a stated assumption.
+- The prediction log must be **written by the serving path and readable by the monitoring job**.
+  If monitoring recomputes features from the source instead of reading the log, you have built a
+  second implementation and a future skew bug (ch. 7).
+
+## What it must contain (and the chapter each tests)
+
+1. **A packaged model artifact** (ch. 1): weights plus preprocessing, a metadata file with
+   version, feature list and order, training data snapshot id, code commit, library versions,
+   metrics, and a golden example. Loading must fail loudly on a version mismatch or a failed
+   smoke test.
+2. **A serving API** (ch. 2): `/healthz`, `/readyz`, `POST /v1/predict`, a bounded
+   `POST /v1/predict/batch`, and `/metrics` in Prometheus text format with a latency
+   **histogram**. Model loaded once at startup; validation via a declared schema returning 422;
+   every response carries `model_version` and a request id; micro-batching with a configurable
+   `max_batch` and `max_wait_ms`.
+3. **A container** (ch. 3): multi-stage build, digest-pinned base, lock file, non-root user,
+   healthcheck, memory and CPU limits, and configuration through environment variables with a
+   fail-fast check at startup. Document the image size and the cold-start time you measured.
+4. **A CI pipeline** (ch. 4): lint and unit tests, data validation against declared
+   expectations, training, evaluation with **at least three slices**, at least two behavioural
+   tests (a directional and an invariance test), a promotion gate comparing against the current
+   production model's recorded metrics, and a container build with an integration test that
+   starts the image and asserts the golden prediction.
+5. **An orchestrated pipeline** (ch. 5): a DAG over date partitions that extracts, validates,
+   builds features, materializes them, and (weekly) retrains. Idempotent tasks, a sensor rather
+   than a bare schedule, bounded retries, a task timeout, and an SLA alert. Demonstrate a
+   backfill of at least 30 partitions.
+6. **A tracker and registry** (ch. 6): every training run recorded with params, metrics,
+   artifacts, code commit, data version, and environment hash; a registry with `staging`,
+   `production`, and `archived` stages and an audit trail. The CI gate and the serving container
+   must both read from it — the gate for its baseline, the server for which artifact to load.
+7. **Monitoring** (ch. 7): a scheduled job over the prediction log computing data-quality checks,
+   input drift (PSI per feature), output drift, operational metrics, and outcome metrics when
+   labels mature — all **sliced by model version** — plus alert rules with severities,
+   hysteresis, deduplication, and runbook links.
+8. **A retraining trigger** (ch. 8): scheduled plus drift-based, with a label-availability and
+   label-maturity check that can *hold*, a gated pipeline that can *block*, and an automatic
+   rollback watcher after promotion. It must never promote without passing the ch. 4 gates.
+9. **A cost and capacity plan** (ch. 9): measured single-row and batched latency, the resulting
+   instance count for a stated peak, the monthly cost, and the one optimization you would do
+   next with the number that justifies it.
+10. **The lifecycle document**: how a code change reaches production, how a model change reaches
+    production, how each is rolled back, who is paged for what, and what happens in the window
+    where drift is visible but labels have not matured.
+
+## Acceptance criteria
+
+- **Reproducibility.** From a clean clone: one command builds the image, one command runs the
+  full CI pipeline locally, and the trained model's metrics match the recorded run within
+  floating-point noise. A second run on the same commit and data snapshot produces an identical
+  model fingerprint.
+- **Artifact integrity.** Loading an artifact whose recorded `sklearn`/`torch` version differs
+  from the runtime raises at startup; the packaged golden example reproduces to within `1e-9`.
+- **API contract.** Invalid payloads return 422 with a field-level message; a request for a
+  feature-complete payload returns a prediction with `model_version` and request id; the batch
+  endpoint rejects more than the configured maximum rows.
+- **Serving performance.** A load test reports p50/p99/p99.9 at concurrency 1, 8, 64, and 256,
+  with and without batching, and identifies the saturation point. Batched throughput is at least
+  5x unbatched at concurrency 64.
+- **CI gates actually block.** Demonstrate four failing pipelines: data validation failure
+  (injected nulls), metric regression against baseline, a slice regression, and a behavioural
+  test failure. Each must stop the pipeline with a readable report and a non-zero exit code.
+- **Pipeline correctness.** Rerunning a partition produces identical output (idempotency); a
+  missing upstream leaves the task waiting rather than writing an empty partition; a 30-partition
+  backfill completes without exceeding the configured source concurrency.
+- **Monitoring detects.** Injected faults are caught by the right monitor: a null-rate spike
+  within one window (quality), a population shift within three windows (input drift), a
+  feature-swap bug (output drift), and a traffic drop (volume). Each fires exactly once and
+  resolves when fixed.
+- **Retraining behaves.** Drift with immature labels produces a *hold* with a stated reason; a
+  candidate no better than production is *blocked*; a genuinely better candidate is promoted
+  through staging and canary and appears in the registry audit trail with an actor.
+- **Rollback works.** With the previous version still loaded, a rollback is a configuration
+  change taking under five seconds, demonstrated end to end while traffic is flowing.
+- **Every threshold is justified.** The lifecycle document names each configured number and the
+  measurement or assumption behind it. "Because the tutorial said 0.25" is not a justification.
+
+## Skills checklist (tick before you claim done)
+
+- [ ] I can package a model so that preprocessing, schema, versions, and a smoke test travel with the weights (ch. 1).
+- [ ] I can explain why loading the estimator without its pipeline is a silent bug, and prevent it (ch. 1).
+- [ ] I can build a serving API with validation, health endpoints, single-load startup, and traceable responses (ch. 2).
+- [ ] I can decide between `def` and `async def` for an endpoint and say what happens if I get it wrong (ch. 2).
+- [ ] I can implement micro-batching and choose `max_batch` and `max_wait_ms` from my latency budget (ch. 2).
+- [ ] I can write a Dockerfile that is reproducible, small, non-root, and ordered for layer caching (ch. 3).
+- [ ] I can set memory and CPU limits from measured usage and explain what throttling does to p99 (ch. 3).
+- [ ] I can test data, code, and model separately, and say which failure each catches (ch. 4).
+- [ ] I can write a promotion gate with slices, behavioural tests, absolute floors, and severity levels (ch. 4).
+- [ ] I can build an idempotent, partitioned pipeline with sensors, retries, timeouts, and an SLA alert (ch. 5).
+- [ ] I can backfill a year of partitions without taking down the source system (ch. 5).
+- [ ] I can log runs so that any past model can be rebuilt, and refuse to register one that cannot (ch. 6).
+- [ ] I can run a registry with stages and an audit trail, and wire CI and serving to read from it (ch. 6).
+- [ ] I can compute data-quality, drift, and outcome metrics from a prediction log, sliced by model version (ch. 7).
+- [ ] I can design alert rules that page rarely and are acted on when they do (ch. 7).
+- [ ] I can choose a retraining trigger and explain why label availability, not compute, sets the cadence (ch. 8).
+- [ ] I can name the feedback loop in my own system and the exploration or holdout that breaks it (ch. 8).
+- [ ] I can size an inference fleet, price it per million predictions, and name the cheapest lever available (ch. 9).
+- [ ] I can tell when batch scoring replaces online serving entirely (ch. 9).
+- [ ] I can write the lifecycle document for my system and defend every threshold in it.

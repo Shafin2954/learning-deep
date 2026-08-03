@@ -100,6 +100,11 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 31,
     badge: 'Ch 1 – 31',
   },
+  'mlops': {
+    tagline: '9 chapters: packaging, FastAPI serving with batching, containers, CI gates on data and models, orchestration, tracking and registries, drift monitoring, retraining triggers, and inference cost.',
+    chapters: 10,
+    badge: 'Ch 1 – 10',
+  },
 };
 
 export default function Home() {
