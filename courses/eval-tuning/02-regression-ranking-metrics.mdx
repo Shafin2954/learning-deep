@@ -1,0 +1,366 @@
+---
+course: eval-tuning
+chapter: 02-regression-ranking-metrics
+title: "Regression and Ranking Metrics"
+order: 2
+---
+
+## Regression metrics differ in what they punish
+
+Every regression metric aggregates the same residuals $r_i = y_i - \hat{y}_i$; they differ only
+in how they weight big ones.
+
+$$
+\mathrm{MAE} = \frac{1}{n}\sum |r_i|, \quad
+\mathrm{RMSE} = \sqrt{\frac{1}{n}\sum r_i^2}, \quad
+\mathrm{MAPE} = \frac{100}{n}\sum \left| \frac{r_i}{y_i} \right|
+$$
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+y = rng.lognormal(4.0, 0.6, 5_000)                       # skewed targets, like prices
+pred = y * rng.normal(1.0, 0.15, 5_000)                  # ~15% multiplicative error
+pred[:20] = y[:20] * 4.0                                 # 20 badly wrong predictions
+
+def reg_metrics(y, pred):
+    r = y - pred
+    return {"MAE": float(np.mean(np.abs(r))),
+            "RMSE": float(np.sqrt(np.mean(r ** 2))),
+            "MedAE": float(np.median(np.abs(r))),
+            "MAPE%": float(np.mean(np.abs(r / y)) * 100),
+            "R2": float(1 - np.sum(r ** 2) / np.sum((y - y.mean()) ** 2))}
+
+clean = reg_metrics(y, y * rng.normal(1.0, 0.15, 5_000))
+dirty = reg_metrics(y, pred)
+print(f"{'metric':8}{'no outliers':>14}{'20 outliers':>14}{'change':>10}")
+for k in clean:
+    print(f"{k:8}{clean[k]:>14.3f}{dirty[k]:>14.3f}{dirty[k]/clean[k]:>9.2f}x")
+```
+
+```output
+metric     no outliers   20 outliers    change
+MAE              7.765         8.403     1.08x
+RMSE            11.528        16.309     1.41x
+MedAE            5.240         5.192     0.99x
+MAPE%           12.049        13.128     1.09x
+R2               0.925         0.849     0.92x
+```
+
+Twenty rows out of five thousand moved RMSE far more than MAE, and left the median absolute
+error almost untouched. **RMSE is the metric to use when large errors are disproportionately
+costly** (a delivery estimate off by three hours is much worse than three off by one); MAE when
+every unit of error costs the same; median absolute error when you want a number outliers cannot
+distort.
+
+### MAPE and its asymmetry
+
+```python
+truth = np.array([10.0, 100.0, 1_000.0])
+over = truth * 1.5                                      # predicted 50% too high
+under = truth * 0.5                                     # predicted 50% too low
+for name, p in [("over-predict", over), ("under-predict", under)]:
+    mape = float(np.mean(np.abs((truth - p) / truth)) * 100)
+    smape = float(np.mean(2 * np.abs(truth - p) / (np.abs(truth) + np.abs(p))) * 100)
+    print(f"{name:14} MAPE {mape:6.1f}%  sMAPE {smape:6.1f}%")
+
+near_zero = np.array([0.01, 5.0, 50.0])
+print(f"\nMAPE with a near-zero actual: "
+      f"{float(np.mean(np.abs((near_zero - (near_zero + 1)) / near_zero)) * 100):,.0f}%"
+      f"  <- one row at y=0.01 dominates everything")
+```
+
+```output
+over-predict   MAPE   50.0%  sMAPE   40.0%
+under-predict  MAPE   50.0%  sMAPE   66.7%
+
+MAPE with a near-zero actual: 3,341%  <- one row at y=0.01 dominates everything
+```
+
+MAPE is popular with stakeholders and treacherous in code: it explodes near zero, and it
+punishes over-prediction more than under-prediction, so **optimizing MAPE biases your model
+low**. Use it for reporting when the audience insists, and optimize something else.
+
+### The right metric is often on the log scale
+
+```python
+def rmsle(y, pred):
+    return float(np.sqrt(np.mean((np.log1p(y) - np.log1p(np.maximum(pred, 0))) ** 2)))
+
+for label, t, p in [("cheap item", 20.0, 40.0), ("expensive item", 2_000.0, 4_000.0)]:
+    print(f"{label:16} abs error {abs(t-p):>8,.0f} | squared {abs(t-p)**2:>12,.0f} "
+          f"| RMSLE {rmsle(np.array([t]), np.array([p])):.3f}")
+print("\nRMSLE treats both as the same mistake: a 2x error is a 2x error")
+```
+
+```output
+cheap item       abs error       20 | squared          400 | RMSLE 0.669
+expensive item   abs error    2,000 | squared    4,000,000 | RMSLE 0.693
+
+RMSLE treats both as the same mistake: a 2x error is a 2x error
+```
+
+## Choosing a metric is choosing a loss
+
+The metric you evaluate on should be the loss you train on. If they disagree, the optimizer
+happily gives you a model that is excellent at the wrong thing.
+
+```python
+x = rng.normal(0, 1, 4_000)
+target = 3.0 * x + rng.normal(0, 0.5, 4_000)
+contaminated = rng.random(4_000) < 0.02                  # 2% of rows are corrupted
+target[contaminated] += rng.normal(60, 10, contaminated.sum())
+
+def fit_l2(x, y):                                        # minimizes squared error
+    A = np.column_stack([x, np.ones_like(x)])
+    return np.linalg.lstsq(A, y, rcond=None)[0]
+
+def fit_l1(x, y, iters=60):                              # IRLS approximation to L1
+    w = np.ones_like(y)
+    beta = fit_l2(x, y)
+    for _ in range(iters):
+        r = np.abs(y - (beta[0] * x + beta[1]))
+        w = 1.0 / np.maximum(r, 1e-3)
+        A = np.column_stack([x, np.ones_like(x)]) * np.sqrt(w)[:, None]
+        beta = np.linalg.lstsq(A, y * np.sqrt(w), rcond=None)[0]
+    return beta
+
+clean_rows = ~contaminated
+for name, beta in [("L2 fit (RMSE)", fit_l2(x, target)), ("L1 fit (MAE)", fit_l1(x, target))]:
+    p = beta[0] * x + beta[1]
+    print(f"{name:16} slope {beta[0]:6.3f} (true 3.000) intercept {beta[1]:6.3f} | "
+          f"MAE on clean rows {np.mean(np.abs(target[clean_rows]-p[clean_rows])):.3f}")
+```
+
+```output
+L2 fit (RMSE)    slope  3.164 (true 3.000) intercept  1.266 | MAE on clean rows 1.282
+L1 fit (MAE)     slope  2.996 (true 3.000) intercept  0.005 | MAE on clean rows 0.398
+```
+
+Two percent contamination shifts the squared-error fit's intercept by more than a point, while
+the L1 fit barely notices — squared error lets a handful of extreme residuals drag the whole
+line, which is the same property that made RMSE move 1.4x in the first demo. **Pick the metric
+from the decision, then train on it** — not the other way around.
+
+## Ranking metrics: order matters, magnitude does not
+
+For search, recommendations, and any "top-k" product surface, the score itself is irrelevant.
+What matters is whether the right items are near the top.
+
+```python
+def precision_at_k(relevant, k):
+    return float(np.mean(relevant[:k]))
+
+def recall_at_k(relevant, k, total_relevant):
+    return float(relevant[:k].sum() / max(total_relevant, 1))
+
+def average_precision(relevant):
+    hits = np.cumsum(relevant)
+    prec_at_hit = hits / (np.arange(len(relevant)) + 1)
+    return float((prec_at_hit * relevant).sum() / max(relevant.sum(), 1))
+
+def dcg(gains, k):
+    g = gains[:k]
+    return float(np.sum(g / np.log2(np.arange(2, len(g) + 2))))
+
+def ndcg(gains, k):
+    ideal = np.sort(gains)[::-1]
+    return dcg(gains, k) / max(dcg(ideal, k), 1e-12)
+
+good = np.array([1, 1, 0, 1, 0, 0, 0, 0, 1, 0])          # relevant items near the top
+bad  = np.array([0, 0, 0, 0, 1, 0, 1, 1, 0, 1])          # same count, ranked badly
+for name, rel in [("good ranking", good), ("bad ranking", bad)]:
+    print(f"{name:14} P@3 {precision_at_k(rel,3):.3f} R@5 {recall_at_k(rel,5,rel.sum()):.3f} "
+          f"AP {average_precision(rel):.3f} NDCG@10 {ndcg(rel.astype(float), 10):.3f}")
+```
+
+```output
+good ranking   P@3 0.667 R@5 0.750 AP 0.799 NDCG@10 0.922
+bad ranking    P@3 0.000 R@5 0.250 AP 0.315 NDCG@10 0.517
+```
+
+Both lists contain four relevant items; only the order differs. Precision@k and recall@k see part
+of that, **average precision** sees all of it, and **NDCG** additionally handles *graded*
+relevance — a perfect match ranked third is not the same as a marginal one ranked third.
+
+```python
+graded = np.array([3, 0, 2, 0, 1, 0, 0, 0, 0, 0], dtype=float)     # 3 = perfect, 1 = marginal
+swapped = graded.copy(); swapped[0], swapped[2] = graded[2], graded[0]
+print(f"ideal order first  NDCG@10 {ndcg(graded, 10):.4f}")
+print(f"top two swapped    NDCG@10 {ndcg(swapped, 10):.4f}")
+print(f"binary metrics cannot see this swap at all: "
+      f"P@3 {precision_at_k((graded>0).astype(int),3):.3f} both ways")
+```
+
+```output
+ideal order first  NDCG@10 0.9212
+top two swapped    NDCG@10 0.8162
+binary metrics cannot see this swap at all: P@3 0.667 both ways
+```
+
+### MRR, and when to use which
+
+```python
+def mrr(relevant_lists):
+    rr = []
+    for rel in relevant_lists:
+        hit = np.flatnonzero(rel)
+        rr.append(1 / (hit[0] + 1) if len(hit) else 0.0)
+    return float(np.mean(rr))
+
+queries = [np.array([0, 1, 0, 0]), np.array([1, 0, 0, 0]), np.array([0, 0, 0, 1])]
+print(f"MRR {mrr(queries):.4f}  (positions 2, 1, 4)")
+print()
+guidance = [
+    ("one correct answer exists",        "MRR",        "search for a known item, QA retrieval"),
+    ("several relevant, order matters",  "NDCG@k",     "recommendations, graded relevance"),
+    ("several relevant, binary",         "MAP",        "document retrieval"),
+    ("fixed slate the user sees",        "P@k / R@k",  "a 10-item carousel"),
+    ("revenue depends on the position",  "custom",     "weight by position value, not by log"),
+]
+for when, metric, example in guidance:
+    print(f"{when:34}{metric:12}{example}")
+```
+
+```output
+MRR 0.5833  (positions 2, 1, 4)
+
+one correct answer exists         MRR         search for a known item, QA retrieval
+several relevant, order matters   NDCG@k      recommendations, graded relevance
+several relevant, binary          MAP         document retrieval
+fixed slate the user sees         P@k / R@k   a 10-item carousel
+revenue depends on the position   custom      weight by position value, not by log
+```
+
+## Cutoffs must match the interface
+
+```python
+rel = (rng.random((2_000, 50)) < 0.08).astype(float)      # 50 candidates per query
+for k in (1, 3, 5, 10, 20, 50):
+    scores = [ndcg(r, k) for r in rel]
+    print(f"NDCG@{k:<3} {np.mean(scores):.4f}   "
+          f"{'<- matches a 10-item page' if k == 10 else ''}")
+```
+
+```output
+NDCG@1   0.0760   
+NDCG@3   0.0809   
+NDCG@5   0.0921   
+NDCG@10  0.1393   <- matches a 10-item page
+NDCG@20  0.2161   
+NDCG@50  0.3916   
+```
+
+The number in `@k` is not a modelling choice, it is a **product** fact: if the page shows ten
+results, `NDCG@10` is the metric and `NDCG@50` is a fiction about an interface nobody sees.
+
+## Try it Yourself
+
+```python
+def evaluate_regression(y, preds, names):
+    print(f"{'model':14}{'MAE':>9}{'RMSE':>9}{'MedAE':>9}{'MAPE%':>9}{'R2':>8}  best on")
+    table = {n: reg_metrics(y, p) for n, p in zip(names, preds)}
+    for n, m in table.items():
+        print(f"{n:14}{m['MAE']:>9.2f}{m['RMSE']:>9.2f}{m['MedAE']:>9.2f}"
+              f"{m['MAPE%']:>9.2f}{m['R2']:>8.3f}")
+    for metric in ("MAE", "RMSE", "MedAE", "MAPE%"):
+        winner = min(table, key=lambda n: table[n][metric])
+        print(f"   {metric:6} winner: {winner}")
+
+base = y * rng.normal(1.0, 0.12, 5_000)
+biased_low = y * rng.normal(0.92, 0.10, 5_000)
+occasionally_wild = y * rng.normal(1.0, 0.10, 5_000)
+occasionally_wild[:30] *= 5
+evaluate_regression(y, [base, biased_low, occasionally_wild],
+                    ["unbiased", "biased low", "wild outliers"])
+```
+
+```output
+model               MAE     RMSE    MedAE    MAPE%      R2  best on
+unbiased           6.23     9.18     4.14     9.56   0.952
+biased low         6.88    10.11     4.63    10.51   0.942
+wild outliers      6.53    21.33     3.45    10.35   0.742
+   MAE    winner: unbiased
+   RMSE   winner: unbiased
+   MedAE  winner: wild outliers
+   MAPE%  winner: unbiased
+```
+
+Three models, and the winner changes with the metric. That is the whole point of this chapter:
+**report several metrics, and state which one the decision uses** — because the model you pick is
+determined by that choice long before any tuning happens (ch. 6).
+
+## Exercise
+
+You are evaluating a delivery-time model. Errors are asymmetric: predicting *late* by 10 minutes
+annoys the customer, predicting *early* by 10 minutes costs a driver an idle wait. Build a
+custom asymmetric metric (a pinball / quantile loss) that penalizes under-prediction twice as
+heavily as over-prediction, and show that the model minimizing it is systematically different
+from the one minimizing RMSE. Then report both, plus the fraction of deliveries inside a
+five-minute window, and recommend one.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def pinball(y, pred, tau):
+    """tau = 0.5 is MAE; tau > 0.5 punishes UNDER-prediction more."""
+    d = y - pred
+    return float(np.mean(np.maximum(tau * d, (tau - 1) * d)))
+
+r = np.random.default_rng(3)
+n = 8_000
+distance = r.gamma(4, 2.0, n)
+true_time = 8 + 2.4 * distance + r.gamma(2, 1.5, n)          # right-skewed delays
+
+b_l2 = np.linalg.lstsq(np.column_stack([np.ones(n), distance]), true_time, rcond=None)[0]
+
+def fit_quantile(x, y, slope, tau):
+    """Shift the intercept to the tau-quantile of the residuals: the minimizer of pinball
+    loss for a location shift. (Full quantile regression optimizes the slope too.)"""
+    resid = y - slope * x
+    return np.array([float(np.quantile(resid, tau)), slope])
+
+b_q = fit_quantile(distance, true_time, slope=b_l2[1], tau=2/3)      # 2:1 asymmetry
+
+pred_l2 = b_l2[0] + b_l2[1] * distance
+pred_q = b_q[0] + b_q[1] * distance
+
+print(f"{'model':16}{'RMSE':>9}{'MAE':>9}{'pinball(2/3)':>15}"
+      f"{'% late':>9}{'% within 5min':>15}")
+for name, p in [("RMSE-fit", pred_l2), ("asymmetric-fit", pred_q)]:
+    late = float(np.mean(true_time > p))
+    within = float(np.mean(np.abs(true_time - p) <= 5))
+    print(f"{name:16}{np.sqrt(np.mean((true_time-p)**2)):>9.3f}"
+          f"{np.mean(np.abs(true_time-p)):>9.3f}{pinball(true_time, p, 2/3):>15.4f}"
+          f"{late:>9.1%}{within:>15.1%}")
+
+print(f"\nintercepts: RMSE fit {b_l2[0]:.2f}, asymmetric fit {b_q[0]:.2f} "
+      f"-> the asymmetric model quotes {b_q[0]-b_l2[0]:+.1f} min of padding")
+print("recommendation: report all three, decide on pinball —")
+print("the business cost of a late promise is not the business cost of an early one")
+```
+
+```output
+model                RMSE      MAE   pinball(2/3)   % late  % within 5min
+RMSE-fit            2.110    1.612         0.8061    40.5%          97.2%
+asymmetric-fit      2.154    1.725         0.7908    33.3%          97.9%
+
+intercepts: RMSE fit 11.07, asymmetric fit 11.50 -> the asymmetric model quotes +0.4 min of padding
+recommendation: report all three, decide on pinball —
+the business cost of a late promise is not the business cost of an early one
+```
+
+The insight: the asymmetric model is *worse* on RMSE and *better* at the thing the business
+actually cares about, which is being late less often. It buys that by quoting about half a minute
+of padding on every delivery — visible in the intercept — and that padding is a product
+decision, not a modelling accident. Push `tau` to 0.9 and both the padding and the late rate move
+sharply: the parameter *is* the policy. Three general lessons follow. **A custom loss is usually a few lines**
+(pinball is one expression), so "we had to use RMSE because that is what the library does" is
+rarely true. **Report the symmetric metrics anyway**, because they are how you compare against
+other teams and against the literature; just do not decide with them. And notice that the
+fraction inside a five-minute window is the metric a customer would recognize — the closer your
+headline number is to something a user could feel, the less translation is needed when the
+decision is made (ch. 3 makes the cost structure explicit and picks the operating point from it).
+</details>
