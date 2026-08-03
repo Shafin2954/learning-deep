@@ -1,0 +1,466 @@
+---
+course: mlops
+chapter: 07-monitoring-alerting
+title: "Monitoring: Data Quality, Drift, and Alerting That Works"
+order: 7
+---
+
+## Monitoring starts with the prediction log
+
+Everything downstream — drift detection, quality metrics, debugging, the next training set — is
+computed from one table: a row per prediction, written by the serving path (ch. 2). If it is not
+logged, it did not happen.
+
+```python
+import numpy as np, json, itertools
+from collections import Counter, defaultdict
+
+rng = np.random.default_rng(0)
+FEATURES = ["age", "income", "prior_claims"]
+ids = itertools.count(1)
+
+def prediction_record(features, score, model_version, latency_ms, day):
+    return {"id": f"p-{next(ids):07d}", "day": day, "model_version": model_version,
+            "features": features, "score": round(float(score), 6),
+            "decision": "review" if score > 0.5 else "accept",
+            "latency_ms": round(latency_ms, 2), "label": None}   # filled in later (ch. 8)
+
+def synth_day(day, n=2_000, shift=0.0, null_rate=0.0, model_version="1.4.0"):
+    age = np.clip(rng.normal(50 + shift, 12, n), 18, 110)
+    income = rng.lognormal(7, 0.6, n)
+    prior = rng.integers(0, 5, n)
+    scores = 1 / (1 + np.exp(-(0.05 * (age - 50) + 0.3 * prior - 1.2)))
+    rows = []
+    for i in range(n):
+        f = {"age": float(age[i]), "income": float(income[i]), "prior_claims": int(prior[i])}
+        if null_rate and rng.random() < null_rate:
+            f["income"] = None
+        rows.append(prediction_record(f, scores[i], model_version,
+                                      float(rng.gamma(2, 3)), day))
+    return rows
+
+log = synth_day(1)
+print(json.dumps(log[0], indent=1))
+print(f"\n{len(log):,} predictions logged for day 1")
+```
+
+```output
+{
+ "id": "p-0000001",
+ "day": 1,
+ "model_version": "1.4.0",
+ "features": {
+  "age": 51.50876265312072,
+  "income": 1410.2931936665645,
+  "prior_claims": 2
+ },
+ "score": 0.371786,
+ "decision": "accept",
+ "latency_ms": 9.07,
+ "label": null
+}
+
+2,000 predictions logged for day 1
+```
+
+Four fields do most of the work later. `model_version` makes every metric sliceable by model
+(ch. 6). `features` lets you recompute drift without a second pipeline. `score` before the
+threshold, not just the decision, because a threshold change should not require new logs. And an
+`id` that the caller also received, so a complaint maps to a row.
+
+## Level 1: data quality on live traffic
+
+The expectations you wrote for training data (ch. 4) apply unchanged to production requests —
+and this is the check that fires first when an upstream pipeline breaks.
+
+```python
+EXPECTATIONS = {
+    "age":          {"min": 18, "max": 110, "null_rate_max": 0.0},
+    "income":       {"min": 0.0, "max": 1e6, "null_rate_max": 0.005},
+    "prior_claims": {"min": 0, "max": 20, "null_rate_max": 0.0},
+}
+
+def quality_check(rows, expectations=EXPECTATIONS):
+    findings = []
+    for name, exp in expectations.items():
+        values = [r["features"][name] for r in rows]
+        nulls = sum(v is None for v in values) / len(values)
+        present = [v for v in values if v is not None]
+        if nulls > exp["null_rate_max"]:
+            findings.append(f"{name}: null rate {nulls:.2%} > {exp['null_rate_max']:.2%}")
+        if present and (min(present) < exp["min"] or max(present) > exp["max"]):
+            findings.append(f"{name}: range [{min(present):.1f}, {max(present):.1f}] "
+                            f"outside [{exp['min']}, {exp['max']}]")
+    return findings
+
+print("clean day :", quality_check(log) or "PASS")
+broken = synth_day(2, null_rate=0.04)
+print("broken day:", quality_check(broken))
+```
+
+```output
+clean day : PASS
+broken day: ['income: null rate 3.45% > 0.50%']
+```
+
+Run it on a rolling window (an hour, a day) rather than per request, so one odd payload does not
+page anyone, and **run it before the drift checks** — a null rate spike explains a distribution
+shift, and reporting both as separate incidents wastes an on-call's night.
+
+## Level 2: input and output drift
+
+```python
+def psi(reference, current, bins=10):
+    edges = np.quantile(reference, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    p = np.histogram(reference, edges)[0] / len(reference) + 1e-6
+    q = np.histogram(current, edges)[0] / len(current) + 1e-6
+    return float(np.sum((p - q) * np.log(p / q)))
+
+def column(rows, name):
+    return np.array([r["features"][name] for r in rows if r["features"][name] is not None],
+                    dtype=float)
+
+def scores_of(rows):
+    return np.array([r["score"] for r in rows])
+
+reference = synth_day(0)
+days = {"normal": synth_day(3),
+        "population shifted": synth_day(4, shift=6.0),
+        "upstream broken": synth_day(5, null_rate=0.04)}
+
+print(f"{'day':20}{'PSI age':>10}{'PSI score':>11}  quality")
+for label, rows in days.items():
+    print(f"{label:20}{psi(column(reference, 'age'), column(rows, 'age')):>10.4f}"
+          f"{psi(scores_of(reference), scores_of(rows)):>11.4f}  "
+          f"{'ok' if not quality_check(rows) else 'FAIL'}")
+```
+
+```output
+day                    PSI age  PSI score  quality
+normal                  0.0039     0.0113  ok
+population shifted      0.2509     0.1636  ok
+upstream broken         0.0111     0.0075  FAIL
+```
+
+Two monitors, two different failures. Input drift says *the world changed*; output drift says
+*the model's behaviour changed*, which can happen with no input drift at all if a feature
+pipeline swapped two columns. Watching the **score distribution** is the cheapest early warning
+in ML monitoring, because it needs no labels and no reference data beyond yesterday.
+
+## Level 3: outcome metrics, when labels arrive
+
+```python
+def attach_labels(rows, delay_days, today, rng):
+    """Labels arrive late; only rows older than the delay have one."""
+    labelled = 0
+    for r in rows:
+        if today - r["day"] >= delay_days:
+            r["label"] = int(rng.random() < r["score"])
+            labelled += 1
+    return labelled
+
+n_labelled = attach_labels(log, delay_days=30, today=45, rng=rng)
+print(f"day-1 predictions with labels by day 45: {n_labelled:,}/{len(log):,}")
+n_labelled_early = attach_labels(synth_day(40), delay_days=30, today=45, rng=rng)
+print(f"day-40 predictions with labels by day 45: {n_labelled_early:,}")
+print("\nthe outcome monitor is always looking at the past;")
+print("the input and output monitors are the only ones looking at now")
+```
+
+```output
+day-1 predictions with labels by day 45: 2,000/2,000
+day-40 predictions with labels by day 45: 0
+
+the outcome monitor is always looking at the past;
+the input and output monitors are the only ones looking at now
+```
+
+## Alert rules: the part that decides whether monitoring is used
+
+```python
+class AlertRule:
+    def __init__(self, name, severity, condition, for_windows=1, runbook=""):
+        self.name, self.severity, self.condition = name, severity, condition
+        self.for_windows, self.runbook = for_windows, runbook
+        self.consecutive, self.fired = 0, False
+
+    def evaluate(self, metrics):
+        if self.condition(metrics):
+            self.consecutive += 1
+        else:
+            self.consecutive = 0
+        should_fire = self.consecutive >= self.for_windows
+        event = None
+        if should_fire and not self.fired:
+            event = ("FIRING", self.name, self.severity, self.runbook)
+        elif not should_fire and self.fired:
+            event = ("RESOLVED", self.name, self.severity, "")
+        self.fired = should_fire
+        return event
+
+RULES = [
+    AlertRule("null_rate_spike", "page", lambda m: m["null_rate"] > 0.01,
+              for_windows=1, runbook="check the upstream extract (ch. 5)"),
+    AlertRule("input_drift", "ticket", lambda m: m["psi_age"] > 0.25,
+              for_windows=3, runbook="compare feature distributions, consider retraining (ch. 8)"),
+    AlertRule("score_drift", "page", lambda m: m["psi_score"] > 0.25,
+              for_windows=2, runbook="check for a feature-pipeline bug or a bad deploy"),
+    AlertRule("latency_p99", "page", lambda m: m["p99_ms"] > 150,
+              for_windows=2, runbook="check batch size and pool saturation (ch. 2)"),
+]
+
+windows = [
+    {"null_rate": 0.000, "psi_age": 0.02, "psi_score": 0.03, "p99_ms": 40},
+    {"null_rate": 0.000, "psi_age": 0.31, "psi_score": 0.05, "p99_ms": 42},   # drift starts
+    {"null_rate": 0.000, "psi_age": 0.33, "psi_score": 0.06, "p99_ms": 44},
+    {"null_rate": 0.040, "psi_age": 0.34, "psi_score": 0.41, "p99_ms": 45},   # pipeline breaks
+    {"null_rate": 0.041, "psi_age": 0.35, "psi_score": 0.44, "p99_ms": 47},
+    {"null_rate": 0.000, "psi_age": 0.30, "psi_score": 0.05, "p99_ms": 41},   # fixed
+]
+for i, m in enumerate(windows, start=1):
+    events = [r.evaluate(m) for r in RULES]
+    fired = [e for e in events if e]
+    line = f"window {i}: " + ("; ".join(f"{e[0]} {e[1]} ({e[2]})" for e in fired) or "quiet")
+    print(line)
+    for e in fired:
+        if e[0] == "FIRING" and e[3]:
+            print(f"{'':11} runbook: {e[3]}")
+```
+
+```output
+window 1: quiet
+window 2: quiet
+window 3: quiet
+window 4: FIRING null_rate_spike (page); FIRING input_drift (ticket)
+            runbook: check the upstream extract (ch. 5)
+            runbook: compare feature distributions, consider retraining (ch. 8)
+window 5: FIRING score_drift (page)
+            runbook: check for a feature-pipeline bug or a bad deploy
+window 6: RESOLVED null_rate_spike (page); RESOLVED score_drift (page)
+```
+
+Four properties separate an alert that gets acted on from one that gets muted. **`for_windows`**
+means a single noisy window does not page anyone. **Severity routes**: `page` wakes a human,
+`ticket` waits for morning. **A runbook link** turns a 3 a.m. page into a procedure instead of an
+investigation. And **RESOLVED events** close the loop, so nobody chases a problem that fixed
+itself.
+
+### Alert on symptoms, page on impact
+
+```python
+candidates = [
+    ("model accuracy dropped 4%",      "user impact",     "page"),
+    ("PSI on one feature > 0.25",      "leading signal",  "ticket"),
+    ("null rate spike in a feature",   "cause",           "page"),
+    ("p99 latency above the SLO",      "user impact",     "page"),
+    ("training run took 20% longer",   "cost signal",     "dashboard only"),
+    ("a single request returned 500",  "noise at scale",  "dashboard only"),
+    ("prediction volume dropped 60%",  "user impact",     "page"),
+]
+print(f"{'signal':34}{'kind':18}route")
+for signal, kind, route in candidates:
+    print(f"{signal:34}{kind:18}{route}")
+```
+
+```output
+signal                            kind              route
+model accuracy dropped 4%         user impact       page
+PSI on one feature > 0.25         leading signal    ticket
+null rate spike in a feature      cause             page
+p99 latency above the SLO         user impact       page
+training run took 20% longer      cost signal       dashboard only
+a single request returned 500     noise at scale    dashboard only
+prediction volume dropped 60%     user impact       page
+```
+
+The row people get wrong is the last one: **a drop in prediction volume is an outage**, and it is
+invisible to every model-quality metric. Something upstream stopped calling you, and no drift
+detector will ever mention it.
+
+## The monitoring pipeline itself
+
+```python
+def monitoring_job(rows, reference_rows, day):
+    """Runs on a schedule (ch. 5), reads the prediction log, writes metrics."""
+    metrics = {
+        "day": day,
+        "n": len(rows),
+        "null_rate": max(sum(r["features"][f] is None for r in rows) / len(rows)
+                         for f in FEATURES),
+        "psi_age": psi(column(reference_rows, "age"), column(rows, "age")),
+        "psi_score": psi(scores_of(reference_rows), scores_of(rows)),
+        "p99_ms": float(np.percentile([r["latency_ms"] for r in rows], 99)),
+        "decision_rate": sum(r["decision"] == "review" for r in rows) / len(rows),
+        "model_versions": dict(Counter(r["model_version"] for r in rows)),
+    }
+    return metrics
+
+m = monitoring_job(synth_day(6, shift=3.0), reference, day=6)
+for k, v in m.items():
+    print(f"{k:16} {v if not isinstance(v, float) else round(v, 4)}")
+```
+
+```output
+day              6
+n                2000
+null_rate        0.0
+psi_age          0.057
+psi_score        0.0508
+p99_ms           20.0346
+decision_rate    0.2595
+model_versions   {'1.4.0': 2000}
+```
+
+Three implementation notes worth stating. The job is **a scheduled batch job over the log**, not
+an in-request computation — drift is a property of a population, not of a request. It writes
+**metrics as data**, so they are queryable and back-fillable. And it slices by `model_version`,
+because during a canary you have two models live and their aggregate is meaningless.
+
+## Try it Yourself
+
+```python
+def alert_load(n_rules, windows_per_day, false_positive_rate, real_incidents_per_month):
+    pages_per_month = n_rules * windows_per_day * 30 * false_positive_rate
+    signal = real_incidents_per_month / max(1e-9, pages_per_month + real_incidents_per_month)
+    verdict = ("healthy" if signal > 0.3 else
+               "noisy — people will start ignoring pages" if signal > 0.05 else
+               "alert fatigue: this monitoring is worse than none")
+    print(f"{n_rules:3} rules, fp rate {false_positive_rate:6.4f} -> "
+          f"{pages_per_month:7.1f} false pages/month | signal {signal:6.1%} | {verdict}")
+
+for fp in (0.01, 0.001, 0.0001):
+    alert_load(12, windows_per_day=24, false_positive_rate=fp, real_incidents_per_month=2)
+print()
+for n in (5, 12, 40):
+    alert_load(n, windows_per_day=24, false_positive_rate=0.001, real_incidents_per_month=2)
+```
+
+```output
+ 12 rules, fp rate 0.0100 ->    86.4 false pages/month | signal   2.3% | alert fatigue: this monitoring is worse than none
+ 12 rules, fp rate 0.0010 ->     8.6 false pages/month | signal  18.8% | noisy — people will start ignoring pages
+ 12 rules, fp rate 0.0001 ->     0.9 false pages/month | signal  69.8% | healthy
+
+  5 rules, fp rate 0.0010 ->     3.6 false pages/month | signal  35.7% | healthy
+ 12 rules, fp rate 0.0010 ->     8.6 false pages/month | signal  18.8% | noisy — people will start ignoring pages
+ 40 rules, fp rate 0.0010 ->    28.8 false pages/month | signal   6.5% | noisy — people will start ignoring pages
+```
+
+Every rule you add multiplies the false-page rate by its own error rate, and the tolerable
+per-window false-positive rate is far smaller than intuition suggests. This is the arithmetic
+behind two rules of thumb: keep paging alerts in the single digits, and raise `for_windows`
+before you loosen a threshold.
+
+## Exercise
+
+Build the full monitoring job as a scheduled task: it reads a day of prediction logs, computes
+data-quality, input-drift, output-drift, and operational metrics **sliced by model version**,
+evaluates the alert rules with hysteresis, deduplicates alerts that are already firing, and
+writes a daily metrics row that a dashboard can query. Run it over 10 simulated days that include
+a canary rollout, a broken upstream, and a genuine population shift, and show what fires on each
+day.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def daily_monitor(days_data, reference_rows, rules):
+    history = []
+    for day, rows in enumerate(days_data, start=1):
+        by_version = defaultdict(list)
+        for r in rows:
+            by_version[r["model_version"]].append(r)
+
+        overall = monitoring_job(rows, reference_rows, day)
+        overall["by_version"] = {
+            v: {"n": len(rs),
+                "psi_score": round(psi(scores_of(reference_rows), scores_of(rs)), 4),
+                "review_rate": round(sum(x["decision"] == "review" for x in rs) / len(rs), 4)}
+            for v, rs in by_version.items()}
+        history.append(overall)
+
+        events = [r.evaluate(overall) for r in rules]
+        fired = [e for e in events if e]
+        versions = "+".join(f"{v}({d['n']})" for v, d in overall["by_version"].items())
+        print(f"day {day:2} | n={overall['n']:,} {versions:22} "
+              f"null={overall['null_rate']:.3f} psi_age={overall['psi_age']:.3f} "
+              f"psi_score={overall['psi_score']:.3f} p99={overall['p99_ms']:.0f}ms")
+        for kind, name, severity, runbook in fired:
+            print(f"{'':8}-> {kind} [{severity}] {name}" + (f" | {runbook}" if runbook else ""))
+    return history
+
+def canary_day(day, share_new=0.1, **kw):
+    rows = synth_day(day, **kw)
+    for r in rows:
+        if rng.random() < share_new:
+            r["model_version"] = "1.5.0"
+            r["score"] = float(np.clip(r["score"] * 1.35, 0, 1))     # the new model scores higher
+            r["decision"] = "review" if r["score"] > 0.5 else "accept"
+    return rows
+
+days_data = [
+    synth_day(1), synth_day(2),
+    canary_day(3), canary_day(4, share_new=0.25),        # canary ramps
+    synth_day(5, null_rate=0.04),                        # upstream breaks
+    synth_day(6, null_rate=0.04),
+    synth_day(7),                                        # fixed
+    synth_day(8, shift=6.0), synth_day(9, shift=7.0), synth_day(10, shift=8.0),  # real shift
+]
+
+fresh_rules = [
+    AlertRule("null_rate_spike", "page", lambda m: m["null_rate"] > 0.01, 1,
+              "check the upstream extract (ch. 5)"),
+    AlertRule("input_drift", "ticket", lambda m: m["psi_age"] > 0.25, 3,
+              "population shifted: consider retraining (ch. 8)"),
+    AlertRule("score_drift", "page", lambda m: m["psi_score"] > 0.25, 2,
+              "feature-pipeline bug or a bad deploy"),
+]
+history = daily_monitor(days_data, reference, fresh_rules)
+
+print("\ndashboard rows written:", len(history))
+print("day 4 by version:", json.dumps(history[3]["by_version"], indent=1))
+```
+
+```output
+day  1 | n=2,000 1.4.0(2000)            null=0.000 psi_age=0.009 psi_score=0.008 p99=19ms
+day  2 | n=2,000 1.4.0(2000)            null=0.000 psi_age=0.006 psi_score=0.011 p99=19ms
+day  3 | n=2,000 1.4.0(1817)+1.5.0(183) null=0.000 psi_age=0.005 psi_score=0.013 p99=20ms
+day  4 | n=2,000 1.5.0(481)+1.4.0(1519) null=0.000 psi_age=0.011 psi_score=0.033 p99=21ms
+day  5 | n=2,000 1.4.0(2000)            null=0.038 psi_age=0.013 psi_score=0.007 p99=20ms
+        -> FIRING [page] null_rate_spike | check the upstream extract (ch. 5)
+day  6 | n=2,000 1.4.0(2000)            null=0.035 psi_age=0.010 psi_score=0.005 p99=20ms
+day  7 | n=2,000 1.4.0(2000)            null=0.000 psi_age=0.006 psi_score=0.009 p99=21ms
+        -> RESOLVED [page] null_rate_spike
+day  8 | n=2,000 1.4.0(2000)            null=0.000 psi_age=0.282 psi_score=0.183 p99=20ms
+day  9 | n=2,000 1.4.0(2000)            null=0.000 psi_age=0.321 psi_score=0.198 p99=19ms
+day 10 | n=2,000 1.4.0(2000)            null=0.000 psi_age=0.437 psi_score=0.298 p99=19ms
+        -> FIRING [ticket] input_drift | population shifted: consider retraining (ch. 8)
+
+dashboard rows written: 10
+day 4 by version: {
+ "1.5.0": {
+  "n": 481,
+  "psi_score": 0.4174,
+  "review_rate": 0.4511
+ },
+ "1.4.0": {
+  "n": 1519,
+  "psi_score": 0.0061,
+  "review_rate": 0.2087
+ }
+}
+```
+
+The insight: the aggregate hides the canary in both directions. On day 4 the overall score PSI is
+0.03 — flat, uninteresting — while the 1.5.0 slice sits at 0.42, because a quarter of traffic is
+being served by a model that scores much higher. Diluted across 2,000 rows, a *genuinely broken*
+canary would look just as calm, which is why the rule must evaluate **per model version**: a
+canary is exactly the situation where you most need to see a distribution move, and exactly the
+situation where the aggregate refuses to show it. Three more things this exercise makes concrete.
+Hysteresis (`for_windows=3` on input drift) is what separates the *real* population shift on days
+8–10 from single-day noise, and it costs two days of delay on a signal that is not urgent
+anyway. Deduplication matters because the broken upstream would otherwise page every window for
+two days instead of once. And the monitoring job writes **rows, not alerts** — the metrics table
+outlives the incident, so when someone asks in three months when the drift started, the answer is
+a query rather than a search through chat history.
+</details>
