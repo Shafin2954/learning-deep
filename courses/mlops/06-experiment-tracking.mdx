@@ -1,0 +1,448 @@
+---
+course: mlops
+chapter: 06-experiment-tracking
+title: "Experiment and Model Tracking"
+order: 6
+---
+
+## The question a tracker answers
+
+Six months from now someone asks: *why is this model in production, and what else did you try?*
+A tracker exists so the answer is a query rather than an archaeology project. Two distinct
+things get tracked, and conflating them is the usual mistake:
+
+- **Experiments (runs)**: every training attempt, with its parameters, metrics, code version,
+  data version, and artifacts. Many per day, mostly disposable.
+- **The model registry**: the few runs that were promoted, with a lifecycle stage
+  (`staging`, `production`, `archived`) and an audit trail. Few per quarter, permanent.
+
+```python
+import json, hashlib, time, itertools
+from collections import defaultdict
+
+class Tracker:
+    """MLflow-style: runs hold params, metrics, tags, and artifacts."""
+    def __init__(self):
+        self.runs, self._ids = {}, itertools.count(1)
+
+    def start_run(self, experiment, tags=None):
+        rid = f"run-{next(self._ids):04d}"
+        self.runs[rid] = {"id": rid, "experiment": experiment, "params": {}, "metrics": {},
+                          "artifacts": {}, "tags": tags or {}, "status": "running"}
+        return rid
+
+    def log_params(self, rid, **params):
+        self.runs[rid]["params"].update(params)
+
+    def log_metrics(self, rid, step=None, **metrics):
+        for k, v in metrics.items():
+            self.runs[rid]["metrics"].setdefault(k, []).append({"step": step, "value": v})
+
+    def log_artifact(self, rid, name, content):
+        digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()[:12]
+        self.runs[rid]["artifacts"][name] = digest
+        return digest
+
+    def end_run(self, rid, status="finished"):
+        self.runs[rid]["status"] = status
+
+    def final(self, rid, metric):
+        return self.runs[rid]["metrics"][metric][-1]["value"]
+
+tr = Tracker()
+rid = tr.start_run("claims-risk", tags={"owner": "risk-team", "trigger": "manual"})
+tr.log_params(rid, model="logreg", C=1.0, max_iter=1000, features=3, seed=0)
+for epoch, loss in [(1, 0.62), (2, 0.51), (3, 0.48)]:
+    tr.log_metrics(rid, step=epoch, train_loss=loss)
+tr.log_metrics(rid, auc=0.7937, auc_slice_age_lt_40=0.7884)
+tr.log_artifact(rid, "model.joblib", {"coef": [0.61, 0.22, 0.77]})
+tr.end_run(rid)
+run = tr.runs[rid]
+print("run     :", run["id"], "| experiment:", run["experiment"], "| status:", run["status"])
+print("params  :", run["params"])
+print("metrics :", {k: [p["value"] for p in v] for k, v in run["metrics"].items()})
+print("artifact:", run["artifacts"], "| tags:", run["tags"])
+```
+
+```output
+run     : run-0001 | experiment: claims-risk | status: finished
+params  : {'model': 'logreg', 'C': 1.0, 'max_iter': 1000, 'features': 3, 'seed': 0}
+metrics : {'train_loss': [0.62, 0.51, 0.48], 'auc': [0.7937], 'auc_slice_age_lt_40': [0.7884]}
+artifact: {'model.joblib': 'e5f5175487f1'} | tags: {'owner': 'risk-team', 'trigger': 'manual'}
+```
+
+Note what a run record is: **parameters in, metrics out, artifacts produced, and the context that
+makes it reproducible**. Anything you would have to remember belongs in it.
+
+## What to log, and what people forget
+
+```python
+REQUIRED = {
+    "code_commit":   "the exact source that produced this run",
+    "data_version":  "snapshot id or partition range — not 'the users table'",
+    "seed":          "so the run is repeatable",
+    "env_hash":      "hash of the lock file (ch. 3)",
+    "params":        "everything a rerun would need",
+    "metrics":       "overall AND per slice (ch. 4)",
+    "artifacts":     "model, preprocessing, evaluation report, plots",
+    "duration_s":    "cost and capacity planning (ch. 9)",
+}
+logged = {"params", "metrics", "artifacts"}
+print(f"{'field':15}{'logged?':10}why it matters")
+for field, why in REQUIRED.items():
+    print(f"{field:15}{'yes' if field in logged else 'MISSING':10}{why}")
+missing = [f for f in REQUIRED if f not in logged]
+print(f"\n{len(missing)} missing fields -> this run cannot be reproduced or explained")
+```
+
+```output
+field          logged?   why it matters
+code_commit    MISSING   the exact source that produced this run
+data_version   MISSING   snapshot id or partition range — not 'the users table'
+seed           MISSING   so the run is repeatable
+env_hash       MISSING   hash of the lock file (ch. 3)
+params         yes       everything a rerun would need
+metrics        yes       overall AND per slice (ch. 4)
+artifacts      yes       model, preprocessing, evaluation report, plots
+duration_s     MISSING   cost and capacity planning (ch. 9)
+
+5 missing fields -> this run cannot be reproduced or explained
+```
+
+The three that are always logged are the three that are least useful in an incident. `data_version`
+and `code_commit` are what let you rebuild a model from a year ago; without them a run record is
+a leaderboard entry, not a reproducibility record.
+
+## Comparing runs is the point
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+def simulate_sweep(tracker, experiment, grid):
+    for params in grid:
+        rid = tracker.start_run(experiment, tags={"trigger": "sweep"})
+        tracker.log_params(rid, **params, seed=0, data_version="2026-05-01")
+        # quality saturates in C; cost keeps growing in C — the usual shape
+        base = 0.72 + 0.12 * (1 - np.exp(-params["C"] / 2)) - 0.0015 * params["max_depth"]
+        tracker.log_metrics(rid, auc=float(np.clip(base + rng.normal(0, 0.002), 0, 1)),
+                            fit_seconds=float(6 + params["max_depth"] * 1.7 + params["C"] * 4))
+        tracker.end_run(rid)
+
+grid = [{"C": c, "max_depth": d} for c in (1.0, 3.0, 6.0, 10.0) for d in (2, 6)]
+simulate_sweep(tr, "claims-risk-sweep", grid)
+
+rows = [(r["id"], r["params"]["C"], r["params"]["max_depth"],
+         r["metrics"]["auc"][-1]["value"], r["metrics"]["fit_seconds"][-1]["value"])
+        for r in tr.runs.values() if r["experiment"] == "claims-risk-sweep"]
+rows.sort(key=lambda t: -t[3])
+print(f"{'run':10}{'C':>7}{'depth':>7}{'auc':>9}{'fit s':>8}")
+for rid_, c, d, a, s in rows[:5]:
+    print(f"{rid_:10}{c:>7}{d:>7}{a:>9.4f}{s:>8.1f}")
+print(f"\nbest run: {rows[0][0]} | worst: {rows[-1][0]} | spread {rows[0][3]-rows[-1][3]:.4f} AUC")
+```
+
+```output
+run             C  depth      auc   fit s
+run-0008     10.0      2   0.8388    49.4
+run-0009     10.0      6   0.8321    56.2
+run-0006      6.0      2   0.8300    33.4
+run-0007      6.0      6   0.8257    40.2
+run-0004      3.0      2   0.8115    21.4
+
+best run: run-0008 | worst: run-0003 | spread 0.0808 AUC
+```
+
+A leaderboard is the cheap part. The expensive question is *which parameter actually mattered*,
+and a tracker answers it because every run carries its parameters alongside its metric.
+
+```python
+def effect_of(rows, param_index, metric_index=3):
+    groups = defaultdict(list)
+    for row in rows:
+        groups[row[param_index]].append(row[metric_index])
+    for value, metrics in sorted(groups.items()):
+        print(f"  {value:>6} -> mean AUC {np.mean(metrics):.4f} (n={len(metrics)})")
+
+print("effect of C:"); effect_of(rows, 1)
+print("effect of max_depth:"); effect_of(rows, 2)
+```
+
+```output
+effect of C:
+     1.0 -> mean AUC 0.7612 (n=2)
+     3.0 -> mean AUC 0.8080 (n=2)
+     6.0 -> mean AUC 0.8279 (n=2)
+    10.0 -> mean AUC 0.8354 (n=2)
+effect of max_depth:
+       2 -> mean AUC 0.8112 (n=4)
+       6 -> mean AUC 0.8051 (n=4)
+```
+
+## The registry: from run to deployed model
+
+```python
+class Registry:
+    STAGES = ("none", "staging", "production", "archived")
+
+    def __init__(self, tracker):
+        self.tracker, self.models, self.audit = tracker, defaultdict(list), []
+
+    def register(self, name, run_id, version=None):
+        v = version or f"{len(self.models[name]) + 1}"
+        run = self.tracker.runs[run_id]
+        entry = {"name": name, "version": v, "run_id": run_id, "stage": "none",
+                 "metrics": {k: vals[-1]["value"] for k, vals in run["metrics"].items()},
+                 "params": run["params"], "artifacts": run["artifacts"]}
+        self.models[name].append(entry)
+        self.audit.append((f"register {name} v{v}", "ci-bot", f"from {run_id}"))
+        return entry
+
+    def transition(self, name, version, stage, actor, archive_existing=True):
+        assert stage in self.STAGES
+        entry = next(e for e in self.models[name] if e["version"] == version)
+        if stage == "production" and archive_existing:
+            for other in self.models[name]:
+                if other["stage"] == "production" and other is not entry:
+                    other["stage"] = "archived"
+                    self.audit.append((f"archive {name} v{other['version']}", actor,
+                                       "superseded"))
+        old, entry["stage"] = entry["stage"], stage
+        self.audit.append((f"{name} v{version}: {old} -> {stage}", actor, "-"))
+        return entry
+
+    def get(self, name, stage="production"):
+        return next((e for e in self.models[name] if e["stage"] == stage), None)
+
+reg = Registry(tr)
+best_run = rows[0][0]
+second = rows[1][0]
+reg.register("claims-risk", best_run, version="1.4.0")
+reg.register("claims-risk", second, version="1.5.0")
+reg.transition("claims-risk", "1.4.0", "production", actor="ci-bot")
+reg.transition("claims-risk", "1.5.0", "staging", actor="ci-bot")
+
+prod = reg.get("claims-risk")
+print(f"serving: {prod['name']} v{prod['version']} from {prod['run_id']} "
+      f"(AUC {prod['metrics']['auc']:.4f})")
+print(f"staging: {reg.get('claims-risk', 'staging')['version']}")
+print("\naudit trail:")
+for what, actor, note in reg.audit:
+    print(f"  {what:38} by {actor:8} {note}")
+```
+
+```output
+serving: claims-risk v1.4.0 from run-0008 (AUC 0.8388)
+staging: 1.5.0
+
+audit trail:
+  register claims-risk v1.4.0            by ci-bot   from run-0008
+  register claims-risk v1.5.0            by ci-bot   from run-0009
+  claims-risk v1.4.0: none -> production by ci-bot   -
+  claims-risk v1.5.0: none -> staging    by ci-bot   -
+```
+
+The registry is what makes "which model is in production?" answerable by machines. Two direct
+consequences: the CI gate (ch. 4) reads its **baseline metrics from the production entry** instead
+of a hard-coded constant, and the serving container resolves `MODEL_URI` by asking the registry
+for `claims-risk@production` rather than being redeployed with a new path.
+
+```python
+def ci_baseline(registry, name):
+    prod = registry.get(name)
+    if prod is None:
+        return "no production model: any candidate passes the relative check"
+    return prod["metrics"]
+
+print("CI reads baseline from the registry:", ci_baseline(reg, "claims-risk"))
+reg.transition("claims-risk", "1.5.0", "production", actor="release-manager")
+print("after promoting 1.5.0     :", ci_baseline(reg, "claims-risk"))
+print("1.4.0 stage is now        :",
+      next(e for e in reg.models["claims-risk"] if e["version"] == "1.4.0")["stage"])
+```
+
+```output
+CI reads baseline from the registry: {'auc': 0.83879944645037, 'fit_seconds': 49.4}
+after promoting 1.5.0     : {'auc': 0.8320856082863681, 'fit_seconds': 56.2}
+1.4.0 stage is now        : archived
+```
+
+Promotion archives the previous production model rather than deleting it — the rollback target
+must still exist, and "which model served this prediction in March?" must stay answerable
+(ch. 7).
+
+## Reproducing a run
+
+```python
+def reproduce(tracker, run_id):
+    run = tracker.runs[run_id]
+    have = {"code_commit": run["params"].get("code_commit"),
+            "data_version": run["params"].get("data_version"),
+            "seed": run["params"].get("seed"),
+            "env_hash": run["params"].get("env_hash")}
+    missing = [k for k, v in have.items() if v is None]
+    if missing:
+        return f"{run_id}: CANNOT reproduce — missing {missing}"
+    return (f"{run_id}: git checkout {have['code_commit']} && "
+            f"data={have['data_version']} seed={have['seed']} env={have['env_hash']}")
+
+print(reproduce(tr, best_run))
+full = tr.start_run("claims-risk")
+tr.log_params(full, C=1.0, max_depth=6, seed=0, data_version="2026-05-01",
+              code_commit="a91f3c2", env_hash="sha256:4e2a1b")
+tr.log_metrics(full, auc=0.7941)
+tr.end_run(full)
+print(reproduce(tr, full))
+```
+
+```output
+run-0008: CANNOT reproduce — missing ['code_commit', 'env_hash']
+run-0010: git checkout a91f3c2 && data=2026-05-01 seed=0 env=sha256:4e2a1b
+```
+
+## Try it Yourself
+
+```python
+def experiment_report(tracker, experiment, metric="auc", cost_metric="fit_seconds",
+                      tolerance=0.02):
+    runs = [r for r in tracker.runs.values()
+            if r["experiment"] == experiment and metric in r["metrics"]]
+    scored = [(r["id"], r["metrics"][metric][-1]["value"],
+               r["metrics"].get(cost_metric, [{"value": 0}])[-1]["value"], r["params"])
+              for r in runs]
+    best = max(scored, key=lambda t: t[1])
+    within = [s for s in scored if s[1] >= best[1] * (1 - tolerance)]
+    cheapest = min(within, key=lambda t: t[2])
+    print(f"runs: {len(scored)} | best {metric} {best[1]:.4f} at {best[0]} "
+          f"(C={best[3]['C']}, depth={best[3]['max_depth']}, {best[2]:.1f}s)")
+    print(f"cheapest within {tolerance:.0%} of best: {cheapest[0]} "
+          f"(C={cheapest[3]['C']}, {cheapest[1]:.4f} at {cheapest[2]:.1f}s -> "
+          f"{1 - cheapest[2] / best[2]:.0%} cheaper for {1 - cheapest[1] / best[1]:.1%} less AUC)")
+    return best, cheapest
+
+experiment_report(tr, "claims-risk-sweep")
+```
+
+```output
+runs: 8 | best auc 0.8388 at run-0008 (C=10.0, depth=2, 49.4s)
+cheapest within 2% of best: run-0006 (C=6.0, 0.8300 at 33.4s -> 32% cheaper for 1.1% less AUC)
+```
+
+The cheapest model within a small tolerance of the best is usually the one to ship (ch. 9): a
+third of the training cost for a tenth of a percent of AUC. Tighten `tolerance` to 0.005 and the
+selection collapses back to the leaderboard winner — which is exactly the conversation worth
+having with whoever pays the compute bill.
+
+## Exercise
+
+Extend the tracker into something a team can actually rely on: add nested runs (a parent sweep
+with child runs), automatic capture of the environment fingerprint and git commit, a `compare`
+function that diffs two runs field by field, and a guard that refuses to register a run into the
+registry unless it has every field from the `REQUIRED` list. Demonstrate the guard rejecting an
+incomplete run and accepting a complete one.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import platform, sklearn
+
+def env_fingerprint():
+    spec = {"python": platform.python_version(), "sklearn": sklearn.__version__,
+            "numpy": np.__version__}
+    return "sha256:" + hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
+
+class TeamTracker(Tracker):
+    def start_run(self, experiment, tags=None, parent=None, code_commit="a91f3c2"):
+        rid = super().start_run(experiment, tags)
+        self.runs[rid]["parent"] = parent
+        self.runs[rid]["params"].update(code_commit=code_commit, env_hash=env_fingerprint())
+        if parent:
+            self.runs[parent].setdefault("children", []).append(rid)
+        return rid
+
+    def compare(self, a, b):
+        ra, rb = self.runs[a], self.runs[b]
+        print(f"{'field':22}{a:>16}{b:>16}")
+        keys = sorted(set(ra["params"]) | set(rb["params"]))
+        for k in keys:
+            va, vb = ra["params"].get(k, "-"), rb["params"].get(k, "-")
+            mark = "  " if va == vb else " *"
+            print(f"{k:22}{str(va):>16}{str(vb):>16}{mark}")
+        for k in sorted(set(ra["metrics"]) | set(rb["metrics"])):
+            va = ra["metrics"].get(k, [{"value": float('nan')}])[-1]["value"]
+            vb = rb["metrics"].get(k, [{"value": float('nan')}])[-1]["value"]
+            print(f"{k:22}{va:>16.4f}{vb:>16.4f}{'  ' if va == vb else ' *'}")
+
+class GuardedRegistry(Registry):
+    def register(self, name, run_id, version=None):
+        run = self.tracker.runs[run_id]
+        present = set(run["params"]) | {"params", "metrics", "artifacts"}
+        if run["metrics"]:
+            present.add("metrics")
+        if run["artifacts"]:
+            present.add("artifacts")
+        missing = [f for f in REQUIRED
+                   if f not in present and f not in ("duration_s",)]
+        if missing:
+            raise ValueError(f"refusing to register {run_id}: missing {missing}")
+        return super().register(name, run_id, version)
+
+tt = TeamTracker()
+sweep = tt.start_run("tuning-sweep")
+tt.log_params(sweep, sweep_type="grid", data_version="2026-05-01", seed=0)
+tt.log_metrics(sweep, auc=0.0)
+
+children = []
+for C in (0.1, 1.0, 10.0):
+    child = tt.start_run("tuning-sweep", parent=sweep)
+    tt.log_params(child, C=C, max_depth=6, seed=0, data_version="2026-05-01")
+    tt.log_metrics(child, auc=float(0.72 + 0.05 * np.log1p(C)))
+    tt.log_artifact(child, "model.joblib", {"C": C})
+    tt.end_run(child)
+    children.append(child)
+tt.end_run(sweep)
+print(f"parent {sweep} has children {tt.runs[sweep]['children']}")
+
+tt.compare(children[0], children[2])
+
+greg = GuardedRegistry(tt)
+try:
+    incomplete = tt.start_run("adhoc")
+    tt.log_params(incomplete, C=1.0)                       # no data_version, no metrics
+    tt.end_run(incomplete)
+    greg.register("claims-risk", incomplete)
+except ValueError as e:
+    print(f"\n{e}")
+
+entry = greg.register("claims-risk", children[2], version="2.0.0")
+greg.transition("claims-risk", "2.0.0", "production", actor="ci-bot")
+print(f"registered and promoted: {entry['name']} v{entry['version']} "
+      f"(AUC {entry['metrics']['auc']:.4f}, env {entry['params']['env_hash']})")
+```
+
+```output
+parent run-0001 has children ['run-0002', 'run-0003', 'run-0004']
+field                         run-0002        run-0004
+C                                  0.1            10.0 *
+code_commit                    a91f3c2         a91f3c2  
+data_version                2026-05-01      2026-05-01  
+env_hash              sha256:a0dde47b4dsha256:a0dde47b4d  
+max_depth                            6               6  
+seed                                 0               0  
+auc                             0.7248          0.8399 *
+
+refusing to register run-0005: missing ['data_version', 'seed']
+registered and promoted: claims-risk v2.0.0 (AUC 0.8399, env sha256:a0dde47b4d)
+```
+
+The insight: the guard is what turns a tracker from a diary into infrastructure. A team that logs
+"when it remembers" ends up with a registry full of models nobody can rebuild, and discovers this
+during the incident where rebuilding matters. Making registration *fail* on a missing
+`data_version` costs one engineer thirty seconds today and saves a week later. Two design notes.
+Nested runs matter because a hyperparameter sweep is one logical experiment with fifty attempts —
+flattening them makes the leaderboard unreadable and hides which sweep produced the winner. And
+capturing the environment automatically, rather than asking humans to log it, is the only version
+that survives contact with a deadline: **anything a person must remember to record is a field
+that will be empty in the run you most need**.
+</details>
