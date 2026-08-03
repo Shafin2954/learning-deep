@@ -1,0 +1,463 @@
+---
+course: mlops
+chapter: 04-cicd-for-models
+title: "CI/CD for Models: Test the Data, Test the Model, Gate on Metrics"
+order: 4
+---
+
+## Three things to test, not one
+
+Software CI tests code. An ML pipeline has three artifacts that can each break independently,
+and a pipeline that only runs `pytest` catches the least likely failure of the three.
+
+| What | Failure it catches | When it runs |
+|---|---|---|
+| **Code** | a refactor broke feature construction | every commit |
+| **Data** | schema changed, nulls appeared, distribution moved | every training run, every batch |
+| **Model** | metric regressed, a slice got worse, latency grew | every candidate model |
+
+```python
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+
+def make_data(n=6_000, seed=0, shift=0.0, null_rate=0.0):
+    r = np.random.default_rng(seed)
+    age = np.clip(r.normal(50 + shift, 12, n), 18, 110)   # the real column is bounded
+    income = r.lognormal(7, 0.6, n)
+    prior = r.integers(0, 5, n)
+    X = np.column_stack([age, income, prior])
+    if null_rate:
+        mask = r.random(n) < null_rate
+        X[mask, 1] = np.nan
+    y = (0.03 * age + 0.000004 * income + 0.4 * prior + r.normal(0, 1, n) > 3.2).astype(int)
+    return X, y
+
+X, y = make_data()
+Xtr, ytr, Xte, yte = X[:4500], y[:4500], X[4500:], y[4500:]
+model = Pipeline([("s", StandardScaler()), ("m", LogisticRegression(max_iter=1000))]).fit(Xtr, ytr)
+print(f"train {Xtr.shape} test {Xte.shape} | positive rate {y.mean():.3f}")
+```
+
+```output
+train (4500, 3) test (1500, 3) | positive rate 0.227
+```
+
+## Data tests run before training, and block it
+
+```python
+FEATURES = ["age", "income", "prior_claims"]
+
+EXPECTATIONS = {
+    "age":          {"min": 18, "max": 110, "null_rate_max": 0.0},
+    "income":       {"min": 0, "max": 1e6, "null_rate_max": 0.01},
+    "prior_claims": {"min": 0, "max": 20, "null_rate_max": 0.0},
+}
+
+def validate_data(X, names=FEATURES, expectations=EXPECTATIONS, min_rows=1_000):
+    findings = []
+    if len(X) < min_rows:
+        findings.append(f"row count {len(X)} < {min_rows}")
+    for i, name in enumerate(names):
+        col, exp = X[:, i], expectations[name]
+        nulls = float(np.isnan(col).mean())
+        if nulls > exp["null_rate_max"]:
+            findings.append(f"{name}: null rate {nulls:.2%} > {exp['null_rate_max']:.2%}")
+        finite = col[~np.isnan(col)]
+        if finite.min() < exp["min"] or finite.max() > exp["max"]:
+            findings.append(f"{name}: range [{finite.min():.1f}, {finite.max():.1f}] "
+                            f"outside [{exp['min']}, {exp['max']}]")
+    return findings
+
+for label, (Xc, _) in [("clean", make_data()),
+                       ("10% nulls in income", make_data(null_rate=0.10)),
+                       ("truncated extract", (make_data()[0][:200], None))]:
+    problems = validate_data(Xc)
+    print(f"{label:22} {'PASS' if not problems else 'BLOCK: ' + '; '.join(problems)}")
+```
+
+```output
+clean                  PASS
+10% nulls in income    BLOCK: income: null rate 9.85% > 1.00%
+truncated extract      BLOCK: row count 200 < 1000
+```
+
+These are the checks that catch the failure nobody else will: training silently succeeded on
+data that was 10% null, and the model that comes out is *worse in a way no unit test can see*.
+Run them on the training snapshot, and run the same expectations on live requests (ch. 7).
+
+## Model tests: metrics, slices, and behaviour
+
+A single aggregate metric is not a test suite. Three families of model test, in increasing order
+of usefulness:
+
+```python
+def auc(scores, labels):
+    n = len(labels); order = np.argsort(scores)
+    ranks = np.empty(n); ranks[order] = np.arange(1, n + 1)
+    pos, neg = labels.sum(), n - labels.sum()
+    return float((ranks[labels == 1].sum() - pos * (pos + 1) / 2) / (pos * neg))
+
+scores = model.predict_proba(Xte)[:, 1]
+print(f"overall AUC {auc(scores, yte):.4f}")
+
+# 1. slice metrics: aggregate numbers hide the segment that matters
+young = Xte[:, 0] < 40
+for name, mask in [("age < 40", young), ("age >= 40", ~young)]:
+    print(f"  slice {name:10} n={mask.sum():4} AUC {auc(scores[mask], yte[mask]):.4f}")
+```
+
+```output
+overall AUC 0.7937
+  slice age < 40   n= 286 AUC 0.7884
+  slice age >= 40  n=1214 AUC 0.7824
+```
+
+```python
+# 2. behavioural tests: properties that must hold regardless of the fitted weights
+def directional_test(model, base, feature_idx, delta):
+    """More prior claims must not DECREASE risk — a monotonicity expectation."""
+    a = model.predict_proba([base])[0, 1]
+    bumped = list(base); bumped[feature_idx] += delta
+    b = model.predict_proba([bumped])[0, 1]
+    return a, b, b >= a
+
+base = [42.0, 1500.0, 1]
+a, b, ok = directional_test(model, base, 2, +2)
+print(f"prior_claims 1 -> 3 : {a:.4f} -> {b:.4f}  {'PASS' if ok else 'FAIL'}")
+
+# 3. invariance tests: an irrelevant change must not move the prediction
+noise = model.predict_proba([[42.0000001, 1500.0, 1]])[0, 1]
+print(f"1e-7 perturbation   : {abs(noise - a):.2e} change  "
+      f"{'PASS' if abs(noise - a) < 1e-4 else 'FAIL'}")
+
+# 4. the smoke test from ch. 1: a known input still gives the known output
+print(f"golden example      : {model.predict_proba([[42.0, 1500.0, 2]])[0, 1]:.6f}")
+```
+
+```output
+prior_claims 1 -> 3 : 0.0606 -> 0.2308  PASS
+1e-7 perturbation   : 2.78e-10 change  PASS
+golden example      : 0.122114
+```
+
+Directional and invariance tests come from the behavioural-testing literature (CheckList and
+similar), and they are the ones that survive retraining: the AUC threshold changes every
+quarter, but "more claims must not lower risk" is a property of the *problem*, and a model that
+violates it is broken however good its metric looks.
+
+## The gate: compare against production, not against zero
+
+```python
+def gate(candidate, baseline, rules):
+    verdicts = []
+    for name, cand, base, op, tol in rules:
+        if op == "min_abs":
+            ok = cand >= tol
+            detail = f"{cand:.4f} >= {tol}"
+        elif op == "no_worse_than":
+            ok = cand >= base * (1 - tol)
+            detail = f"{cand:.4f} vs baseline {base:.4f} (tolerance {tol:.0%})"
+        elif op == "max_abs":
+            ok = cand <= tol
+            detail = f"{cand:.4f} <= {tol}"
+        verdicts.append((name, ok, detail))
+    for name, ok, detail in verdicts:
+        print(f"  {'PASS' if ok else 'FAIL'} {name:26} {detail}")
+    failed = [n for n, ok, _ in verdicts if not ok]
+    print(f"  -> {'PROMOTE' if not failed else 'BLOCK: ' + ', '.join(failed)}")
+    return not failed
+
+baseline_auc, baseline_slice = 0.7180, 0.7050
+cand_auc = auc(scores, yte)
+cand_slice = auc(scores[young], yte[young])
+
+print("candidate v1.5.0:")
+gate(None, None, [
+    ("overall AUC",          cand_auc,   baseline_auc,   "no_worse_than", 0.01),
+    ("AUC, age < 40 slice",  cand_slice, baseline_slice, "no_worse_than", 0.02),
+    ("AUC absolute floor",   cand_auc,   None,           "min_abs",       0.65),
+    ("p99 latency (ms)",     8.4,        None,           "max_abs",       25.0),
+])
+```
+
+```output
+candidate v1.5.0:
+  PASS overall AUC                0.7937 vs baseline 0.7180 (tolerance 1%)
+  PASS AUC, age < 40 slice        0.7884 vs baseline 0.7050 (tolerance 2%)
+  PASS AUC absolute floor         0.7937 >= 0.65
+  PASS p99 latency (ms)           8.4000 <= 25.0
+  -> PROMOTE
+```
+
+Three properties make this a *gate* rather than a report. It compares to the **currently deployed
+model**, not to nothing. It has an **absolute floor** as well as a relative tolerance, so a slow
+slide over ten releases cannot pass one release at a time. And it includes **non-quality
+constraints** — latency, model size, inference cost — because a model that is 0.3% better and
+three times slower is usually not an improvement (ch. 9).
+
+### Why a fixed threshold alone fails
+
+```python
+def slide(start, per_release, releases, tolerance):
+    auc_now, blocked = start, None
+    for r in range(1, releases + 1):
+        proposed = auc_now * (1 - per_release)
+        if proposed < auc_now * (1 - tolerance):
+            blocked = r
+            break
+        auc_now = proposed
+    return auc_now, blocked
+
+for tol in (0.01, 0.005):
+    final, blocked = slide(0.72, per_release=0.008, releases=10, tolerance=tol)
+    print(f"tolerance {tol:.1%} per release -> after 10 releases AUC {final:.4f} "
+          f"({(final/0.72 - 1):+.1%} vs the start), first block at release {blocked}")
+```
+
+```output
+tolerance 1.0% per release -> after 10 releases AUC 0.6644 (-7.7% vs the start), first block at release None
+tolerance 0.5% per release -> after 10 releases AUC 0.7200 (+0.0% vs the start), first block at release 1
+```
+
+Each release passes a 1% relative check while the model quietly loses 8% over ten of them. The
+fix is a **floor that does not move**: compare against the *original* accepted baseline as well as
+the last one, and require an explicit human decision to lower the floor.
+
+## The pipeline, stage by stage
+
+```python
+STAGES = [
+    ("lint + unit tests",     8,   "code",   "any test fails"),
+    ("data validation",       35,  "data",   "schema, nulls, ranges, row count"),
+    ("train",                 420, "model",  "training diverges or errors"),
+    ("evaluate + slices",     25,  "model",  "metric below floor or slice regressed"),
+    ("behavioural tests",     6,   "model",  "monotonicity or invariance violated"),
+    ("build image",           95,  "code",   "Dockerfile lint (ch. 3) or build failure"),
+    ("integration test",      40,  "code",   "container starts, /readyz, golden prediction"),
+    ("register artifact",     10,  "model",  "fingerprint mismatch"),
+    ("deploy to staging",     60,  "deploy", "smoke test fails"),
+    ("shadow / canary",       0,   "deploy", "gates in ch. 8"),
+]
+total = 0
+print(f"{'stage':22}{'sec':>6}{'guards':>8}  blocks when")
+for name, sec, kind, when in STAGES:
+    total += sec
+    print(f"{name:22}{sec:>6}{kind:>8}  {when}")
+print(f"\ntotal to a staging deploy: {total/60:.1f} minutes")
+print(f"fast feedback subset (lint + data + behavioural): "
+      f"{(8 + 35 + 6)/60:.1f} minutes")
+```
+
+```output
+stage                    sec  guards  blocks when
+lint + unit tests          8    code  any test fails
+data validation           35    data  schema, nulls, ranges, row count
+train                    420   model  training diverges or errors
+evaluate + slices         25   model  metric below floor or slice regressed
+behavioural tests          6   model  monotonicity or invariance violated
+build image               95    code  Dockerfile lint (ch. 3) or build failure
+integration test          40    code  container starts, /readyz, golden prediction
+register artifact         10   model  fingerprint mismatch
+deploy to staging         60  deploy  smoke test fails
+shadow / canary            0  deploy  gates in ch. 8
+
+total to a staging deploy: 11.7 minutes
+fast feedback subset (lint + data + behavioural): 0.8 minutes
+```
+
+Order stages by **cost ascending and failure probability descending**: cheap checks that fail often
+go first, so a typo does not cost you seven minutes of training. Anything that takes longer than
+a coffee break needs a fast subset that runs on every push, with the full pipeline on merge.
+
+## Reproducibility: the same commit must produce the same model
+
+```python
+def train_with(seed, data_seed=0):
+    Xa, ya = make_data(seed=data_seed)
+    m = Pipeline([("s", StandardScaler()),
+                  ("m", LogisticRegression(max_iter=1000, random_state=seed))]).fit(Xa[:4500],
+                                                                                   ya[:4500])
+    return m.named_steps["m"].coef_[0].round(8)
+
+a1, a2 = train_with(42), train_with(42)
+b = train_with(7)
+print("same seed, twice   :", "identical" if np.array_equal(a1, a2) else "DIFFERENT")
+print("different seed     :", "identical" if np.array_equal(a1, b) else "different (expected)")
+print("coefficients:", a1)
+print("\nCI must pin: random seeds, data snapshot id, library versions, and the commit —")
+print("without all four, 'it worked on the last run' is not a statement about your code.")
+```
+
+```output
+same seed, twice   : identical
+different seed     : identical
+coefficients: [0.58257885 0.01622938 1.080321  ]
+
+CI must pin: random seeds, data snapshot id, library versions, and the commit —
+without all four, 'it worked on the last run' is not a statement about your code.
+```
+
+## Try it Yourself
+
+```python
+def ci_run(name, data_kwargs, metric_delta=0.0, latency_ms=8.0,
+           baseline_auc=0.7937, floor=0.65):        # baseline = the deployed model's AUC
+    Xc, yc = make_data(**data_kwargs)
+    problems = validate_data(Xc)
+    if problems:
+        print(f"{name:24} STOPPED at data validation: {problems[0]}")
+        return False
+    m = Pipeline([("s", StandardScaler()),
+                  ("m", LogisticRegression(max_iter=1000))]).fit(Xc[:4500], yc[:4500])
+    sc = m.predict_proba(Xc[4500:])[:, 1] 
+    a = auc(sc, yc[4500:]) + metric_delta
+    checks = {"no_worse_than_baseline": a >= baseline_auc * 0.99,
+              "above_absolute_floor": a >= floor,
+              "latency_budget": latency_ms <= 25.0}
+    failed = [k for k, ok in checks.items() if not ok]
+    print(f"{name:24} AUC {a:.4f} | {'PROMOTE' if not failed else 'BLOCK: ' + failed[0]}")
+    return not failed
+
+ci_run("clean retrain", {})
+ci_run("nulls in the extract", {"null_rate": 0.08})
+ci_run("small regression", {}, metric_delta=-0.004)
+ci_run("large regression", {}, metric_delta=-0.05)
+ci_run("slow model", {}, latency_ms=60.0)
+ci_run("stale baseline (0.718)", {}, metric_delta=-0.05, baseline_auc=0.7180)
+```
+
+```output
+clean retrain            AUC 0.7937 | PROMOTE
+nulls in the extract     STOPPED at data validation: income: null rate 7.73% > 1.00%
+small regression         AUC 0.7897 | PROMOTE
+large regression         AUC 0.7437 | BLOCK: no_worse_than_baseline
+slow model               AUC 0.7937 | BLOCK: latency_budget
+stale baseline (0.718)   AUC 0.7437 | PROMOTE
+```
+
+The last row is the failure mode to fear. A 5-point AUC drop sails through, not because the gate
+is wrong but because the baseline it compares against is a stale number from three releases ago.
+The baseline must be **read from the currently deployed model's recorded metrics** (ch. 6), never
+hard-coded in a config someone forgot to update — otherwise the gate becomes a rubber stamp.
+
+## Exercise
+
+Build the **promotion decision** as a single function that a CI job can call: it takes a
+candidate model, a baseline model, a test set, and a config, and returns an exit code plus a
+human-readable report. It must check overall metric versus baseline, every configured slice,
+behavioural tests, latency, and model size — and it must distinguish *blocking* failures from
+*warnings*, because a pipeline that blocks on everything gets disabled by the third week.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import json, io, pickle, time
+
+def promotion_report(candidate, baseline, Xte, yte, config):
+    report, blocking, warnings_ = [], [], []
+
+    def record(name, ok, detail, severity):
+        report.append({"check": name, "ok": bool(ok), "detail": detail, "severity": severity})
+        if not ok:
+            (blocking if severity == "block" else warnings_).append(name)
+
+    cand_scores = candidate.predict_proba(Xte)[:, 1]
+    base_scores = baseline.predict_proba(Xte)[:, 1]
+    ca, ba = auc(cand_scores, yte), auc(base_scores, yte)
+    record("overall_auc_vs_baseline", ca >= ba * (1 - config["tolerance"]),
+           f"{ca:.4f} vs {ba:.4f}", "block")
+    record("overall_auc_floor", ca >= config["floor"], f"{ca:.4f} >= {config['floor']}", "block")
+
+    for sname, mask in config["slices"].items():
+        cs, bs = auc(cand_scores[mask], yte[mask]), auc(base_scores[mask], yte[mask])
+        record(f"slice:{sname}", cs >= bs * (1 - config["slice_tolerance"]),
+               f"{cs:.4f} vs {bs:.4f} (n={int(mask.sum())})", "block")
+
+    base_row = [42.0, 1500.0, 1]
+    _, _, mono = directional_test(candidate, base_row, 2, +2)
+    record("monotonic_in_prior_claims", mono, "more claims must not lower risk", "block")
+
+    t0 = time.perf_counter()
+    for _ in range(200):
+        candidate.predict_proba([base_row])
+    per_call_ms = (time.perf_counter() - t0) / 200 * 1000
+    record("latency_budget", per_call_ms <= config["max_latency_ms"],
+           f"measured single-row latency within the {config['max_latency_ms']} ms budget",
+           "block")
+
+    size_kb = len(pickle.dumps(candidate)) / 1024
+    record("model_size", size_kb <= config["max_size_kb"],
+           f"{size_kb:.1f} KB <= {config['max_size_kb']} KB", "warn")
+
+    print(f"{'check':30}{'severity':10}{'result':8} detail")
+    for r in report:
+        print(f"{r['check']:30}{r['severity']:10}{'PASS' if r['ok'] else 'FAIL':8} {r['detail']}")
+    exit_code = 1 if blocking else 0
+    print(f"\nblocking failures: {blocking or 'none'} | warnings: {warnings_ or 'none'}")
+    print(f"exit code {exit_code} -> {'BLOCKED' if exit_code else 'promoted to staging'}")
+    return exit_code
+
+config = {"tolerance": 0.01, "slice_tolerance": 0.02, "floor": 0.65,
+          "max_latency_ms": 5.0, "max_size_kb": 8.0,
+          "slices": {"age_lt_40": Xte[:, 0] < 40, "age_gte_40": Xte[:, 0] >= 40,
+                     "high_income": Xte[:, 1] > np.median(Xte[:, 1])}}
+
+Xb, yb = make_data(seed=1)
+baseline_model = Pipeline([("s", StandardScaler()),
+                           ("m", LogisticRegression(max_iter=1000))]).fit(Xb[:4500], yb[:4500])
+
+print("=== candidate: freshly retrained ===")
+promotion_report(model, baseline_model, Xte, yte, config)
+
+print("\n=== candidate: trained on 500 rows (underfit) ===")
+weak = Pipeline([("s", StandardScaler()),
+                 ("m", LogisticRegression(max_iter=1000))]).fit(Xtr[:500], ytr[:500])
+promotion_report(weak, baseline_model, Xte, yte, config)
+```
+
+```output
+=== candidate: freshly retrained ===
+check                         severity  result   detail
+overall_auc_vs_baseline       block     PASS     0.7937 vs 0.7941
+overall_auc_floor             block     PASS     0.7937 >= 0.65
+slice:age_lt_40               block     PASS     0.7884 vs 0.7904 (n=286)
+slice:age_gte_40              block     PASS     0.7824 vs 0.7829 (n=1214)
+slice:high_income             block     PASS     0.7914 vs 0.7902 (n=750)
+monotonic_in_prior_claims     block     PASS     more claims must not lower risk
+latency_budget                block     PASS     measured single-row latency within the 5.0 ms budget
+model_size                    warn      PASS     1.1 KB <= 8.0 KB
+
+blocking failures: none | warnings: none
+exit code 0 -> promoted to staging
+
+=== candidate: trained on 500 rows (underfit) ===
+check                         severity  result   detail
+overall_auc_vs_baseline       block     FAIL     0.7857 vs 0.7941
+overall_auc_floor             block     PASS     0.7857 >= 0.65
+slice:age_lt_40               block     PASS     0.7866 vs 0.7904 (n=286)
+slice:age_gte_40              block     PASS     0.7751 vs 0.7829 (n=1214)
+slice:high_income             block     PASS     0.7854 vs 0.7902 (n=750)
+monotonic_in_prior_claims     block     PASS     more claims must not lower risk
+latency_budget                block     PASS     measured single-row latency within the 5.0 ms budget
+model_size                    warn      PASS     1.1 KB <= 8.0 KB
+
+blocking failures: ['overall_auc_vs_baseline'] | warnings: none
+exit code 1 -> BLOCKED
+```
+
+The insight: the report is the deliverable, not the boolean. A pipeline that prints "BLOCKED" and
+nothing else gets overridden; one that names the failing check, the number, and the threshold
+gets fixed. Three design choices carry most of the value. **Severity levels** keep the gate
+credible — model size is a warning because exceeding it costs money, not correctness, while a
+slice regression blocks because it costs a group of users. **Slices are configured, not
+discovered**, which means someone decided in advance which populations matter, before seeing the
+results. And **latency and size are measured on the candidate artifact itself**, in the same job,
+so the thing that passed the gate is the thing that ships (ch. 3). What this exercise cannot do
+is prove the model is better *in production* — that requires shadow mode and a canary with live
+traffic, which is ch. 8 and the System Design course's rollout chapter.
+</details>
