@@ -95,6 +95,11 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 12,
     badge: 'Ch 1 – 12',
   },
+  'eval-tuning': {
+    tagline: '12 chapters: metrics that answer your question, cost-optimal thresholds, calibration, CV pitfalls, Optuna, permutation importance and SHAP, PDP/ICE/ALE, error analysis, and honest model comparison.',
+    chapters: 13,
+    badge: 'Ch 1 – 13',
+  },
   'system-design': {
     tagline: '30 chapters: consistent hashing, caching, Bloom filters, storage engines, replication, sharding, transactions, CAP, Raft, rate limiting, resilience, ML systems, and six case studies.',
     chapters: 31,
