@@ -1,0 +1,485 @@
+---
+course: eval-tuning
+chapter: 12-experiment-tracking
+title: "Experiment Tracking: What to Log and Why"
+order: 12
+---
+
+## A run is a claim, and a claim needs evidence
+
+"The new model gets 0.912" is not a result. A result is: *this code, on this data, with these
+hyperparameters and this seed, produced these per-fold scores, and here is the artefact.* Tracking
+is the practice of recording exactly enough to (a) reproduce the number and (b) compare it
+honestly against another number. Everything in this chapter serves one of those two goals.
+
+```python
+import numpy as np
+import pandas as pd
+import hashlib, json
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+X, y = make_classification(n_samples=4_000, n_features=20, n_informative=8,
+                           n_redundant=4, class_sep=0.7, random_state=0)
+
+def fingerprint(obj) -> str:
+    """Stable content hash. Same bytes in, same id out, on any machine."""
+    if isinstance(obj, np.ndarray):
+        payload = obj.tobytes() + str(obj.shape).encode() + str(obj.dtype).encode()
+    else:
+        payload = json.dumps(obj, sort_keys=True, default=str).encode()
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+print(f"data fingerprint X: {fingerprint(X)}")
+print(f"data fingerprint y: {fingerprint(y)}")
+print(f"config fingerprint: {fingerprint({'model': 'rf', 'n_estimators': 200, 'seed': 0})}")
+```
+
+```output
+data fingerprint X: bf06a9ced910
+data fingerprint y: b42534562e26
+config fingerprint: 944676a597fb
+```
+
+Those twelve characters are the cheapest insurance in machine learning. A run whose data
+fingerprint you did not record cannot be reproduced, only re-enacted.
+
+## The minimum viable tracker
+
+```python
+RUNS = []
+
+def log_run(name, config, per_fold_scores, data_fp, notes="", tags=()):
+    scores = np.asarray(per_fold_scores, dtype=float)
+    run = {
+        "run_id": len(RUNS),                       # a counter, not a timestamp: reproducible
+        "name": name,
+        "config": dict(config),
+        "config_fp": fingerprint(config),
+        "data_fp": data_fp,
+        "folds": [round(float(s), 6) for s in scores],
+        "mean": float(scores.mean()),
+        "std": float(scores.std(ddof=1)),
+        "notes": notes,
+        "tags": list(tags),
+    }
+    RUNS.append(run)
+    return run
+
+def cv_scores(make_model, X, y, k=5, seed=0):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    out = []
+    for tr, va in cv.split(X, y):
+        m = make_model().fit(X[tr], y[tr])
+        out.append(roc_auc_score(y[va], m.predict_proba(X[va])[:, 1]))
+    return out
+
+data_fp = fingerprint(X) + "/" + fingerprint(y)
+baseline_cfg = {"model": "logreg", "C": 1.0, "cv_seed": 0, "k": 5}
+baseline = log_run("baseline-logreg", baseline_cfg,
+                   cv_scores(lambda: make_pipeline(StandardScaler(),
+                                                   LogisticRegression(max_iter=1_000)), X, y),
+                   data_fp, notes="reference model, do not delete")
+for key, val in baseline.items():
+    if key != "config":
+        print(f"{key:10} {val}")
+```
+
+```output
+run_id     0
+name       baseline-logreg
+config_fp  bd19042ab689
+data_fp    bf06a9ced910/b42534562e26
+folds      [0.903931, 0.9088, 0.887594, 0.899294, 0.890169]
+mean       0.8979573799133119
+std        0.008987433262754873
+notes      reference model, do not delete
+tags       []
+```
+
+Note what is stored: **every fold score**, not just the mean. A mean without its folds cannot be
+compared to anything — the next section is entirely about why.
+
+```python
+rf_cfg = {"model": "rf", "n_estimators": 300, "min_samples_leaf": 5, "cv_seed": 0, "k": 5}
+gb_cfg = {"model": "hgb", "max_depth": 4, "cv_seed": 0, "k": 5}
+log_run("forest-300", rf_cfg,
+        cv_scores(lambda: RandomForestClassifier(n_estimators=300, min_samples_leaf=5,
+                                                 random_state=0), X, y), data_fp)
+log_run("hgb-depth4", gb_cfg,
+        cv_scores(lambda: HistGradientBoostingClassifier(max_depth=4, random_state=0), X, y),
+        data_fp)
+
+board = pd.DataFrame([{"run_id": r["run_id"], "name": r["name"], "mean": round(r["mean"], 4),
+                       "std": round(r["std"], 4), "data_fp": r["data_fp"][:12]} for r in RUNS])
+print(board.to_string(index=False))
+```
+
+```output
+ run_id            name   mean    std      data_fp
+      0 baseline-logreg 0.8980 0.0090 bf06a9ced910
+      1      forest-300 0.9626 0.0082 bf06a9ced910
+      2      hgb-depth4 0.9655 0.0055 bf06a9ced910
+```
+
+## The mean is not the result
+
+Three runs, three means, and the temptation is to declare a winner. The fold scores say how much
+that ranking is worth.
+
+```python
+for r in RUNS:
+    folds = np.array(r["folds"])
+    print(f"{r['name']:16} mean {r['mean']:.4f} | folds "
+          f"{' '.join(f'{f:.4f}' for f in folds)} | spread {folds.max() - folds.min():.4f}")
+```
+
+```output
+baseline-logreg  mean 0.8980 | folds 0.9039 0.9088 0.8876 0.8993 0.8902 | spread 0.0212
+forest-300       mean 0.9626 | folds 0.9742 0.9552 0.9546 0.9660 0.9629 | spread 0.0196
+hgb-depth4       mean 0.9655 | folds 0.9733 0.9612 0.9602 0.9688 0.9638 | spread 0.0131
+```
+
+The gap between the best and second-best mean is smaller than the fold-to-fold spread of either.
+That does not prove they are equivalent — it means the comparison has to be done **paired**, fold
+by fold, because the folds are shared and their difficulty is a common source of variance.
+
+### Paired differences, and why the naive t-test lies
+
+```python
+from scipy import stats
+
+def naive_paired_t(a, b):
+    d = np.asarray(a) - np.asarray(b)
+    k = len(d)
+    t = d.mean() / (d.std(ddof=1) / np.sqrt(k))
+    return float(t), float(2 * stats.t.sf(abs(t), df=k - 1))
+
+def corrected_paired_t(a, b, n_test, n_train):
+    """Nadeau-Bengio: CV folds overlap in training data, so the naive variance is too small."""
+    d = np.asarray(a) - np.asarray(b)
+    k = len(d)
+    var = d.var(ddof=1) * (1 / k + n_test / n_train)
+    t = d.mean() / np.sqrt(var)
+    return float(t), float(2 * stats.t.sf(abs(t), df=k - 1))
+
+best, second = RUNS[2], RUNS[1]
+d = np.array(best["folds"]) - np.array(second["folds"])
+print(f"comparing {best['name']} vs {second['name']}")
+print(f"per-fold differences: {np.round(d, 4)}")
+print(f"mean difference {d.mean():+.4f}\n")
+t1, p1 = naive_paired_t(best["folds"], second["folds"])
+t2, p2 = corrected_paired_t(best["folds"], second["folds"], n_test=800, n_train=3_200)
+print(f"naive paired t     : t={t1:+.3f}  p={p1:.4f}")
+print(f"corrected (NB)     : t={t2:+.3f}  p={p2:.4f}")
+```
+
+```output
+comparing hgb-depth4 vs forest-300
+per-fold differences: [-0.0009  0.006   0.0056  0.0028  0.0009]
+mean difference +0.0029
+
+naive paired t     : t=+2.128  p=0.1004
+corrected (NB)     : t=+1.419  p=0.2290
+```
+
+The correction multiplies the variance by $\tfrac{1}{k} + \tfrac{n_{\text{test}}}{n_{\text{train}}}$
+because cross-validation folds are **not independent** — every pair of training sets overlaps in
+most of their rows, so the naive estimate of the difference's variance is far too small and the
+naive p-value is far too confident.
+
+$$
+\hat{\sigma}^2_{\text{corrected}} = \left(\frac{1}{k} + \frac{n_{\text{test}}}{n_{\text{train}}}\right) \hat{\sigma}^2_{d}
+$$
+
+Log the folds and this test costs four lines. Log only the mean and you cannot run it at all.
+
+## Practical significance is a separate question
+
+```python
+def decide(a, b, n_test, n_train, min_effect=0.005, alpha=0.05):
+    d = np.asarray(a) - np.asarray(b)
+    t, p = corrected_paired_t(a, b, n_test, n_train)
+    lo, hi = np.percentile(
+        [np.random.default_rng(s).choice(d, len(d), replace=True).mean() for s in range(2_000)],
+        [2.5, 97.5])
+    if p < alpha and d.mean() >= min_effect:
+        verdict = "SHIP: significant and large enough to matter"
+    elif p < alpha:
+        verdict = "significant but below the effect floor: not worth the complexity"
+    elif hi < min_effect:
+        verdict = "NO: confidently smaller than the effect floor"
+    else:
+        verdict = "UNDECIDED: need more folds or more data"
+    return {"mean_diff": round(float(d.mean()), 4), "p_corrected": round(p, 4),
+            "boot_95ci": (round(float(lo), 4), round(float(hi), 4)), "verdict": verdict}
+
+for challenger in (RUNS[1], RUNS[2]):
+    out = decide(challenger["folds"], RUNS[0]["folds"], n_test=800, n_train=3_200)
+    print(f"{challenger['name']:12} vs baseline: {out}")
+```
+
+```output
+forest-300   vs baseline: {'mean_diff': 0.0646, 'p_corrected': 0.0008, 'boot_95ci': (0.0552, 0.0706), 'verdict': 'SHIP: significant and large enough to matter'}
+hgb-depth4   vs baseline: {'mean_diff': 0.0675, 'p_corrected': 0.0003, 'boot_95ci': (0.0598, 0.0724), 'verdict': 'SHIP: significant and large enough to matter'}
+```
+
+Two thresholds, deliberately separate: **statistical** significance (is the difference real?) and
+**practical** significance (is it worth shipping?). A 0.0004 AUC gain can be real and still not
+justify a new dependency, a slower model, or a retraining pipeline. Write your effect floor down
+*before* you run the comparison — it is the number people quietly move afterwards.
+
+## The winner's curse in a leaderboard
+
+```python
+rng = np.random.default_rng(0)
+true_quality = 0.80
+n_candidates, k = 20, 5
+observed = true_quality + rng.normal(0, 0.02, (n_candidates, k))   # all identical in truth
+means = observed.mean(axis=1)
+champion = int(means.argmax())
+fresh = true_quality + np.random.default_rng(99).normal(0, 0.02, k)  # a fresh evaluation
+print(f"all {n_candidates} candidates are identical in truth (quality {true_quality})")
+print(f"reported best: candidate {champion} at {means[champion]:.4f}")
+print(f"mean of all candidates      : {means.mean():.4f}")
+print(f"the champion, re-evaluated  : {fresh.mean():.4f}")
+print(f"inflation from picking a max: {means[champion] - means.mean():+.4f}")
+```
+
+```output
+all 20 candidates are identical in truth (quality 0.8)
+reported best: candidate 9 at 0.8249
+mean of all candidates      : 0.8016
+the champion, re-evaluated  : 0.7944
+inflation from picking a max: +0.0233
+```
+
+Twenty identical models, and the leaderboard shows a clear winner sitting 2.3 points of AUC above
+the field — which evaporates to 0.7944, *below* the field average, the moment it is re-evaluated
+on fresh folds. This is
+the selection bias of ch. 5 wearing a different hat, and a tracker makes it *worse* by making it
+easy to run hundreds of variants. The defences are the same: hold out a final set you touch once,
+re-evaluate the champion on fresh folds before believing it, and record how many runs you did —
+which is a field in your run store, not a memory.
+
+## What to log
+
+| Field | Why it earns its place |
+|-------|------------------------|
+| `data_fp`, row count, class balance | "same code, worse score" is usually different data |
+| `config` + `config_fp` | the exact knobs; the hash makes duplicate runs obvious |
+| all seeds (split, model, sampler) | the difference between reproducible and re-enactable |
+| per-fold scores, not just the mean | required for any paired comparison |
+| the CV scheme (k, grouping, time cutoff) | a score is meaningless without its protocol (ch. 5) |
+| threshold and calibration method | the decision layer is part of the model (ch. 3–4) |
+| slice metrics for known segments | catches the regression an average hides (ch. 11) |
+| library versions, git commit | the silent-change surface |
+| artefact path and hash, and the number of runs in the search | so "the model" is a file you can point at, with context for the winner's curse |
+
+```python
+def run_manifest(run, extra=None):
+    manifest = {
+        "run_id": run["run_id"], "name": run["name"],
+        "config": run["config"], "config_fp": run["config_fp"], "data_fp": run["data_fp"],
+        "metric": {"name": "roc_auc", "mean": round(run["mean"], 6),
+                   "std": round(run["std"], 6), "folds": run["folds"]},
+        "protocol": {"cv": "StratifiedKFold", "k": run["config"].get("k"),
+                     "seed": run["config"].get("cv_seed")},
+        "env": {"numpy": np.__version__, "pandas": pd.__version__},
+    }
+    manifest.update(extra or {})
+    return manifest
+
+m = run_manifest(RUNS[2], extra={"runs_in_search": len(RUNS), "artifact": "models/hgb-d4.joblib"})
+print(json.dumps(m, indent=1)[:430])
+```
+
+```output
+{
+ "run_id": 2,
+ "name": "hgb-depth4",
+ "config": {
+  "model": "hgb",
+  "max_depth": 4,
+  "cv_seed": 0,
+  "k": 5
+ },
+ "config_fp": "f21867c91b85",
+ "data_fp": "bf06a9ced910/b42534562e26",
+ "metric": {
+  "name": "roc_auc",
+  "mean": 0.965456,
+  "std": 0.005497,
+  "folds": [
+   0.9733,
+   0.961219,
+   0.960212,
+   0.968781,
+   0.963769
+  ]
+ },
+ "protocol": {
+  "cv": "StratifiedKFold",
+  "k": 5,
+  "seed": 0
+ },
+ "env": {
+  "numpy
+```
+
+That manifest is the unit a reviewer reads. If any line of it is missing, some question they will
+ask has no answer.
+
+## Try it Yourself
+
+```python
+def compare_configs(a, b):
+    keys = sorted(set(a["config"]) | set(b["config"]))
+    for key in keys:
+        va, vb = a["config"].get(key, "-"), b["config"].get(key, "-")
+        mark = " " if va == vb else "*"
+        print(f" {mark} {key:18} {str(va):>12} | {str(vb):<12}")
+
+print(f"{RUNS[1]['name']} vs {RUNS[2]['name']}   (* = differs)")
+compare_configs(RUNS[1], RUNS[2])
+
+log_run("hgb-depth4-rerun", dict(gb_cfg),
+        cv_scores(lambda: HistGradientBoostingClassifier(max_depth=4, random_state=0), X, y),
+        data_fp, tags=("reproducibility-check",))
+dupes = {}
+for r in RUNS:
+    dupes.setdefault((r["config_fp"], r["data_fp"]), []).append(r["run_id"])
+print("\nruns sharing a (config, data) fingerprint:",
+      {k[0][:8]: v for k, v in dupes.items() if len(v) > 1})
+print("same config and data reproduce the metric:",
+      RUNS[2]["folds"] == RUNS[3]["folds"])
+```
+
+```output
+forest-300 vs hgb-depth4   (* = differs)
+   cv_seed                       0 | 0           
+   k                             5 | 5           
+ * max_depth                     - | 4           
+ * min_samples_leaf              5 | -           
+ * model                        rf | hgb         
+ * n_estimators                300 | -           
+
+runs sharing a (config, data) fingerprint: {'f21867c9': [2, 3]}
+same config and data reproduce the metric: True
+```
+
+The duplicate check is the assertion that turns a log into a test suite: an identical
+`(config_fp, data_fp)` pair must produce identical fold scores, and when it does not, something
+unrecorded is varying — an unseeded shuffle, a library upgrade, thread non-determinism. Change one
+value in `gb_cfg` and watch the fingerprint change with it.
+
+## Exercise
+
+Write the report a reviewer needs to approve or reject a model change: a champion-versus-challenger
+comparison that states the effect size with a confidence interval, the corrected significance, the
+per-slice check for regressions, and an explicit verdict with its reasoning. Run it on two
+challengers, one that genuinely improves and one that does not.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def evaluate_with_slices(make_model, X, y, slices, k=5, seed=0):
+    """Per-fold overall scores plus per-slice out-of-fold scores from one pass."""
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    oof = np.zeros(len(y))
+    folds = []
+    for tr, va in cv.split(X, y):
+        m = make_model().fit(X[tr], y[tr])
+        oof[va] = m.predict_proba(X[va])[:, 1]
+        folds.append(roc_auc_score(y[va], oof[va]))
+    slice_scores = {name: roc_auc_score(y[mask], oof[mask]) for name, mask in slices.items()}
+    return folds, slice_scores
+
+feature_median = np.median(X[:, 0])
+slices = {"f0_low": X[:, 0] <= feature_median, "f0_high": X[:, 0] > feature_median,
+          "f1_low": X[:, 1] <= np.median(X[:, 1]), "f1_high": X[:, 1] > np.median(X[:, 1])}
+
+champion = lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=1_000))
+challengers = {
+    "hgb-depth4": lambda: HistGradientBoostingClassifier(max_depth=4, random_state=0),
+    "logreg-C0.9": lambda: make_pipeline(StandardScaler(),
+                                         LogisticRegression(C=0.9, max_iter=1_000)),
+}
+
+champ_folds, champ_slices = evaluate_with_slices(champion, X, y, slices)
+print(f"champion: mean AUC {np.mean(champ_folds):.4f}\n")
+
+for name, make in challengers.items():
+    folds, sl = evaluate_with_slices(make, X, y, slices)
+    verdict = decide(folds, champ_folds, n_test=len(y) // 5, n_train=len(y) * 4 // 5)
+    regressions = {s: round(sl[s] - champ_slices[s], 4)
+                   for s in slices if sl[s] < champ_slices[s] - 0.005}
+    print(f"challenger {name}")
+    print(f"  mean AUC {np.mean(folds):.4f} vs {np.mean(champ_folds):.4f} "
+          f"(diff {verdict['mean_diff']:+.4f})")
+    print(f"  corrected p {verdict['p_corrected']:.4f} | bootstrap 95% CI {verdict['boot_95ci']}")
+    print(f"  slice regressions worse than 0.005: {regressions or 'none'}")
+    blocked = bool(regressions)
+    print(f"  VERDICT: {'BLOCKED by slice regression' if blocked else verdict['verdict']}\n")
+```
+
+```output
+champion: mean AUC 0.8980
+
+challenger hgb-depth4
+  mean AUC 0.9655 vs 0.8980 (diff +0.0675)
+  corrected p 0.0003 | bootstrap 95% CI (0.0598, 0.0724)
+  slice regressions worse than 0.005: none
+  VERDICT: SHIP: significant and large enough to matter
+
+challenger logreg-C0.9
+  mean AUC 0.8980 vs 0.8980 (diff +0.0000)
+  corrected p 0.8843 | bootstrap 95% CI (-0.0, 0.0)
+  slice regressions worse than 0.005: none
+  VERDICT: NO: confidently smaller than the effect floor
+```
+
+The two challengers land on opposite sides of every test, which is the point of running both. The
+boosted model clears the effect floor by a wide margin (+0.0675, corrected p 0.0003) and its
+bootstrap interval never approaches zero. The re-tuned logistic regression moves the mean by
++0.0000 with a corrected p of 0.8843 and an interval that is zero to four decimals — a decisive
+*no*, which is a useful result rather than a failed experiment.
+
+The easy case here hides why the correction matters, so look back at `hgb-depth4` against
+`forest-300`: naive p 0.1004, corrected p 0.2290. Same five folds, same difference of +0.0029, and
+the naive test is more than twice as confident about it. On a closer race that factor is the
+difference between shipping and not.
+
+Three details in this report do real work. The **slice check** can veto a challenger that wins on
+average, which is the failure mode ch. 11 exists to catch: an aggregate gain that hides a segment
+getting worse. The **confidence interval** is reported alongside the p-value, because "is it
+non-zero" and "how big is it" are different questions and only the second one sizes the business
+case. And the champion is evaluated **in the same call**, on the same folds, from the same seed —
+comparing against a number copied from an earlier notebook is how teams end up shipping a model
+that was only ever better than a differently-split baseline.
+
+What this report still cannot do is protect you from the number of times you ran it. Every
+challenger you test against the same champion on the same folds is another draw in the winner's
+curse; log the count, and when the count gets large, spend a fresh split (ch. 5) on the finalist
+before you ship it.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You will not need them daily, but
+you will stop being surprised when you meet them.
+
+- **Conformal prediction** — wraps any model in prediction sets with a guaranteed coverage rate, distribution-free; the honest answer when "give me a confidence" actually needs to mean something.
+- **Counterfactual and contrastive explanations** — "what would have to change for this decision to flip?", which is what a rejected applicant actually wants to know, rather than an attribution.
+- **LIME and anchors** — fit a sparse local model (LIME) or find a rule that pins the prediction (anchors) around one point; faster than SHAP, less consistent, still common in production.
+- **Influence functions** — which *training rows* drove this prediction; the tool for finding the mislabelled example that broke a segment, at a heavy compute cost.
+- **Fairness metrics and bias audits** — demographic parity, equalized odds, calibration within groups; mathematically incompatible with each other in general, so the choice is a policy decision, not a metric selection.
+- **Multi-objective and Pareto tuning, ASHA and Hyperband** — fronts instead of winners (ch. 7) and asynchronous rung schedules that keep every worker busy on large sweeps.
+- **Drift and performance monitoring (PSI, KS)** — population-stability index and Kolmogorov-Smirnov tests on live feature distributions; the bridge from this course to MLOps.
+- **Statistical significance of model comparisons** — corrected resampled t-tests, McNemar's test for paired classifications, and multiple-comparison corrections; the discipline that stops a leaderboard from shipping noise.
