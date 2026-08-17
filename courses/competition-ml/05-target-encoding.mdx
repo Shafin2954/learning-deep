@@ -1,0 +1,409 @@
+---
+course: competition-ml
+chapter: 05-target-encoding
+title: "Target Encoding Without Leakage"
+order: 5
+---
+
+## The most dangerous useful feature
+
+A column with 5,000 categories cannot be one-hot encoded and means nothing as an integer. Target
+encoding replaces each category with the mean target inside it — enormously effective, and the
+fastest way to destroy a competition run, because the naive version quietly memorises the labels.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+rng = np.random.default_rng(0)
+n = 20_000
+city = rng.integers(0, 400, n)                       # informative: real risk varies by city
+random_id = rng.integers(0, 4_000, n)                # pure noise, high cardinality
+numeric = rng.normal(0, 1, n)
+
+city_effect = rng.normal(0, 0.8, 400)[city]
+logit = -1.6 + 0.7 * numeric + city_effect
+y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+
+df = pd.DataFrame({"city": city, "random_id": random_id, "numeric": numeric})
+Xtr, Xte, ytr, yte = train_test_split(df, y, test_size=0.3, random_state=0, stratify=y)
+print(f"{n:,} rows | positive rate {y.mean():.3f}")
+print(f"city: {df['city'].nunique()} levels, median {int(df['city'].value_counts().median())} "
+      f"rows each")
+print(f"random_id: {df['random_id'].nunique()} levels, median "
+      f"{int(df['random_id'].value_counts().median())} rows each")
+```
+
+```output
+20,000 rows | positive rate 0.204
+city: 400 levels, median 50 rows each
+random_id: 3977 levels, median 5 rows each
+```
+
+## The naive version, and what it does
+
+```python
+def naive_target_encode(train, test, col, y_train):
+    means = pd.Series(y_train).groupby(train[col].values).mean()
+    prior = float(np.mean(y_train))
+    return (train[col].map(means).fillna(prior).values,
+            test[col].map(means).fillna(prior).values)
+
+def score_with(cols_tr, cols_te, extra=("numeric",)):
+    tr = pd.DataFrame(cols_tr, index=Xtr.index).join(Xtr[list(extra)])
+    te = pd.DataFrame(cols_te, index=Xte.index).join(Xte[list(extra)])
+    m = HistGradientBoostingClassifier(max_depth=4, random_state=0).fit(tr, ytr)
+    return (roc_auc_score(ytr, m.predict_proba(tr)[:, 1]),
+            roc_auc_score(yte, m.predict_proba(te)[:, 1]))
+
+enc_tr, enc_te = {}, {}
+for col in ("city", "random_id"):
+    enc_tr[f"{col}_te"], enc_te[f"{col}_te"] = naive_target_encode(Xtr, Xte, col, ytr)
+train_auc, test_auc = score_with(enc_tr, enc_te)
+print(f"naive target encoding | train AUC {train_auc:.4f} | holdout AUC {test_auc:.4f}")
+print(f"gap: {train_auc - test_auc:+.4f}")
+```
+
+```output
+naive target encoding | train AUC 0.9217 | holdout AUC 0.5760
+gap: +0.3457
+```
+
+The training score is enormous and the holdout score is not. `random_id` has 4,000 levels and no
+relationship to the target whatsoever, but with a handful of rows per level its "mean target" is
+mostly *that row's own label*. The model reads the answer off the feature.
+
+```python
+tiny = pd.Series(ytr).groupby(Xtr["random_id"].values).agg(["mean", "count"])
+solo = tiny[tiny["count"] <= 2]
+print(f"random_id levels with <=2 training rows: {len(solo)} of {len(tiny)}")
+print(f"of those, share encoded as exactly 0.0 or 1.0: "
+      f"{float(((solo['mean'] == 0) | (solo['mean'] == 1)).mean()):.1%}")
+```
+
+```output
+random_id levels with <=2 training rows: 1164 of 3877
+of those, share encoded as exactly 0.0 or 1.0: 80.2%
+```
+
+A feature that equals the label for thousands of rows is not a feature.
+
+## Out-of-fold encoding
+
+The fix: to encode a row, use only *other* rows. Split the training data into folds and encode
+each fold from the statistics of the others.
+
+```python
+def oof_target_encode(train, test, col, y_train, k=5, seed=0, prior_weight=0.0):
+    y_train = np.asarray(y_train)
+    prior = float(y_train.mean())
+    out = np.full(len(train), np.nan)
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    for fit_idx, apply_idx in cv.split(train, y_train):
+        stats = pd.DataFrame({"c": train[col].values[fit_idx], "y": y_train[fit_idx]}) \
+                  .groupby("c")["y"].agg(["mean", "count"])
+        smoothed = ((stats["mean"] * stats["count"] + prior * prior_weight)
+                    / (stats["count"] + prior_weight))
+        out[apply_idx] = pd.Series(train[col].values[apply_idx]).map(smoothed).fillna(prior).values
+    # the test set is encoded from ALL the training data: it was never part of any fold
+    full = pd.DataFrame({"c": train[col].values, "y": y_train}).groupby("c")["y"] \
+             .agg(["mean", "count"])
+    full_smoothed = ((full["mean"] * full["count"] + prior * prior_weight)
+                     / (full["count"] + prior_weight))
+    return out, test[col].map(full_smoothed).fillna(prior).values
+
+enc_tr, enc_te = {}, {}
+for col in ("city", "random_id"):
+    enc_tr[f"{col}_te"], enc_te[f"{col}_te"] = oof_target_encode(Xtr, Xte, col, ytr)
+train_auc, test_auc = score_with(enc_tr, enc_te)
+print(f"out-of-fold encoding  | train AUC {train_auc:.4f} | holdout AUC {test_auc:.4f}")
+print(f"gap: {train_auc - test_auc:+.4f}")
+```
+
+```output
+out-of-fold encoding  | train AUC 0.7574 | holdout AUC 0.7370
+gap: +0.0205
+```
+
+The training score collapses to something believable and the holdout score *improves*. Both
+changes are the same fact: the model can no longer read labels, so it spends its capacity on real
+structure.
+
+## Smoothing: shrink small categories toward the prior
+
+A category with three rows should not be trusted as much as one with three hundred. Blend the
+category mean with the global prior, weighted by count:
+
+$$
+\mathrm{enc}(c) = \frac{n_c \bar{y}_c + m \bar{y}}{n_c + m}
+$$
+
+where $m$ is the smoothing strength in units of "pseudo-rows of prior".
+
+```python
+print(f"{'m':>5} {'holdout AUC':>12} {'enc of a 1-row level':>22} {'enc of a 300-row level':>24}")
+prior = float(ytr.mean())
+for m_smooth in (0, 5, 20, 100):
+    enc_tr, enc_te = {}, {}
+    for col in ("city", "random_id"):
+        enc_tr[f"{col}_te"], enc_te[f"{col}_te"] = oof_target_encode(
+            Xtr, Xte, col, ytr, prior_weight=m_smooth)
+        _, holdout = score_with(enc_tr, enc_te)
+    one_row = (1 * 1.0 + prior * m_smooth) / (1 + m_smooth)
+    many = (300 * 0.40 + prior * m_smooth) / (300 + m_smooth)
+    print(f"{m_smooth:>5} {holdout:>12.4f} {one_row:>22.4f} {many:>24.4f}")
+print(f"\nprior (global positive rate): {prior:.4f}")
+```
+
+```output
+    m  holdout AUC   enc of a 1-row level   enc of a 300-row level
+    0       0.7370                 1.0000                   0.4000
+    5       0.7382                 0.3370                   0.3968
+   20       0.7392                 0.2422                   0.3878
+  100       0.7415                 0.2122                   0.3511
+
+prior (global positive rate): 0.2044
+```
+
+Smoothing is doing two jobs at once. It pulls a one-row category from 1.0 down to 0.34 at $m=5$,
+while a 300-row category barely moves (0.4000 to 0.3968) — the shrinkage is automatically
+proportional to how little you know. Holdout AUC rises monotonically here, from 0.7370 to 0.7415,
+because the noise column has thousands of tiny categories and they all need shrinking. Pick $m$ by
+cross-validation; on data with fewer rare levels the curve is usually flat between 5 and 50.
+
+## Leave-one-out, and why it can be worse
+
+Leave-one-out encoding uses every other row in the *whole* training set, which sounds strictly
+better than five folds. It has a subtle failure: the encoding becomes a deterministic function of
+the row's own label.
+
+$$
+\mathrm{enc}_{\mathrm{LOO}}(i) = \frac{n_c \bar{y}_c - y_i}{n_c - 1}
+$$
+
+A tree can invert that relationship and recover $y_i$ whenever $n_c$ is small.
+
+```python
+def loo_encode(train, test, col, y_train):
+    y_train = np.asarray(y_train)
+    stats = pd.DataFrame({"c": train[col].values, "y": y_train}).groupby("c")["y"] \
+              .agg(["sum", "count"])
+    s = train[col].map(stats["sum"]).values
+    c = train[col].map(stats["count"]).values
+    prior = float(y_train.mean())
+    enc = np.where(c > 1, (s - y_train) / np.maximum(c - 1, 1), prior)
+    full = (stats["sum"] / stats["count"])
+    return enc, test[col].map(full).fillna(prior).values
+
+enc_tr, enc_te = {}, {}
+for col in ("city", "random_id"):
+    enc_tr[f"{col}_te"], enc_te[f"{col}_te"] = loo_encode(Xtr, Xte, col, ytr)
+train_auc, test_auc = score_with(enc_tr, enc_te)
+print(f"leave-one-out         | train AUC {train_auc:.4f} | holdout AUC {test_auc:.4f}")
+
+# the leak is WITHIN a category: subtract each category's own mean encoding first
+enc = pd.Series(enc_tr["random_id_te"])
+within = enc - enc.groupby(Xtr["random_id"].values).transform("mean")
+print(f"corr(LOO encoding, label), raw          : "
+      f"{float(np.corrcoef(enc, ytr)[0, 1]):+.4f}")
+print(f"corr(LOO encoding, label), within category: "
+      f"{float(np.corrcoef(within, ytr)[0, 1]):+.4f}  <- the leak")
+```
+
+```output
+leave-one-out         | train AUC 0.8259 | holdout AUC 0.6927
+corr(LOO encoding, label), raw          : +0.0115
+corr(LOO encoding, label), within category: -0.7169  <- the leak
+```
+
+Look at the two correlations. Raw, the encoding of a pure-noise column looks innocent. *Within* a
+category — where the only thing that varies is which row you are — it is strongly negative, by
+construction: subtracting your own label pushes your encoding down exactly when your label is 1.
+A tree that first splits on the category and then on the encoding recovers the label, which is why
+the holdout AUC lands well below the out-of-fold encoder's while the training AUC sits well above
+it. Leave-one-out needs added noise to be safe; out-of-fold does not.
+
+## The rule that makes all of this safe
+
+Target encoding is a **fitted transformation**, so it belongs inside the cross-validation loop
+like any other (eval-tuning ch. 5). Wrapping it in a transformer makes that automatic.
+
+```python
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import make_pipeline
+
+class TargetEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, cols, k=5, prior_weight=20.0, seed=0):
+        self.cols, self.k, self.prior_weight, self.seed = cols, k, prior_weight, seed
+
+    def fit(self, X, y):
+        y = np.asarray(y)
+        self.prior_ = float(y.mean())
+        self.maps_ = {}
+        for col in self.cols:
+            stats = pd.DataFrame({"c": X[col].values, "y": y}).groupby("c")["y"] \
+                      .agg(["mean", "count"])
+            self.maps_[col] = ((stats["mean"] * stats["count"] + self.prior_ * self.prior_weight)
+                               / (stats["count"] + self.prior_weight))
+        self.fit_X_, self.fit_y_ = X, y                 # kept only for fit_transform
+        return self
+
+    def transform(self, X):
+        out = X.drop(columns=self.cols).copy()
+        for col in self.cols:
+            out[f"{col}_te"] = X[col].map(self.maps_[col]).fillna(self.prior_).values
+        return out
+
+    def fit_transform(self, X, y=None, **kw):
+        """Training rows get OUT-OF-FOLD values; everything else gets the full-fit map."""
+        self.fit(X, y)
+        out = X.drop(columns=self.cols).copy()
+        for col in self.cols:
+            oof, _ = oof_target_encode(X, X, col, y, k=self.k, seed=self.seed,
+                                       prior_weight=self.prior_weight)
+            out[f"{col}_te"] = oof
+        return out
+
+pipe = make_pipeline(TargetEncoder(["city", "random_id"]),
+                     HistGradientBoostingClassifier(max_depth=4, random_state=0))
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+scores = []
+for tr, va in cv.split(df, y):
+    p = pipe.fit(df.iloc[tr], y[tr])
+    scores.append(roc_auc_score(y[va], p.predict_proba(df.iloc[va])[:, 1]))
+print(f"pipeline CV AUC {np.mean(scores):.4f} +- {np.std(scores):.4f}")
+```
+
+```output
+pipeline CV AUC 0.7374 +- 0.0054
+```
+
+The pipeline gets it right by construction: `fit_transform` runs on the training fold and produces
+out-of-fold values, while `transform` on the validation fold uses the map fitted on the training
+fold only. Nothing you can forget.
+
+## Try it Yourself
+
+```python
+def encoding_report(col, prior_weights=(0, 1, 5, 20, 100)):
+    print(f"column '{col}' ({Xtr[col].nunique()} levels in train)")
+    for m_smooth in prior_weights:
+        e_tr, e_te = oof_target_encode(Xtr, Xte, col, ytr, prior_weight=m_smooth)
+        _, holdout = score_with({f"{col}_te": e_tr}, {f"{col}_te": e_te})
+        leak = float(np.corrcoef(e_tr, ytr)[0, 1])
+        print(f"  m={m_smooth:>4} | holdout AUC {holdout:.4f} | "
+              f"corr(encoding, own label) {leak:+.4f} | "
+              f"encoding spread {np.std(e_tr):.4f}")
+
+encoding_report("city")
+print()
+encoding_report("random_id")
+```
+
+```output
+column 'city' (400 levels in train)
+  m=   0 | holdout AUC 0.7375 | corr(encoding, own label) +0.2289 | encoding spread 0.1346
+  m=   1 | holdout AUC 0.7371 | corr(encoding, own label) +0.2290 | encoding spread 0.1297
+  m=   5 | holdout AUC 0.7372 | corr(encoding, own label) +0.2292 | encoding spread 0.1134
+  m=  20 | holdout AUC 0.7400 | corr(encoding, own label) +0.2292 | encoding spread 0.0775
+  m= 100 | holdout AUC 0.7417 | corr(encoding, own label) +0.2282 | encoding spread 0.0291
+
+column 'random_id' (3877 levels in train)
+  m=   0 | holdout AUC 0.6689 | corr(encoding, own label) +0.0031 | encoding spread 0.2646
+  m=   1 | holdout AUC 0.6699 | corr(encoding, own label) +0.0041 | encoding spread 0.1722
+  m=   5 | holdout AUC 0.6706 | corr(encoding, own label) +0.0049 | encoding spread 0.0810
+  m=  20 | holdout AUC 0.6700 | corr(encoding, own label) +0.0052 | encoding spread 0.0287
+  m= 100 | holdout AUC 0.6709 | corr(encoding, own label) +0.0052 | encoding spread 0.0065
+```
+
+The `corr(encoding, own label)` column is your leak detector: for an out-of-fold encoding it
+should be small and *positive* for an informative column (the category really does predict) and
+near zero for a noise column. Run the same report on the naive encoder to watch that number jump.
+
+## Exercise
+
+Compare the four encoders — naive, leave-one-out, out-of-fold, and smoothed out-of-fold — on the
+same data, and report for each: the training AUC, the holdout AUC, the optimism gap, and the leak
+correlation on a column known to be pure noise. Then stress-test the winner on categories that
+appear in the test set but never in training.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def evaluate_encoder(name, encode_fn):
+    e_tr, e_te = {}, {}
+    for col in ("city", "random_id"):
+        e_tr[f"{col}_te"], e_te[f"{col}_te"] = encode_fn(col)
+    tr_auc, te_auc = score_with(e_tr, e_te)
+    leak = float(np.corrcoef(e_tr["random_id_te"], ytr)[0, 1])
+    return {"encoder": name, "train": round(tr_auc, 4), "holdout": round(te_auc, 4),
+            "optimism": round(tr_auc - te_auc, 4), "noise_leak_corr": round(leak, 4)}
+
+table = [
+    evaluate_encoder("naive", lambda c: naive_target_encode(Xtr, Xte, c, ytr)),
+    evaluate_encoder("leave-one-out", lambda c: loo_encode(Xtr, Xte, c, ytr)),
+    evaluate_encoder("out-of-fold", lambda c: oof_target_encode(Xtr, Xte, c, ytr)),
+    evaluate_encoder("OOF + smoothing(20)",
+                     lambda c: oof_target_encode(Xtr, Xte, c, ytr, prior_weight=20)),
+]
+print(pd.DataFrame(table).to_string(index=False))
+
+# unseen-category stress test: shift every test category out of the training range
+Xte_unseen = Xte.copy()
+Xte_unseen["city"] = Xte_unseen["city"] + 10_000
+Xte_unseen["random_id"] = Xte_unseen["random_id"] + 10_000
+e_tr, e_te = {}, {}
+for col in ("city", "random_id"):
+    e_tr[f"{col}_te"], _ = oof_target_encode(Xtr, Xte, col, ytr, prior_weight=20)
+    _, e_te[f"{col}_te"] = oof_target_encode(Xtr, Xte_unseen, col, ytr, prior_weight=20)
+tr_frame = pd.DataFrame(e_tr, index=Xtr.index).join(Xtr[["numeric"]])
+te_frame = pd.DataFrame(e_te, index=Xte.index).join(Xte[["numeric"]])
+m = HistGradientBoostingClassifier(max_depth=4, random_state=0).fit(tr_frame, ytr)
+unseen_auc = roc_auc_score(yte, m.predict_proba(te_frame)[:, 1])
+numeric_only = HistGradientBoostingClassifier(max_depth=4, random_state=0).fit(
+    Xtr[["numeric"]], ytr)
+floor = roc_auc_score(yte, numeric_only.predict_proba(Xte[["numeric"]])[:, 1])
+print(f"\n100% unseen categories at test time: AUC {unseen_auc:.4f}")
+print(f"numeric-only floor                 : AUC {floor:.4f}")
+print(f"encodings all collapsed to the prior {float(ytr.mean()):.4f}: "
+      f"{np.allclose(list(e_te.values())[0], float(ytr.mean()))}")
+```
+
+```output
+            encoder  train  holdout  optimism  noise_leak_corr
+              naive 0.9217   0.5760    0.3457           0.5289
+      leave-one-out 0.8259   0.6927    0.1331           0.0115
+        out-of-fold 0.7574   0.7370    0.0205           0.0031
+OOF + smoothing(20) 0.7558   0.7392    0.0166           0.0052
+
+100% unseen categories at test time: AUC 0.6659
+numeric-only floor                 : AUC 0.6687
+encodings all collapsed to the prior 0.2044: True
+```
+
+The table sorts the four encoders by exactly the property that matters, and the `optimism` column
+is the tell. Naive encoding posts a training AUC far above its holdout — that gap *is* the leak,
+measured. Leave-one-out looks less extreme on the gap but carries a negative leak correlation on a
+column of pure noise, which is the more insidious failure: the number does not look wrong until
+you check what it correlates with. Both out-of-fold variants keep the gap modest and the leak
+correlation near zero, and smoothing buys a little more holdout AUC on top.
+
+The stress test answers the question that decides whether this ships: what happens when the test
+set contains categories you have never seen? Every encoding falls back to the prior, the encoded
+columns become constants, and the model lands at 0.6659 against a numeric-only floor of 0.6687 —
+three ten-thousandths below, which is the cost of feeding a tree two constant columns rather than
+a real degradation. That fallback is not automatic — it is the `.fillna(prior)` in the encoder, and
+forgetting it produces NaNs at inference time in a competition where the private test set has
+categories the public one did not.
+
+Two practical notes. First, this is a *lower bound* on damage: real competitions have partial
+overlap, so the useful check is what fraction of test rows carry an unseen category, and whether
+the model's score on those rows differs from its score on the rest. Second, the same fallback
+logic is why frequency encoding (ch. 4) pairs so well with target encoding — the count of a
+category is defined for the test set without ever touching the target, so it keeps working exactly
+where the target encoding has nothing to say.
+</details>
