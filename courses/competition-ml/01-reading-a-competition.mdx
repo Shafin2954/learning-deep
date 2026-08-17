@@ -1,0 +1,384 @@
+---
+course: competition-ml
+chapter: 01-reading-a-competition
+title: "Reading a Competition: Metric, Leak Risk, CV Design"
+order: 1
+---
+
+## The first hour decides the month
+
+Before a single model, three questions have answers that constrain everything after them: **what
+exactly is being scored**, **how could this data leak**, and **what validation scheme reproduces
+the leaderboard**. Teams that get these wrong spend weeks improving a number that does not move
+their rank.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 8_000
+signal = rng.normal(0, 1, n)
+noise_level = rng.uniform(0.5, 1.5, n)
+p_true = 1 / (1 + np.exp(-(0.9 * signal - 1.4)))
+y = (rng.random(n) < p_true).astype(int)
+score_a = np.clip(p_true + rng.normal(0, 0.05, n), 1e-6, 1 - 1e-6)   # calibrated
+score_b = np.clip(score_a * 0.45 + 0.02, 1e-6, 1 - 1e-6)             # SAME ordering, squashed
+print(f"rows {n} | positive rate {y.mean():.3f}")
+print(f"model A mean prediction {score_a.mean():.3f} | model B {score_b.mean():.3f}")
+```
+
+```output
+rows 8000 | positive rate 0.228
+model A mean prediction 0.231 | model B 0.124
+```
+
+Two models, one of them a monotone squashing of the other. They are identical to any rank-based
+metric and very different to any probability-based one.
+
+## Metric families, and what each one rewards
+
+```python
+from sklearn.metrics import roc_auc_score, log_loss, average_precision_score, accuracy_score
+
+rows = []
+for name, s in (("A calibrated", score_a), ("B same ranking, squashed", score_b)):
+    s = np.clip(s, 1e-6, 1 - 1e-6)
+    rows.append({
+        "model": name,
+        "ROC AUC": round(roc_auc_score(y, s), 5),
+        "PR AUC": round(average_precision_score(y, s), 5),
+        "log loss": round(log_loss(y, s), 5),
+        "acc @0.5": round(accuracy_score(y, s > 0.5), 5),
+    })
+print(pd.DataFrame(rows).to_string(index=False))
+```
+
+```output
+                   model  ROC AUC  PR AUC  log loss  acc @0.5
+            A calibrated  0.71431  0.4322   0.49733   0.77975
+B same ranking, squashed  0.71431  0.4322   0.52931   0.77238
+```
+
+Read that table as a decision tree for your effort:
+
+- **Rank metrics** (ROC AUC, MAP, NDCG) — only the ordering matters. Calibration work is wasted;
+  blending by *rank* is safe (ch. 8).
+- **Probability metrics** (log loss, Brier) — the values matter. A model that ranks perfectly can
+  still lose badly, and calibration is free score (eval-tuning ch. 4).
+- **Threshold metrics** (accuracy, F1, quadratic kappa) — the cut point is part of your
+  submission. Optimising it on out-of-fold predictions is usually worth more than a better model.
+
+```python
+best_thr, best_f1 = None, -1
+for thr in np.linspace(0.01, 0.99, 99):
+    tp = int(((score_a > thr) & (y == 1)).sum())
+    fp = int(((score_a > thr) & (y == 0)).sum())
+    fn = int(((score_a <= thr) & (y == 1)).sum())
+    f1 = 2 * tp / max(2 * tp + fp + fn, 1)
+    if f1 > best_f1:
+        best_thr, best_f1 = thr, f1
+naive_tp = int(((score_a > 0.5) & (y == 1)).sum())
+naive_fp = int(((score_a > 0.5) & (y == 0)).sum())
+naive_fn = int(((score_a <= 0.5) & (y == 1)).sum())
+naive_f1 = 2 * naive_tp / max(2 * naive_tp + naive_fp + naive_fn, 1)
+print(f"F1 at the default 0.5 threshold : {naive_f1:.4f}")
+print(f"F1 at the tuned threshold {best_thr:.2f}    : {best_f1:.4f}")
+print(f"free gain from one line of code : {best_f1 - naive_f1:+.4f}")
+```
+
+```output
+F1 at the default 0.5 threshold : 0.2515
+F1 at the tuned threshold 0.24    : 0.4650
+free gain from one line of code : +0.2135
+```
+
+That gain is larger than most feature-engineering ideas will give you, and it costs a loop.
+
+## Leak hunting is a checklist, not an instinct
+
+A leak is any signal in the training data that will not exist at prediction time. Four patterns
+cover most competition leaks, and all four are detectable in minutes.
+
+```python
+comp = pd.DataFrame({
+    "id": np.arange(n),
+    "feature_1": signal + rng.normal(0, 0.4, n),
+    "feature_2": rng.normal(0, 1, n),
+    "recorded_at": np.sort(rng.integers(0, 10_000, n)),   # rows arrive in time order
+    "target": y,
+})
+# the organiser sorted the file by outcome before shuffling in the negatives (a real, common bug)
+comp = comp.sort_values(["target", "id"], kind="stable").reset_index(drop=True)
+comp["row_number"] = np.arange(len(comp))
+
+print("correlation of the target with:")
+for col in ("id", "row_number", "recorded_at", "feature_1", "feature_2"):
+    r = float(np.corrcoef(comp[col], comp["target"])[0, 1])
+    flag = "  <- LEAK" if abs(r) > 0.3 and col in ("id", "row_number", "recorded_at") else ""
+    print(f"  {col:12} {r:+.4f}{flag}")
+```
+
+```output
+correlation of the target with:
+  id           +0.0193
+  row_number   +0.7262  <- LEAK
+  recorded_at  +0.0194
+  feature_1    +0.3106
+  feature_2    +0.0074
+```
+
+`row_number` correlates at +0.73 with the target purely because of how the file was assembled.
+A model handed that column will top your local CV and score at chance on the leaderboard. The rule
+is blunt: **any identifier, index, or file-order artefact is suspect until proven inert.**
+
+### Duplicates that cross the split
+
+```python
+dup_rows = comp.sample(300, random_state=1).copy()
+comp_train = comp.iloc[:6_000]
+comp_test = pd.concat([comp.iloc[6_000:], dup_rows]).reset_index(drop=True)
+
+feat_cols = ["feature_1", "feature_2"]
+key_train = comp_train[feat_cols].round(6).astype(str).agg("|".join, axis=1)
+key_test = comp_test[feat_cols].round(6).astype(str).agg("|".join, axis=1)
+overlap = set(key_train) & set(key_test)
+print(f"train rows {len(comp_train)} | test rows {len(comp_test)}")
+print(f"exact feature-duplicate rows shared across the split: {len(overlap)} "
+      f"({len(overlap) / len(comp_test):.1%} of test)")
+```
+
+```output
+train rows 6000 | test rows 2300
+exact feature-duplicate rows shared across the split: 221 (9.6% of test)
+```
+
+Duplicates across a split are two different things at once: a validation problem (your CV is
+optimistic by the duplicate share) and an opportunity (if the *real* test set has them, a
+nearest-neighbour lookup is a legitimate part of a solution). Measure it before you decide which.
+
+### Group structure hiding as rows
+
+```python
+comp["customer_id"] = rng.integers(0, 900, len(comp))     # many rows per customer
+per_customer = comp.groupby("customer_id")["target"].agg(["count", "mean"])
+same_label = float(((per_customer["mean"] == 0) | (per_customer["mean"] == 1)).mean())
+print(f"customers: {len(per_customer)} | median rows each: "
+      f"{per_customer['count'].median():.0f}")
+print(f"share of customers whose rows all share one label: {same_label:.1%}")
+print("=> random k-fold would put the same customer on both sides of the split")
+```
+
+```output
+customers: 900 | median rows each: 9
+share of customers whose rows all share one label: 12.2%
+=> random k-fold would put the same customer on both sides of the split
+```
+
+## Designing the CV before the first model
+
+The validation scheme is a *hypothesis about the test split*. State it explicitly, then check it
+against whatever the organiser told you.
+
+| What the data has | What the test split probably is | Your CV |
+|---|---|---|
+| plain i.i.d. rows | random | stratified k-fold |
+| repeated entities | unseen entities | GroupKFold on the entity |
+| a time column, test after train | future | rolling origin / a single time cut |
+| both | future rows of unseen entities | grouped + time cut |
+| heavy class imbalance | same imbalance | repeated stratified k-fold |
+
+```python
+def suggest_cv(frame, target="target", id_like=(), time_col=None, group_col=None):
+    notes = []
+    n_rows = len(frame)
+    pos = float(frame[target].mean())
+    if group_col is not None:
+        rows_per = frame.groupby(group_col).size()
+        if rows_per.max() > 1:
+            notes.append(f"GroupKFold on '{group_col}' "
+                         f"(up to {rows_per.max()} rows per group)")
+    if time_col is not None:
+        notes.append(f"time-ordered split on '{time_col}' (train past, validate future)")
+    if min(pos, 1 - pos) * n_rows < 500:
+        notes.append(f"repeated stratified folds: only {int(min(pos, 1 - pos) * n_rows)} "
+                     f"minority rows")
+    for col in id_like:
+        r = abs(float(np.corrcoef(frame[col], frame[target])[0, 1]))
+        if r > 0.1:
+            notes.append(f"DROP '{col}': |corr with target| = {r:.3f}")
+    return notes or ["stratified k-fold; no structure detected"]
+
+for note in suggest_cv(comp, id_like=("id", "row_number"), time_col="recorded_at",
+                       group_col="customer_id"):
+    print(f"- {note}")
+```
+
+```output
+- GroupKFold on 'customer_id' (up to 21 rows per group)
+- time-ordered split on 'recorded_at' (train past, validate future)
+- DROP 'row_number': |corr with target| = 0.726
+```
+
+The output is a plan you can defend, produced before any modelling. When your CV and the
+leaderboard later disagree (ch. 2), this is the document you re-read first.
+
+## Try it Yourself
+
+```python
+def competition_brief(frame, target, metric, id_like=(), time_col=None, group_col=None):
+    metric_family = {"auc": "rank", "map": "rank", "ndcg": "rank",
+                     "logloss": "probability", "brier": "probability",
+                     "accuracy": "threshold", "f1": "threshold", "kappa": "threshold",
+                     "rmse": "regression", "rmsle": "regression"}[metric]
+    advice = {
+        "rank": "calibration is worthless; rank-average when blending; tune ordering only",
+        "probability": "calibrate (eval-tuning ch. 4); never rank-average raw probabilities",
+        "threshold": "tune the cut on out-of-fold predictions; it is part of the model",
+        "regression": "check whether the metric is on a log scale before transforming y",
+    }[metric_family]
+    print(f"metric        {metric} ({metric_family})")
+    print(f"implication   {advice}")
+    print(f"rows          {len(frame):,}   positive rate {frame[target].mean():.3f}")
+    print("validation plan:")
+    for note in suggest_cv(frame, target, id_like, time_col, group_col):
+        print(f"  - {note}")
+
+competition_brief(comp, "target", "auc", id_like=("id", "row_number"),
+                  time_col="recorded_at", group_col="customer_id")
+print()
+competition_brief(comp, "target", "f1", id_like=("id",))
+```
+
+```output
+metric        auc (rank)
+implication   calibration is worthless; rank-average when blending; tune ordering only
+rows          8,000   positive rate 0.228
+validation plan:
+  - GroupKFold on 'customer_id' (up to 21 rows per group)
+  - time-ordered split on 'recorded_at' (train past, validate future)
+  - DROP 'row_number': |corr with target| = 0.726
+
+metric        f1 (threshold)
+implication   tune the cut on out-of-fold predictions; it is part of the model
+rows          8,000   positive rate 0.228
+validation plan:
+  - stratified k-fold; no structure detected
+```
+
+Run this on every competition you enter, before you open a modelling notebook. Add your own
+checks — a train/test column-set diff, a missing-value pattern comparison, a check for constant
+columns — and the brief becomes the first cell of every solution you write.
+
+## Exercise
+
+Turn the brief into something that *scores* a competition's risk. For a given train/test pair,
+produce a report with a numeric risk level for each of the four leak families (identifier, order,
+duplicate, group), a recommended CV scheme, and a list of columns to drop before modelling. Test
+it on a clean dataset and on a deliberately poisoned one, and confirm it stays quiet on the clean
+one.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def leak_audit(train, test, target, feature_cols, id_like=(), group_col=None):
+    findings = []
+
+    for col in id_like:                                    # 1. identifier leaks
+        if col not in train:
+            continue
+        r = abs(float(np.corrcoef(train[col], train[target])[0, 1]))
+        findings.append(("identifier", col, round(r, 4),
+                         "HIGH" if r > 0.3 else "medium" if r > 0.1 else "low"))
+
+    order_corr = abs(float(np.corrcoef(np.arange(len(train)), train[target])[0, 1]))
+    findings.append(("row order", "(file order)", round(order_corr, 4),
+                     "HIGH" if order_corr > 0.3 else "medium" if order_corr > 0.1 else "low"))
+
+    ktr = train[feature_cols].round(6).astype(str).agg("|".join, axis=1)
+    kte = test[feature_cols].round(6).astype(str).agg("|".join, axis=1)
+    share = len(set(ktr) & set(kte)) / max(len(kte), 1)
+    findings.append(("duplicates", "train∩test", round(share, 4),
+                     "HIGH" if share > 0.05 else "medium" if share > 0.005 else "low"))
+
+    if group_col:
+        rows_per = train.groupby(group_col).size()
+        multi = float((rows_per > 1).mean())
+        findings.append(("group structure", group_col, round(multi, 4),
+                         "HIGH" if multi > 0.5 else "medium" if multi > 0.1 else "low"))
+
+    rep = pd.DataFrame(findings, columns=["family", "where", "evidence", "risk"])
+    drop = [c for f, c, e, r in findings if f in ("identifier",) and r != "low"]
+    if order_corr > 0.1:
+        drop.append("(shuffle the file before splitting)")
+    return rep, drop
+
+feature_cols = ["feature_1", "feature_2"]
+# the organiser shuffles rows into train/test, but the row_number column survives the shuffle
+shuf = comp.sample(frac=1.0, random_state=3).reset_index(drop=True)
+train_p = shuf.iloc[:6_000]
+test_p = pd.concat([shuf.iloc[6_000:], shuf.sample(300, random_state=1)]).reset_index(drop=True)
+print("POISONED dataset")
+rep, drop = leak_audit(train_p, test_p, "target", feature_cols,
+                       id_like=("id", "row_number"), group_col="customer_id")
+print(rep.to_string(index=False))
+print(f"action: drop {drop}\n")
+
+clean = comp.sample(frac=1.0, random_state=7).reset_index(drop=True).copy()
+clean["id"] = np.arange(len(clean))
+clean["row_number"] = np.arange(len(clean))
+clean["customer_id"] = np.arange(len(clean))              # one row per entity
+c_train, c_test = clean.iloc[:6_000], clean.iloc[6_000:]
+print("CLEAN dataset")
+rep2, drop2 = leak_audit(c_train, c_test, "target", feature_cols,
+                         id_like=("id", "row_number"), group_col="customer_id")
+print(rep2.to_string(index=False))
+print(f"action: drop {drop2 or 'nothing'}")
+```
+
+```output
+POISONED dataset
+         family        where  evidence risk
+     identifier           id    0.0293  low
+     identifier   row_number    0.7286 HIGH
+      row order (file order)    0.0041  low
+     duplicates   train∩test    0.0961 HIGH
+group structure  customer_id    0.9889 HIGH
+action: drop ['row_number']
+
+CLEAN dataset
+         family        where  evidence risk
+     identifier           id    0.0045  low
+     identifier   row_number    0.0045  low
+      row order (file order)    0.0045  low
+     duplicates   train∩test    0.0000  low
+group structure  customer_id    0.0000  low
+action: drop nothing
+```
+
+The audit does the job on both inputs, which is the part people skip: a detector that only ever
+fires is as useless as one that never does. On the poisoned frame it flags `row_number` at 0.7286,
+a 9.6% duplicate overlap, and pervasive group structure, and it names the column to drop; on the
+clean frame every one of those numbers collapses below 0.005 and it recommends nothing.
+
+Read the poisoned report's *third* row too: the file-order check comes back low (0.0041) even
+though the file was assembled sorted by target. That is correct and instructive — the organiser
+shuffled the rows into train and test, so position no longer carries the signal, but the
+`row_number` **column** they forgot to delete still does. Two checks that sound like the same
+check are not, and dropping either one would have missed a leak.
+
+Three things to note about the design. The evidence column carries the **number**, not just the
+verdict, because a 0.11 correlation and a 0.98 correlation are both "medium-or-worse" and only one
+of them is worth a morning. The duplicate check compares **rounded feature keys** rather than
+whole rows, since a float printed at full precision almost never matches and you would conclude
+there are no duplicates when 4% of the test set is a copy. And the group check reports the
+*share* of multi-row groups rather than the maximum, because one customer with 500 rows in a
+million-row file is a different problem from half the file being repeat customers.
+
+What no audit can find is the leak that lives in the meaning of a column rather than its
+statistics — a "days since last payment" field that was computed after the outcome, a status flag
+that only exists once a case is closed. For those, the tool is a data dictionary and a
+conversation, and the tell is a feature whose importance is implausibly high (eval-tuning ch. 8)
+for what it claims to measure.
+</details>
