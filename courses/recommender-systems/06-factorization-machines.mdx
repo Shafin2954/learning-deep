@@ -1,0 +1,427 @@
+---
+course: recommender-systems
+chapter: 06-factorization-machines
+title: "Factorization Machines"
+order: 6
+---
+
+## Matrix factorisation, generalised to any features
+
+Matrix factorisation learns one vector per user and one per item, which works exactly as long as
+your input is a (user, item) pair. The moment you have context — the hour of day, the device, the
+page the user came from — you need a model that factorises *arbitrary* feature interactions.
+Factorization machines are that model, and they contain MF as a special case.
+
+$$
+\hat{y}(\mathbf{x}) = w_0 + \sum_{i=1}^{n} w_i x_i
++ \sum_{i=1}^{n}\sum_{j=i+1}^{n} \langle \mathbf{v}_i, \mathbf{v}_j \rangle\, x_i x_j
+$$
+
+Every feature gets a weight $w_i$ *and* a latent vector $\mathbf{v}_i$. The interaction between two
+features is their vectors' dot product, so a pair that never co-occurs in training still gets a
+prediction — the vectors were learned from other pairs.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n_users, n_items = 1_500, 400
+n_devices, n_dayparts = 3, 4
+
+user_vec = rng.normal(0, 1, (n_users, 3))
+item_vec = rng.normal(0, 1, (n_items, 3))
+device_pref = rng.normal(0, 0.7, (n_devices, 3))          # device shifts what people click
+daypart_pref = rng.normal(0, 0.7, (n_dayparts, 3))
+item_bias = rng.normal(0, 0.8, n_items)
+
+n_rows = 60_000
+u = rng.integers(0, n_users, n_rows)
+i = rng.integers(0, n_items, n_rows)
+dev = rng.integers(0, n_devices, n_rows)
+day = rng.integers(0, n_dayparts, n_rows)
+
+logit = (-1.2 + item_bias[i]
+         + (user_vec[u] * item_vec[i]).sum(axis=1)                 # taste x item
+         + (device_pref[dev] * item_vec[i]).sum(axis=1) * 0.8      # device x item
+         + (daypart_pref[day] * item_vec[i]).sum(axis=1) * 0.6)    # time x item
+y = (rng.random(n_rows) < 1 / (1 + np.exp(-logit))).astype(np.float64)
+
+df = pd.DataFrame({"user": u, "item": i, "device": dev, "daypart": day, "y": y})
+split = int(0.8 * n_rows)
+train, test = df.iloc[:split].reset_index(drop=True), df.iloc[split:].reset_index(drop=True)
+print(f"{n_rows:,} impressions | click rate {y.mean():.3f} | "
+      f"train {len(train):,} test {len(test):,}")
+print(f"feature fields: user ({n_users}), item ({n_items}), device ({n_devices}), "
+      f"daypart ({n_dayparts})")
+```
+
+```output
+60,000 impressions | click rate 0.340 | train 48,000 test 12,000
+feature fields: user (1500), item (400), device (3), daypart (4)
+```
+
+Note what the generator did: the click depends on **item x device** and **item x daypart**, not
+just on user and item. A matrix factorisation cannot see those terms at all.
+
+## One-hot encoding and the design matrix
+
+```python
+FIELDS = ["user", "item", "device", "daypart"]
+SIZES = [n_users, n_items, n_devices, n_dayparts]
+OFFSETS = np.cumsum([0] + SIZES[:-1])
+n_features = sum(SIZES)
+
+def encode(frame, fields=FIELDS):
+    idx = np.column_stack([frame[f].values + OFFSETS[FIELDS.index(f)] for f in fields])
+    return idx
+
+idx_train, idx_test = encode(train), encode(test)
+y_train, y_test = train["y"].values, test["y"].values
+print(f"design matrix: {n_features:,} features, {idx_train.shape[1]} active per row")
+print(f"first row active indices: {idx_train[0]} "
+      f"(user {train['user'][0]}, item {train['item'][0]} + {OFFSETS[1]}, ...)")
+```
+
+```output
+design matrix: 1,907 features, 4 active per row
+first row active indices: [ 388 1845 1900 1903] (user 388, item 345 + 1500, ...)
+```
+
+Because every row has exactly one active feature per field, the sparse dot products collapse to
+array lookups — which is what makes FMs fast despite the quadratic-looking formula.
+
+## The $O(kn)$ identity that makes FMs practical
+
+The double sum over pairs is $O(n^2)$ as written. It is equal to:
+
+$$
+\sum_{i<j} \langle \mathbf{v}_i, \mathbf{v}_j\rangle x_i x_j
+= \frac{1}{2}\sum_{f=1}^{k}\left[\left(\sum_{i=1}^{n} v_{i,f} x_i\right)^{2}
+- \sum_{i=1}^{n} v_{i,f}^{2} x_i^{2}\right]
+$$
+
+which costs $O(kn)$ — one pass to accumulate the sum, one to accumulate the sum of squares.
+
+```python
+def pairwise_naive(V, active):
+    total = 0.0
+    for a in range(len(active)):
+        for b in range(a + 1, len(active)):
+            total += V[active[a]] @ V[active[b]]
+    return total
+
+def pairwise_fast(V, active):
+    s = V[active].sum(axis=0)
+    return 0.5 * float((s ** 2).sum() - (V[active] ** 2).sum())
+
+V_check = np.random.default_rng(1).normal(0, 0.1, (n_features, 8))
+for row in range(3):
+    a = idx_train[row]
+    print(f"row {row}: naive {pairwise_naive(V_check, a):+.10f} | "
+          f"fast {pairwise_fast(V_check, a):+.10f} | "
+          f"match {np.isclose(pairwise_naive(V_check, a), pairwise_fast(V_check, a))}")
+```
+
+```output
+row 0: naive -0.0382042893 | fast -0.0382042893 | match True
+row 1: naive -0.0340220224 | fast -0.0340220224 | match True
+row 2: naive +0.1263194906 | fast +0.1263194906 | match True
+```
+
+## Training an FM
+
+For logistic loss with $p = \sigma(\hat{y})$ and residual $e = p - y$, the gradients are
+
+$$
+\frac{\partial L}{\partial w_i} = e\,x_i, \qquad
+\frac{\partial L}{\partial v_{i,f}} = e\left(x_i \sum_{j} v_{j,f}x_j - v_{i,f}x_i^2\right)
+$$
+
+and the inner sum is the same $s_f$ you already computed for the forward pass.
+
+```python
+def fm_fit(idx, y, n_features, k=8, epochs=40, lr=2.0, lam=1e-5, batch=2_048,
+           seed=0, idx_val=None, y_val=None, verbose=False):
+    r = np.random.default_rng(seed)
+    w0 = float(np.log(y.mean() / (1 - y.mean())))          # start at the base rate
+    w = np.zeros(n_features)
+    V = r.normal(0, 0.05, (n_features, k))
+    n = len(y)
+    for epoch in range(epochs):
+        order = r.permutation(n)
+        for start in range(0, n, batch):
+            b = order[start:start + batch]
+            A = idx[b]                                     # (B, fields) active indices
+            Vb = V[A]                                      # (B, fields, k)
+            s = Vb.sum(axis=1)                             # (B, k)
+            inter = 0.5 * ((s ** 2).sum(axis=1) - (Vb ** 2).sum(axis=(1, 2)))
+            pred = w0 + w[A].sum(axis=1) + inter
+            p = 1.0 / (1.0 + np.exp(-np.clip(pred, -30, 30)))
+            e = (p - y[b])[:, None]                        # (B, 1)
+            w0 -= lr * float(e.mean())
+            np.add.at(w, A, -lr * np.repeat(e, A.shape[1], axis=1) / len(b))
+            grad_V = e[:, :, None] * (s[:, None, :] - Vb)  # (B, fields, k)
+            np.add.at(V, A, -lr * grad_V / len(b))
+            V -= lr * lam * V
+            w -= lr * lam * w
+        if verbose and idx_val is not None and (epoch + 1) % 10 == 0:
+            print(f"  epoch {epoch + 1:>2}: val logloss {fm_logloss(w0, w, V, idx_val, y_val):.4f} "
+                  f"| val AUC {fm_auc(w0, w, V, idx_val, y_val):.4f}")
+    return w0, w, V
+
+def fm_predict(w0, w, V, idx):
+    Vb = V[idx]
+    s = Vb.sum(axis=1)
+    inter = 0.5 * ((s ** 2).sum(axis=1) - (Vb ** 2).sum(axis=(1, 2)))
+    return w0 + w[idx].sum(axis=1) + inter
+
+def fm_logloss(w0, w, V, idx, y):
+    p = 1.0 / (1.0 + np.exp(-np.clip(fm_predict(w0, w, V, idx), -30, 30)))
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+def fm_auc(w0, w, V, idx, y):
+    from sklearn.metrics import roc_auc_score
+    return float(roc_auc_score(y, fm_predict(w0, w, V, idx)))
+
+w0, w, V = fm_fit(idx_train, y_train, n_features, k=8,
+                  idx_val=idx_test, y_val=y_test, verbose=True)
+print(f"\nFM (k=8, all fields): logloss {fm_logloss(w0, w, V, idx_test, y_test):.4f} | "
+      f"AUC {fm_auc(w0, w, V, idx_test, y_test):.4f}")
+```
+
+```output
+  epoch 10: val logloss 0.6076 | val AUC 0.7042
+  epoch 20: val logloss 0.5721 | val AUC 0.7202
+  epoch 30: val logloss 0.5619 | val AUC 0.7366
+  epoch 40: val logloss 0.5637 | val AUC 0.7383
+
+FM (k=8, all fields): logloss 0.5637 | AUC 0.7383
+```
+
+## FM with only user and item *is* matrix factorisation
+
+```python
+def fit_on_fields(fields, k=8, epochs=40, seed=0):
+    sizes = [SIZES[FIELDS.index(f)] for f in fields]
+    offsets = np.cumsum([0] + sizes[:-1])
+    n_feat = sum(sizes)
+    enc = lambda frame: np.column_stack([frame[f].values + offsets[j]
+                                         for j, f in enumerate(fields)])
+    a, b, c = fm_fit(enc(train), y_train, n_feat, k=k, epochs=epochs, seed=seed)
+    return (fm_logloss(a, b, c, enc(test), y_test), fm_auc(a, b, c, enc(test), y_test))
+
+print(f"{'fields':>34} {'logloss':>9} {'AUC':>8}")
+for fields in (["user"], ["item"], ["user", "item"],
+               ["user", "item", "device"], ["user", "item", "device", "daypart"]):
+    ll, auc = fit_on_fields(fields)
+    print(f"{'+'.join(fields):>34} {ll:>9.4f} {auc:>8.4f}")
+```
+
+```output
+                            fields   logloss      AUC
+                              user    0.6425   0.5103
+                              item    0.5839   0.7154
+                         user+item    0.5840   0.7134
+                  user+item+device    0.5651   0.7356
+          user+item+device+daypart    0.5637   0.7383
+```
+
+The `user + item` row is matrix factorisation with biases, written in FM notation: the only
+possible interaction is between a user feature and an item feature, and $\langle \mathbf{v}_u,
+\mathbf{v}_i \rangle$ is exactly $\mathbf{p}_u \cdot \mathbf{q}_i$ from ch. 4. Everything below
+that row is what MF cannot express.
+
+## Why the shared vectors matter: unseen pairs
+
+```python
+observed = set(map(tuple, train[["user", "item"]].values))
+print(f"user x item pairs: {n_users * n_items:,} possible | {len(observed):,} observed in train")
+
+rare = test[[(uu, ii) not in observed for uu, ii in zip(test["user"], test["item"])]]
+print(f"test rows whose (user, item) pair never appeared in training: {len(rare):,} "
+      f"({len(rare) / len(test):.1%} of the test set)")
+if len(rare):
+    idx_rare = encode(rare)
+    print(f"  FM AUC on those rows: {fm_auc(w0, w, V, idx_rare, rare['y'].values):.4f}")
+print(f"  FM AUC on all test rows: {fm_auc(w0, w, V, idx_test, y_test):.4f}")
+```
+
+```output
+user x item pairs: 600,000 possible | 46,071 observed in train
+test rows whose (user, item) pair never appeared in training: 11,074 (92.3% of the test set)
+  FM AUC on those rows: 0.7354
+  FM AUC on all test rows: 0.7383
+```
+
+92% of the test rows contain a (user, item) pair the model never saw, and it scores 0.7354 on
+them against 0.7383 overall — a difference of three thousandths. A one-hot logistic regression with
+explicit interaction terms would have **no parameter at all** for those pairs. The FM has one, because $\mathbf{v}_{\text{item}}$ and
+$\mathbf{v}_{\text{device}}$ were each learned from every row they appear in, and their dot
+product is defined whether or not those two ever met.
+
+## Try it Yourself
+
+```python
+print(f"{'k':>4} {'logloss':>9} {'AUC':>8} {'params':>10}")
+for k in (0, 2, 8, 24):
+    if k == 0:
+        from sklearn.linear_model import LogisticRegression
+        M = sparse.csr_matrix((np.ones(idx_train.size),
+                               (np.repeat(np.arange(len(idx_train)), idx_train.shape[1]),
+                                idx_train.ravel())), shape=(len(idx_train), n_features))
+        Mt = sparse.csr_matrix((np.ones(idx_test.size),
+                                (np.repeat(np.arange(len(idx_test)), idx_test.shape[1]),
+                                 idx_test.ravel())), shape=(len(idx_test), n_features))
+        lr_model = LogisticRegression(max_iter=500, C=1.0).fit(M, y_train)
+        from sklearn.metrics import roc_auc_score, log_loss
+        p = lr_model.predict_proba(Mt)[:, 1]
+        print(f"{'lin':>4} {log_loss(y_test, p):>9.4f} {roc_auc_score(y_test, p):>8.4f} "
+              f"{n_features:>10,}")
+        continue
+    a, b, c = fm_fit(idx_train, y_train, n_features, k=k)
+    print(f"{k:>4} {fm_logloss(a, b, c, idx_test, y_test):>9.4f} "
+          f"{fm_auc(a, b, c, idx_test, y_test):>8.4f} {n_features * (k + 1):>10,}")
+```
+
+```output
+   k   logloss      AUC     params
+ lin    0.5854   0.7039      1,907
+   2    0.5677   0.7298      5,721
+   8    0.5637   0.7383     17,163
+  24    0.5683   0.7382     47,675
+```
+
+The linear row is the control: same features, no interactions, AUC 0.7039. Two latent dimensions
+already beat it (0.7298), eight is the peak (0.7383), and twenty-four buys nothing while tripling
+the parameter count — the same rank-versus-regularisation trade as ch. 4, on a model with many
+more feature types. Note that the true generating process used three latent dimensions; the peak
+sits above that because the model must also absorb the item bias and the field-specific effects
+through the same vectors.
+
+## Exercise
+
+Extend the FM into something you could deploy: add a numeric feature, verify the fast interaction
+formula against the naive one on the full design matrix, measure what each field contributes, and
+compare against both a linear model and a matrix factorisation restricted to (user, item). Report
+the per-field contribution in a form a product owner could read.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def field_ablation(base_fields, k=8, epochs=40):
+    full_ll, full_auc = fit_on_fields(base_fields, k=k, epochs=epochs)
+    rows = [{"fields": "+".join(base_fields), "logloss": round(full_ll, 4),
+             "AUC": round(full_auc, 4), "delta AUC": 0.0}]
+    for drop in base_fields:
+        rest = [f for f in base_fields if f != drop]
+        ll, auc = fit_on_fields(rest, k=k, epochs=epochs)
+        rows.append({"fields": "-" + drop, "logloss": round(ll, 4),
+                     "AUC": round(auc, 4), "delta AUC": round(auc - full_auc, 4)})
+    return pd.DataFrame(rows)
+
+print("field ablation (drop one field at a time)")
+print(field_ablation(FIELDS).to_string(index=False))
+
+# verify the O(kn) identity on every test row at once
+Vb = V[idx_test]
+fast = 0.5 * ((Vb.sum(axis=1) ** 2).sum(axis=1) - (Vb ** 2).sum(axis=(1, 2)))
+naive = np.zeros(len(idx_test))
+for a in range(idx_test.shape[1]):
+    for b in range(a + 1, idx_test.shape[1]):
+        naive += (V[idx_test[:, a]] * V[idx_test[:, b]]).sum(axis=1)
+print(f"\nO(kn) identity vs O(n^2) sum on {len(idx_test):,} rows: "
+      f"max abs difference {np.abs(fast - naive).max():.2e}")
+
+# what does the model think each field is worth, per prediction?
+def contribution_report(w0, w, V, idx, y, n_show=3):
+    Vb = V[idx]
+    s = Vb.sum(axis=1)
+    print(f"\n{'row':>5} {'y':>3} {'bias':>7} " +
+          " ".join(f"{f + ' lin':>10}" for f in FIELDS) + f" {'pairwise':>9} {'p':>7}")
+    for r_i in range(n_show):
+        lin = [w[idx[r_i, j]] for j in range(len(FIELDS))]
+        inter = 0.5 * float((s[r_i] ** 2).sum() - (Vb[r_i] ** 2).sum())
+        total = w0 + sum(lin) + inter
+        p = 1 / (1 + np.exp(-total))
+        print(f"{r_i:>5} {int(y[r_i]):>3} {w0:>7.3f} " +
+              " ".join(f"{v:>10.3f}" for v in lin) + f" {inter:>9.3f} {p:>7.3f}")
+
+contribution_report(w0, w, V, idx_test, y_test)
+
+mf_ll, mf_auc = fit_on_fields(["user", "item"])
+lin_M = sparse.csr_matrix((np.ones(idx_train.size),
+                           (np.repeat(np.arange(len(idx_train)), idx_train.shape[1]),
+                            idx_train.ravel())), shape=(len(idx_train), n_features))
+lin_Mt = sparse.csr_matrix((np.ones(idx_test.size),
+                            (np.repeat(np.arange(len(idx_test)), idx_test.shape[1]),
+                             idx_test.ravel())), shape=(len(idx_test), n_features))
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, log_loss
+lin = LogisticRegression(max_iter=500).fit(lin_M, y_train)
+p_lin = lin.predict_proba(lin_Mt)[:, 1]
+print(f"\n{'model':>28} {'logloss':>9} {'AUC':>8}")
+print(f"{'linear (no interactions)':>28} {log_loss(y_test, p_lin):>9.4f} "
+      f"{roc_auc_score(y_test, p_lin):>8.4f}")
+print(f"{'FM on user+item (= MF)':>28} {mf_ll:>9.4f} {mf_auc:>8.4f}")
+print(f"{'FM on all four fields':>28} "
+      f"{fm_logloss(w0, w, V, idx_test, y_test):>9.4f} "
+      f"{fm_auc(w0, w, V, idx_test, y_test):>8.4f}")
+```
+
+```output
+field ablation (drop one field at a time)
+                  fields  logloss    AUC  delta AUC
+user+item+device+daypart   0.5637 0.7383     0.0000
+                   -user   0.5537 0.7467     0.0084
+                   -item   0.6441 0.5061    -0.2323
+                 -device   0.5753 0.7169    -0.0214
+                -daypart   0.5651 0.7356    -0.0027
+
+O(kn) identity vs O(n^2) sum on 12,000 rows: max abs difference 7.99e-15
+
+  row   y    bias   user lin   item lin device lin daypart lin  pairwise       p
+    0   1  -2.168     -0.035     -0.297     -0.577     -0.783     1.672   0.101
+    1   1  -2.168      0.010      0.248     -0.038     -0.967     2.996   0.520
+    2   0  -2.168      0.054     -0.322     -0.872      0.115     0.482   0.062
+
+                       model   logloss      AUC
+    linear (no interactions)    0.5854   0.7039
+      FM on user+item (= MF)    0.5840   0.7134
+       FM on all four fields    0.5637   0.7383
+```
+
+The ablation table is the product-readable answer: it says, in AUC, what each field is worth given
+the others. Read it against how the data was generated — clicks depend on item x user,
+item x device and item x daypart. `item` participates in every interaction term and removing it
+costs 0.2323 AUC, collapsing the model to chance. `device` costs 0.0214, `daypart` 0.0027.
+
+And then there is `user`, whose removal **improves** the model by 0.0084. That is not a paradox:
+1,500 users share 48,000 training rows, so each user's latent vector is estimated from about 32
+observations and is mostly noise, while the item, device and daypart vectors are each estimated
+from thousands. A field earns its place by having enough data per level, not by being conceptually
+important — and "drop the user features" is a real answer that CTR teams reach surprisingly often
+for exactly this reason.
+
+The identity check is not ceremony. The fast form is an algebraic rearrangement, so any difference
+beyond floating-point noise means the implementation has drifted from the maths — and the usual
+cause is a subtle indexing bug in the gradient, which this check catches while the loss curve
+still looks plausible.
+
+Three things to carry forward. **FMs subsume the models of the last two chapters**: restrict the
+fields to user and item and you have MF with biases, exactly, which is why the FM row and the MF
+row differ only by what extra context the FM was allowed to see. **The shared latent vectors are
+the whole trick** — they are what let the model score a feature combination it has never observed,
+and that property is what makes FMs a genuine answer to cold start (ch. 9) rather than a bigger
+version of the same problem. And **field-aware FMs** (FFM) go one step further, giving each
+feature a *different* vector per interacting field, at a memory cost of one vector per field pair;
+they win CTR competitions and are correspondingly harder to serve.
+
+The per-row contribution table is the deployment-facing piece. A linear term per field plus one
+pairwise scalar is not a full explanation, but it is enough to answer "why did this ad get
+shown?" with numbers that add up to the prediction — the same reconciliation discipline as
+eval-tuning ch. 9, in a model that was never designed for interpretability.
+</details>
