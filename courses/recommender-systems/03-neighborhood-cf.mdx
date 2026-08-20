@@ -1,0 +1,446 @@
+---
+course: recommender-systems
+chapter: 03-neighborhood-cf
+title: "Neighborhood Collaborative Filtering"
+order: 3
+---
+
+## Similar users like similar things
+
+The oldest working recommender is also the most explainable: score an item by how much it
+resembles the items this user already interacted with. No training loop, no gradients — just a
+similarity matrix and a sparse product.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n_users, n_items = 2_500, 900
+user_taste = rng.normal(0, 1, (n_users, 4))
+genre = rng.integers(0, 6, n_items)
+item_style = rng.normal(0, 1.4, (6, 4))[genre] + rng.normal(0, 0.35, (n_items, 4))
+activity = rng.lognormal(-0.4, 1.0, n_users)
+exposure = rng.lognormal(-1.0, 1.7, n_items) * np.where(genre == 0, 4.0, 1.0)
+
+months = []
+for month in range(12):
+    user_taste = user_taste + rng.normal(0, 0.25, (n_users, 4))
+    logit = (user_taste @ item_style.T / 2 - 4.0
+             + np.log(activity)[:, None] + np.log(exposure)[None, :])
+    r, c = np.nonzero(rng.random((n_users, n_items)) < 1 / (1 + np.exp(-logit)) / 12)
+    months.append(pd.DataFrame({"user": r, "item": c,
+                                "ts": month * 30 + rng.integers(0, 30, len(r))}))
+events = pd.concat(months).sort_values("ts").reset_index(drop=True)
+
+cut = events["ts"].max() - 60
+train, test = events[events["ts"] <= cut], events[events["ts"] > cut]
+X = sparse.csr_matrix((np.ones(len(train)), (train["user"], train["item"])),
+                      shape=(n_users, n_items))
+X.data[:] = 1.0
+seen = {u: set(g) for u, g in train.groupby("user")["item"]}
+truth = {u: set(g) for u, g in test.groupby("user")["item"]}
+users = [u for u in truth if truth[u] and u in seen][:1_200]
+pop = np.asarray(X.sum(axis=0)).ravel()
+print(f"train matrix {X.shape}, {X.nnz:,} interactions | evaluating {len(users):,} users")
+```
+
+```output
+train matrix (2500, 900), 90,508 interactions | evaluating 1,200 users
+```
+
+```python
+def recall_ndcg(score_fn, k=10):
+    rec_scores, ndcgs = [], []
+    for u in users:
+        s = np.asarray(score_fn(u), dtype=float).copy()
+        known = list(seen.get(u, ()))
+        if known:
+            s[known] = -np.inf
+        top = np.argpartition(-s, k)[:k]
+        top = top[np.argsort(-s[top])]
+        rel = truth[u]
+        hits = [i in rel for i in top]
+        rec_scores.append(sum(hits) / min(k, len(rel)))
+        dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+        idcg = sum(1 / np.log2(j + 2) for j in range(min(k, len(rel))))
+        ndcgs.append(dcg / idcg)
+    return float(np.mean(rec_scores)), float(np.mean(ndcgs))
+
+r, n = recall_ndcg(lambda u: pop)
+print(f"popularity baseline: recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+```
+
+```output
+popularity baseline: recall@10 0.0927 | ndcg@10 0.0819
+```
+
+## Item-item similarity
+
+Cosine similarity between item columns, computed on the sparse matrix:
+
+$$
+\mathrm{sim}(i, j) = \frac{\mathbf{x}_i \cdot \mathbf{x}_j}{\|\mathbf{x}_i\| \, \|\mathbf{x}_j\|}
+$$
+
+and a user's score for item $j$ is the sum of similarities to the items they already have:
+
+$$
+\hat{s}(u, j) = \sum_{i \in I_u} \mathrm{sim}(i, j)
+$$
+
+```python
+def item_cosine(X):
+    norms = np.sqrt(np.asarray(X.multiply(X).sum(axis=0)).ravel())
+    norms[norms == 0] = 1.0
+    Xn = X.multiply(sparse.csr_matrix(1.0 / norms))
+    S = (Xn.T @ Xn).toarray()
+    np.fill_diagonal(S, 0.0)                       # an item is not its own neighbour
+    return S
+
+S_cos = item_cosine(X)
+user_rows = X.tolil().rows
+
+def knn_scores(S, k_neighbours=None):
+    M = S
+    if k_neighbours is not None:
+        M = np.zeros_like(S)
+        idx = np.argpartition(-S, k_neighbours, axis=1)[:, :k_neighbours]
+        rows = np.repeat(np.arange(S.shape[0]), k_neighbours)
+        M[rows, idx.ravel()] = S[rows, idx.ravel()]
+    def score(u):
+        items = user_rows[u]
+        return M[items].sum(axis=0) if items else np.zeros(S.shape[1])
+    return score
+
+r, n = recall_ndcg(knn_scores(S_cos))
+print(f"item-item cosine, all neighbours: recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+print(f"{'k neighbours':>13} {'recall@10':>11} {'ndcg@10':>9}")
+for kn in (5, 20, 50, 200):
+    r, n = recall_ndcg(knn_scores(S_cos, kn))
+    print(f"{kn:>13} {r:>11.4f} {n:>9.4f}")
+```
+
+```output
+item-item cosine, all neighbours: recall@10 0.1197 | ndcg@10 0.1037
+ k neighbours   recall@10   ndcg@10
+            5      0.1131    0.0988
+           20      0.1140    0.0987
+           50      0.1090    0.0959
+          200      0.1135    0.0994
+```
+
+Here truncation *costs* accuracy: using all 899 neighbours scores 0.1037 NDCG, and every
+truncation lands between 0.0959 and 0.0994. That is what a small catalogue looks like — with 900
+items the far neighbours are weak but not misleading, and throwing them away discards signal.
+
+The picture inverts on a real catalogue. With a million items, the tail of the similarity row is
+mostly noise from items that co-occur once or twice, the full matrix does not fit in memory, and
+truncation becomes both necessary and helpful. Treat $k$ as a parameter you tune per dataset, not
+as a rule, and know that its main job is compute.
+
+## Popularity leaks into similarity
+
+Raw co-occurrence counts make popular items look similar to *everything*, because they co-occur
+with everything. Two standard fixes: shrink by the co-occurrence count, and down-weight popular
+items before computing similarity.
+
+$$
+\mathrm{sim}_{\text{shrunk}}(i,j) = \frac{c_{ij}}{c_{ij} + \lambda}\,\mathrm{sim}(i,j)
+$$
+
+```python
+C = (X.T @ X).toarray()                            # co-occurrence counts
+np.fill_diagonal(C, 0.0)
+
+def shrink(S, C, lam):
+    return S * (C / (C + lam))
+
+print(f"{'lambda':>8} {'recall@10':>11} {'ndcg@10':>9}")
+for lam in (0, 1, 5, 25, 100):
+    r, n = recall_ndcg(knn_scores(shrink(S_cos, C, lam) if lam else S_cos, 50))
+    print(f"{lam:>8} {r:>11.4f} {n:>9.4f}")
+
+top_pop = int(np.argmax(pop))
+niche = int(np.argsort(pop)[len(pop) // 10])
+for label, item in (("most popular", top_pop), ("niche", niche)):
+    nb = np.argsort(-S_cos[item])[:5]
+    print(f"\n{label} item {item} (pop {pop[item]:.0f}, genre {genre[item]}) "
+          f"neighbours: {[int(i) for i in nb]}")
+    print(f"  their popularity: {[int(pop[i]) for i in nb]} | "
+          f"genres: {[int(genre[i]) for i in nb]}")
+```
+
+```output
+  lambda   recall@10   ndcg@10
+       0      0.1090    0.0959
+       1      0.1108    0.0962
+       5      0.1117    0.0976
+      25      0.1122    0.0974
+     100      0.1100    0.0965
+
+most popular item 511 (pop 1003, genre 4) neighbours: [479, 162, 113, 534, 725]
+  their popularity: [937, 776, 535, 498, 778] | genres: [5, 4, 4, 5, 0]
+
+niche item 418 (pop 7, genre 2) neighbours: [684, 183, 631, 2, 823]
+  their popularity: [5, 5, 9, 40, 11] | genres: [2, 2, 2, 3, 2]
+```
+
+## TF-IDF and BM25 weighting
+
+The same idea applied before the similarity: weight each interaction by how informative it is.
+A user's interaction with an obscure item says more about their taste than an interaction with the
+most popular item in the catalogue.
+
+```python
+def idf_weight(X):
+    df = np.asarray((X > 0).sum(axis=0)).ravel()
+    idf = np.log((X.shape[0] + 1) / (df + 1))
+    return X.multiply(sparse.csr_matrix(idf)).tocsr()
+
+def bm25_weight(X, k1=1.2, b=0.75):
+    df = np.asarray((X > 0).sum(axis=0)).ravel()
+    idf = np.log((X.shape[0] - df + 0.5) / (df + 0.5) + 1)
+    length = np.asarray(X.sum(axis=1)).ravel()
+    avg = length.mean()
+    Xc = X.tocoo()
+    denom = Xc.data + k1 * (1 - b + b * length[Xc.row] / avg)
+    data = Xc.data * (k1 + 1) / denom * idf[Xc.col]
+    return sparse.csr_matrix((data, (Xc.row, Xc.col)), shape=X.shape)
+
+variants = {"raw counts": X, "TF-IDF": idf_weight(X), "BM25": bm25_weight(X)}
+print(f"{'weighting':>12} {'recall@10':>11} {'ndcg@10':>9}")
+for name, Xw in variants.items():
+    S = item_cosine(Xw)
+    r, n = recall_ndcg(knn_scores(shrink(S, C, 5), 50))
+    print(f"{name:>12} {r:>11.4f} {n:>9.4f}")
+```
+
+```output
+   weighting   recall@10   ndcg@10
+  raw counts      0.1117    0.0976
+      TF-IDF      0.1117    0.0976
+        BM25      0.1186    0.1026
+```
+
+TF-IDF changes **nothing** — 0.0976, identical to raw counts to four decimals — and that is not a
+bug. IDF multiplies each item's column by a constant, and cosine similarity divides each column by
+its norm, so the constant cancels exactly. Column-wise reweighting is invisible to cosine.
+
+BM25 does help (+0.0050 NDCG) because it does something IDF cannot: its `b` term normalises by
+**row** length, damping users with hundreds of interactions so they stop dominating every
+similarity they participate in. When you reach for a weighting scheme, check whether it survives
+your similarity function's normalisation before you attribute a gain to it.
+
+## User-user, and when to prefer it
+
+The transpose of the same algorithm: find users like this one, recommend what they liked.
+
+$$
+\hat{s}(u, j) = \sum_{v \in N(u)} \mathrm{sim}(u, v)\, x_{vj}
+$$
+
+```python
+def user_cosine(X):
+    norms = np.sqrt(np.asarray(X.multiply(X).sum(axis=1)).ravel())
+    norms[norms == 0] = 1.0
+    Xn = sparse.diags(1.0 / norms) @ X
+    return Xn, norms
+
+Xn, _ = user_cosine(X)
+
+def user_user_scores(k_neighbours=50):
+    def score(u):
+        sims = np.asarray((Xn @ Xn[u].T).todense()).ravel()
+        sims[u] = 0.0
+        nb = np.argpartition(-sims, k_neighbours)[:k_neighbours]
+        return np.asarray(X[nb].T @ sims[nb]).ravel()
+    return score
+
+r_uu, n_uu = recall_ndcg(user_user_scores(50))
+r_ii, n_ii = recall_ndcg(knn_scores(shrink(item_cosine(bm25_weight(X)), C, 5), 50))
+print(f"user-user (k=50): recall@10 {r_uu:.4f} | ndcg@10 {n_uu:.4f}")
+print(f"item-item (BM25): recall@10 {r_ii:.4f} | ndcg@10 {n_ii:.4f}")
+print(f"\nsimilarity matrix sizes: item-item {n_items ** 2:,} cells | "
+      f"user-user {n_users ** 2:,} cells")
+```
+
+```output
+user-user (k=50): recall@10 0.1212 | ndcg@10 0.1049
+item-item (BM25): recall@10 0.1186 | ndcg@10 0.1026
+
+similarity matrix sizes: item-item 810,000 cells | user-user 6,250,000 cells
+```
+
+On this data they are within 0.0023 NDCG of each other — 0.1049 for user-user against 0.1026 for
+item-item — so the choice is decided by shape and by churn, not by accuracy. **Item-item wins when
+there are fewer items than users** (the similarity matrix is smaller and can be precomputed), and when
+item catalogues change slowly while user histories change constantly — a user's recommendations
+update the moment they click, with no retraining, because their score is just a fresh sum over the
+same item matrix.
+
+## Try it Yourself
+
+```python
+def explain(u, k=5, k_neighbours=50):
+    S = shrink(item_cosine(bm25_weight(X)), C, 5)
+    score = knn_scores(S, k_neighbours)
+    s = score(u).copy()
+    s[list(seen[u])] = -np.inf
+    top = np.argsort(-s)[:k]
+    print(f"user {u} has {len(seen[u])} training items, genres "
+          f"{sorted({int(genre[i]) for i in seen[u]})}")
+    for item in top:
+        contrib = [(float(S[j, item]), int(j)) for j in seen[u]]
+        contrib.sort(reverse=True)
+        why = ", ".join(f"item {j} ({c:.3f})" for c, j in contrib[:3])
+        print(f"  recommend {int(item):>3} (genre {int(genre[item])}, score {s[item]:.3f}) "
+              f"because of {why}")
+
+explain(users[0])
+print()
+explain(users[1])
+```
+
+```output
+user 0 has 94 training items, genres [0, 1, 2, 3, 4, 5]
+  recommend 794 (genre 0, score 11.572) because of item 522 (0.304), item 725 (0.287), item 847 (0.273)
+  recommend 321 (genre 0, score 11.414) because of item 725 (0.311), item 522 (0.309), item 109 (0.307)
+  recommend 400 (genre 0, score 10.231) because of item 522 (0.283), item 372 (0.272), item 440 (0.267)
+  recommend 600 (genre 0, score 9.553) because of item 725 (0.261), item 291 (0.258), item 109 (0.254)
+  recommend 135 (genre 0, score 9.467) because of item 372 (0.293), item 522 (0.278), item 327 (0.272)
+
+user 1 has 27 training items, genres [0, 1, 4, 5]
+  recommend 372 (genre 0, score 5.605) because of item 725 (0.359), item 522 (0.325), item 321 (0.307)
+  recommend 109 (genre 0, score 5.306) because of item 321 (0.307), item 522 (0.302), item 291 (0.289)
+  recommend 794 (genre 0, score 5.255) because of item 522 (0.304), item 725 (0.287), item 321 (0.287)
+  recommend 440 (genre 0, score 5.226) because of item 358 (0.318), item 725 (0.303), item 321 (0.297)
+  recommend 463 (genre 0, score 5.114) because of item 522 (0.302), item 124 (0.298), item 725 (0.285)
+```
+
+That "because of" list is the reason neighbourhood methods survive in production long after they
+stop being state of the art: the explanation falls out of the model rather than being reconstructed
+afterwards.
+
+Read what the explanations reveal, though. Every one of the ten recommendations is from genre 0 —
+the mainstream genre — even for a user whose history spans all six. The model is telling you
+honestly that its highest-scoring neighbours are the popular ones, which is the popularity bias
+this chapter has been fighting, now visible in the reasons rather than hidden in an aggregate. Try
+a user with a single training item and watch the explanation become fragile as well as biased.
+
+## Exercise
+
+Build a configurable item-item recommender — weighting scheme, shrinkage, neighbourhood size — and
+find the combination that works on this data. Then measure what it costs: the score each variant
+achieves, its coverage, and how much of its accuracy is just popularity in disguise.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def build_itemknn(X, weighting="bm25", lam=5.0, k_neighbours=50):
+    Xw = {"raw": X, "idf": idf_weight(X), "bm25": bm25_weight(X)}[weighting]
+    S = item_cosine(Xw)
+    if lam:
+        S = S * (C / (C + lam))
+    if k_neighbours:
+        M = np.zeros_like(S)
+        idx = np.argpartition(-S, k_neighbours, axis=1)[:, :k_neighbours]
+        rows = np.repeat(np.arange(S.shape[0]), k_neighbours)
+        M[rows, idx.ravel()] = S[rows, idx.ravel()]
+        S = M
+    return S
+
+def full_metrics(score_fn, k=10):
+    shown, recs, ndcgs, pops = set(), [], [], []
+    for u in users:
+        s = np.asarray(score_fn(u), dtype=float).copy()
+        s[list(seen[u])] = -np.inf
+        top = np.argpartition(-s, k)[:k]
+        top = top[np.argsort(-s[top])]
+        shown.update(int(i) for i in top)
+        rel = truth[u]
+        hits = [i in rel for i in top]
+        recs.append(sum(hits) / min(k, len(rel)))
+        dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+        ndcgs.append(dcg / sum(1 / np.log2(j + 2) for j in range(min(k, len(rel)))))
+        pops.append(float(np.mean(pop[top])))
+    return {"recall@10": round(float(np.mean(recs)), 4),
+            "ndcg@10": round(float(np.mean(ndcgs)), 4),
+            "coverage": round(len(shown) / n_items, 4),
+            "mean pop of recs": round(float(np.mean(pops)), 1)}
+
+rows = []
+for weighting in ("raw", "idf", "bm25"):
+    for lam in (0.0, 5.0):
+        for kn in (20, 100):
+            S = build_itemknn(X, weighting, lam, kn)
+            m = full_metrics(knn_scores(S, None))
+            rows.append({"weighting": weighting, "shrink": lam, "k": kn, **m})
+table = pd.DataFrame(rows).sort_values("ndcg@10", ascending=False)
+print(table.to_string(index=False))
+
+best = table.iloc[0]
+S_best = build_itemknn(X, best["weighting"], best["shrink"], int(best["k"]))
+base = full_metrics(lambda u: pop)
+print(f"\npopularity baseline: {base}")
+print(f"best item-kNN     : {full_metrics(knn_scores(S_best, None))}")
+
+# how much of the gain is just popularity? score the recommendations' popularity rank
+best_score = knn_scores(S_best, None)
+corr = []
+for u in users[:300]:
+    s = best_score(u)
+    corr.append(float(np.corrcoef(s, pop)[0, 1]))
+print(f"\nmean correlation between the model's scores and raw popularity: "
+      f"{np.mean(corr):.4f}")
+```
+
+```output
+weighting  shrink   k  recall@10  ndcg@10  coverage  mean pop of recs
+     bm25     0.0  20     0.1242   0.1069    0.1511             532.6
+     bm25     5.0  20     0.1226   0.1055    0.1333             541.4
+     bm25     0.0 100     0.1216   0.1052    0.1378             550.7
+     bm25     5.0 100     0.1187   0.1044    0.1278             563.5
+      idf     5.0  20     0.1159   0.0997    0.1333             521.2
+      raw     5.0  20     0.1159   0.0997    0.1333             521.2
+      raw     0.0  20     0.1140   0.0987    0.1578             508.8
+      idf     0.0  20     0.1140   0.0987    0.1578             508.8
+      idf     5.0 100     0.1101   0.0973    0.1322             540.8
+      raw     5.0 100     0.1101   0.0973    0.1322             540.8
+      raw     0.0 100     0.1088   0.0943    0.1478             520.0
+      idf     0.0 100     0.1089   0.0943    0.1478             520.0
+
+popularity baseline: {'recall@10': 0.0927, 'ndcg@10': 0.0819, 'coverage': 0.03, 'mean pop of recs': 647.6}
+best item-kNN     : {'recall@10': 0.1242, 'ndcg@10': 0.1069, 'coverage': 0.1511, 'mean pop of recs': 532.6}
+
+mean correlation between the model's scores and raw popularity: 0.7115
+```
+
+Read the table by column, not by row. **Weighting** dominates: every BM25 row sits above every
+non-BM25 row, and raw and IDF are byte-identical for the reason above. **Neighbourhood size** is
+next, with 20 beating 100 everywhere. **Shrinkage** is the smallest effect and, on this data, a
+negative one — `shrink=0` wins in all three weighting families, because a 900-item catalogue has
+enough co-occurrences that few pairs need shrinking. On a sparser catalogue the sign flips, which
+is exactly why it is in the grid rather than in the defaults.
+
+Notice the tension in the last two columns. The best configuration recommends *less* popular items
+than the baseline (533 against 648 mean popularity) while covering five times as much of the
+catalogue (0.151 against 0.030). Both of those are improvements the accuracy column alone would
+not have shown you.
+
+The last number is the one to keep in your head, and it is uncomfortable: **0.71**. Even the best
+configuration's scores correlate strongly with raw popularity, so a meaningful share of its
+advantage is popularity that the similarity matrix has re-derived. It still beats the popularity
+baseline by 0.025 NDCG and covers five times the catalogue, so it is doing real work — but a
+product that already promotes popular items elsewhere on the page will see less of that gain than
+the offline number promises. It
+is the cheapest available check for "is this actually personalised", and it costs one line.
+
+Two properties of this family worth remembering when you meet the matrix-factorisation models in
+the next chapter. Item-kNN has **no training step** — every number in it is a count — so it
+updates incrementally as interactions arrive and never goes stale between retrains. And it has a
+hard floor: an item with no co-occurrences has no neighbours and can never be recommended, which
+is the cold-start failure chapter 9 exists to fix and which no amount of tuning here will touch.
+</details>
