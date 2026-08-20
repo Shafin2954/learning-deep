@@ -1,0 +1,455 @@
+---
+course: competition-ml
+chapter: 12-reproducibility-submission-hygiene
+title: "Reproducibility, Seeds, and Submission Hygiene"
+order: 12
+---
+
+## The two ways competitions are lost after the modelling is done
+
+The first is believing a gain that was seed noise. The second is uploading a file whose rows are
+in the wrong order. Neither has anything to do with machine learning, and both are entirely
+preventable with about forty lines of code.
+
+```python
+import numpy as np
+import pandas as pd
+import hashlib, json
+from sklearn.datasets import make_classification
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+
+X, y = make_classification(n_samples=8_000, n_features=20, n_informative=8, n_redundant=4,
+                           class_sep=0.7, flip_y=0.03, random_state=0)
+X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+test_ids = np.arange(100_000, 103_000)
+X_test = pd.DataFrame(np.random.default_rng(1).normal(0, 1, (3_000, 20)),
+                      columns=X.columns)
+print(f"train {X.shape} | test {X_test.shape}")
+```
+
+```output
+train (8000, 20) | test (3000, 20)
+```
+
+## How much of your "improvement" is the seed?
+
+```python
+# a realistic competition size: noise is invisible on 8,000 easy rows
+X_small, y_small = X.iloc[:1_200], y[:1_200]
+
+def cv_auc(make_model, X, y, cv_seed=0, k=4):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=cv_seed)
+    scores = []
+    for tr, va in cv.split(X, y):
+        m = make_model().fit(X.iloc[tr], y[tr])
+        scores.append(roc_auc_score(y[va], m.predict_proba(X.iloc[va])[:, 1]))
+    return float(np.mean(scores))
+
+model_seeds = [cv_auc(lambda s=s: RandomForestClassifier(n_estimators=120, min_samples_leaf=5,
+                                                         random_state=s, n_jobs=1),
+                      X_small, y_small)
+               for s in range(6)]
+cv_seeds = [cv_auc(lambda: RandomForestClassifier(n_estimators=120, min_samples_leaf=5,
+                                                  random_state=0, n_jobs=1),
+                   X_small, y_small, cv_seed=s)
+            for s in range(6)]
+print(f"varying the MODEL seed (folds fixed): mean {np.mean(model_seeds):.4f} | "
+      f"range {max(model_seeds) - min(model_seeds):.4f}")
+print(f"  {[round(v, 4) for v in model_seeds]}")
+print(f"varying the FOLD seed (model fixed) : mean {np.mean(cv_seeds):.4f} | "
+      f"range {max(cv_seeds) - min(cv_seeds):.4f}")
+print(f"  {[round(v, 4) for v in cv_seeds]}")
+```
+
+```output
+varying the MODEL seed (folds fixed): mean 0.9505 | range 0.0011
+  [0.9499, 0.9503, 0.951, 0.95, 0.9508, 0.9509]
+varying the FOLD seed (model fixed) : mean 0.9517 | range 0.0047
+  [0.9499, 0.9522, 0.9546, 0.9528, 0.95, 0.9506]
+```
+
+Two different noise sources, and they are **not** the same size: the fold seed moves the score four
+times as much as the model seed. That ordering is typical and it has a cause — changing the model
+seed re-randomises 120 trees whose average is stable, while changing the fold seed changes *which
+rows are being scored*, and 300 validation rows are a small sample.
+
+Before you believe any improvement, compare it against both ranges, and against the larger one in
+particular: a change under 0.005 on this data is not a change at all (eval-tuning ch. 12).
+
+### Seed averaging is a technique; seed hunting is not
+
+```python
+def oof_predictions(seed, k=4, cv_seed=0):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=cv_seed)
+    oof = np.zeros(len(y))
+    for tr, va in cv.split(X, y):
+        m = RandomForestClassifier(n_estimators=120, min_samples_leaf=5,
+                                   random_state=seed, n_jobs=1).fit(X.iloc[tr], y[tr])
+        oof[va] = m.predict_proba(X.iloc[va])[:, 1]
+    return oof
+
+singles = [oof_predictions(s) for s in range(5)]
+print(f"{'seeds averaged':>16} {'AUC':>8}")
+for k_seeds in (1, 2, 3, 5):
+    avg = np.mean(singles[:k_seeds], axis=0)
+    print(f"{k_seeds:>16} {roc_auc_score(y, avg):>8.4f}")
+best_seed = max(range(5), key=lambda i: roc_auc_score(y, singles[i]))
+print(f"\nbest individual seed ({best_seed}): "
+      f"{roc_auc_score(y, singles[best_seed]):.4f}  <- do NOT submit this one")
+```
+
+```output
+  seeds averaged      AUC
+               1   0.9733
+               2   0.9739
+               3   0.9740
+               5   0.9741
+
+best individual seed (1): 0.9740  <- do NOT submit this one
+```
+
+Averaging over seeds reduces variance and is a legitimate free gain — small here (+0.0008 from one
+seed to five) because a 120-tree forest is already an average, and much larger for models that are
+not, such as a single neural net or a boosted tree with aggressive subsampling.
+
+*Choosing* the best seed is the opposite: maximising a noisy quantity, the same selection bias as
+ch. 8's weight fitting in its purest form. Note that the best individual seed (0.9740) does not
+even beat the five-seed average (0.9741) in-sample, and on the test set it has no reason to lead
+at all. If you find yourself with a "best seed", you have found noise.
+
+## Everything else that makes a run irreproducible
+
+```python
+def set_all_seeds(seed=0):
+    """The three that matter for a scikit-learn/numpy stack."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)                 # legacy global RNG, still used by some libraries
+    return np.random.default_rng(seed)   # the one you should actually pass around
+
+rng = set_all_seeds(0)
+print("seeded: python random, numpy legacy global, and a returned Generator")
+
+a = RandomForestClassifier(n_estimators=60, random_state=0, n_jobs=1).fit(X, y)
+b = RandomForestClassifier(n_estimators=60, random_state=0, n_jobs=4).fit(X, y)
+print(f"same seed, 1 thread vs 4 threads, identical predictions: "
+      f"{np.array_equal(a.predict_proba(X)[:, 1], b.predict_proba(X)[:, 1])}")
+
+shuffled = np.random.default_rng(7).permutation(len(y))
+c = RandomForestClassifier(n_estimators=60, random_state=0, n_jobs=1).fit(
+    X.iloc[shuffled], y[shuffled])
+same = np.array_equal(a.predict_proba(X)[:, 1], c.predict_proba(X)[:, 1])
+print(f"same seed, rows shuffled before fitting, identical predictions: {same}")
+```
+
+```output
+seeded: python random, numpy legacy global, and a returned Generator
+same seed, 1 thread vs 4 threads, identical predictions: True
+same seed, rows shuffled before fitting, identical predictions: False
+```
+
+Row order changes the result even with the seed fixed, because the RNG stream is consumed against
+whatever order the data arrives in. That is the mechanism behind most "it worked yesterday"
+reports. The checklist:
+
+| Source | Fix |
+|---|---|
+| model RNG | `random_state=` on every estimator, written in the config |
+| fold assignment | one splitter, one seed, created once and reused |
+| row order | sort by a stable key before fitting, or record the order |
+| library versions | pin them, and record them in the run manifest |
+| `PYTHONHASHSEED` | set it if any code iterates over a `set` of strings |
+| thread count | fix it if you need bit-identical output; expect tiny drift otherwise |
+| GPU kernels | deterministic mode where the framework offers one, at a speed cost |
+
+## Building the submission
+
+The modelling is over. Everything from here is data handling, and it is where files get ruined.
+
+```python
+model = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(X, y)
+preds = model.predict_proba(X_test)[:, 1]
+
+sample_submission = pd.DataFrame({"id": np.random.default_rng(3).permutation(test_ids),
+                                  "target": 0.5})
+sub_wrong = sample_submission.copy()
+sub_wrong["target"] = preds                                  # concatenated by POSITION
+
+right = pd.DataFrame({"id": test_ids, "target": preds})
+sub_right = sample_submission[["id"]].merge(right, on="id", how="left")  # aligned by KEY
+
+print(f"sample submission id order matches test order: "
+      f"{np.array_equal(sample_submission['id'].values, test_ids)}")
+print(f"correlation between the two submissions: "
+      f"{np.corrcoef(sub_wrong.sort_values('id')['target'], sub_right.sort_values('id')['target'])[0, 1]:.4f}")
+```
+
+```output
+sample submission id order matches test order: False
+correlation between the two submissions: 0.0167
+```
+
+Both files have the right ids, the right number of rows, and a plausible distribution of values.
+One of them is a random permutation of the correct answer. **Always merge on the key; never assign
+a column by position.**
+
+## A submission validator
+
+```python
+def validate_submission(sub, sample, id_col="id", target_col="target",
+                        lo=0.0, hi=1.0, previous=None):
+    problems, notes = [], []
+    if list(sub.columns) != list(sample.columns):
+        problems.append(f"columns {list(sub.columns)} != expected {list(sample.columns)}")
+    if len(sub) != len(sample):
+        problems.append(f"{len(sub)} rows, expected {len(sample)}")
+    if sub[id_col].duplicated().any():
+        problems.append(f"{int(sub[id_col].duplicated().sum())} duplicate ids")
+    missing = set(sample[id_col]) - set(sub[id_col])
+    if missing:
+        problems.append(f"{len(missing)} ids missing")
+    if not np.array_equal(sub[id_col].values, sample[id_col].values):
+        problems.append("id order differs from the sample submission")
+    t = sub[target_col]
+    if t.isna().any():
+        problems.append(f"{int(t.isna().sum())} NaN predictions")
+    if t.min() < lo or t.max() > hi:
+        problems.append(f"values outside [{lo}, {hi}]: min {t.min():.4f} max {t.max():.4f}")
+    if t.nunique() < 10:
+        problems.append(f"only {t.nunique()} distinct values")
+    notes.append(f"mean {t.mean():.4f} | sd {t.std():.4f} | "
+                 f"min {t.min():.4f} | max {t.max():.4f}")
+    if previous is not None:
+        joined = sub.merge(previous, on=id_col, suffixes=("", "_prev"))
+        r = float(np.corrcoef(joined[target_col], joined[f"{target_col}_prev"])[0, 1])
+        notes.append(f"correlation with previous submission: {r:.4f}")
+        if r < 0.5:
+            problems.append(f"correlation with the previous submission is only {r:.4f}")
+    for n in notes:
+        print(f"  note: {n}")
+    for p in problems:
+        print(f"  PROBLEM: {p}")
+    print(f"  => {'OK' if not problems else str(len(problems)) + ' problem(s)'}")
+    return not problems
+
+print("correct submission:")
+validate_submission(sub_right, sample_submission)
+print("\npositionally-assigned submission:")
+validate_submission(sub_wrong, sample_submission, previous=sub_right)
+```
+
+```output
+correct submission:
+  note: mean 0.5313 | sd 0.3542 | min 0.0030 | max 0.9916
+  => OK
+
+positionally-assigned submission:
+  note: mean 0.5313 | sd 0.3542 | min 0.0030 | max 0.9916
+  note: correlation with previous submission: 0.0167
+  PROBLEM: correlation with the previous submission is only 0.0167
+  => 1 problem(s)
+```
+
+The positional file passes every structural check — the only thing that catches it is the
+correlation against a known-good submission. That is why the last check exists, and why you keep
+your previous best on disk.
+
+```python
+broken = sub_right.copy()
+broken.loc[broken.index[:5], "target"] = np.nan
+broken.loc[broken.index[5:10], "target"] = 1.7
+broken = pd.concat([broken, broken.iloc[[0]]], ignore_index=True)
+print("deliberately broken submission:")
+validate_submission(broken, sample_submission)
+```
+
+```output
+deliberately broken submission:
+  note: mean 0.5334 | sd 0.3570 | min 0.0030 | max 1.7000
+  PROBLEM: 3001 rows, expected 3000
+  PROBLEM: 1 duplicate ids
+  PROBLEM: id order differs from the sample submission
+  PROBLEM: 6 NaN predictions
+  PROBLEM: values outside [0.0, 1.0]: min 0.0030 max 1.7000
+  => 5 problem(s)
+```
+
+## Try it Yourself
+
+```python
+def submission_manifest(sub, model_name, config, cv_score, seeds, target_col="target"):
+    payload = sub[target_col].round(8).to_numpy().tobytes()
+    return {
+        "model": model_name,
+        "config": config,
+        "cv_score": round(float(cv_score), 6),
+        "seeds": seeds,
+        "n_rows": int(len(sub)),
+        "pred_hash": hashlib.sha256(payload).hexdigest()[:12],
+        "pred_mean": round(float(sub[target_col].mean()), 6),
+        "libs": {"numpy": np.__version__, "pandas": pd.__version__},
+    }
+
+m1 = submission_manifest(sub_right, "hgb-depth5", {"max_depth": 5}, 0.8123,
+                         {"model": 0, "cv": 0})
+print(json.dumps(m1, indent=1))
+resubmitted = sub_right.copy()
+print(f"\nre-built file has the same hash: "
+      f"{submission_manifest(resubmitted, 'hgb-depth5', {'max_depth': 5}, 0.8123, {'model': 0, 'cv': 0})['pred_hash'] == m1['pred_hash']}")
+```
+
+```output
+{
+ "model": "hgb-depth5",
+ "config": {
+  "max_depth": 5
+ },
+ "cv_score": 0.8123,
+ "seeds": {
+  "model": 0,
+  "cv": 0
+ },
+ "n_rows": 3000,
+ "pred_hash": "e4b74cdf5114",
+ "pred_mean": 0.531283,
+ "libs": {
+  "numpy": "2.4.6",
+  "pandas": "3.0.5"
+ }
+}
+
+re-built file has the same hash: True
+```
+
+The prediction hash is the cheapest anti-mistake device in a competition: two submissions with the
+same hash are the same file, whatever you named them, and a "new" model whose hash matches
+yesterday's means you submitted the wrong thing. Add fields you find yourself wanting — the git
+commit, the feature-set name, the blend weights (ch. 8).
+
+## Exercise
+
+Build the last mile: a function that takes a set of candidate submissions with their CV scores,
+picks the final two (one best, one diverse hedge), validates both, writes their manifests, and
+refuses to proceed if anything fails. Test it on a set that includes one deliberately broken file.
+
+<details>
+<summary>Solution</summary>
+
+```python
+rng = np.random.default_rng(11)
+base = sub_right["target"].values
+candidates = {
+    "hgb":        {"pred": base, "cv": 0.8123, "seeds": {"model": 0, "cv": 0}},
+    "hgb-seedavg": {"pred": np.clip(base + rng.normal(0, 0.01, len(base)), 0, 1),
+                    "cv": 0.8141, "seeds": {"model": "0-4 averaged", "cv": 0}},
+    "forest":     {"pred": np.clip(base * 0.7 + rng.random(len(base)) * 0.3, 0, 1),
+                   "cv": 0.8065, "seeds": {"model": 0, "cv": 0}},
+    "blend":      {"pred": np.clip(0.6 * base + 0.4 * rng.random(len(base)), 0, 1),
+                   "cv": 0.8150, "seeds": {"model": "blend", "cv": 0}},
+    "broken":     {"pred": np.where(rng.random(len(base)) < 0.02, np.nan, base),
+                   "cv": 0.8200, "seeds": {"model": 9, "cv": 0}},
+}
+
+def final_two(candidates, sample, id_col="id", target_col="target"):
+    frames, valid = {}, {}
+    print("validation")
+    for name, c in candidates.items():
+        frame = sample[[id_col]].merge(
+            pd.DataFrame({id_col: test_ids, target_col: c["pred"]}), on=id_col, how="left")
+        print(f"  [{name}]")
+        ok = validate_submission(frame, sample)
+        frames[name], valid[name] = frame, ok
+
+    usable = {n: candidates[n] for n in candidates if valid[n]}
+    print(f"\nusable candidates: {sorted(usable)}")
+    if not usable:
+        raise RuntimeError("no valid submission")
+
+    champion = max(usable, key=lambda n: usable[n]["cv"])
+    corr = {}
+    for name in usable:
+        if name == champion:
+            continue
+        corr[name] = float(np.corrcoef(frames[champion][target_col],
+                                       frames[name][target_col])[0, 1])
+    # the hedge: the best-scoring candidate that is least correlated with the champion
+    scored = sorted(corr.items(), key=lambda kv: kv[1])
+    hedge = None
+    for name, r in scored:
+        if usable[name]["cv"] >= usable[champion]["cv"] - 0.01:
+            hedge = (name, r)
+            break
+    hedge = hedge or (scored[0][0], scored[0][1])
+
+    print(f"\nchampion: {champion} (CV {usable[champion]['cv']:.4f})")
+    print(f"hedge   : {hedge[0]} (CV {usable[hedge[0]]['cv']:.4f}, "
+          f"correlation with champion {hedge[1]:.4f})")
+    print("\ncorrelation of each usable candidate with the champion:")
+    for name, r in sorted(corr.items(), key=lambda kv: -kv[1]):
+        print(f"  {name:12} {r:+.4f}  CV {usable[name]['cv']:.4f}")
+
+    manifests = [submission_manifest(frames[n], n, {}, usable[n]["cv"], usable[n]["seeds"])
+                 for n in (champion, hedge[0])]
+    print("\nmanifests written:")
+    for m in manifests:
+        print(f"  {m['model']:12} hash {m['pred_hash']} | mean {m['pred_mean']:.4f} | "
+              f"cv {m['cv_score']:.4f} | seeds {m['seeds']}")
+    return champion, hedge[0], manifests
+
+champion, hedge, manifests = final_two(candidates, sample_submission)
+```
+
+```output
+validation
+  [hgb]
+  note: mean 0.5313 | sd 0.3542 | min 0.0030 | max 0.9916
+  => OK
+  [hgb-seedavg]
+  note: mean 0.5315 | sd 0.3542 | min 0.0000 | max 1.0000
+  => OK
+  [forest]
+  note: mean 0.5223 | sd 0.2639 | min 0.0077 | max 0.9875
+  => OK
+  [blend]
+  note: mean 0.5162 | sd 0.2409 | min 0.0121 | max 0.9894
+  => OK
+  [broken]
+  note: mean 0.5302 | sd 0.3544 | min 0.0030 | max 0.9916
+  PROBLEM: 65 NaN predictions
+  => 1 problem(s)
+
+usable candidates: ['blend', 'forest', 'hgb', 'hgb-seedavg']
+
+champion: blend (CV 0.8150)
+hedge   : forest (CV 0.8065, correlation with champion 0.8269)
+
+correlation of each usable candidate with the champion:
+  hgb          +0.8753  CV 0.8123
+  hgb-seedavg  +0.8750  CV 0.8141
+  forest       +0.8269  CV 0.8065
+
+manifests written:
+  blend        hash 5f30c197f648 | mean 0.5162 | cv 0.8150 | seeds {'model': 'blend', 'cv': 0}
+  forest       hash 0218cdbab6af | mean 0.5223 | cv 0.8065 | seeds {'model': 0, 'cv': 0}
+```
+
+The broken candidate is rejected before it can be chosen, which matters because it has the
+**highest CV score in the set** — exactly the shape of the real accident, where the file you most
+want to submit is the one with something wrong in it. Validation runs before selection, never
+after.
+
+The hedge rule is the other piece worth keeping. Picking the top two by CV score usually gives you
+two nearly identical files, which wastes a submission slot: if the champion is wrong about the
+test set, its near-twin is wrong the same way. Selecting the *least correlated* candidate within a
+tolerance of the champion's score buys a genuinely different bet for a fraction of a point of
+expected CV. Set that tolerance from your own noise measurement (ch. 2), not from taste — 0.01 is
+right when fold noise is around 0.005 and far too generous when it is 0.0005.
+
+Two habits that finish the job. Write the manifest **at submission time**, not afterwards, so the
+hash is computed from the bytes you actually uploaded. And keep the previous best on disk so the
+correlation check has something to compare against — it is the only check in the validator that
+catches a positionally-misaligned file, and misalignment is the single most common way a good
+model produces a terrible score.
+</details>
