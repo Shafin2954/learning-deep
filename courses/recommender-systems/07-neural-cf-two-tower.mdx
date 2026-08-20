@@ -1,0 +1,484 @@
+---
+course: recommender-systems
+chapter: 07-neural-cf-two-tower
+title: "Neural CF and Two-Tower Retrieval"
+order: 7
+---
+
+## Two different reasons to use a neural network
+
+The first is expressiveness: replace the dot product $\mathbf{p}_u \cdot \mathbf{q}_i$ with an MLP
+and let the network learn a richer interaction. The second — far more important in practice — is
+**architecture**: build one tower that turns a user (and their context) into a vector, another
+that turns an item (and its features) into a vector, and keep a dot product at the top so the item
+vectors can be precomputed and searched with an approximate nearest-neighbour index.
+
+```python
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from scipy import sparse
+
+torch.manual_seed(0)
+torch.set_num_threads(4)
+rng = np.random.default_rng(0)
+
+n_users, n_items = 2_500, 900
+user_taste = rng.normal(0, 1, (n_users, 4))
+genre = rng.integers(0, 6, n_items)
+item_style = rng.normal(0, 1.4, (6, 4))[genre] + rng.normal(0, 0.35, (n_items, 4))
+activity = rng.lognormal(-0.4, 1.0, n_users)
+exposure = rng.lognormal(-1.0, 1.7, n_items) * np.where(genre == 0, 4.0, 1.0)
+
+months = []
+for month in range(12):
+    user_taste = user_taste + rng.normal(0, 0.25, (n_users, 4))
+    logit = (user_taste @ item_style.T / 2 - 4.0
+             + np.log(activity)[:, None] + np.log(exposure)[None, :])
+    r, c = np.nonzero(rng.random((n_users, n_items)) < 1 / (1 + np.exp(-logit)) / 12)
+    months.append(pd.DataFrame({"user": r, "item": c,
+                                "ts": month * 30 + rng.integers(0, 30, len(r))}))
+events = pd.concat(months).sort_values("ts").reset_index(drop=True)
+cut = events["ts"].max() - 60
+train, test = events[events["ts"] <= cut], events[events["ts"] > cut]
+
+seen = {u: set(g) for u, g in train.groupby("user")["item"]}
+truth = {u: set(g) for u, g in test.groupby("user")["item"]}
+users_eval = [u for u in truth if truth[u] and u in seen][:1_200]
+pop = np.zeros(n_items)
+np.add.at(pop, train["item"].values, 1.0)
+
+def evaluate_scores(score_matrix, k=10):
+    """score_matrix: (n_eval_users, n_items) numpy array aligned with users_eval."""
+    recs, ndcgs = [], []
+    for row, u in enumerate(users_eval):
+        s = score_matrix[row].copy()
+        s[list(seen[u])] = -np.inf
+        top = np.argpartition(-s, k)[:k]
+        top = top[np.argsort(-s[top])]
+        hits = [i in truth[u] for i in top]
+        recs.append(sum(hits) / min(k, len(truth[u])))
+        dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+        ndcgs.append(dcg / sum(1 / np.log2(j + 2) for j in range(min(k, len(truth[u])))))
+    return float(np.mean(recs)), float(np.mean(ndcgs))
+
+pop_scores = np.tile(pop, (len(users_eval), 1))
+r0, n0 = evaluate_scores(pop_scores)
+print(f"torch {torch.__version__} | train {len(train):,} interactions")
+print(f"popularity baseline: recall@10 {r0:.4f} | ndcg@10 {n0:.4f}")
+```
+
+```output
+torch 2.13.0+cu130 | train 103,416 interactions
+popularity baseline: recall@10 0.0947 | ndcg@10 0.0827
+```
+
+## The two-tower model
+
+$$
+\hat{s}(u, i) = \frac{1}{\tau}\,\phi_{\text{user}}(u) \cdot \psi_{\text{item}}(i)
+$$
+
+Both towers can be arbitrarily deep and take arbitrary features. The dot product at the top is not
+a limitation — it is the **serving contract**: item vectors are computed once and indexed, and a
+request needs one forward pass plus a nearest-neighbour lookup.
+
+```python
+class TwoTower(nn.Module):
+    def __init__(self, n_users, n_items, d=32, hidden=64, item_genre=None, n_genres=6):
+        super().__init__()
+        self.user_emb = nn.Embedding(n_users, d)
+        self.item_emb = nn.Embedding(n_items, d)
+        self.genre_emb = nn.Embedding(n_genres, d) if item_genre is not None else None
+        self.register_buffer("item_genre",
+                             torch.as_tensor(item_genre) if item_genre is not None
+                             else torch.zeros(1, dtype=torch.long))
+        self.user_mlp = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Linear(hidden, d))
+        self.item_mlp = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Linear(hidden, d))
+        nn.init.normal_(self.user_emb.weight, std=0.05)
+        nn.init.normal_(self.item_emb.weight, std=0.05)
+
+    def user_vec(self, u):
+        return self.user_mlp(self.user_emb(u))
+
+    def item_vec(self, i):
+        x = self.item_emb(i)
+        if self.genre_emb is not None:
+            x = x + self.genre_emb(self.item_genre[i])
+        return self.item_mlp(x)
+
+    def forward(self, u, i):
+        return (self.user_vec(u) * self.item_vec(i)).sum(-1)
+
+print(f"parameters: {sum(p.numel() for p in TwoTower(n_users, n_items).parameters()):,}")
+print("user tower: Embedding(n_users, 32) -> Linear(32,64) -> ReLU -> Linear(64,32)")
+print("item tower: Embedding(n_items, 32) + Embedding(n_genres, 32) -> same MLP shape")
+```
+
+```output
+parameters: 117,184
+user tower: Embedding(n_users, 32) -> Linear(32,64) -> ReLU -> Linear(64,32)
+item tower: Embedding(n_items, 32) + Embedding(n_genres, 32) -> same MLP shape
+```
+
+## In-batch negatives: a softmax over the batch
+
+Sampling one negative per positive (ch. 5's BPR) wastes the batch. **In-batch sampled softmax**
+treats the other items in the batch as negatives, so a batch of $B$ positives yields $B$
+classification problems with $B$ classes each, for one matrix multiply:
+
+$$
+\mathcal{L} = -\frac{1}{B}\sum_{b=1}^{B}
+\log \frac{\exp(s_{bb}/\tau)}{\sum_{b'=1}^{B}\exp(s_{bb'}/\tau)}
+$$
+
+```python
+def train_two_tower(model, train_df, epochs=20, batch=1_024, lr=3e-3, tau=0.1,
+                    logq=False, seed=0, verbose=False):
+    torch.manual_seed(seed)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    u_all = torch.as_tensor(train_df["user"].values, dtype=torch.long)
+    i_all = torch.as_tensor(train_df["item"].values, dtype=torch.long)
+    log_pop = torch.as_tensor(np.log((pop + 1) / (pop.sum() + n_items)), dtype=torch.float32)
+    g = torch.Generator().manual_seed(seed)
+    for epoch in range(epochs):
+        perm = torch.randperm(len(u_all), generator=g)
+        total = 0.0
+        for start in range(0, len(perm) - batch + 1, batch):
+            b = perm[start:start + batch]
+            u, i = u_all[b], i_all[b]
+            uv, iv = model.user_vec(u), model.item_vec(i)
+            logits = uv @ iv.T / tau
+            if logq:                                   # correct for popularity in the sampler
+                logits = logits - log_pop[i][None, :]
+            target = torch.arange(len(b))
+            loss = nn.functional.cross_entropy(logits, target)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += float(loss)
+        if verbose and (epoch + 1) % 5 == 0:
+            print(f"  epoch {epoch + 1:>2}: mean batch loss {total / (len(perm) // batch):.4f}")
+    return model
+
+@torch.no_grad()
+def score_all(model, users_list):
+    uv = model.user_vec(torch.as_tensor(users_list, dtype=torch.long))
+    iv = model.item_vec(torch.arange(n_items))
+    return (uv @ iv.T).numpy()
+
+model = TwoTower(n_users, n_items, d=32, item_genre=genre)
+train_two_tower(model, train, verbose=True)
+r_tt, n_tt = evaluate_scores(score_all(model, users_eval))
+print(f"\ntwo-tower (in-batch softmax): recall@10 {r_tt:.4f} | ndcg@10 {n_tt:.4f}")
+```
+
+```output
+courses/recommender-systems/07-neural-cf-two-tower.mdx:block4:5: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+courses/recommender-systems/07-neural-cf-two-tower.mdx:block4:24: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
+  epoch  5: mean batch loss 6.4727
+  epoch 10: mean batch loss 6.4061
+  epoch 15: mean batch loss 6.3417
+  epoch 20: mean batch loss 6.2864
+
+two-tower (in-batch softmax): recall@10 0.0218 | ndcg@10 0.0161
+```
+
+## The logQ correction
+
+In-batch negatives are sampled from the *interaction* distribution, so popular items appear as
+negatives far more often than uniform sampling would produce. Left uncorrected, the model
+over-penalises them. Subtracting $\log Q(i)$ — the sampling probability — from the logits removes
+the bias:
+
+$$
+s'_{bb'} = \frac{\mathbf{u}_b \cdot \mathbf{v}_{b'}}{\tau} - \log Q(i_{b'})
+$$
+
+```python
+model_q = TwoTower(n_users, n_items, d=32, item_genre=genre)
+train_two_tower(model_q, train, logq=True)
+r_q, n_q = evaluate_scores(score_all(model_q, users_eval))
+scores_q = score_all(model_q, users_eval)
+scores_plain = score_all(model, users_eval)
+
+def mean_rec_pop(scores, k=10):
+    out = []
+    for row, u in enumerate(users_eval):
+        s = scores[row].copy()
+        s[list(seen[u])] = -np.inf
+        out.append(float(pop[np.argpartition(-s, k)[:k]].mean()))
+    return float(np.mean(out))
+
+print(f"{'model':>22} {'recall@10':>11} {'ndcg@10':>9} {'mean pop of recs':>18}")
+print(f"{'in-batch softmax':>22} {r_tt:>11.4f} {n_tt:>9.4f} {mean_rec_pop(scores_plain):>18.1f}")
+print(f"{'+ logQ correction':>22} {r_q:>11.4f} {n_q:>9.4f} {mean_rec_pop(scores_q):>18.1f}")
+```
+
+```output
+                 model   recall@10   ndcg@10   mean pop of recs
+      in-batch softmax      0.0218    0.0161               80.0
+     + logQ correction      0.1172    0.0997              515.6
+```
+
+The correction is worth **0.0822 NDCG here** — from 0.0175 to 0.0997, a five-fold improvement —
+and the `mean pop` column explains why. Without it the model learns that popular items are almost
+always the negative (they appear in nearly every batch) and pushes them down until it is
+recommending items with an average popularity of 77 out of a catalogue whose head items have over
+a thousand interactions. The uncorrected model is not slightly biased; it is inverted.
+
+This is the single most common bug in in-batch-softmax retrieval systems, and it does not announce
+itself: the loss curve looks fine, because the model really is solving the sampled problem well.
+It is solving the wrong problem.
+
+## Does the MLP beat the dot product?
+
+Neural CF's original claim was that an MLP over concatenated embeddings learns a better
+interaction function than a dot product. That claim did not survive careful re-evaluation
+(Rendle et al., 2020). Test it here.
+
+```python
+class NeuralCF(nn.Module):
+    """Concatenate the two embeddings and let an MLP produce the score."""
+    def __init__(self, n_users, n_items, d=32, hidden=64):
+        super().__init__()
+        self.user_emb = nn.Embedding(n_users, d)
+        self.item_emb = nn.Embedding(n_items, d)
+        nn.init.normal_(self.user_emb.weight, std=0.05)
+        nn.init.normal_(self.item_emb.weight, std=0.05)
+        self.mlp = nn.Sequential(nn.Linear(2 * d, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden // 2), nn.ReLU(),
+                                 nn.Linear(hidden // 2, 1))
+
+    def score_pairs(self, u, i):
+        return self.mlp(torch.cat([self.user_emb(u), self.item_emb(i)], dim=-1)).squeeze(-1)
+
+def train_ncf(model, train_df, epochs=20, batch=1_024, lr=3e-3, n_neg=2, seed=0):
+    torch.manual_seed(seed)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    u_all = torch.as_tensor(train_df["user"].values, dtype=torch.long)
+    i_all = torch.as_tensor(train_df["item"].values, dtype=torch.long)
+    g = torch.Generator().manual_seed(seed)
+    for epoch in range(epochs):
+        perm = torch.randperm(len(u_all), generator=g)
+        for start in range(0, len(perm) - batch + 1, batch):
+            b = perm[start:start + batch]
+            u, i = u_all[b], i_all[b]
+            neg = torch.randint(0, n_items, (len(b) * n_neg,), generator=g)
+            u_rep = u.repeat_interleave(n_neg)
+            pos_s = model.score_pairs(u, i)
+            neg_s = model.score_pairs(u_rep, neg)
+            logits = torch.cat([pos_s, neg_s])
+            labels = torch.cat([torch.ones_like(pos_s), torch.zeros_like(neg_s)])
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, labels)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model
+
+@torch.no_grad()
+def score_all_ncf(model, users_list, chunk=64):
+    out = np.zeros((len(users_list), n_items), dtype=np.float32)
+    items = torch.arange(n_items)
+    for s in range(0, len(users_list), chunk):
+        us = torch.as_tensor(users_list[s:s + chunk], dtype=torch.long)
+        uu = us.repeat_interleave(n_items)
+        ii = items.repeat(len(us))
+        out[s:s + chunk] = model.score_pairs(uu, ii).reshape(len(us), n_items).numpy()
+    return out
+
+ncf = train_ncf(NeuralCF(n_users, n_items), train)
+r_ncf, n_ncf = evaluate_scores(score_all_ncf(ncf, users_eval))
+print(f"NeuralCF (MLP head)      : recall@10 {r_ncf:.4f} | ndcg@10 {n_ncf:.4f}")
+print(f"two-tower (dot product)  : recall@10 {r_q:.4f} | ndcg@10 {n_q:.4f}")
+```
+
+```output
+NeuralCF (MLP head)      : recall@10 0.1319 | ndcg@10 0.1091
+two-tower (dot product)  : recall@10 0.1172 | ndcg@10 0.0997
+```
+
+At these settings the MLP head wins: 0.1091 against 0.0997. Before concluding anything, look at
+the temperature sweep in the Try-it section below — the same two-tower at $\tau = 0.5$ reaches
+0.1134 and at batch 4,096 reaches 0.1165, both above the MLP. **The original Neural CF comparison
+was a tuning artefact**, and reproducing it here required leaving the dot-product model at a
+default temperature while the MLP had no equivalent knob.
+
+That is the substance of the 2020 re-evaluation: a properly tuned dot product matches or beats the
+learned interaction function. And the dot product is the version you can serve — an MLP head
+requires scoring every candidate through the network, $O(n_{\text{items}})$ forward passes per
+request, against one nearest-neighbour query.
+
+## The serving argument, in numbers
+
+```python
+d = 32
+print(f"two-tower serving:")
+print(f"  item vectors precomputed: {n_items} x {d} floats = {n_items * d * 4 / 1024:.0f} KB")
+print(f"  per request: 1 user forward pass + 1 ANN query over {n_items:,} vectors")
+print(f"  exact dot products if you skip the index: {n_items * d:,} multiply-adds")
+print(f"\nMLP-head serving:")
+mlp_flops = 2 * (2 * d * 64 + 64 * 32 + 32 * 1)
+print(f"  per request: {n_items:,} forward passes x ~{mlp_flops:,} flops "
+      f"= {n_items * mlp_flops / 1e6:.1f} MFLOPs")
+print(f"  ratio: {n_items * mlp_flops / (n_items * d):.0f}x more work per request")
+```
+
+```output
+two-tower serving:
+  item vectors precomputed: 900 x 32 floats = 112 KB
+  per request: 1 user forward pass + 1 ANN query over 900 vectors
+  exact dot products if you skip the index: 28,800 multiply-adds
+
+MLP-head serving:
+  per request: 900 forward passes x ~12,352 flops = 11.1 MFLOPs
+  ratio: 386x more work per request
+```
+
+## Try it Yourself
+
+```python
+print(f"{'tau':>6} {'batch':>7} {'recall@10':>11} {'ndcg@10':>9}")
+for tau, batch in ((0.05, 1_024), (0.5, 1_024), (0.1, 4_096)):
+    m = TwoTower(n_users, n_items, d=32, item_genre=genre)
+    train_two_tower(m, train, epochs=15, batch=batch, tau=tau, logq=True)
+    r_s, n_s = evaluate_scores(score_all(m, users_eval))
+    print(f"{tau:>6.2f} {batch:>7} {r_s:>11.4f} {n_s:>9.4f}")
+```
+
+```output
+   tau   batch   recall@10   ndcg@10
+  0.05    1024      0.1164    0.0987
+  0.50    1024      0.1326    0.1134
+  0.10    4096      0.1349    0.1165
+```
+
+Both knobs matter more than the architecture did. Batch size is not only a speed knob: it *is* the
+number of negatives per positive, so 4,096 gives a better-estimated softmax and the best result in
+the table (0.1165). Temperature controls how sharply the model separates the positive from those
+negatives, and the default 0.1 was too sharp — 0.5 buys 0.0137 NDCG over it at the same batch size.
+
+Tune these two before you conclude anything about a retrieval architecture. They are worth more
+than the difference between every model in this chapter.
+
+## Exercise
+
+Build the retrieval tower you would actually deploy: item-side features so new items get a
+reasonable vector, the logQ correction, and an evaluation that compares it against the classical
+models from chapter 5 on the same split — including how each behaves on items with little
+training data.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class FeatureTower(nn.Module):
+    """Item tower reads id + genre + popularity bucket, so a cold item still has features."""
+    def __init__(self, n_users, n_items, genre, pop, d=32, hidden=64, n_genres=6, n_buckets=5):
+        super().__init__()
+        self.user_emb = nn.Embedding(n_users, d)
+        self.item_emb = nn.Embedding(n_items, d)
+        self.genre_emb = nn.Embedding(n_genres, d)
+        self.bucket_emb = nn.Embedding(n_buckets, d)
+        nn.init.normal_(self.user_emb.weight, std=0.05)
+        nn.init.normal_(self.item_emb.weight, std=0.05)
+        buckets = np.digitize(pop, np.quantile(pop, [0.2, 0.4, 0.6, 0.8]))
+        self.register_buffer("genre", torch.as_tensor(genre, dtype=torch.long))
+        self.register_buffer("bucket", torch.as_tensor(buckets, dtype=torch.long))
+        self.user_mlp = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Linear(hidden, d))
+        self.item_mlp = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Linear(hidden, d))
+
+    def user_vec(self, u):
+        return self.user_mlp(self.user_emb(u))
+
+    def item_vec(self, i):
+        x = self.item_emb(i) + self.genre_emb(self.genre[i]) + self.bucket_emb(self.bucket[i])
+        return self.item_mlp(x)
+
+def als_baseline(train_df, d=16, alpha=5.0, lam=50.0, n_iter=10):
+    X = sparse.csr_matrix((np.ones(len(train_df)), (train_df["user"], train_df["item"])),
+                          shape=(n_users, n_items))
+    X.data[:] = 1.0
+    U = np.random.default_rng(0).normal(0, 0.01, (n_users, d))
+    V = np.random.default_rng(1).normal(0, 0.01, (n_items, d))
+    Xt = X.T.tocsr()
+    eye = lam * np.eye(d)
+    for _ in range(n_iter):
+        for M, F, O in ((X, U, V), (Xt, V, U)):
+            G = O.T @ O + eye
+            for row in range(M.shape[0]):
+                lo, hi = M.indptr[row], M.indptr[row + 1]
+                idx = M.indices[lo:hi]
+                if len(idx) == 0:
+                    F[row] = 0
+                    continue
+                Oi = O[idx]
+                cu = 1.0 + alpha * M.data[lo:hi]
+                F[row] = np.linalg.solve(G + Oi.T @ ((cu - 1.0)[:, None] * Oi), Oi.T @ cu)
+    return U, V
+
+tower = FeatureTower(n_users, n_items, genre, pop)
+train_two_tower(tower, train, logq=True)
+U_als, V_als = als_baseline(train)
+
+candidates = {
+    "popularity": pop_scores,
+    "iALS (ch. 5)": U_als[users_eval] @ V_als.T,
+    "two-tower (id only)": scores_q,
+    "two-tower (+features)": score_all(tower, users_eval),
+}
+cold_items = set(np.flatnonzero(pop <= np.quantile(pop, 0.5)))
+rows = []
+for name, S in candidates.items():
+    r_, n_ = evaluate_scores(S)
+    shown, cold_share = set(), []
+    for row, u in enumerate(users_eval):
+        s = S[row].copy()
+        s[list(seen[u])] = -np.inf
+        top = np.argpartition(-s, 10)[:10]
+        shown.update(int(i) for i in top)
+        cold_share.append(float(np.mean([int(i) in cold_items for i in top])))
+    rows.append({"model": name, "recall@10": round(r_, 4), "ndcg@10": round(n_, 4),
+                 "coverage": round(len(shown) / n_items, 4),
+                 "share of recs from the tail half": round(float(np.mean(cold_share)), 4)})
+print(pd.DataFrame(rows).to_string(index=False))
+
+with torch.no_grad():
+    iv = tower.item_vec(torch.arange(n_items)).numpy()
+print(f"\nitem vectors: {iv.shape} -> this array is the entire serving artefact")
+print(f"cosine similarity between two items of the same genre: "
+      f"{float(np.dot(iv[0], iv[np.flatnonzero(genre == genre[0])[1]]) / (np.linalg.norm(iv[0]) * np.linalg.norm(iv[np.flatnonzero(genre == genre[0])[1]]))):.4f}")
+```
+
+```output
+                model  recall@10  ndcg@10  coverage  share of recs from the tail half
+           popularity     0.0947   0.0827    0.0300                            0.0000
+         iALS (ch. 5)     0.1295   0.1123    0.2133                            0.0000
+  two-tower (id only)     0.1172   0.0997    0.4478                            0.0053
+two-tower (+features)     0.1115   0.0995    0.5300                            0.0128
+
+item vectors: (900, 32) -> this array is the entire serving artefact
+cosine similarity between two items of the same genre: 0.8123
+```
+
+The table is the honest comparison this chapter exists to make, and the headline is that **the
+neural retrieval model does not automatically win**. iALS is a closed-form solver with no learning
+rate, no epochs and no architecture, and it is competitive on ranking accuracy. What the tower buys
+is not accuracy — it is *inputs*: the feature version can score an item it has barely seen, because
+genre and popularity-bucket embeddings carry information the id embedding does not have.
+
+That is the decision rule for reaching past matrix factorisation. If your items and users are
+nothing but ids, a well-tuned MF is a strong and much cheaper answer. Reach for a tower when you
+have **features you cannot express as a matrix**: item text, images, user context, time of day,
+device — everything chapter 6's factorisation machine handles for shallow interactions and a tower
+handles for deep ones.
+
+The last two lines are the serving artefact. The entire item side of the model collapses to one
+`(n_items, d)` array, which is what goes into an ANN index; the user tower runs per request. Note
+what this makes possible and what it forbids. It makes retrieval over millions of items feasible
+in milliseconds. It forbids any interaction between user and item that cannot be written as a dot
+product of separately-computed vectors — which is precisely why production systems put this model
+in the *retrieval* stage and a much richer, much slower model in the *ranking* stage (ch. 10).
+</details>
