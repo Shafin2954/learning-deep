@@ -1,0 +1,474 @@
+---
+course: eval-tuning
+chapter: 06-hyperparameter-search
+title: "Hyperparameter Search: Grid to Random to Bayesian"
+order: 6
+---
+
+## A search is a space, a budget, and an objective
+
+Every tuning method is the same three decisions: which knobs and ranges you allow (the *space*),
+how many evaluations you can afford (the *budget*), and what number you are maximising (the
+*objective*). The objective is always a cross-validation protocol, so everything from ch. 5
+applies — if the folds leak, the search will find the configuration that exploits the leak best.
+
+```python
+import numpy as np
+import itertools
+from sklearn.datasets import make_classification
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import cross_val_score
+
+X, y = make_classification(n_samples=3_000, n_features=25, n_informative=8,
+                           n_redundant=5, class_sep=0.8, random_state=0)
+
+def score(params, cv=4):
+    m = DecisionTreeClassifier(random_state=0, **params)
+    return float(cross_val_score(m, X, y, cv=cv, scoring="roc_auc").mean())
+
+print(f"default tree     : AUC {score({}):.4f}")
+print(f"one hand-picked  : AUC {score(dict(max_depth=6, min_samples_leaf=20)):.4f}")
+```
+
+```output
+default tree     : AUC 0.8437
+one hand-picked  : AUC 0.9159
+```
+
+Two knobs, one line, seven points of AUC. That gap is why tuning exists — and, once you are near
+the top of the space, why the next seven points will cost a thousand times more effort.
+
+## Grid search runs out of budget exponentially
+
+A grid over $k$ hyperparameters with $m$ values each costs $m^k$ evaluations:
+
+$$
+N_{\mathrm{grid}} = \prod_{i=1}^{k} m_i
+$$
+
+Three values on five knobs is already 243 fits; five values is 3,125. The trap is that adding a
+knob multiplies the cost while adding a *value* to an existing knob only refines a dimension you
+were already covering.
+
+| knobs | 3 values each | 5 values each | 5 values, at 2 s per fit |
+|-------|---------------|---------------|--------------------------|
+| 2 | 9 | 25 | 50 s |
+| 3 | 27 | 125 | 4 min |
+| 5 | 243 | 3,125 | 1.7 h |
+| 8 | 6,561 | 390,625 | 9 days |
+
+## Why random search beats grid when only some knobs matter
+
+The decisive argument (Bergstra and Bengio, 2012) is about *effective resolution*. A $5 \times 5$
+grid spends 25 evaluations but only ever tries **5 distinct values** of each knob. Random search
+with the same 25 evaluations tries 25 distinct values of each. When one knob dominates and the
+other is nearly irrelevant, that is a 5x difference in resolution where it counts.
+
+```python
+def toy(a, b):                      # only `a` matters; `b` is nearly irrelevant
+    return np.exp(-((a - 0.37) / 0.15) ** 2) + 0.02 * b
+
+grid_vals = np.linspace(0.05, 0.95, 5)
+grid_best = max(toy(a, b) for a in grid_vals for b in grid_vals)
+
+r = np.random.default_rng(0)
+rand_best = [max(toy(a, b) for a, b in
+                 zip(r.uniform(0, 1, 25), r.uniform(0, 1, 25))) for _ in range(200)]
+
+print(f"5x5 grid (25 evals)      : best {grid_best:.4f}  "
+      f"(distinct values of a tried: {len(grid_vals)})")
+print(f"random 25 evals, 200 runs: mean best {np.mean(rand_best):.4f}, "
+      f"median {np.median(rand_best):.4f}, beats the grid in "
+      f"{100 * np.mean(np.array(rand_best) > grid_best):.0f}% of runs")
+```
+
+```output
+5x5 grid (25 evals)      : best 0.6886  (distinct values of a tried: 5)
+random 25 evals, 200 runs: mean best 0.9808, median 1.0015, beats the grid in 99% of runs
+```
+
+The grid's nearest `a` value to the peak is 0.275, so it collects two thirds of the available
+height and stops; every one of its 25 fits re-tests those same five `a` values against a knob that
+does not matter. Random search gets 25 independent chances at `a`, and it does not need you to
+have guessed the right axis resolution in advance.
+
+### How many random trials do you need?
+
+If a fraction $q$ of the space is "good enough", the probability that $n$ independent draws all
+miss it is $(1-q)^n$, so
+
+$$
+P(\text{at least one hit}) = 1 - (1-q)^n
+\qquad\Longrightarrow\qquad
+n = \frac{\log(1-P)}{\log(1-q)}
+$$
+
+```python
+for q in (0.10, 0.05, 0.01):
+    for P in (0.90, 0.95, 0.99):
+        n = int(np.ceil(np.log(1 - P) / np.log(1 - q)))
+        print(f"top {q:.0%} region, want {P:.0%} confidence -> {n:>4} random trials")
+```
+
+```output
+top 10% region, want 90% confidence ->   22 random trials
+top 10% region, want 95% confidence ->   29 random trials
+top 10% region, want 99% confidence ->   44 random trials
+top 5% region, want 90% confidence ->   45 random trials
+top 5% region, want 95% confidence ->   59 random trials
+top 5% region, want 99% confidence ->   90 random trials
+top 1% region, want 90% confidence ->  230 random trials
+top 1% region, want 95% confidence ->  299 random trials
+top 1% region, want 99% confidence ->  459 random trials
+```
+
+Sixty trials for a 95% shot at the top 5% is the number worth memorising. Note what it does *not*
+depend on: the number of hyperparameters. Random search's guarantee is about the volume of the
+good region, not the dimension — which is why it degrades gracefully where grid search falls off
+a cliff.
+
+## Sample scale parameters on a log scale
+
+A learning rate, a regularisation strength, or a leaf-size limit spans decades. Drawing uniformly
+from $[10^{-5}, 10^{-1}]$ puts 90% of the mass in the top decade alone; you want each decade
+equally represented, which means drawing the *exponent* uniformly.
+
+```python
+r = np.random.default_rng(1)
+uni = r.uniform(1e-5, 1e-1, 2_000)
+log = 10 ** r.uniform(-5, -1, 2_000)
+edges = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+print("decade          uniform   log-uniform")
+for lo, hi in zip(edges[:-1], edges[1:]):
+    a = float(np.mean((uni >= lo) & (uni < hi)))
+    b = float(np.mean((log >= lo) & (log < hi)))
+    print(f"[{lo:.0e}, {hi:.0e})   {a:7.1%}   {b:9.1%}")
+```
+
+```output
+decade          uniform   log-uniform
+[1e-05, 1e-04)      0.1%       25.9%
+[1e-04, 1e-03)      0.9%       24.8%
+[1e-03, 1e-02)      8.6%       24.5%
+[1e-02, 1e-01)     90.5%       24.9%
+```
+
+Same rule for integers with a wide range (`min_samples_leaf`, `n_estimators`): draw
+`int(10 ** uniform(lo, hi))`. Knobs with a natural linear meaning — `max_depth`, a dropout rate,
+a subsample fraction — stay uniform.
+
+## Grid versus random on a real model, equal budget
+
+```python
+depths, leaves, feats = [3, 6, 10], [1, 10, 50], [0.3, 0.6, 1.0]
+best_grid = max((score(dict(max_depth=d, min_samples_leaf=l, max_features=f)), (d, l, f))
+                for d, l, f in itertools.product(depths, leaves, feats))
+
+r = np.random.default_rng(0)
+best_rand = (-1.0, None)
+for _ in range(27):                                   # identical budget: 27 fits
+    p = dict(max_depth=int(r.integers(2, 20)),
+             min_samples_leaf=int(10 ** r.uniform(0, 2.2)),
+             max_features=float(r.uniform(0.2, 1.0)))
+    s = score(p)
+    if s > best_rand[0]:
+        best_rand = (s, p)
+
+print(f"grid   27 fits: AUC {best_grid[0]:.4f}  {best_grid[1]}")
+print(f"random 27 fits: AUC {best_rand[0]:.4f}  "
+      f"depth={best_rand[1]['max_depth']} leaf={best_rand[1]['min_samples_leaf']} "
+      f"feat={best_rand[1]['max_features']:.2f}")
+```
+
+```output
+grid   27 fits: AUC 0.9132  (6, 10, 0.6)
+random 27 fits: AUC 0.9143  depth=8 leaf=32 feat=0.72
+```
+
+The margin is small — this space is forgiving — but notice *where* random landed: a leaf size of
+32 and a feature fraction of 0.72, neither of which was on the grid. The grid can only ever return
+a corner of the lattice you wrote down.
+
+## Bayesian optimization: model the objective, then ask where to look
+
+Random search throws away everything it learned. Bayesian optimization keeps a **surrogate model**
+of the objective — cheap to evaluate, with uncertainty — and picks the next point by maximising an
+**acquisition function** over that surrogate.
+
+The standard surrogate is a Gaussian process. Given evaluated points $X$ with scores $\mathbf{y}$
+and kernel $k$, the posterior at a new point $x_*$ is Gaussian with
+
+$$
+\mu(x_*) = k_*^\top K^{-1}\mathbf{y}, \qquad
+\sigma^2(x_*) = k(x_*,x_*) - k_*^\top K^{-1} k_*
+$$
+
+where $K_{ij} = k(x_i, x_j)$ and $(k_*)_i = k(x_i, x_*)$.
+
+```python
+from scipy.stats import norm
+
+def rbf(A, B, ls=0.12, var=0.05):
+    return var * np.exp(-0.5 * (A[:, None] - B[None, :]) ** 2 / ls ** 2)
+
+def posterior(xs, ys, grid, noise=1e-4):
+    K = rbf(xs, xs) + noise * np.eye(len(xs))
+    L = np.linalg.cholesky(K)                          # stable inverse (ch. 12 of math course)
+    a = np.linalg.solve(L.T, np.linalg.solve(L, ys - ys.mean()))
+    Ks = rbf(grid, xs)
+    mu = Ks @ a + ys.mean()
+    v = np.linalg.solve(L, Ks.T)
+    sd = np.sqrt(np.clip(np.diag(rbf(grid, grid)) - (v ** 2).sum(0), 1e-12, None))
+    return mu, sd
+
+def objective(x):                                      # a stand-in validation curve
+    x = np.asarray(x, dtype=float)
+    return (0.62 + 0.30 * np.exp(-((x - 0.72) / 0.10) ** 2)
+                 + 0.12 * np.exp(-((x - 0.22) / 0.18) ** 2) - 0.05 * x)
+
+grid = np.linspace(0, 1, 501)
+xs = np.array([0.05, 0.35, 0.60, 0.95]); ys = objective(xs)
+mu, sd = posterior(xs, ys, grid)
+for x in (0.20, 0.45, 0.72, 0.90):
+    i = int(np.abs(grid - x).argmin())
+    print(f"x={x:.2f}  posterior mean {mu[i]:.4f} +- {sd[i]:.4f}   true {objective(x):.4f}")
+```
+
+```output
+x=0.20  posterior mean 0.6662 +- 0.1728   true 0.7285
+x=0.45  posterior mean 0.6705 +- 0.1336   true 0.6212
+x=0.72  posterior mean 0.6431 +- 0.1741   true 0.8841
+x=0.90  posterior mean 0.5805 +- 0.0895   true 0.5867
+```
+
+The surrogate is confident near evaluated points and uncertain between them — exactly the
+information random search discards.
+
+### Expected improvement
+
+With $f^+$ the best score so far, $\mu$ and $\sigma$ the posterior at $x$, and
+$z = (\mu - f^+ - \xi)/\sigma$:
+
+$$
+\mathrm{EI}(x) = (\mu - f^+ - \xi)\,\Phi(z) + \sigma\,\phi(z)
+$$
+
+The first term rewards points the surrogate *expects* to be better (exploitation); the second
+rewards points it is *unsure* about (exploration). The constant $\xi$ nudges the balance.
+
+```python
+def ei(mu, sd, best, xi=0.01):
+    z = (mu - best - xi) / sd
+    return (mu - best - xi) * norm.cdf(z) + sd * norm.pdf(z)
+
+acq = ei(mu, sd, ys.max())
+print(f"after 4 evaluations, EI wants x = {grid[acq.argmax()]:.3f}")
+print(f"the true optimum is at        x = {grid[objective(grid).argmax()]:.3f}")
+for x in (0.20, 0.45, 0.72, 0.90):
+    i = int(np.abs(grid - x).argmin())
+    print(f"  EI({x:.2f}) = {acq[i]:.5f}")
+```
+
+```output
+after 4 evaluations, EI wants x = 0.202
+the true optimum is at        x = 0.720
+  EI(0.20) = 0.06053
+  EI(0.45) = 0.04697
+  EI(0.72) = 0.05102
+  EI(0.90) = 0.00551
+```
+
+EI does not head straight for the true optimum at 0.72 — it goes to 0.202 first, next to the
+best point it has seen, where the surrogate's mean is highest. The peak at 0.72 has comparable EI
+(0.051 against 0.061) purely from uncertainty. That is the balance working: exploit the known
+hill, but keep the unexplored gap on the shortlist.
+
+### The loop, and what it buys
+
+```python
+def bayes_opt(seed, budget=20, n_init=4):
+    r = np.random.default_rng(seed)
+    xs = r.uniform(0, 1, n_init); ys = objective(xs)
+    for _ in range(budget - n_init):
+        mu, sd = posterior(xs, ys, grid)
+        nxt = grid[ei(mu, sd, ys.max()).argmax()]
+        xs = np.append(xs, nxt); ys = np.append(ys, objective(nxt))
+    return np.maximum.accumulate(ys)
+
+budget = 20
+bo = np.mean([bayes_opt(s, budget) for s in range(5)], axis=0)
+rs = np.mean([np.maximum.accumulate(objective(np.random.default_rng(100 + s)
+                                              .uniform(0, 1, budget))) for s in range(5)], axis=0)
+print(f"true optimum: {objective(grid).max():.4f}   (mean of 5 runs each)")
+for n in (4, 8, 12, 16, 20):
+    print(f"{n:>3} trials: random {rs[n-1]:.4f} | GP+EI {bo[n-1]:.4f}")
+```
+
+```output
+true optimum: 0.8841   (mean of 5 runs each)
+  4 trials: random 0.7597 | GP+EI 0.7180
+  8 trials: random 0.8139 | GP+EI 0.8834
+ 12 trials: random 0.8605 | GP+EI 0.8840
+ 16 trials: random 0.8605 | GP+EI 0.8840
+ 20 trials: random 0.8669 | GP+EI 0.8840
+```
+
+Eight Bayesian trials beat twenty random ones, and by trial 12 the search is within 0.0001 of the
+true optimum and stops moving. Read the first row too: at 4 trials Bayesian optimization is
+*behind*, because those four points are the random initialisation — the surrogate has nothing to
+model until they land. That ratio, roughly 2–3x fewer evaluations for the same result, is the
+honest headline for Bayesian optimization on smooth, low-dimensional, expensive objectives.
+
+## When Bayesian optimization is not worth it
+
+- **Cheap objectives.** Fitting the surrogate and maximising EI costs real time. If a fit takes
+  200 ms, run 500 random trials instead of 50 clever ones.
+- **Many dimensions.** GPs degrade past roughly 20 knobs; tree-structured samplers (TPE, ch. 7)
+  handle conditional and categorical spaces far better.
+- **Massive parallelism.** Random search is embarrassingly parallel; sequential BO is not. With
+  64 workers, 64 random trials land before one BO chain reaches trial 5.
+- **Noisy objectives.** If CV noise is 0.01 AUC (ch. 5), the surrogate models the noise as
+  signal and chases it. Increase folds or accept a coarse search.
+
+The pragmatic default: **coarse random search to find the region, then a fine search inside it.**
+
+```python
+r = np.random.default_rng(3)
+coarse = [(score(dict(max_depth=int(d), min_samples_leaf=int(l))), int(d), int(l))
+          for d, l in zip(r.integers(2, 25, 12), 10 ** r.uniform(0, 2.4, 12))]
+coarse.sort(reverse=True)
+top = coarse[:3]
+d_lo, d_hi = min(t[1] for t in top), max(t[1] for t in top)
+l_lo, l_hi = min(t[2] for t in top), max(t[2] for t in top)
+print(f"coarse best {coarse[0][0]:.4f} at depth={coarse[0][1]} leaf={coarse[0][2]}")
+print(f"top-3 region: depth [{d_lo}, {d_hi}]  leaf [{l_lo}, {l_hi}]")
+
+r = np.random.default_rng(4)
+fine = max((score(dict(max_depth=int(d), min_samples_leaf=int(l))), int(d), int(l))
+           for d, l in zip(r.integers(d_lo, d_hi + 1, 12), r.integers(l_lo, l_hi + 1, 12)))
+print(f"fine best   {fine[0]:.4f} at depth={fine[1]} leaf={fine[2]}   "
+      f"(24 fits total, gain {fine[0] - coarse[0][0]:+.4f})")
+```
+
+```output
+coarse best 0.9153 at depth=15 leaf=25
+top-3 region: depth [11, 20]  leaf [17, 36]
+fine best   0.9178 at depth=20 leaf=21   (24 fits total, gain +0.0026)
+```
+
+Twenty-four fits split into a coarse pass and a fine pass reach 0.9178, above the 0.9143 that 27
+undirected random fits found — and the fine pass only searched inside the box spanned by the
+coarse top-3. The risk is obvious and worth naming: if the coarse pass misses the good region,
+the fine pass cannot recover it. Keep the coarse ranges generous.
+
+## Try it Yourself
+
+```python
+def run_search(sampler, budget, seed):
+    """sampler(rng) -> dict of params. Returns the best-so-far curve."""
+    r = np.random.default_rng(seed)
+    best, curve = -1.0, []
+    for _ in range(budget):
+        best = max(best, score(sampler(r)))
+        curve.append(best)
+    return curve
+
+wide = lambda r: dict(max_depth=int(r.integers(2, 30)),
+                      min_samples_leaf=int(10 ** r.uniform(0, 3)),
+                      max_features=float(r.uniform(0.1, 1.0)))
+narrow = lambda r: dict(max_depth=int(r.integers(5, 12)),
+                        min_samples_leaf=int(10 ** r.uniform(1, 2)),
+                        max_features=float(r.uniform(0.4, 0.9)))
+
+for name, sampler in (("wide space", wide), ("narrow space", narrow)):
+    curves = np.array([run_search(sampler, 12, seed) for seed in range(3)])
+    m = curves.mean(axis=0)
+    print(f"{name:12} best-so-far after 4/8/12 fits: "
+          f"{m[3]:.4f} / {m[7]:.4f} / {m[11]:.4f}")
+```
+
+```output
+wide space   best-so-far after 4/8/12 fits: 0.8867 / 0.9043 / 0.9062
+narrow space best-so-far after 4/8/12 fits: 0.9057 / 0.9124 / 0.9142
+```
+
+A good prior narrows the space, and a narrow space finds a good answer with a fraction of the
+budget — but it can only find what you allowed. Widen the ranges and re-run to see how much a
+tight prior is worth here.
+
+## Exercise
+
+Random search wastes full-cost evaluations on configurations that are visibly hopeless after a
+tenth of the work. Implement **successive halving**: start many configurations on a small slice of
+the data, keep the top half, double the slice, repeat until one survives on the full dataset.
+Measure cost in "full-data-equivalent fits" so the comparison with plain random search is fair,
+and report whether screening more configurations cheaply beats evaluating fewer thoroughly.
+
+<details>
+<summary>Solution</summary>
+
+```python
+Xb, yb = make_classification(n_samples=6_000, n_features=25, n_informative=8,
+                             n_redundant=5, class_sep=0.8, random_state=0)
+
+def evaluate(p, frac):
+    n = int(len(yb) * frac)
+    idx = np.random.default_rng(0).permutation(len(yb))[:n]
+    m = DecisionTreeClassifier(random_state=0, **p)
+    return float(cross_val_score(m, Xb[idx], yb[idx], cv=3, scoring="roc_auc").mean())
+
+def sample(r):                                    # a deliberately harsh space
+    return dict(max_depth=int(r.integers(2, 40)),
+                min_samples_leaf=int(10 ** r.uniform(0, 3)),
+                max_features=float(r.uniform(0.05, 1.0)),
+                ccp_alpha=float(10 ** r.uniform(-5, -1)))
+
+r = np.random.default_rng(0)
+alive = [sample(r) for _ in range(64)]
+frac, cost = 1 / 16, 0.0
+while True:
+    scored = sorted(((evaluate(p, frac), p) for p in alive), key=lambda t: -t[0])
+    cost += frac * len(alive)                     # cost in full-data-equivalent fits
+    print(f"rung: {len(alive):>2} configs on {frac:6.1%} of the data | "
+          f"best {scored[0][0]:.4f} | cumulative cost {cost:.1f} fits")
+    if len(alive) == 1 or frac >= 1.0:
+        break
+    alive = [p for _, p in scored[:max(1, len(alive) // 2)]]
+    frac = min(1.0, frac * 2)
+
+sha_auc = evaluate(scored[0][1], 1.0)
+print(f"\nsuccessive halving: AUC {sha_auc:.4f} for {cost:.0f} full-data-equivalent fits")
+for s in (1, 2, 3):
+    rr = np.random.default_rng(s)
+    best = max(evaluate(sample(rr), 1.0) for _ in range(int(cost)))
+    print(f"random search, {int(cost)} full fits, seed {s}: AUC {best:.4f}")
+```
+
+```output
+rung: 64 configs on   6.2% of the data | best 0.9081 | cumulative cost 4.0 fits
+rung: 32 configs on  12.5% of the data | best 0.9132 | cumulative cost 8.0 fits
+rung: 16 configs on  25.0% of the data | best 0.9314 | cumulative cost 12.0 fits
+rung:  8 configs on  50.0% of the data | best 0.9467 | cumulative cost 16.0 fits
+rung:  4 configs on 100.0% of the data | best 0.9587 | cumulative cost 20.0 fits
+
+successive halving: AUC 0.9587 for 20 full-data-equivalent fits
+random search, 20 full fits, seed 1: AUC 0.9539
+random search, 20 full fits, seed 2: AUC 0.9512
+random search, 20 full fits, seed 3: AUC 0.9470
+```
+
+Successive halving beats all three random-search runs at identical cost. The mechanism is visible
+in the rungs: it screened **64** configurations for the price of 20 full fits, because the first
+rung cost only 1/16 of a fit each. Random search at the same budget only ever saw 20. Do not read
+the rising best-so-far column as progress from the search alone — each rung also trains on twice
+as much data, and that alone raises every score. Only the final rung's number is comparable to
+random search's.
+
+The assumption it rests on is that a configuration's ranking at a small budget predicts its
+ranking at the full budget. That holds for data-size budgets on tabular models and for
+epoch budgets on neural nets; it fails when a configuration is slow to start but ultimately best —
+a low learning rate with a long schedule looks terrible at epoch 1. Hyperband hedges exactly this
+by running several brackets with different starting budgets, and ASHA makes the whole thing
+asynchronous so idle workers never wait for a rung to finish. Optuna ships both as *pruners*
+(ch. 7), which is where this hand-rolled loop gets replaced by four lines of configuration.
+</details>

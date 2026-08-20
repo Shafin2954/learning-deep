@@ -1,0 +1,465 @@
+---
+course: eval-tuning
+chapter: 04-calibration
+title: "Probability Calibration: Platt and Isotonic"
+order: 4
+---
+
+## Ranking well and being right are different properties
+
+A model is **calibrated** when, among cases it scores 0.30, about 30% are positive. AUC does not
+require this — it only cares about order — so a model can rank perfectly and still be
+systematically wrong about magnitudes, which breaks every cost calculation from ch. 3.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+n = 40_000
+p_true = rng.beta(0.9, 12, n)                       # the real probability of each case
+y = (rng.random(n) < p_true).astype(int)
+
+perfect = p_true                                     # calibrated AND well-ranked
+overconfident = np.clip(p_true ** 0.55, 0, 1)        # same order, inflated probabilities
+shrunk = p_true * 0.4                                # same order, deflated
+
+def auc(y, s):
+    order = np.argsort(s); ys = y[order]
+    ranks = np.empty(len(y)); ranks[order] = np.arange(1, len(y) + 1)
+    P, N = ys.sum(), len(ys) - ys.sum()
+    return float((ranks[y == 1].sum() - P * (P + 1) / 2) / (P * N))
+
+for name, s in [("perfect", perfect), ("overconfident", overconfident), ("shrunk", shrunk)]:
+    print(f"{name:14} AUC {auc(y, s):.4f} | mean predicted {s.mean():.4f} "
+          f"| actual rate {y.mean():.4f}")
+```
+
+```output
+perfect        AUC 0.7669 | mean predicted 0.0701 | actual rate 0.0690
+overconfident  AUC 0.7669 | mean predicted 0.2055 | actual rate 0.0690
+shrunk         AUC 0.7669 | mean predicted 0.0280 | actual rate 0.0690
+```
+
+Identical AUC, wildly different probabilities. The overconfident model claims a 21% average risk
+where the truth is 7%; fed into the threshold formula from ch. 3, it flags a wildly wrong number
+of cases while its AUC insists nothing is wrong.
+
+## Measuring calibration: reliability, ECE, and Brier
+
+```python
+def reliability(y, s, bins=10):
+    edges = np.quantile(s, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    idx = np.digitize(s, edges[1:-1])
+    rows = []
+    for b in range(bins):
+        m = idx == b
+        if m.sum() == 0:
+            continue
+        rows.append((float(s[m].mean()), float(y[m].mean()), int(m.sum())))
+    return rows
+
+def ece(y, s, bins=10):
+    rows = reliability(y, s, bins)
+    total = sum(c for *_, c in rows)
+    return float(sum(abs(pred - obs) * c for pred, obs, c in rows) / total)
+
+def brier(y, s):
+    return float(np.mean((s - y) ** 2))
+
+print(f"{'bin':>4}{'mean predicted':>16}{'observed rate':>15}{'count':>8}")
+for i, (pred, obs, c) in enumerate(reliability(y, overconfident)):
+    flag = "  <- over" if pred > obs * 1.5 else ""
+    print(f"{i:>4}{pred:>16.4f}{obs:>15.4f}{c:>8,}{flag}")
+
+print()
+for name, s in [("perfect", perfect), ("overconfident", overconfident), ("shrunk", shrunk)]:
+    print(f"{name:14} ECE {ece(y, s):.4f} | Brier {brier(y, s):.5f} | AUC {auc(y, s):.4f}")
+```
+
+```output
+ bin  mean predicted  observed rate   count
+   0          0.0381         0.0035   4,000  <- over
+   1          0.0807         0.0103   4,000  <- over
+   2          0.1142         0.0175   4,000  <- over
+   3          0.1445         0.0325   4,000  <- over
+   4          0.1749         0.0410   4,000  <- over
+   5          0.2063         0.0597   4,000  <- over
+   6          0.2412         0.0703   4,000  <- over
+   7          0.2816         0.1027   4,000  <- over
+   8          0.3341         0.1318   4,000  <- over
+   9          0.4396         0.2208   4,000  <- over
+
+perfect        ECE 0.0029 | Brier 0.05974 | AUC 0.7669
+overconfident  ECE 0.1365 | Brier 0.08152 | AUC 0.7669
+shrunk         ECE 0.0410 | Brier 0.06298 | AUC 0.7669
+```
+
+Read the table as "what I said" versus "what happened". **ECE** is the average gap, weighted by
+bin size; **Brier** is the mean squared error of the probabilities, which decomposes into
+calibration plus refinement — so a model can improve Brier either by being better calibrated or
+by separating the classes better.
+
+$$
+\mathrm{Brier} = \underbrace{\mathbb{E}\left[(\hat{p} - \bar{y}_{\text{bin}})^2\right]}_{\text{calibration}}
+\; - \; \underbrace{\mathbb{E}\left[(\bar{y}_{\text{bin}} - \bar{y})^2\right]}_{\text{refinement}}
+\; + \; \underbrace{\bar{y}(1 - \bar{y})}_{\text{irreducible}}
+$$
+
+## Platt scaling: fit a sigmoid on the scores
+
+Platt scaling fits a one-dimensional logistic regression from the model's score (or its logit) to
+the label, on a **held-out** set:
+
+$$
+\hat{p} = \sigma(a \cdot z + b), \qquad z = \operatorname{logit}(s)
+$$
+
+```python
+def logit(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
+
+def fit_platt(scores, y, iters=400, lr=0.5):
+    z = logit(scores)
+    a, b = 1.0, 0.0
+    for _ in range(iters):
+        pred = 1 / (1 + np.exp(-(a * z + b)))
+        ga = float(np.mean((pred - y) * z)); gb = float(np.mean(pred - y))
+        a -= lr * ga; b -= lr * gb
+    return a, b
+
+def apply_platt(scores, ab):
+    a, b = ab
+    return 1 / (1 + np.exp(-(a * logit(scores) + b)))
+
+# split: fit the calibrator on one half, evaluate on the other
+half = n // 2
+cal_idx, test_idx = slice(0, half), slice(half, n)
+ab = fit_platt(overconfident[cal_idx], y[cal_idx])
+platt = apply_platt(overconfident[test_idx], ab)
+yt = y[test_idx]
+
+print(f"platt parameters: a={ab[0]:.3f} b={ab[1]:.3f}")
+print(f"{'model':16}{'ECE':>9}{'Brier':>10}{'AUC':>9}{'mean p':>9}")
+for name, s in [("raw", overconfident[test_idx]), ("platt-calibrated", platt)]:
+    print(f"{name:16}{ece(yt, s):>9.4f}{brier(yt, s):>10.5f}{auc(yt, s):>9.4f}{s.mean():>9.4f}")
+print(f"{'actual rate':16}{'':>9}{'':>10}{'':>9}{yt.mean():>9.4f}")
+```
+
+```output
+platt parameters: a=1.478 b=-0.843
+model                 ECE     Brier      AUC   mean p
+raw                0.1378   0.08087   0.7637   0.2051
+platt-calibrated   0.0055   0.05861   0.7637   0.0702
+actual rate                                    0.0673
+```
+
+Two things to notice. Calibration **does not change the ranking** — AUC is untouched, because a
+monotone transform cannot reorder anything. And the calibrator must be fitted on data the model
+did not train on; fitting it on the training set reproduces the training-set overconfidence.
+
+## Isotonic regression: monotone, non-parametric, hungrier for data
+
+Platt assumes the distortion is sigmoid-shaped. Isotonic regression assumes only that the mapping
+is **monotone non-decreasing**, and fits an arbitrary step function by pool-adjacent-violators.
+
+```python
+def fit_isotonic(scores, y):
+    order = np.argsort(scores)
+    x, t = scores[order], y[order].astype(float)
+    # pool adjacent violators
+    values, weights = list(t), [1.0] * len(t)
+    i = 0
+    while i < len(values) - 1:
+        if values[i] > values[i + 1]:
+            w = weights[i] + weights[i + 1]
+            v = (values[i] * weights[i] + values[i + 1] * weights[i + 1]) / w
+            values[i:i + 2] = [v]; weights[i:i + 2] = [w]
+            i = max(i - 1, 0)
+        else:
+            i += 1
+    xs, ys_ = [], []
+    pos = 0
+    for v, w in zip(values, weights):
+        pos += int(w)
+        xs.append(x[pos - 1]); ys_.append(v)
+    return np.array(xs), np.array(ys_)
+
+def apply_isotonic(scores, fit):
+    xs, ys_ = fit
+    idx = np.searchsorted(xs, scores, side="left")
+    idx = np.clip(idx, 0, len(ys_) - 1)
+    return ys_[idx]
+
+iso_fit = fit_isotonic(overconfident[cal_idx], y[cal_idx])
+iso = apply_isotonic(overconfident[test_idx], iso_fit)
+print(f"isotonic steps: {len(iso_fit[0]):,} (one per pooled block)")
+for name, s in [("raw", overconfident[test_idx]), ("platt", platt), ("isotonic", iso)]:
+    print(f"{name:12} ECE {ece(yt, s):.4f} | Brier {brier(yt, s):.5f} | AUC {auc(yt, s):.4f}")
+```
+
+```output
+isotonic steps: 716 (one per pooled block)
+raw          ECE 0.1378 | Brier 0.08087 | AUC 0.7637
+platt        ECE 0.0055 | Brier 0.05861 | AUC 0.7637
+isotonic     ECE 0.0056 | Brier 0.05861 | AUC 0.7642
+```
+
+```python
+def sigmoid_distortion(pt):
+    return np.clip(pt ** 0.55, 0, 1)                 # exactly the shape Platt assumes
+
+def kinked_distortion(pt):
+    return np.where(pt < 0.05, pt * 4.0, 0.20 + (pt - 0.05) * 0.3)    # not sigmoid at all
+
+def calibration_by_size(sizes, distortion, label, seed=1):
+    r = np.random.default_rng(seed)
+    print(f"{label}\n{'cal set':>9}{'raw ECE':>10}{'platt ECE':>11}{'isotonic ECE':>14}  winner")
+    for m in sizes:
+        pt = r.beta(0.9, 12, m + 20_000)
+        yy = (r.random(m + 20_000) < pt).astype(int)
+        s = np.clip(distortion(pt), 1e-6, 1 - 1e-6)
+        cal, test = slice(0, m), slice(m, m + 20_000)
+        pl = apply_platt(s[test], fit_platt(s[cal], yy[cal]))
+        it = apply_isotonic(s[test], fit_isotonic(s[cal], yy[cal]))
+        e_raw, e_pl, e_it = ece(yy[test], s[test]), ece(yy[test], pl), ece(yy[test], it)
+        print(f"{m:>9,}{e_raw:>10.4f}{e_pl:>11.4f}{e_it:>14.4f}  "
+              f"{'platt' if e_pl < e_it else 'isotonic'}")
+
+calibration_by_size([200, 1_000, 20_000], sigmoid_distortion, "sigmoid-shaped distortion:")
+print()
+calibration_by_size([200, 1_000, 20_000], kinked_distortion, "kinked distortion:")
+```
+
+```output
+sigmoid-shaped distortion:
+  cal set   raw ECE  platt ECE  isotonic ECE  winner
+      200    0.1371     0.0113        0.0234  platt
+    1,000    0.1360     0.0135        0.0162  platt
+   20,000    0.1351     0.0051        0.0049  isotonic
+
+kinked distortion:
+  cal set   raw ECE  platt ECE  isotonic ECE  winner
+      200    0.0842     0.0221        0.0234  platt
+    1,000    0.0824     0.0235        0.0162  isotonic
+   20,000    0.0820     0.0223        0.0049  isotonic
+```
+
+Both halves of the standard guidance are visible here. When the distortion really is
+sigmoid-shaped, Platt's two parameters are exactly right and isotonic can only lose — badly at
+200 rows, where it overfits. When the distortion is kinked, Platt cannot represent it at any
+sample size, and isotonic wins as soon as it has enough rows to estimate the steps. **Platt for
+small calibration sets, isotonic when you have thousands of held-out rows and no reason to trust
+the sigmoid assumption.**
+
+## What breaks calibration in the first place
+
+```python
+causes = [
+    ("class weights / resampling", "SMOTE or class_weight shifts the base rate the model implies"),
+    ("regularization", "shrinkage pulls probabilities toward the mean"),
+    ("tree ensembles", "averaging votes compresses probabilities away from 0 and 1"),
+    ("SVMs / margins", "the decision value is not a probability at all"),
+    ("distribution shift", "yesterday's calibration expires when the population moves"),
+    ("threshold-free training", "a model fitted on AUC has no reason to be calibrated"),
+]
+for cause, why in causes:
+    print(f"{cause:28} {why}")
+
+# resampling to 50/50 is the most common and the most surprising
+base_rate = 0.02
+resampled_rate = 0.5
+odds_shift = (resampled_rate / (1 - resampled_rate)) / (base_rate / (1 - base_rate))
+print(f"\ntraining on a 50/50 resample of a {base_rate:.0%} problem multiplies the odds by "
+      f"{odds_shift:.0f}x")
+p_model = np.array([0.10, 0.50, 0.90])
+corrected = p_model / (p_model + (1 - p_model) * odds_shift)
+for pm, pc in zip(p_model, corrected):
+    print(f"   model says {pm:.2f} -> true probability {pc:.4f}")
+```
+
+```output
+class weights / resampling   SMOTE or class_weight shifts the base rate the model implies
+regularization               shrinkage pulls probabilities toward the mean
+tree ensembles               averaging votes compresses probabilities away from 0 and 1
+SVMs / margins               the decision value is not a probability at all
+distribution shift           yesterday's calibration expires when the population moves
+threshold-free training      a model fitted on AUC has no reason to be calibrated
+
+training on a 50/50 resample of a 2% problem multiplies the odds by 49x
+   model says 0.10 -> true probability 0.0023
+   model says 0.50 -> true probability 0.0200
+   model says 0.90 -> true probability 0.1552
+```
+
+If you rebalance the training set, the model's probabilities refer to the **rebalanced** world.
+The prior-correction formula above undoes it exactly, and forgetting it is how a model that
+"performs great" produces flag volumes ten times the plan.
+
+## Calibration is a per-segment property
+
+```python
+seg = rng.integers(0, 2, n)
+p_seg = np.where(seg == 0, p_true, np.clip(p_true * 2.2, 0, 1))
+y2 = (rng.random(n) < p_seg).astype(int)
+s2 = p_true                                          # the model ignores the segment entirely
+
+print(f"overall ECE {ece(y2, s2):.4f}")
+for g in (0, 1):
+    m = seg == g
+    print(f"  segment {g}: predicted {s2[m].mean():.4f} actual {y2[m].mean():.4f} "
+          f"ECE {ece(y2[m], s2[m]):.4f}")
+```
+
+```output
+overall ECE 0.0420
+  segment 0: predicted 0.0699 actual 0.0718 ECE 0.0049
+  segment 1: predicted 0.0703 actual 0.1522 ECE 0.0819
+```
+
+A model can be well calibrated on average and badly calibrated for a group that matters. **Always
+report calibration per segment**, especially for segments that map to people — this is where a
+fairness audit starts (ch. 12).
+
+## Try it Yourself
+
+```python
+def calibration_report(y, s, name, bins=8):
+    print(f"{name}: ECE {ece(y, s, bins):.4f} | Brier {brier(y, s):.5f} | "
+          f"mean p {s.mean():.4f} vs actual {y.mean():.4f}")
+    for pred, obs, c in reliability(y, s, bins):
+        bar = "#" * int(obs / max(1e-9, max(o for _, o, _ in reliability(y, s, bins))) * 30)
+        print(f"   said {pred:6.3f} | happened {obs:6.3f} | n={c:>6,} {bar}")
+
+calibration_report(yt, overconfident[test_idx], "raw (overconfident)")
+print()
+calibration_report(yt, platt, "platt")
+```
+
+```output
+raw (overconfident): ECE 0.1378 | Brier 0.08087 | mean p 0.2051 vs actual 0.0673
+   said  0.044 | happened  0.004 | n= 2,500 
+   said  0.094 | happened  0.010 | n= 2,500 #
+   said  0.133 | happened  0.029 | n= 2,500 ####
+   said  0.171 | happened  0.038 | n= 2,500 #####
+   said  0.210 | happened  0.060 | n= 2,500 ########
+   said  0.256 | happened  0.084 | n= 2,500 ############
+   said  0.312 | happened  0.112 | n= 2,500 ################
+   said  0.421 | happened  0.200 | n= 2,500 ##############################
+
+platt: ECE 0.0048 | Brier 0.05861 | mean p 0.0702 vs actual 0.0673
+   said  0.005 | happened  0.004 | n= 2,500 
+   said  0.015 | happened  0.010 | n= 2,500 #
+   said  0.026 | happened  0.029 | n= 2,500 ####
+   said  0.040 | happened  0.038 | n= 2,500 #####
+   said  0.058 | happened  0.060 | n= 2,500 ########
+   said  0.082 | happened  0.084 | n= 2,500 ############
+   said  0.118 | happened  0.112 | n= 2,500 ################
+   said  0.218 | happened  0.200 | n= 2,500 ##############################
+```
+
+Change `overconfident` to `shrunk` and rerun: the bars move the other way, the ECE is similar,
+and Platt fixes both — because a sigmoid can stretch as well as squash. Then try calibrating on
+only 200 rows and watch isotonic fall apart while Platt holds.
+
+## Exercise
+
+Build the calibration step of a real pipeline: split into train / calibration / test, fit a model
+on train, fit both Platt and isotonic calibrators on the calibration split, choose between them
+by cross-validated Brier score on the calibration split, and then show the *decision* consequence
+— compute the cost-optimal threshold from ch. 3 on raw and calibrated scores and report the
+difference in expected cost on the test set.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+
+r = np.random.default_rng(5)
+N = 30_000
+X = r.normal(0, 1, (N, 6))
+logit_true = -3.2 + 1.1 * X[:, 0] - 0.8 * X[:, 1] + 0.6 * X[:, 2] * X[:, 3]
+p_star = 1 / (1 + np.exp(-logit_true))
+Y = (r.random(N) < p_star).astype(int)
+
+tr, cal, te = slice(0, 18_000), slice(18_000, 24_000), slice(24_000, N)
+
+# The most common calibration-breaker in practice: train on a balanced resample.
+tr_idx = np.arange(18_000)
+pos = tr_idx[Y[tr] == 1]
+neg = r.choice(tr_idx[Y[tr] == 0], size=len(pos), replace=False)
+balanced = np.concatenate([pos, neg])
+print(f"training set rebalanced: {len(balanced):,} rows at {Y[balanced].mean():.0%} positive "
+      f"(true base rate {Y.mean():.2%})")
+
+model = RandomForestClassifier(n_estimators=120, min_samples_leaf=20,
+                               random_state=0, n_jobs=1).fit(X[balanced], Y[balanced])
+raw_cal = model.predict_proba(X[cal])[:, 1]
+raw_te = model.predict_proba(X[te])[:, 1]
+
+# pick the calibrator by Brier on a split of the calibration set
+inner = len(raw_cal) // 2
+ab = fit_platt(raw_cal[:inner], Y[cal][:inner])
+iso_fit2 = fit_isotonic(raw_cal[:inner], Y[cal][:inner])
+cand = {"platt": apply_platt(raw_cal[inner:], ab),
+        "isotonic": apply_isotonic(raw_cal[inner:], iso_fit2)}
+scores = {k: brier(Y[cal][inner:], v) for k, v in cand.items()}
+choice = min(scores, key=scores.get)
+print(f"calibrator selection on held-out calibration rows: "
+      + " | ".join(f"{k} Brier {v:.5f}" for k, v in scores.items()) + f" -> {choice}")
+
+# refit the winner on the FULL calibration split, then apply to test
+final = (apply_platt(raw_te, fit_platt(raw_cal, Y[cal])) if choice == "platt"
+         else apply_isotonic(raw_te, fit_isotonic(raw_cal, Y[cal])))
+yte = Y[te]
+
+print(f"\n{'scores':14}{'ECE':>9}{'Brier':>10}{'AUC':>9}{'mean p':>9}  actual {yte.mean():.4f}")
+for name, s in [("raw", raw_te), (choice, final)]:
+    print(f"{name:14}{ece(yte, s):>9.4f}{brier(yte, s):>10.5f}{auc(yte, s):>9.4f}{s.mean():>9.4f}")
+
+COSTS = {"tp": -40.0, "fp": 6.0, "fn": 250.0, "tn": 0.0}
+t_star = (COSTS["fp"] - COSTS["tn"]) / ((COSTS["fn"] - COSTS["tp"]) + (COSTS["fp"] - COSTS["tn"]))
+
+def cost_at(y, s, t):
+    pred = s >= t
+    return float(int((pred & (y == 1)).sum()) * COSTS["tp"]
+                 + int((pred & (y == 0)).sum()) * COSTS["fp"]
+                 + int((~pred & (y == 1)).sum()) * COSTS["fn"])
+
+grid = np.linspace(0.001, 0.5, 500)
+print(f"\nanalytic optimal threshold p* = {t_star:.4f}")
+for name, s in [("raw", raw_te), (choice, final)]:
+    empirical = grid[int(np.argmin([cost_at(yte, s, t) for t in grid]))]
+    print(f"{name:10} cost at p* {cost_at(yte, s, t_star):>10,.0f} | "
+          f"empirical best t {empirical:.4f} cost {min(cost_at(yte, s, t) for t in grid):>10,.0f} "
+          f"| gap {cost_at(yte, s, t_star) - min(cost_at(yte, s, t) for t in grid):>9,.0f}")
+```
+
+```output
+training set rebalanced: 3,030 rows at 50% positive (true base rate 8.23%)
+calibrator selection on held-out calibration rows: platt Brier 0.06453 | isotonic Brier 0.06489 -> platt
+
+scores              ECE     Brier      AUC   mean p  actual 0.0783
+raw              0.3170   0.18097   0.8135   0.3953
+platt            0.0099   0.06266   0.8135   0.0812
+
+analytic optimal threshold p* = 0.0203
+raw        cost at p*     14,380 | empirical best t 0.2530 cost     10,228 | gap     4,152
+platt      cost at p*     10,574 | empirical best t 0.0230 cost     10,300 | gap       274
+```
+
+The insight: the calibrated model has the **same AUC** and is worth real money, because the whole
+cost-optimal-threshold machinery from ch. 3 assumes the number it thresholds is a probability.
+Look at the last column — on raw scores, applying the analytic $p^{*}$ lands far from the actual
+optimum, so you would have had to grid-search the threshold on a labelled validation set and
+re-search it every time costs changed. After calibration the analytic threshold is close to
+optimal, which means the business can change the cost ratio in a config file and the system does
+the right thing without re-tuning. Three practical notes. The **three-way split matters**: fitting
+the calibrator on training data teaches it the training-set overconfidence, and fitting it on the
+test set is leakage (ch. 5). **Choosing between Platt and isotonic is itself a model-selection
+decision** and needs its own held-out data, which is what the inner split does. And calibration
+**expires** — it is fitted to a population, so it must be refitted when the population shifts,
+which is why the MLOps course treats it as a monitored artifact rather than a one-time step.
+</details>

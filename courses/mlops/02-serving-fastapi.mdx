@@ -1,0 +1,478 @@
+---
+course: mlops
+chapter: 02-serving-fastapi
+title: "Serving with FastAPI: Async, Validation, and Batching"
+order: 2
+---
+
+## The smallest correct model server
+
+A prediction endpoint has four jobs in a fixed order: validate the request, build the feature
+row, run the model, and return a traceable response. FastAPI gives you the first and last almost
+for free, because the schema (ch. 1) *is* the API documentation and the validation layer.
+
+```python
+import numpy as np, joblib, tempfile, pathlib, json
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+X = np.column_stack([rng.normal(50, 12, 4_000), rng.lognormal(7, 0.6, 4_000),
+                     rng.integers(0, 5, 4_000)])                     # same model as ch. 1
+y = (0.03 * X[:, 0] + 0.000004 * X[:, 1] + 0.4 * X[:, 2]
+     + rng.normal(0, 1, 4_000) > 3.2).astype(int)
+pipe = Pipeline([("scale", StandardScaler()),
+                 ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+MODEL_VERSION, FEATURES = "1.4.0", ["age", "income", "prior_claims"]
+print("model trained:", MODEL_VERSION, "| features:", FEATURES)
+```
+
+```output
+model trained: 1.4.0 | features: ['age', 'income', 'prior_claims']
+```
+
+```python
+import warnings; warnings.filterwarnings("ignore")     # keep the demo output clean
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="claims-risk")
+
+class ClaimRequest(BaseModel):
+    age: float = Field(ge=18, le=110)
+    income: float = Field(gt=0)
+    prior_claims: int = Field(ge=0, le=20)
+
+class Prediction(BaseModel):        # the response schema is a contract too
+    probability: float
+    decision: str
+    model_version: str
+
+@app.get("/healthz")                       # liveness: is the process alive?
+def healthz():
+    return {"status": "ok"}
+
+@app.get("/readyz")                        # readiness: can it serve? (model loaded)
+def readyz():
+    return {"status": "ready" if pipe is not None else "loading",
+            "model_version": MODEL_VERSION}
+
+@app.post("/v1/predict", response_model=Prediction)
+def predict(req: ClaimRequest):
+    row = [[getattr(req, f) for f in FEATURES]]
+    p = float(pipe.predict_proba(row)[0, 1])
+    return Prediction(probability=round(p, 6),
+                      decision="review" if p > 0.5 else "accept",
+                      model_version=MODEL_VERSION)
+
+client = TestClient(app)
+print("GET  /healthz     ->", client.get("/healthz").json())
+print("GET  /readyz      ->", client.get("/readyz").json())
+r = client.post("/v1/predict", json={"age": 42, "income": 1500.0, "prior_claims": 2})
+print("POST /v1/predict  ->", r.status_code, r.json())
+bad = client.post("/v1/predict", json={"age": 8, "income": 1500.0, "prior_claims": 2})
+print("invalid request   ->", bad.status_code, bad.json()["detail"][0]["msg"])
+```
+
+```output
+GET  /healthz     -> {'status': 'ok'}
+GET  /readyz      -> {'status': 'ready', 'model_version': '1.4.0'}
+POST /v1/predict  -> 200 {'probability': 0.120603, 'decision': 'accept', 'model_version': '1.4.0'}
+invalid request   -> 422 Input should be greater than or equal to 18
+```
+
+Note the two health endpoints and why they differ (they are the liveness/readiness split from
+the System Design course): `/healthz` failing means *restart me*; `/readyz` failing means *stop
+sending traffic but leave me alone*. Wiring them together is how a slow model load turns into a
+restart loop.
+
+## Load the model once, at startup
+
+```python
+from contextlib import asynccontextmanager
+
+STATE = {}
+
+@asynccontextmanager
+async def lifespan(app):
+    d = pathlib.Path(tempfile.mkdtemp())
+    joblib.dump(pipe, d / "model.joblib")
+    STATE["model"] = joblib.load(d / "model.joblib")     # once per process, not per request
+    STATE["ready"] = True
+    yield                                               # <- the app serves traffic here
+    STATE.clear()                                       # graceful shutdown: release resources
+
+app2 = FastAPI(lifespan=lifespan)
+
+@app2.get("/readyz")
+def ready2():
+    return {"ready": STATE.get("ready", False)}
+
+@app2.post("/v1/predict")
+def predict2(req: ClaimRequest):
+    if not STATE.get("ready"):
+        raise HTTPException(status_code=503, detail="model not loaded")
+    row = [[getattr(req, f) for f in FEATURES]]
+    return {"probability": round(float(STATE["model"].predict_proba(row)[0, 1]), 6)}
+
+with TestClient(app2) as c:                             # the context manager runs lifespan
+    print("ready:", c.get("/readyz").json())
+    print("predict:", c.post("/v1/predict",
+                             json={"age": 42, "income": 1500.0, "prior_claims": 2}).json())
+print("after shutdown, STATE is", STATE)
+```
+
+```output
+ready: {'ready': True}
+predict: {'probability': 0.120603}
+after shutdown, STATE is {}
+```
+
+Loading inside the request handler is the classic mistake: it multiplies your p99 by the load
+time and your memory by the concurrency. Load once in `lifespan`, expose readiness only after it
+succeeds, and let the orchestrator hold traffic until then.
+
+## `def` versus `async def`: the rule that decides your throughput
+
+FastAPI runs a plain `def` endpoint in a **thread pool** and an `async def` endpoint on the
+**event loop**. Getting this backwards is the most common performance bug in a Python model
+server.
+
+| Endpoint body | Declare it | Why |
+|---|---|---|
+| CPU-bound inference (`predict`, numpy, torch) | `def` | runs in the thread pool; the event loop stays free |
+| `await`-ing a database, cache, or HTTP call | `async def` | the loop serves other requests while waiting |
+| Blocking I/O with no async client (`requests`, `psycopg2`) | `def` | blocking the loop stalls *every* concurrent request |
+| Mixed: await features, then predict | `async def` + `run_in_threadpool` | keep the CPU work off the loop |
+
+```python
+import asyncio, time
+from fastapi.concurrency import run_in_threadpool
+
+async def fetch_features(user_id):                      # pretend: a call to the feature store
+    await asyncio.sleep(0.01)
+    return {"age": 42.0, "income": 1500.0, "prior_claims": 2}
+
+def score(features):                                    # CPU-bound: never await this
+    row = [[features[f] for f in FEATURES]]
+    return float(pipe.predict_proba(row)[0, 1])
+
+@app.post("/v2/predict/{user_id}")
+async def predict_v2(user_id: str):
+    features = await fetch_features(user_id)            # I/O: yields the loop
+    p = await run_in_threadpool(score, features)        # CPU work: off the loop
+    return {"user": user_id, "probability": round(p, 6)}
+
+print("mixed endpoint:", client.post("/v2/predict/u_42").json())
+async def concurrency_demo(n):
+    start = asyncio.get_event_loop().time()
+    await asyncio.gather(*[fetch_features(i) for i in range(n)])
+    return asyncio.get_event_loop().time() - start
+
+elapsed = asyncio.run(concurrency_demo(50))
+print(f"50 concurrent 10 ms fetches, sequential would be {50 * 10} ms")
+print(f"finished in under 100 ms: {elapsed < 0.1}  (they overlap on one thread)")
+```
+
+```output
+mixed endpoint: {'user': 'u_42', 'probability': 0.120603}
+50 concurrent 10 ms fetches, sequential would be 500 ms
+finished in under 100 ms: True  (they overlap on one thread)
+```
+
+Fifty I/O-bound calls finish in the time of one, because they overlap. The same trick applied to
+CPU work gains nothing — Python's GIL means `predict` does not overlap with `predict`, which is
+why inference scales with **processes** (workers), not with coroutines.
+
+## Batching: the throughput lever
+
+Model inference is far cheaper per row in batches: the per-call overhead — Python dispatch,
+array allocation, BLAS setup — is paid once per batch, not once per row. A server that scores one
+row per request wastes most of its hardware, so a batching layer collects requests for a few
+milliseconds and runs them together.
+
+```python
+class MicroBatcher:
+    """Collect requests until max_batch or max_wait, then run one inference call."""
+    def __init__(self, fn, max_batch=32, max_wait_ms=5):
+        self.fn, self.max_batch, self.max_wait = fn, max_batch, max_wait_ms / 1000
+        self.queue, self.timer, self.calls = [], None, 0
+
+    async def submit(self, row):
+        fut = asyncio.get_event_loop().create_future()
+        self.queue.append((row, fut))
+        if self.timer is None:                       # start the clock on the first waiter
+            self.timer = asyncio.create_task(self._deadline())
+        if len(self.queue) >= self.max_batch:        # full batch: go now, do not wait
+            await self.flush()
+        return await fut
+
+    async def _deadline(self):
+        await asyncio.sleep(self.max_wait)
+        self.timer = None
+        await self.flush()
+
+    async def flush(self):
+        timer, self.timer = self.timer, None
+        if timer is not None:
+            timer.cancel()
+        batch, self.queue = self.queue, []
+        if not batch:
+            return
+        self.calls += 1
+        for (_, fut), value in zip(batch, self.fn([row for row, _ in batch])):
+            if not fut.done():
+                fut.set_result(value)
+
+def batch_score(rows):
+    return pipe.predict_proba(np.array(rows))[:, 1].tolist()
+
+async def load_test(n_requests, max_batch=32):
+    b = MicroBatcher(batch_score, max_batch=max_batch, max_wait_ms=5)
+    rows = [[42.0, 1500.0, 2]] * n_requests
+    out = await asyncio.gather(*[b.submit(r) for r in rows])
+    return b.calls, out[0]
+
+for n in (1, 10, 100, 500):
+    calls, first = asyncio.run(load_test(n))
+    print(f"{n:4} concurrent requests -> {calls:3} model call(s), "
+          f"{n/calls:6.1f} rows per call, first result {first:.6f}")
+```
+
+```output
+   1 concurrent requests ->   1 model call(s),    1.0 rows per call, first result 0.120603
+  10 concurrent requests ->   1 model call(s),   10.0 rows per call, first result 0.120603
+ 100 concurrent requests ->   4 model call(s),   25.0 rows per call, first result 0.120603
+ 500 concurrent requests ->  16 model call(s),   31.2 rows per call, first result 0.120603
+```
+
+At one request, batching costs a model call and nothing else; at 500, it collapses 500 calls into
+16. The price is the wait: `max_wait_ms` is added to every request that arrives when the queue is
+quiet, so it must be a small fraction of your latency budget — 5 ms against a 150 ms budget is
+cheap insurance, 50 ms is not.
+
+## Timeouts, concurrency limits, and backpressure
+
+Two lines of configuration decide how your server behaves when it is overloaded, and both
+default to "badly". Set a **request timeout** shorter than the caller's patience, and cap the
+**in-flight request count** so that arrival number 65 gets an immediate `503` with a
+`Retry-After` header instead of joining a queue nobody is waiting on any more.
+
+```python
+from starlette.responses import JSONResponse
+from fastapi import Request
+
+MAX_INFLIGHT = 64
+inflight = {"n": 0, "rejected": 0}
+app3 = FastAPI()          # middleware must be registered before the app starts serving
+
+@app3.post("/v1/predict")
+def predict3(req: ClaimRequest):
+    return {"probability": round(float(
+        pipe.predict_proba([[getattr(req, f) for f in FEATURES]])[0, 1]), 6)}
+
+@app3.middleware("http")
+async def limit_concurrency(request: Request, call_next):
+    if inflight["n"] >= MAX_INFLIGHT:
+        inflight["rejected"] += 1
+        return JSONResponse({"detail": "server busy"}, status_code=503,
+                            headers={"Retry-After": "1"})
+    inflight["n"] += 1
+    try:
+        return await call_next(request)
+    finally:
+        inflight["n"] -= 1
+
+c3 = TestClient(app3)
+payload = {"age": 42, "income": 1500.0, "prior_claims": 2}
+print("normal   :", c3.post("/v1/predict", json=payload).status_code)
+inflight["n"] = MAX_INFLIGHT                                  # simulate saturation
+r = c3.post("/v1/predict", json=payload)
+print("saturated:", r.status_code, r.json(), "| Retry-After:", r.headers.get("retry-after"))
+inflight["n"] = 0
+```
+
+```output
+normal   : 200
+saturated: 503 {'detail': 'server busy'} | Retry-After: 1
+```
+
+Set the limit *below* the point where your p99 collapses — measured, not guessed (ch. 9). The
+full treatment of shedding, bulkheads, and breakers lives in the System Design course; here the
+point is only that a model server needs the limit set, because inference is the expensive part
+of the request and queueing it is worse than refusing it.
+
+## Workers, and why one process is not enough
+
+```python
+def sizing(rps, model_ms, workers, util=0.6):
+    per_worker = 1000 / model_ms * util
+    instances = max(1, int(-(-rps // (per_worker * workers))))
+    print(f"{rps:>6,} rps at {model_ms:5.1f} ms | {workers} workers -> "
+          f"{per_worker:6.0f} rps/worker -> {instances:3} instances")
+
+for w in (1, 4, 8):
+    sizing(2_000, 5.0, w)
+for ms in (1.0, 50.0):
+    sizing(2_000, ms, 4)
+```
+
+```output
+ 2,000 rps at   5.0 ms | 1 workers ->    120 rps/worker ->  17 instances
+ 2,000 rps at   5.0 ms | 4 workers ->    120 rps/worker ->   5 instances
+ 2,000 rps at   5.0 ms | 8 workers ->    120 rps/worker ->   3 instances
+ 2,000 rps at   1.0 ms | 4 workers ->    600 rps/worker ->   1 instances
+ 2,000 rps at  50.0 ms | 4 workers ->     12 rps/worker ->  42 instances
+```
+
+The GIL means one Python process uses roughly one core for inference, so throughput comes from
+`uvicorn --workers N` (or several containers). Rule of thumb: workers about equal to cores, minus headroom,
+and **memory multiplies with workers** — four workers holding a 2 GB model need 8 GB unless the
+model is memory-mapped or shared.
+
+## Try it Yourself
+
+```python
+async def latency_profile(n_requests, max_batch, max_wait_ms, model_ms=0.05, overhead_ms=1.2):
+    b = MicroBatcher(batch_score, max_batch=max_batch, max_wait_ms=max_wait_ms)
+    rows = [[42.0, 1500.0, 2]] * n_requests
+    await asyncio.gather(*[b.submit(r) for r in rows])
+    per_call = overhead_ms + (n_requests / b.calls) * model_ms
+    wait = min(max_wait_ms, max_batch / max(1, n_requests) * 1000)
+    print(f"n={n_requests:4} batch<={max_batch:3} wait={max_wait_ms:2} ms -> "
+          f"{b.calls:3} calls | est. added latency {wait + per_call:6.2f} ms | "
+          f"{n_requests / b.calls:6.1f} rows/call")
+
+for cfg in [(500, 8, 5), (500, 32, 5), (500, 128, 5), (10, 128, 5), (10, 128, 50)]:
+    asyncio.run(latency_profile(*cfg))
+```
+
+```output
+n= 500 batch<=  8 wait= 5 ms ->  63 calls | est. added latency   6.60 ms |    7.9 rows/call
+n= 500 batch<= 32 wait= 5 ms ->  16 calls | est. added latency   7.76 ms |   31.2 rows/call
+n= 500 batch<=128 wait= 5 ms ->   4 calls | est. added latency  12.45 ms |  125.0 rows/call
+n=  10 batch<=128 wait= 5 ms ->   1 calls | est. added latency   6.70 ms |   10.0 rows/call
+n=  10 batch<=128 wait=50 ms ->   1 calls | est. added latency  51.70 ms |   10.0 rows/call
+```
+
+Bigger batches always help throughput and only sometimes help latency. The last two rows are the
+warning: at low traffic a large `max_wait` is pure added delay, because the batch never fills.
+Tune `max_batch` for your peak and `max_wait` for your quiet hour.
+
+## Exercise
+
+Extend the server with the operational endpoints a real deployment needs: `/metrics` in
+Prometheus text format (request count, error count, and a latency histogram — not a
+pre-computed percentile), a `/v1/predict/batch` endpoint that accepts up to 100 rows in one
+request, and per-request structured logging with a request id. Then show that the histogram
+buckets can be summed across two "instances" to give a correct fleet-wide p95, which averaging
+per-instance percentiles cannot.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import itertools, bisect
+from collections import Counter
+
+request_counter = itertools.count(1)
+from typing import List
+
+BUCKETS = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000]      # milliseconds
+metrics = {"requests": Counter(), "errors": Counter(), "hist": Counter(), "sum_ms": 0.0}
+logs = []
+
+def observe(endpoint, ms, status):
+    metrics["requests"][endpoint] += 1
+    if status >= 500:
+        metrics["errors"][endpoint] += 1
+    metrics["sum_ms"] += ms
+    idx = bisect.bisect_left(BUCKETS, ms)
+    for b in BUCKETS[idx:]:                                # cumulative buckets, Prometheus-style
+        metrics["hist"][b] += 1
+    metrics["hist"]["+Inf"] += 1
+
+class BatchRequest(BaseModel):
+    rows: List[ClaimRequest] = Field(max_length=100)
+
+@app.post("/v1/predict/batch")
+def predict_batch(req: BatchRequest):
+    rid = f"req-{next(request_counter):06d}"
+    X = np.array([[getattr(r, f) for f in FEATURES] for r in req.rows])
+    probs = pipe.predict_proba(X)[:, 1]
+    logs.append({"request_id": rid, "endpoint": "/v1/predict/batch",
+                 "n_rows": len(req.rows), "model_version": MODEL_VERSION})
+    return {"request_id": rid, "predictions": [round(float(p), 6) for p in probs]}
+
+@app.get("/metrics")
+def prometheus_metrics():
+    lines = [f'predict_requests_total{{endpoint="{ep}"}} {n}'
+             for ep, n in metrics["requests"].items()]
+    lines += [f'predict_latency_ms_bucket{{le="{b}"}} {metrics["hist"][b]}'
+              for b in BUCKETS + ["+Inf"]]
+    lines.append(f'predict_latency_ms_count {metrics["hist"]["+Inf"]}')
+    return "\n".join(lines)
+
+r = client.post("/v1/predict/batch", json={"rows": [
+    {"age": 42, "income": 1500.0, "prior_claims": 2},
+    {"age": 61, "income": 900.0, "prior_claims": 0},
+    {"age": 27, "income": 3000.0, "prior_claims": 4}]})
+print("batch response:", r.json())
+print("log line      :", logs[-1])
+
+for ms in [3, 4, 6, 8, 12, 30, 80, 400]:                   # pretend observations
+    observe("/v1/predict", ms, 200)
+print("\n" + client.get("/metrics").json()[:200], "...")
+
+def p95_from_buckets(hist, total):
+    target = 0.95 * total
+    for b in BUCKETS:
+        if hist[b] >= target:
+            return b
+    return "+Inf"
+
+def hist_of(samples):
+    h = Counter()
+    for ms in samples:
+        for bb in BUCKETS[bisect.bisect_left(BUCKETS, ms):]: h[bb] += 1
+        h["+Inf"] += 1
+    return h
+
+a = hist_of([2, 3, 4, 5, 6, 7, 8, 9, 10, 900])            # instance A: one very slow request
+b = hist_of([40, 45, 48, 50, 52, 55, 60, 62, 70, 80])     # instance B: uniformly slower
+merged = Counter({k: a[k] + b[k] for k in set(a) | set(b)})
+print(f"\ninstance A p95 bucket: {p95_from_buckets(a, a['+Inf'])} ms")
+print(f"instance B p95 bucket: {p95_from_buckets(b, b['+Inf'])} ms")
+print(f"average of the two   : "
+      f"{(p95_from_buckets(a, a['+Inf']) + p95_from_buckets(b, b['+Inf'])) / 2} ms  <- meaningless")
+print(f"fleet p95 from summed buckets: {p95_from_buckets(merged, merged['+Inf'])} ms  <- correct")
+```
+
+```output
+batch response: {'request_id': 'req-000001', 'predictions': [0.120603, 0.073679, 0.222639]}
+log line      : {'request_id': 'req-000001', 'endpoint': '/v1/predict/batch', 'n_rows': 3, 'model_version': '1.4.0'}
+
+predict_requests_total{endpoint="/v1/predict"} 8
+predict_latency_ms_bucket{le="1"} 0
+predict_latency_ms_bucket{le="2"} 0
+predict_latency_ms_bucket{le="5"} 2
+predict_latency_ms_bucket{le="10"} 4
+predic ...
+
+instance A p95 bucket: 1000 ms
+instance B p95 bucket: 100 ms
+average of the two   : 550.0 ms  <- meaningless
+fleet p95 from summed buckets: 100 ms  <- correct
+```
+
+The insight: percentiles do not add, but **histogram buckets do**. Each instance exports counts
+per bucket; the monitoring system sums them across the fleet and computes the quantile once, on
+the merged distribution — which is why Prometheus exports `_bucket` series rather than a `p95`
+gauge, and why exporting a pre-computed percentile from each pod quietly destroys the fleet-level
+number. Two more details this exercise makes concrete: the batch endpoint needs a **bounded**
+`max_length`, or one request can allocate an unbounded array and take the process down; and the
+request id belongs in both the response and the log line, so a user's complaint ("my request at
+14:03 was wrong") maps to exactly one log entry and one model version.
+</details>

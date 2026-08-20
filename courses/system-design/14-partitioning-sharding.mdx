@@ -1,0 +1,419 @@
+---
+course: system-design
+chapter: 14-partitioning-sharding
+title: "Partitioning and Sharding"
+order: 14
+---
+
+## Replication copies data; partitioning splits it
+
+Replication (ch. 13) gives every node the same data. Partitioning gives every node a *slice*,
+so the dataset and the write throughput can exceed one machine. You almost always do both:
+each partition is replicated, and each node holds partitions of several different key ranges.
+
+The goal is one word: **balance**. A partitioning scheme is good if data and traffic land evenly
+and stay that way as the cluster changes.
+
+```python
+import hashlib, random
+from collections import Counter
+random.seed(0)
+
+keys = [f"user:{i}" for i in range(100_000)]
+
+def by_range(key, n):
+    """Range partitioning on the key's first character group."""
+    bucket = ord(key.split(":")[1][0]) - ord("0")     # '0'..'9'
+    return bucket % n
+
+def by_hash(key, n):
+    return int(hashlib.md5(key.encode()).hexdigest(), 16) % n
+
+for name, fn in [("range", by_range), ("hash", by_hash)]:
+    c = Counter(fn(k, 8) for k in keys)
+    lo, hi = min(c.values()), max(c.values())
+    print(f"{name:6} partitioning over 8 shards: min {lo:6,} max {hi:6,} "
+          f"max/min {hi/lo:5.2f}")
+```
+
+```output
+range  partitioning over 8 shards: min 11,111 max 22,222 max/min  2.00
+hash   partitioning over 8 shards: min 12,309 max 12,611 max/min  1.02
+```
+
+Hash partitioning balances by construction, because the hash destroys whatever structure the
+keys had. That is also exactly what it costs you.
+
+## Range vs hash: you are choosing which queries stay cheap
+
+```python
+sorted_keys = sorted(f"event:2026-{m:02}-{d:02}" for m in range(1, 13) for d in range(1, 29))
+
+def range_shard(key, boundaries):
+    for i, b in enumerate(boundaries):
+        if key < b: return i
+    return len(boundaries)
+
+boundaries = ["event:2026-04", "event:2026-07", "event:2026-10"]
+q = [k for k in sorted_keys if "2026-05" <= k[6:13] <= "2026-06"]
+shards_touched = {range_shard(k, boundaries) for k in q}
+print(f"range partitioning: a 2-month scan touches shards {sorted(shards_touched)}")
+
+shards_touched = {by_hash(k, 4) for k in q}
+print(f"hash  partitioning: the same scan touches shards {sorted(shards_touched)}")
+```
+
+```output
+range partitioning: a 2-month scan touches shards [1]
+hash  partitioning: the same scan touches shards [0, 1, 2, 3]
+```
+
+Range partitioning keeps a scan on one shard; hash partitioning scatters it across all of them.
+And the reverse holds for writes: with time-ordered range partitioning, **every new write goes to
+the last shard**, which becomes a hot spot while the others idle.
+
+```python
+# Boundaries were chosen when the table was split: one shard per month of 2026.
+month_bounds = [f"event:2026-{m:02}" for m in range(2, 13)]      # 11 bounds -> 12 shards
+todays_writes = [f"event:2026-12-28T{i:06}" for i in range(50_000)]
+
+c = Counter(range_shard(k, month_bounds) for k in todays_writes)
+print(f"range-on-time: today's 50,000 writes land on shards {sorted(c)} "
+      f"-> hottest shard takes {max(c.values())/(50_000/12):.1f}x its share")
+
+c = Counter(by_hash(k, 12) for k in todays_writes)
+print(f"hash-on-key  : writes land on {len(c)} shards "
+      f"-> hottest shard takes {max(c.values())/(50_000/12):.2f}x its share")
+```
+
+```output
+range-on-time: today's 50,000 writes land on shards [11] -> hottest shard takes 12.0x its share
+hash-on-key  : writes land on 12 shards -> hottest shard takes 1.02x its share
+```
+
+The standard fix is a **compound key**: partition by something high-cardinality (`device_id`,
+`user_id`) and *sort* by time inside the partition. Writes spread across devices; a per-device
+time range scan is still one contiguous read. This is exactly the Cassandra
+`PRIMARY KEY ((device_id), timestamp)` shape, and the DynamoDB partition-key/sort-key pair
+(ch. 10).
+
+## Rebalancing: never use `hash % n`
+
+You saw this in ch. 4: changing $n$ remaps nearly every key. There are three real strategies.
+
+```python
+def moved_fraction(assign_before, assign_after, sample):
+    return sum(assign_before(k) != assign_after(k) for k in sample) / len(sample)
+
+sample = keys[:20_000]
+print("modulo, 8 -> 9 nodes:      ",
+      f"{moved_fraction(lambda k: by_hash(k, 8), lambda k: by_hash(k, 9), sample):6.1%} of keys move")
+
+# Fixed partitions: a permanent partition count, with an explicit partition -> node map.
+PARTS = 256
+def fixed_partition(k): return by_hash(k, PARTS)
+
+def assign(n_nodes, previous=None):
+    """Adding a node steals partitions from the most-loaded nodes, and nothing else moves."""
+    if previous is None:
+        return {p: p % n_nodes for p in range(PARTS)}
+    m = dict(previous)
+    target = PARTS // n_nodes
+    load = Counter(m.values())
+    new_node = n_nodes - 1
+    for p in sorted(m):
+        if load[m[p]] > target and load[new_node] < target:
+            load[m[p]] -= 1
+            m[p] = new_node
+            load[new_node] += 1
+    return m
+
+map8 = assign(8)
+map9 = assign(9, previous=map8)
+before = lambda k: map8[fixed_partition(k)]
+after  = lambda k: map9[fixed_partition(k)]
+print("fixed partitions (256), 8 -> 9 nodes:",
+      f"{moved_fraction(before, after, sample):6.1%} of keys move (ideal {1/9:.1%})")
+```
+
+```output
+modulo, 8 -> 9 nodes:        88.5% of keys move
+fixed partitions (256), 8 -> 9 nodes:  11.2% of keys move (ideal 11.1%)
+```
+
+- **Fixed partition count** (Elasticsearch, Riak, Kafka): choose a number far larger than the
+  node count once — say 256 or 1024 — and move whole partitions when nodes join. Simple and
+  predictable; the cost is that the partition count is permanent, so choose for the biggest
+  cluster you will ever have.
+- **Consistent hashing with virtual nodes** (ch. 4): partitions are implicit; adding a node
+  claims a $1/n$ share.
+- **Dynamic partitioning** (HBase, MongoDB): a partition **splits** when it grows past a
+  threshold and **merges** when it shrinks — the only scheme that adapts to skewed key
+  distributions automatically, at the cost of a moving-parts control plane.
+
+```python
+def dynamic_split(sizes, max_mb=64, min_mb=16):
+    out = []
+    for s in sizes:
+        while s > max_mb:
+            out.append(max_mb // 2); s -= max_mb // 2      # split in half
+        out.append(s)
+    merged, buf = [], 0
+    for s in out:                                          # merge small neighbours
+        if s < min_mb:
+            buf += s
+            if buf >= min_mb: merged.append(buf); buf = 0
+        else:
+            merged.append(s)
+    if buf: merged.append(buf)
+    return merged
+
+print("before:", [200, 8, 5, 70, 3])
+print("after :", dynamic_split([200, 8, 5, 70, 3]))
+```
+
+```output
+before: [200, 8, 5, 70, 3]
+after : [32, 32, 32, 32, 32, 40, 32, 38, 16]
+```
+
+One oversized partition became six, three undersized ones became one, and the partition count
+now tracks the data instead of the cluster — which is what makes this scheme the right fit for
+range-partitioned stores with unpredictable key distributions.
+
+## Routing: how a request finds its shard
+
+```python
+class Router:
+    """Three ways to answer 'which node holds this key?'"""
+    def __init__(self, nodes): self.map = {p: p % nodes for p in range(PARTS)}
+
+    def client_side(self, key):        # the client library holds the map (Cassandra, Kafka)
+        return self.map[fixed_partition(key)], "0 extra hops"
+
+    def proxy(self, key):              # a routing tier holds the map (Vitess, mongos)
+        return self.map[fixed_partition(key)], "1 extra hop, but dumb clients"
+
+    def any_node(self, key):           # ask any node; it forwards (Cassandra coordinator)
+        return self.map[fixed_partition(key)], "1 extra hop on a miss, no client map"
+
+r = Router(8)
+for how in ("client_side", "proxy", "any_node"):
+    node, cost = getattr(r, how)("user:12345")
+    print(f"{how:12} -> node {node} ({cost})")
+```
+
+```output
+client_side  -> node 1 (0 extra hops)
+proxy        -> node 1 (1 extra hop, but dumb clients)
+any_node     -> node 1 (1 extra hop on a miss, no client map)
+```
+
+Whichever you choose, the routing map is *shared cluster state* that must stay consistent
+during a rebalance — which is why real systems keep it in ZooKeeper, etcd, or a gossip protocol
+(ch. 17). A stale map is not fatal if nodes can forward misrouted requests, which is why
+"ask any node" is the most robust option.
+
+## Secondary indexes: local or global, pick your pain
+
+The partition key answers one question cheaply. Any other filter is a secondary index, and
+there are exactly two ways to partition it.
+
+```python
+docs = [{"id": i, "color": random.choice(["red", "blue", "green"]),
+         "make": random.choice(["toyota", "honda", "ford"])} for i in range(10_000)]
+
+local = {}     # index partitioned by document: each shard indexes only its own docs
+for d in docs:
+    shard = by_hash(f"doc:{d['id']}", 8)
+    local.setdefault(shard, {}).setdefault(d["color"], []).append(d["id"])
+
+global_ = {}   # index partitioned by term: one shard owns all docs for a term
+for d in docs:
+    shard = by_hash(d["color"], 8)
+    global_.setdefault(shard, {}).setdefault(d["color"], []).append(d["id"])
+
+print(f"query color=red, LOCAL index : ask all {len(local)} shards, merge results")
+print(f"   shards holding red docs: {sum('red' in idx for idx in local.values())}")
+print(f"query color=red, GLOBAL index: ask {sum('red' in idx for idx in global_.values())} shard")
+print(f"   but a write must now touch the doc's shard AND the term's shard")
+```
+
+```output
+query color=red, LOCAL index : ask all 8 shards, merge results
+   shards holding red docs: 8
+query color=red, GLOBAL index: ask 1 shard
+   but a write must now touch the doc's shard AND the term's shard
+```
+
+**Local (document-partitioned) indexes** make writes cheap and reads a scatter-gather across every
+shard. **Global (term-partitioned) indexes** make reads a single lookup and writes distributed —
+so they are usually updated asynchronously, which means your index is eventually consistent with
+your data. Elasticsearch uses local; DynamoDB global secondary indexes use global.
+
+### Scatter-gather is where tail latency comes from
+
+```python
+import statistics
+
+def scatter_gather_p99(shards, per_shard_p99=0.01, trials=20_000, seed=1):
+    """Wait for the slowest of `shards` responses: the tail compounds (ch. 2)."""
+    rng = random.Random(seed)
+    slow = 0
+    for _ in range(trials):
+        if any(rng.random() < per_shard_p99 for _ in range(shards)):
+            slow += 1
+    return slow / trials
+
+for n in (1, 8, 32, 128):
+    print(f"{n:4} shards queried -> {scatter_gather_p99(n):6.1%} of requests hit at least one "
+          f"p99-slow shard")
+```
+
+```output
+   1 shards queried ->   1.1% of requests hit at least one p99-slow shard
+   8 shards queried ->   7.8% of requests hit at least one p99-slow shard
+  32 shards queried ->  27.1% of requests hit at least one p99-slow shard
+ 128 shards queried ->  72.2% of requests hit at least one p99-slow shard
+```
+
+At 128 shards, a scatter-gather query is slow more often than not, even though each shard is
+fast 99% of the time. This is why sharded systems push so hard to make queries **single-shard**:
+it is not about the work, it is about the tail.
+
+## Hot shards and the celebrity problem
+
+```python
+def load_with_celebrity(n_shards=16, requests=200_000, celeb_share=0.35, seed=2):
+    rng = random.Random(seed)
+    c = Counter()
+    for _ in range(requests):
+        key = "user:celebrity" if rng.random() < celeb_share else f"user:{rng.randrange(1_000_000)}"
+        c[by_hash(key, n_shards)] += 1
+    return max(c.values()) / (requests / n_shards)
+
+print(f"one celebrity taking 35% of traffic -> hottest shard is "
+      f"{load_with_celebrity():.1f}x the average")
+
+def salted(key, salts=16):
+    return f"{key}#{random.randrange(salts)}"
+random.seed(3)
+c = Counter(by_hash(salted("user:celebrity"), 16) for _ in range(50_000))
+print(f"after salting the hot key into 16 sub-keys: hottest shard "
+      f"{max(c.values())/(50_000/16):.2f}x average (reads must now fan out to 16)")
+```
+
+```output
+one celebrity taking 35% of traffic -> hottest shard is 6.2x the average
+after salting the hot key into 16 sub-keys: hottest shard 3.05x average (reads must now fan out to 16)
+```
+
+Sixteen salts cut the hot shard from 6.2x to 3.0x — not to 1.0x, because 16 random salts
+landing on 16 shards collide; 64 salts would flatten it further, at 64x the read fan-out.
+Salting trades hot-shard load for read fan-out — the same trade as
+ch. 10's hot-partition fix. The alternatives are to cache the celebrity at a layer above the
+shards (ch. 5), or to special-case it in the application (fan-out on read for celebrities,
+ch. 8). All three are used in production; none of them are elegant.
+
+## Try it Yourself
+
+```python
+def capacity_plan(rows, row_bytes, writes_per_s, node_disk_tb=2, node_write_qps=8_000,
+                  replication=3):
+    data_tb = rows * row_bytes * replication / 1e12
+    by_disk = -(-int(data_tb) // node_disk_tb) or 1
+    by_write = -(-writes_per_s * replication // node_write_qps)
+    shards = max(by_disk, by_write)
+    limit = "disk" if by_disk >= by_write else "write throughput"
+    print(f"{rows:>14,} rows | {data_tb:8.1f} TB replicated | {writes_per_s:>8,} w/s "
+          f"-> {shards:4} shards (bound by {limit})")
+
+capacity_plan(500_000_000,    400, 2_000)
+capacity_plan(50_000_000_000, 400, 20_000)
+capacity_plan(1_000_000_000,  200, 500_000)
+```
+
+```output
+   500,000,000 rows |      0.6 TB replicated |    2,000 w/s ->    1 shards (bound by disk)
+50,000,000,000 rows |     60.0 TB replicated |   20,000 w/s ->   30 shards (bound by disk)
+ 1,000,000,000 rows |      0.6 TB replicated |  500,000 w/s ->  188 shards (bound by write throughput)
+```
+
+Change `node_write_qps` to 2,000 (a node with slower disks) and watch the write-bound cases
+double. Capacity planning is exactly this: compute both bounds, take the max, then add headroom
+for the growth you expect before the next rebalance.
+
+## Exercise
+
+Implement a **shard splitter** for range-partitioned data: given a partition's key list and a
+target maximum size, split it at the median key and return the new boundary. Then simulate 30
+rounds of skewed inserts (80% of keys landing in one range) and show that dynamic splitting
+keeps every partition under the limit, reporting the final partition count and the largest
+partition.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import bisect
+
+class RangeTable:
+    def __init__(self, max_size=1_000):
+        self.bounds = []                 # sorted split points
+        self.parts = [[]]                # parts[i] holds keys in [bounds[i-1], bounds[i])
+        self.max_size = max_size
+        self.splits = 0
+
+    def _index(self, key):
+        return bisect.bisect_right(self.bounds, key)
+
+    def insert(self, key):
+        i = self._index(key)
+        bisect.insort(self.parts[i], key)
+        if len(self.parts[i]) > self.max_size:
+            self._split(i)
+
+    def _split(self, i):
+        part = self.parts[i]
+        mid = len(part) // 2
+        pivot = part[mid]
+        self.parts[i:i+1] = [part[:mid], part[mid:]]
+        self.bounds.insert(i, pivot)
+        self.splits += 1
+
+t = RangeTable(max_size=1_000)
+random.seed(0)
+for round_ in range(30):
+    for _ in range(2_000):
+        if random.random() < 0.8:
+            key = f"hot:{random.randrange(10_000):08}"       # 80% into one narrow range
+        else:
+            key = f"{random.choice('abcdefg')}:{random.randrange(10**6):08}"
+        t.insert(key)
+
+sizes = [len(p) for p in t.parts]
+print(f"inserted {sum(sizes):,} keys")
+print(f"partitions: {len(t.parts)} (from {t.splits} splits)")
+print(f"largest partition: {max(sizes):,} keys (limit {t.max_size:,})")
+print(f"smallest: {min(sizes):,} | median: {sorted(sizes)[len(sizes)//2]:,}")
+hot_parts = sum(1 for p in t.parts if p and p[0].startswith("hot:"))
+print(f"partitions covering the hot range: {hot_parts} <- the skew was absorbed by splitting")
+```
+
+```output
+inserted 60,000 keys
+partitions: 73 (from 72 splits)
+largest partition: 997 keys (limit 1,000)
+smallest: 501 | median: 881
+partitions covering the hot range: 58 <- the skew was absorbed by splitting
+```
+
+The insight: dynamic splitting is the only rebalancing scheme that responds to the *data*
+rather than to the node count, so it is the right answer for range-partitioned stores where you
+cannot predict the key distribution. The hot range ends up covered by many narrow partitions,
+which can then be spread across nodes. The costs are real: splits move data while serving
+traffic, the routing map changes constantly (so every client must tolerate a stale map and
+follow redirects), and a bad split point can leave you with partitions that immediately split
+again. Note also what splitting cannot fix — a single key that is hot on its own is
+unsplittable, and needs the salting or caching answers from earlier in this chapter.
+</details>

@@ -1,0 +1,327 @@
+---
+course: system-design
+chapter: 04-load-balancing-consistent-hashing
+title: "Load Balancing and Consistent Hashing"
+order: 4
+---
+
+## Four balancing policies, and when each is wrong
+
+A load balancer answers one question per request: which backend? The policy you pick decides
+how badly a slow or fat request hurts you.
+
+```python
+import random, statistics
+random.seed(0)
+
+N_REQ, N_BACK = 5_000, 5
+# Request costs are heavy-tailed: most cheap, a few very expensive.
+costs = [random.paretovariate(1.5) for _ in range(N_REQ)]
+
+def simulate(policy):
+    load = [0.0] * N_BACK          # accumulated work per backend
+    inflight = [0] * N_BACK
+    for i, c in enumerate(costs):
+        b = policy(i, load, inflight)
+        load[b] += c
+        inflight[b] += 1
+    return load
+
+policies = {
+    "round robin":  lambda i, load, inf: i % N_BACK,
+    "random":       lambda i, load, inf: random.randrange(N_BACK),
+    "least loaded": lambda i, load, inf: min(range(N_BACK), key=lambda b: load[b]),
+    "power of 2":   lambda i, load, inf: min(random.sample(range(N_BACK), 2), key=lambda b: load[b]),
+}
+for name, p in policies.items():
+    load = simulate(p)
+    print(f"{name:13} max/mean = {max(load)/statistics.mean(load):.3f}   "
+          f"spread = {max(load) - min(load):8.1f}")
+```
+
+```output
+round robin   max/mean = 1.326   spread =   1567.1
+random        max/mean = 1.193   spread =    973.3
+least loaded  max/mean = 1.005   spread =     24.6
+power of 2    max/mean = 1.007   spread =     33.1
+```
+
+Round robin balances *counts*, not *work*: with heavy-tailed request costs it lets one
+backend accumulate the expensive requests. "Least loaded" is optimal here but needs global
+state. **Power of two choices** — sample two backends at random, pick the less loaded — gets
+almost all of the benefit with two lookups and no coordination, which is why it is the
+default in modern proxies.
+
+### Weighted round robin for heterogeneous fleets
+
+When backends differ in size (a 32-core box next to an 8-core box), give each a weight and
+distribute in proportion.
+
+```python
+weights = {"big-1": 4, "big-2": 4, "small-1": 1, "small-2": 1}
+
+def smooth_wrr(weights, n):
+    """Nginx's smooth weighted round robin: no bursts of the same backend."""
+    current = {k: 0 for k in weights}
+    total = sum(weights.values())
+    out = []
+    for _ in range(n):
+        for k in current:
+            current[k] += weights[k]
+        best = max(current, key=lambda k: current[k])
+        current[best] -= total
+        out.append(best)
+    return out
+
+seq = smooth_wrr(weights, 20)
+print(" ".join(seq))
+from collections import Counter
+print(Counter(seq))
+```
+
+```output
+big-1 big-2 small-1 big-1 big-2 small-2 big-1 big-2 big-1 big-2 big-1 big-2 small-1 big-1 big-2 small-2 big-1 big-2 big-1 big-2
+Counter({'big-1': 8, 'big-2': 8, 'small-1': 2, 'small-2': 2})
+```
+
+The big boxes get 4x the traffic, and the sequence interleaves rather than sending four
+requests in a row to one node — which matters when each request holds a connection.
+
+## The modulo problem
+
+Now switch from stateless backends to a *sharded cache*: each key must land on the node that
+holds it. The obvious mapping is `hash(key) % N`.
+
+```python
+import hashlib
+
+def h(key):
+    return int(hashlib.md5(str(key).encode()).hexdigest(), 16)
+
+keys = [f"user:{i}" for i in range(100_000)]
+
+def mod_assign(keys, n):
+    return {k: h(k) % n for k in keys}
+
+before = mod_assign(keys, 8)
+after  = mod_assign(keys, 9)          # add one node
+moved = sum(before[k] != after[k] for k in keys)
+print(f"nodes 8 -> 9: {moved:,}/{len(keys):,} keys moved = {moved/len(keys):.1%}")
+```
+
+```output
+nodes 8 -> 9: 88,737/100,000 keys moved = 88.7%
+```
+
+Adding one node to eight remapped 89% of keys. Every one of those is a cache miss hammering
+the database at the same moment — adding capacity causes an outage. This is the problem
+consistent hashing exists to solve.
+
+## Consistent hashing: the ring
+
+Hash both keys *and* nodes onto the same circular space $[0, 2^{m})$. A key belongs to the
+first node found walking clockwise from the key's position. Add or remove a node and only the
+keys in that node's arc move.
+
+$$
+\text{node}(k) = \min \{\, n \in \text{ring} : h(n) \ge h(k) \,\}, \quad
+\text{wrapping to } \min(\text{ring}) \text{ if none}
+$$
+
+```python
+import bisect
+
+class Ring:
+    def __init__(self, nodes=(), vnodes=1):
+        self.vnodes = vnodes
+        self.ring = []            # sorted hashes
+        self.owner = {}           # hash -> node name
+        for n in nodes:
+            self.add(n)
+
+    def _points(self, node):
+        return [h(f"{node}#{i}") for i in range(self.vnodes)]
+
+    def add(self, node):
+        for p in self._points(node):
+            bisect.insort(self.ring, p)
+            self.owner[p] = node
+
+    def remove(self, node):
+        for p in self._points(node):
+            self.ring.remove(p)
+            del self.owner[p]
+
+    def get(self, key):
+        i = bisect.bisect(self.ring, h(key)) % len(self.ring)
+        return self.owner[self.ring[i]]
+
+r = Ring([f"cache-{i}" for i in range(8)], vnodes=1)
+before = {k: r.get(k) for k in keys}
+r.add("cache-8")
+after = {k: r.get(k) for k in keys}
+moved = sum(before[k] != after[k] for k in keys)
+print(f"ring 8 -> 9 nodes: {moved:,} keys moved = {moved/len(keys):.2%}  (ideal = {1/9:.2%})")
+```
+
+```output
+ring 8 -> 9 nodes: 19,210 keys moved = 19.21%  (ideal = 11.11%)
+```
+
+Under a fifth moved instead of nine-tenths, and the keys that moved came only from the
+neighbours whose arc the new node split. In expectation, adding the $n$-th node moves $1/n$ of
+the keys; with a single hash point per node the variance around that is large, which is the
+next problem to fix.
+
+### One hash point per node is not enough
+
+With a single point per node, arc lengths are random and wildly uneven — some node owns three
+times its share.
+
+```python
+from collections import Counter
+
+def spread(vnodes):
+    r = Ring([f"cache-{i}" for i in range(8)], vnodes=vnodes)
+    c = Counter(r.get(k) for k in keys)
+    lo, hi = min(c.values()), max(c.values())
+    return lo / len(keys), hi / len(keys), hi / lo
+
+for v in (1, 8, 64, 256):
+    lo, hi, ratio = spread(v)
+    print(f"vnodes/node {v:4}: min {lo:6.2%}  max {hi:6.2%}  max/min {ratio:5.2f}"
+          f"   (ideal share {1/8:.2%})")
+```
+
+```output
+vnodes/node    1: min  1.28%  max 33.98%  max/min 26.52   (ideal share 12.50%)
+vnodes/node    8: min  6.24%  max 21.80%  max/min  3.49   (ideal share 12.50%)
+vnodes/node   64: min 10.61%  max 14.27%  max/min  1.34   (ideal share 12.50%)
+vnodes/node  256: min 11.40%  max 14.16%  max/min  1.24   (ideal share 12.50%)
+```
+
+**Virtual nodes** fix this: hash each physical node to many points, so its ownership is the
+union of many small arcs and the law of large numbers flattens the distribution. 128–256
+virtual nodes per physical node is the standard choice — enough to be even, cheap enough to
+keep the ring small.
+
+### Virtual nodes also let you weight
+
+A node with twice the memory simply gets twice the virtual nodes, and the ring handles the
+rest — no special-case code.
+
+```python
+r = Ring([], vnodes=128)
+r.add("big-1"); r.add("big-1-extra")     # 2x points for the big box, same physical machine
+r.add("small-1"); r.add("small-2")
+alias = {"big-1": "big", "big-1-extra": "big", "small-1": "small-1", "small-2": "small-2"}
+c = Counter(alias[r.get(k)] for k in keys)
+for node, n in sorted(c.items()):
+    print(f"{node:8} {n/len(keys):6.2%}")
+```
+
+```output
+big      51.42%
+small-1  24.74%
+small-2  23.84%
+```
+
+The big box owns half the keyspace and the two small ones a quarter each, with no branch
+anywhere in the lookup path — capacity planning becomes a matter of counting points on the
+ring.
+
+## Removing a node is the failure case
+
+The property you actually care about during an incident: when a node dies, its keys must
+scatter across *all* survivors, not pile onto its clockwise neighbour.
+
+```python
+r = Ring([f"cache-{i}" for i in range(6)], vnodes=128)
+before = {k: r.get(k) for k in keys}
+r.remove("cache-3")
+after = {k: r.get(k) for k in keys}
+
+moved = [k for k in keys if before[k] != after[k]]
+print(f"lost node owned {sum(v == 'cache-3' for v in before.values()):,} keys; "
+      f"{len(moved):,} keys moved")
+print("they landed on:", Counter(after[k] for k in moved).most_common())
+```
+
+```output
+lost node owned 15,235 keys; 15,235 keys moved
+they landed on: [('cache-5', 3806), ('cache-0', 3681), ('cache-2', 2933), ('cache-1', 2592), ('cache-4', 2223)]
+```
+
+Every survivor absorbed roughly a fifth. With `vnodes=1` the whole load would have landed on
+one unlucky neighbour, which would then fall over — a cascading failure (ch. 22).
+
+## Try it Yourself
+
+```python
+r = Ring([f"cache-{i}" for i in range(4)], vnodes=128)
+sample = [f"user:{i}" for i in range(20_000)]
+base = {k: r.get(k) for k in sample}
+
+for new in ("cache-4", "cache-5", "cache-6"):
+    r.add(new)
+    now = {k: r.get(k) for k in sample}
+    moved = sum(base[k] != now[k] for k in sample)
+    n = len(set(r.owner.values()))
+    print(f"added {new}: {moved/len(sample):6.2%} of keys moved since start "
+          f"(ideal for {n} nodes ~ {1 - 4/n:.2%})")   # compared against the 4-node mapping
+```
+
+```output
+added cache-4: 20.69% of keys moved since start (ideal for 5 nodes ~ 20.00%)
+added cache-5: 34.74% of keys moved since start (ideal for 6 nodes ~ 33.33%)
+added cache-6: 43.61% of keys moved since start (ideal for 7 nodes ~ 42.86%)
+```
+
+Change `vnodes=128` to `vnodes=1` and rerun: total movement stays similar but the *balance*
+falls apart. Then try `Ring([...], vnodes=512)` and see the ring-build cost grow.
+
+## Exercise
+
+Implement **rendezvous hashing** (also called highest-random-weight, HRW): for a key $k$,
+compute $w(k, n) = \text{hash}(k \Vert n)$ for every node $n$ and assign the key to the node
+with the highest weight. Compare it against the consistent-hash ring on two metrics for 8
+nodes growing to 9: fraction of keys moved, and the max/min load ratio.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def hrw(key, nodes):
+    return max(nodes, key=lambda n: h(f"{key}|{n}"))
+
+nodes8 = [f"cache-{i}" for i in range(8)]
+nodes9 = nodes8 + ["cache-8"]
+
+b = {k: hrw(k, nodes8) for k in keys}
+a = {k: hrw(k, nodes9) for k in keys}
+moved = sum(b[k] != a[k] for k in keys)
+c = Counter(b.values())
+print(f"HRW  moved {moved/len(keys):6.2%} (ideal {1/9:.2%})   max/min load {max(c.values())/min(c.values()):.3f}")
+
+r = Ring(nodes8, vnodes=128)
+rb = {k: r.get(k) for k in keys}
+r.add("cache-8")
+ra = {k: r.get(k) for k in keys}
+rmoved = sum(rb[k] != ra[k] for k in keys)
+rc = Counter(rb.values())
+print(f"ring moved {rmoved/len(keys):6.2%} (ideal {1/9:.2%})   max/min load {max(rc.values())/min(rc.values()):.3f}")
+print(f"lookup cost: HRW O(N) per key, ring O(log(N*vnodes)) per key")
+```
+
+```output
+HRW  moved 11.21% (ideal 11.11%)   max/min load 1.027
+ring moved 12.24% (ideal 11.11%)   max/min load 1.299
+lookup cost: HRW O(N) per key, ring O(log(N*vnodes)) per key
+```
+
+The insight: rendezvous hashing achieves near-perfect balance with **no virtual nodes and no
+ring to maintain**, and it moves the theoretical minimum of keys. Its cost is $O(N)$ hashes
+per lookup instead of one binary search, which is irrelevant for tens of nodes and
+disqualifying for thousands. Use HRW for small, changing clusters (shard maps, session
+routing); use the ring with virtual nodes when the node count is large or lookups are hot.
+</details>

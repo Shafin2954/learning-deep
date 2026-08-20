@@ -1,0 +1,402 @@
+---
+course: system-design
+chapter: 17-consensus-raft-paxos
+title: "Consensus: Raft and Paxos, the Idea"
+order: 17
+---
+
+## What consensus is for
+
+Consensus is how a group of nodes agrees on **one value**, or on **one order of values**, despite
+crashes and lost messages. You need it in exactly three situations, and you should be able to
+name them on demand:
+
+- **Leader election** — who is the primary right now (ch. 13)?
+- **Replicated state machine** — apply the same log of commands, in the same order, everywhere.
+- **Atomic decisions** — lock acquisition, uniqueness constraints, configuration changes.
+
+You almost never implement it. You *use* it — etcd, ZooKeeper, Consul — and knowing the shape
+tells you what those services can and cannot promise.
+
+```python
+guarantees = [
+    ("agreement",  "no two nodes decide different values"),
+    ("validity",   "the decided value was proposed by someone"),
+    ("termination","every non-faulty node eventually decides (given enough synchrony)"),
+]
+for name, meaning in guarantees:
+    print(f"{name:12} {meaning}")
+print("\nFLP result: with even one crash-faulty node and no timing assumptions,")
+print("no deterministic protocol guarantees all three. Real systems add timeouts")
+print("(a failure detector) and settle for 'terminates when the network behaves'.")
+```
+
+```output
+agreement    no two nodes decide different values
+validity     the decided value was proposed by someone
+termination  every non-faulty node eventually decides (given enough synchrony)
+
+FLP result: with even one crash-faulty node and no timing assumptions,
+no deterministic protocol guarantees all three. Real systems add timeouts
+(a failure detector) and settle for 'terminates when the network behaves'.
+```
+
+## Raft in one page: terms, votes, logs
+
+Raft splits the problem into three pieces: **leader election**, **log replication**, and
+**safety**. Every node is a follower, a candidate, or a leader, and time is divided into
+numbered **terms** — a logical clock that makes stale leaders detectable.
+
+```python
+class RaftNode:
+    def __init__(self, name):
+        self.name, self.term, self.state = name, 0, "follower"
+        self.voted_for, self.log, self.commit_index = None, [], -1
+
+    def request_vote(self, candidate, term, last_log_index, last_log_term):
+        if term < self.term:
+            return False, f"{self.name}: stale term {term} < {self.term}"
+        if term > self.term:                       # a higher term always wins
+            self.term, self.state, self.voted_for = term, "follower", None
+        if self.voted_for not in (None, candidate):
+            return False, f"{self.name}: already voted for {self.voted_for} in term {term}"
+        # safety: never vote for a candidate whose log is behind ours
+        my_last_term = self.log[-1][0] if self.log else -1
+        my_last_index = len(self.log) - 1
+        if (last_log_term, last_log_index) < (my_last_term, my_last_index):
+            return False, f"{self.name}: candidate log is behind"
+        self.voted_for = candidate
+        return True, f"{self.name}: voted for {candidate} in term {term}"
+
+cluster = [RaftNode(n) for n in ("n1", "n2", "n3")]
+votes = [node.request_vote("n1", term=1, last_log_index=-1, last_log_term=-1)
+         for node in cluster]
+for granted, why in votes:
+    print(("GRANT " if granted else "DENY  ") + why)
+print(f"\nvotes for n1: {sum(g for g, _ in votes)}/3 -> "
+      f"{'elected leader' if sum(g for g, _ in votes) > 1.5 else 'no majority'}")
+
+print("\nn3 campaigns in the same term 1:")
+for node in cluster:
+    print("   ", node.request_vote("n3", term=1, last_log_index=-1, last_log_term=-1)[1])
+```
+
+```output
+GRANT n1: voted for n1 in term 1
+GRANT n2: voted for n1 in term 1
+GRANT n3: voted for n1 in term 1
+
+votes for n1: 3/3 -> elected leader
+
+n3 campaigns in the same term 1:
+    n1: already voted for n1 in term 1
+    n2: already voted for n1 in term 1
+    n3: already voted for n1 in term 1
+```
+
+Two rules make this safe. A node grants **at most one vote per term**, so two candidates cannot
+both reach a majority (any two majorities of the same set intersect). And a node refuses to vote
+for a candidate whose log is behind its own, which guarantees the winner already holds every
+committed entry.
+
+### Split votes and randomized timeouts
+
+```python
+import random
+
+def election_round(n_nodes, timeouts):
+    """Whoever times out first becomes a candidate; simultaneous candidates split the vote."""
+    first = min(timeouts)
+    candidates = [i for i, t in enumerate(timeouts) if t == first]
+    if len(candidates) == 1:
+        return f"node {candidates[0]} wins immediately"
+    return f"split vote among {candidates} -> new term, retry"
+
+print("fixed timeouts (all 150 ms):", election_round(5, [150] * 5))
+
+rng = random.Random(0)
+rounds = 0
+for attempt in range(10):
+    timeouts = [rng.randrange(150, 301) for _ in range(5)]     # randomized [150,300) ms
+    rounds += 1
+    if len(set(timeouts)) == len(timeouts):
+        break
+print(f"randomized timeouts: settled after {rounds} round(s) -> {election_round(5, timeouts)}")
+```
+
+```output
+fixed timeouts (all 150 ms): split vote among [0, 1, 2, 3, 4] -> new term, retry
+randomized timeouts: settled after 1 round(s) -> node 2 wins immediately
+```
+
+Fixed timeouts guarantee split votes forever; **randomizing the election timeout** is Raft's
+entire answer to the problem, and it is why the recommended range (150–300 ms) is wider than the
+round-trip time.
+
+## Log replication and the commit rule
+
+The leader appends a command to its log and sends `AppendEntries` to followers. An entry is
+**committed** once a majority has stored it — and only then may it be applied to the state
+machine and acknowledged to the client.
+
+```python
+class RaftLog:
+    def __init__(self, n_nodes):
+        self.n = n_nodes
+        self.logs = [[] for _ in range(n_nodes)]     # logs[0] is the leader
+        self.commit_index = -1
+
+    def append(self, term, command, replicate_to=()):
+        self.logs[0].append((term, command))
+        idx = len(self.logs[0]) - 1
+        for f in replicate_to:
+            self.logs[f] = self.logs[0][:idx + 1]
+        stored = 1 + len(replicate_to)
+        if stored > self.n // 2:
+            self.commit_index = idx
+            return f"index {idx} COMMITTED ({stored}/{self.n} replicas) -> ack the client"
+        return f"index {idx} pending ({stored}/{self.n} replicas) -> client still waiting"
+
+r = RaftLog(5)
+print(r.append(1, "SET x=1", replicate_to=(1, 2)))     # 3 of 5: majority
+print(r.append(1, "SET y=2", replicate_to=(1,)))       # 2 of 5: not yet
+print(r.append(1, "SET z=3", replicate_to=(1, 2, 3)))  # 4 of 5
+print("committed through index:", r.commit_index)
+```
+
+```output
+index 0 COMMITTED (3/5 replicas) -> ack the client
+index 1 pending (2/5 replicas) -> client still waiting
+index 2 COMMITTED (4/5 replicas) -> ack the client
+committed through index: 2
+```
+
+A client waits for a *majority*, not for everyone — that is what keeps consensus available when
+a minority is slow or dead, and it is why consensus clusters are sized 3, 5, or 7 (ch. 16).
+
+### Log divergence and how the leader repairs it
+
+A crashed leader may leave followers with extra or missing entries. The new leader never deletes
+its own entries; it forces followers to match by walking back to the last agreeing index.
+
+```python
+leader   = [(1, "a"), (1, "b"), (2, "c"), (2, "d")]
+follower = [(1, "a"), (1, "b"), (2, "x")]              # diverged at index 2
+
+def repair(leader, follower):
+    i = min(len(leader), len(follower)) - 1
+    steps = []
+    while i >= 0 and leader[i] != follower[i]:
+        steps.append(f"index {i} mismatch: follower has {follower[i]}, rewind")
+        i -= 1
+    steps.append(f"agreement at index {i}; overwrite follower from index {i+1}")
+    return follower[:i + 1] + leader[i + 1:], steps
+
+fixed, steps = repair(leader, follower)
+for s in steps: print(s)
+print("follower after repair:", fixed)
+```
+
+```output
+index 2 mismatch: follower has (2, 'x'), rewind
+agreement at index 1; overwrite follower from index 2
+follower after repair: [(1, 'a'), (1, 'b'), (2, 'c'), (2, 'd')]
+```
+
+The follower's uncommitted entry `(2, "x")` is destroyed. That is legal precisely because it was
+never committed — no client was ever told it succeeded. **Committed entries are never lost;
+uncommitted ones have no promises attached.**
+
+## Why leases are not enough (and why fencing is required)
+
+A leader usually holds a **lease**: "I am leader until $t + \Delta$", which lets it serve reads
+locally without a round trip. The catch is that a process can be paused — GC, VM migration,
+scheduler starvation — past its own lease expiry without noticing.
+
+```python
+def lease_check(now, lease_expiry, pause_s, fenced):
+    wake = now + pause_s
+    expired = wake > lease_expiry
+    if not expired:
+        return f"woke at t={wake}: lease valid, write ok"
+    if fenced:
+        return f"woke at t={wake}: lease expired at {lease_expiry}, write REJECTED by fencing token"
+    return f"woke at t={wake}: lease expired at {lease_expiry}, but write ACCEPTED -> corruption"
+
+print(lease_check(now=0, lease_expiry=10, pause_s=3,  fenced=False))
+print(lease_check(now=0, lease_expiry=10, pause_s=25, fenced=False))
+print(lease_check(now=0, lease_expiry=10, pause_s=25, fenced=True))
+```
+
+```output
+woke at t=3: lease valid, write ok
+woke at t=25: lease expired at 10, but write ACCEPTED -> corruption
+woke at t=25: lease expired at 10, write REJECTED by fencing token
+```
+
+Checking the clock before acting is not sufficient, because the pause can happen *between* the
+check and the write. The only safe construction is the one from ch. 13: the storage system
+itself rejects writes carrying an old epoch. **A lock service is only as safe as the resource's
+willingness to enforce fencing tokens.**
+
+## Paxos, Multi-Paxos, and why Raft won the tutorials
+
+```python
+comparison = [
+    ("Basic Paxos",  "agree on ONE value", "prepare(n) / promise / accept(n,v) / accepted",
+     "provably minimal, notoriously hard to turn into a system"),
+    ("Multi-Paxos",  "agree on a LOG",     "elect a stable leader, skip prepare per entry",
+     "what Chubby and Spanner actually run"),
+    ("Raft",         "agree on a LOG",     "strong leader + terms + log matching",
+     "designed for understandability; etcd, Consul, TiKV, CockroachDB"),
+]
+for name, goal, mechanism, note in comparison:
+    print(f"{name:13} goal: {goal:20} {mechanism}\n{'':13} {note}")
+```
+
+```output
+Basic Paxos   goal: agree on ONE value   prepare(n) / promise / accept(n,v) / accepted
+              provably minimal, notoriously hard to turn into a system
+Multi-Paxos   goal: agree on a LOG       elect a stable leader, skip prepare per entry
+              what Chubby and Spanner actually run
+Raft          goal: agree on a LOG       strong leader + terms + log matching
+              designed for understandability; etcd, Consul, TiKV, CockroachDB
+```
+
+The deep similarity: both protocols get safety from **quorum intersection** — any two majorities
+share a node, so a new leader always learns of anything previously committed. The difference is
+packaging. Paxos allows any node to propose at any time and reconciles afterwards; Raft forbids
+it, insisting the leader's log is authoritative, which removes cases at the cost of a little
+flexibility.
+
+## What this costs, and when to avoid it
+
+```python
+def consensus_cost(rtt_ms, ops_per_s, batch=1):
+    per_op = rtt_ms / batch                       # batching amortizes the round trip
+    print(f"rtt {rtt_ms:3} ms, batch {batch:4} -> commit latency {per_op:6.2f} ms, "
+          f"ceiling ~{1000/per_op*batch:9,.0f} ops/s per cluster")
+
+consensus_cost(1, 0, batch=1)
+consensus_cost(1, 0, batch=100)
+consensus_cost(80, 0, batch=1)
+consensus_cost(80, 0, batch=100)
+```
+
+```output
+rtt   1 ms, batch    1 -> commit latency   1.00 ms, ceiling ~    1,000 ops/s per cluster
+rtt   1 ms, batch  100 -> commit latency   0.01 ms, ceiling ~10,000,000 ops/s per cluster
+rtt  80 ms, batch    1 -> commit latency  80.00 ms, ceiling ~       12 ops/s per cluster
+rtt  80 ms, batch  100 -> commit latency   0.80 ms, ceiling ~  125,000 ops/s per cluster
+```
+
+A single consensus group is a throughput ceiling, and adding nodes makes it *slower*, not
+faster — more replicas means more messages, and the quorum is larger. The scaling answer is
+**many consensus groups**: shard the keyspace and run one Raft group per shard (CockroachDB,
+TiKV, Spanner all do this). Keep the coordinated part small, and keep everything that does not
+need agreement out of it entirely.
+
+## Try it Yourself
+
+```python
+def cluster_safety(n, failures):
+    quorum = n // 2 + 1
+    alive = n - failures
+    return (f"n={n} quorum={quorum} | {failures} node(s) down -> {alive} alive -> "
+            f"{'AVAILABLE' if alive >= quorum else 'UNAVAILABLE (no majority)'}")
+
+for n in (3, 4, 5, 7):
+    for f in range(0, n // 2 + 2):
+        print(cluster_safety(n, f))
+    print()
+```
+
+```output
+n=3 quorum=2 | 0 node(s) down -> 3 alive -> AVAILABLE
+n=3 quorum=2 | 1 node(s) down -> 2 alive -> AVAILABLE
+n=3 quorum=2 | 2 node(s) down -> 1 alive -> UNAVAILABLE (no majority)
+
+n=4 quorum=3 | 0 node(s) down -> 4 alive -> AVAILABLE
+n=4 quorum=3 | 1 node(s) down -> 3 alive -> AVAILABLE
+n=4 quorum=3 | 2 node(s) down -> 2 alive -> UNAVAILABLE (no majority)
+n=4 quorum=3 | 3 node(s) down -> 1 alive -> UNAVAILABLE (no majority)
+
+n=5 quorum=3 | 0 node(s) down -> 5 alive -> AVAILABLE
+n=5 quorum=3 | 1 node(s) down -> 4 alive -> AVAILABLE
+n=5 quorum=3 | 2 node(s) down -> 3 alive -> AVAILABLE
+n=5 quorum=3 | 3 node(s) down -> 2 alive -> UNAVAILABLE (no majority)
+
+n=7 quorum=4 | 0 node(s) down -> 7 alive -> AVAILABLE
+n=7 quorum=4 | 1 node(s) down -> 6 alive -> AVAILABLE
+n=7 quorum=4 | 2 node(s) down -> 5 alive -> AVAILABLE
+n=7 quorum=4 | 3 node(s) down -> 4 alive -> AVAILABLE
+n=7 quorum=4 | 4 node(s) down -> 3 alive -> UNAVAILABLE (no majority)
+```
+
+Compare `n=3` with `n=4`: both tolerate exactly one failure, so the fourth node adds cost, adds
+latency, and buys nothing. Then compare `n=5` and `n=7` and decide whether tolerating a third
+simultaneous failure is worth two more round trips of quorum width — for most systems it is not.
+
+## Exercise
+
+Implement the **safety check** that makes Raft correct: given a set of nodes with logs and
+terms, determine which nodes are eligible to become leader in the next term. A candidate is
+eligible only if its log is at least as up to date as a majority of the cluster — where "up to
+date" compares the last entry's term first, then the log length. Show that an ineligible node
+can never win, and explain what would break if this rule were removed.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def last_entry(log):
+    return (log[-1][0], len(log) - 1) if log else (-1, -1)
+
+def eligible(candidate_log, all_logs):
+    """A candidate wins only if a majority of nodes would grant it a vote."""
+    mine = last_entry(candidate_log)
+    grants = sum(1 for log in all_logs if mine >= last_entry(log))
+    return grants > len(all_logs) // 2, grants
+
+logs = [
+    [(1, "a"), (1, "b"), (2, "c")],     # n0: holds the committed term-2 entry
+    [(1, "a"), (1, "b"), (2, "c")],     # n1: same
+    [(1, "a"), (1, "b"), (2, "c")],     # n2: same -> 3 of 5 = committed
+    [(1, "a")],                         # n3: far behind
+    [(1, "a"), (1, "b")],               # n4: missing the term-2 entry
+]
+for i, log in enumerate(logs):
+    ok, grants = eligible(log, logs)
+    print(f"n{i} last={last_entry(log)} -> {grants}/5 votes -> "
+          f"{'CAN become leader' if ok else 'cannot win an election'}")
+
+print("\nwhat the rule protects:")
+print("  entry (2, 'c') at index 2 is stored on n0, n1, n2 = 3 of 5 -> COMMITTED, client acked")
+print("  n3 and n4 do not have it, and neither can gather a majority of votes.")
+print("  If they could, their log would overwrite index 2 on every follower")
+print("  and an acknowledged write would vanish.")
+```
+
+```output
+n0 last=(2, 2) -> 5/5 votes -> CAN become leader
+n1 last=(2, 2) -> 5/5 votes -> CAN become leader
+n2 last=(2, 2) -> 5/5 votes -> CAN become leader
+n3 last=(1, 0) -> 1/5 votes -> cannot win an election
+n4 last=(1, 1) -> 2/5 votes -> cannot win an election
+
+what the rule protects:
+  entry (2, 'c') at index 2 is stored on n0, n1, n2 = 3 of 5 -> COMMITTED, client acked
+  n3 and n4 do not have it, and neither can gather a majority of votes.
+  If they could, their log would overwrite index 2 on every follower
+  and an acknowledged write would vanish.
+```
+
+The insight: the up-to-date check is what turns *quorum intersection* into a durability
+guarantee. A committed entry lives on a majority; any winning candidate must be voted for by a
+majority; two majorities share at least one node; that shared node holds the committed entry and
+therefore refuses to vote for anyone missing it. Remove the check and the protocol still elects
+leaders happily — it just silently loses acknowledged writes, which is the worst failure mode a
+storage system can have. This is also the reason Raft never commits an entry from a *previous*
+term by counting replicas alone: the leader must first commit one entry of its own term, which
+transitively marks the earlier ones safe.
+</details>

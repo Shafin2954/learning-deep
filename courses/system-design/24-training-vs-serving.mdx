@@ -1,0 +1,360 @@
+---
+course: system-design
+chapter: 24-training-vs-serving
+title: "Training vs Serving: Batch and Online Inference"
+order: 24
+---
+
+## Two systems with opposite requirements
+
+Training and serving run the same mathematics under contradictory constraints, and almost every
+production ML problem comes from pretending they are one system.
+
+| | Training | Serving |
+|---|---|---|
+| Latency budget | hours | milliseconds |
+| Data access | whole history, random order | one entity, right now |
+| Failure | rerun the job | a user sees an error |
+| Scaling | throughput, GPU-bound | concurrency, tail-latency-bound |
+| Correctness | offline metric on a holdout | the same prediction the model was trained to make |
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+# One trained model: weights are all that crosses the boundary.
+X = rng.normal(size=(50_000, 32))
+w_true = rng.normal(size=32)
+y = X @ w_true + rng.normal(scale=0.3, size=50_000)
+w_hat = np.linalg.lstsq(X, y, rcond=None)[0]      # "training": minutes, whole dataset
+
+def predict(features):                             # "serving": microseconds, one row
+    return float(features @ w_hat)
+
+print(f"training: fit {X.shape[0]:,} rows x {X.shape[1]} features")
+print(f"weights transferred to serving: {w_hat.nbytes} bytes")
+print(f"serving one request: {predict(X[0]):+.4f} (truth {y[0]:+.4f})")
+```
+
+```output
+training: fit 50,000 rows x 32 features
+weights transferred to serving: 256 bytes
+serving one request: -5.5774 (truth -6.0028)
+```
+
+The only artifact that crosses the boundary is a few hundred bytes of weights — and everything
+that goes wrong in production is about the *features* that surround them (ch. 25), not the
+weights themselves.
+
+## Three serving modes
+
+```python
+modes = [
+    ("batch (precomputed)", "score everything nightly, store the results, serve a lookup",
+     "1 ms", "up to 24h stale", "cheap: one pass over the data"),
+    ("online (on demand)",  "run the model inside the request",
+     "5-200 ms", "perfectly fresh", "expensive: pay per request"),
+    ("streaming (near-line)","score on an event, write the result to a store",
+     "1 ms lookup", "seconds stale", "moderate: pay per event"),
+]
+for name, how, latency, freshness, cost in modes:
+    print(f"{name:22} {how}\n{'':22} serve {latency:10} freshness {freshness:16} {cost}")
+```
+
+```output
+batch (precomputed)    score everything nightly, store the results, serve a lookup
+                       serve 1 ms       freshness up to 24h stale  cheap: one pass over the data
+online (on demand)     run the model inside the request
+                       serve 5-200 ms   freshness perfectly fresh  expensive: pay per request
+streaming (near-line)  score on an event, write the result to a store
+                       serve 1 ms lookup freshness seconds stale    moderate: pay per event
+```
+
+The decision rule is short. **If the input space is small and enumerable, precompute.** A daily
+churn score for 10 million users is 10 million rows — trivially cacheable, and the model can be
+as expensive as you like. **If the input depends on the request** (a search query, a cart, a
+fraud check on this transaction), you must serve online. And if it depends on a *recent event*
+rather than the request itself, score on the event and store the result.
+
+```python
+def mode_cost(users, items, model_ms, rps, hours=24):
+    combos = users * items
+    batch_hours = combos * model_ms / 1000 / 3600
+    online_calls = rps * 3600 * hours
+    print(f"{users:>12,} x {items:>7,} = {combos:>15,} combinations | "
+          f"precompute takes {batch_hours:9,.1f} core-hours | "
+          f"online serves {online_calls:>12,} calls/day")
+
+mode_cost(10_000_000, 1, model_ms=2, rps=500)          # per-user score: enumerable
+mode_cost(10_000_000, 50_000, model_ms=2, rps=500)     # user x item: not enumerable
+```
+
+```output
+  10,000,000 x       1 =      10,000,000 combinations | precompute takes       5.6 core-hours | online serves   43,200,000 calls/day
+  10,000,000 x  50,000 = 500,000,000,000 combinations | precompute takes 277,777.8 core-hours | online serves   43,200,000 calls/day
+```
+
+Ten million user scores precompute in a few core-hours. Ten million users times fifty thousand
+items is 500 billion combinations — no amount of hardware makes that a batch job, which is why
+recommendation systems use a two-stage design: cheap **retrieval** narrows 50,000 items to 200,
+then an expensive **ranker** runs online on those 200 only.
+
+## Batching: the throughput lever, and what it costs
+
+A model that processes one row at a time wastes most of the hardware. Batching amortizes the
+per-call overhead across many rows — and adds waiting time, because the batch must fill.
+
+```python
+def throughput(batch_size, overhead_ms=0.5, per_row_ms=0.02):
+    """Per-call overhead (dispatch, memory setup, kernel launch) is paid once per batch."""
+    ms = overhead_ms + batch_size * per_row_ms
+    return batch_size / ms * 1000, ms
+
+print(f"{'batch':>7}{'rows/s':>12}{'ms/batch':>11}{'speedup':>10}")
+base, _ = throughput(1)
+for bs in (1, 8, 32, 128, 512):
+    rows_s, ms = throughput(bs)
+    print(f"{bs:>7}{rows_s:>12,.0f}{ms:>11.2f}{rows_s/base:>9.1f}x")
+```
+
+```output
+  batch      rows/s   ms/batch   speedup
+      1       1,923       0.52      1.0x
+      8      12,121       0.66      6.3x
+     32      28,070       1.14     14.6x
+    128      41,830       3.06     21.8x
+    512      47,672      10.74     24.8x
+```
+
+An order of magnitude of throughput from one parameter, and the shape is what matters: while
+the fixed overhead dominates, doubling the batch nearly doubles throughput; once the per-row
+cost dominates, the curve flattens. Real measurements on CPU and GPU follow exactly this curve,
+with GPUs having a much larger `overhead_ms` and a much smaller `per_row_ms` — which is why GPU
+serving is dreadful at batch size 1 and excellent at 128. The catch is the queue: **dynamic
+batching** collects requests for a few milliseconds before running, so every request pays that
+wait.
+
+```python
+def dynamic_batching(rps, max_batch, max_wait_ms, batch_ms_fn):
+    """Expected added latency from waiting for a batch to fill."""
+    fill_time_ms = max_batch / rps * 1000
+    wait = min(fill_time_ms, max_wait_ms)
+    compute = batch_ms_fn(max_batch if fill_time_ms <= max_wait_ms else int(rps * max_wait_ms / 1000))
+    print(f"{rps:>7,} rps | wait {wait:6.1f} ms + compute {compute:5.1f} ms "
+          f"= {wait + compute:6.1f} ms added | batch actually formed: "
+          f"{max(1, min(max_batch, int(rps * max_wait_ms / 1000))):4}")
+
+batch_ms = lambda n: 0.5 + n * 0.02
+for rps in (50, 500, 5_000, 50_000):
+    dynamic_batching(rps, max_batch=64, max_wait_ms=10, batch_ms_fn=batch_ms)
+```
+
+```output
+     50 rps | wait   10.0 ms + compute   0.5 ms =   10.5 ms added | batch actually formed:    1
+    500 rps | wait   10.0 ms + compute   0.6 ms =   10.6 ms added | batch actually formed:    5
+  5,000 rps | wait   10.0 ms + compute   1.5 ms =   11.5 ms added | batch actually formed:   50
+ 50,000 rps | wait    1.3 ms + compute   1.8 ms =    3.1 ms added | batch actually formed:   64
+```
+
+At low traffic the batch never fills, so every request pays the full 10 ms timeout for nothing —
+which is why `max_wait` should be a small fraction of your latency budget. At high traffic the
+batch fills instantly and batching is pure profit. **Batching helps exactly when you are busy**,
+which is fortunate, because that is when you need it.
+
+## The latency budget of an online prediction
+
+```python
+def serving_budget(steps):
+    total = sum(ms for _, ms in steps)
+    print(f"{'stage':26}{'ms':>7}{'share':>9}")
+    for name, ms in steps:
+        print(f"{name:26}{ms:>7.1f}{ms/total:>9.0%}")
+    print(f"{'TOTAL':26}{total:>7.1f}")
+    print(f"\nmodel arithmetic is {steps[3][1]/total:.0%} of it — everything else is plumbing")
+
+serving_budget([
+    ("network in + auth",        3.0),
+    ("fetch online features",   12.0),
+    ("preprocess / encode",      2.5),
+    ("model forward pass",       4.0),
+    ("post-process + rules",     1.5),
+    ("log the prediction",       0.5),
+    ("network out",              2.0),
+])
+```
+
+```output
+stage                          ms    share
+network in + auth             3.0      12%
+fetch online features        12.0      47%
+preprocess / encode           2.5      10%
+model forward pass            4.0      16%
+post-process + rules          1.5       6%
+log the prediction            0.5       2%
+network out                   2.0       8%
+TOTAL                        25.5
+
+model arithmetic is 16% of it — everything else is plumbing
+```
+
+Feature fetching dominates, and it is the part people forget to design. The fixes are the same
+ones from the rest of this course: cache the features (ch. 5), colocate the store with the
+service, batch the lookups into one multi-get, and precompute anything that does not depend on
+the request (ch. 25).
+
+### Caching predictions
+
+```python
+from collections import Counter
+import random
+random.seed(3)
+
+def hit_rate(distinct_inputs, requests, cache_size):
+    """Predictions are cacheable when the same input recurs — Zipf again (ch. 5)."""
+    weights = [1 / (r ** 1.1) for r in range(1, distinct_inputs + 1)]
+    reqs = random.choices(range(distinct_inputs), weights=weights, k=requests)
+    top = {k for k, _ in Counter(reqs).most_common(cache_size)}
+    hits = sum(1 for r in reqs if r in top)
+    print(f"{distinct_inputs:>9,} distinct inputs, cache of {cache_size:>6,} -> "
+          f"hit rate {hits/requests:6.1%}")
+
+hit_rate(1_000, 200_000, 200)               # a small enumerable input space
+hit_rate(1_000_000, 200_000, 10_000)        # search queries: a long tail
+hit_rate(50_000_000, 200_000, 10_000)       # per-user-per-item: essentially uncacheable
+```
+
+```output
+    1,000 distinct inputs, cache of    200 -> hit rate  84.4%
+1,000,000 distinct inputs, cache of 10,000 -> hit rate  84.1%
+50,000,000 distinct inputs, cache of 10,000 -> hit rate  76.4%
+```
+
+Prediction caching works when inputs repeat and the model is deterministic and stable. Two
+requirements people forget: the cache key must include the **model version** (ch. 26), or a
+deploy silently serves the old model's answers forever; and anything personalized has an input
+space too large to cache at all.
+
+## Cost: where the money goes
+
+```python
+def serving_cost(rps, model_ms, cores_per_instance=4, instance_usd_hour=0.20, util=0.6):
+    capacity = cores_per_instance * 1000 / model_ms * util
+    instances = max(1, int(-(-rps // capacity)))
+    monthly = instances * instance_usd_hour * 24 * 30
+    per_million = monthly / (rps * 2.6e6 / 1e6) if rps else 0
+    print(f"{rps:>7,} rps at {model_ms:5.1f} ms/pred -> {instances:4} instances | "
+          f"${monthly:9,.0f}/month | ${per_million:6.3f} per million predictions")
+
+for ms in (1, 10, 100):
+    serving_cost(2_000, ms)
+print()
+for rps in (100, 2_000, 50_000):
+    serving_cost(rps, 10)
+```
+
+```output
+  2,000 rps at   1.0 ms/pred ->    1 instances | $      144/month | $ 0.028 per million predictions
+  2,000 rps at  10.0 ms/pred ->    9 instances | $    1,296/month | $ 0.249 per million predictions
+  2,000 rps at 100.0 ms/pred ->   84 instances | $   12,096/month | $ 2.326 per million predictions
+
+    100 rps at  10.0 ms/pred ->    1 instances | $      144/month | $ 0.554 per million predictions
+  2,000 rps at  10.0 ms/pred ->    9 instances | $    1,296/month | $ 0.249 per million predictions
+ 50,000 rps at  10.0 ms/pred ->  209 instances | $   30,096/month | $ 0.232 per million predictions
+```
+
+A 10x slower model costs 10x more to serve, forever — which is why distillation, quantization,
+and a smaller architecture are *infrastructure* decisions, not research ones. Compare that
+monthly figure against the batch alternative before choosing online serving: if 95% of your
+predictions are for inputs that existed yesterday, most of that spend is avoidable.
+
+## Try it Yourself
+
+```python
+def choose(freshness_needed_s, input_space, model_ms, qps):
+    """A decision procedure you can actually apply in a design review."""
+    enumerable = input_space <= 100_000_000
+    precompute_hours = input_space * model_ms / 1000 / 3600
+    if enumerable and freshness_needed_s > 3600 and precompute_hours < 12:
+        choice = f"BATCH: precompute in {precompute_hours:.1f} core-hours, serve a lookup"
+    elif freshness_needed_s > 10 and enumerable:
+        choice = "STREAMING: score on the event, store the result, serve a lookup"
+    else:
+        choice = f"ONLINE: {qps:,} qps x {model_ms} ms — budget for it"
+    print(f"space {input_space:>13,} | freshness {freshness_needed_s:>7,}s | {choice}")
+
+choose(freshness_needed_s=86_400, input_space=10_000_000, model_ms=2,  qps=500)
+choose(freshness_needed_s=60,     input_space=10_000_000, model_ms=2,  qps=500)
+choose(freshness_needed_s=0,      input_space=10**12,     model_ms=15, qps=3_000)
+choose(freshness_needed_s=86_400, input_space=10**9,      model_ms=50, qps=100)
+```
+
+```output
+space    10,000,000 | freshness  86,400s | BATCH: precompute in 5.6 core-hours, serve a lookup
+space    10,000,000 | freshness      60s | STREAMING: score on the event, store the result, serve a lookup
+space 1,000,000,000,000 | freshness       0s | ONLINE: 3,000 qps x 15 ms — budget for it
+space 1,000,000,000 | freshness  86,400s | ONLINE: 100 qps x 50 ms — budget for it
+```
+
+The fourth case is the interesting one: enumerable in principle, but 13,000 core-hours of
+precompute means the "cheap" option is not cheap. Change `model_ms` to 5 and it flips. This is
+the calculation to do *before* the architecture diagram, not after.
+
+## Exercise
+
+You are serving a fraud model on payment authorizations: 3,000 requests per second at peak, a
+150 ms end-to-end budget, and the model takes 8 ms per row alone but 0.4 ms per row in batches
+of 32. Feature lookups take 20 ms. Design the serving path and compute: the number of instances
+needed with and without dynamic batching, the p99 latency of each, and what happens to both when
+the feature store's p99 rises to 200 ms.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def design(rps, per_row_ms, batch_row_ms, batch_size, feature_ms, budget_ms,
+           max_wait_ms=5, cores=8, util=0.6):
+    # --- no batching ---
+    cap_single = cores * 1000 / per_row_ms * util
+    inst_single = max(1, int(-(-rps // cap_single)))
+    lat_single = feature_ms + per_row_ms
+
+    # --- dynamic batching ---
+    fill_ms = batch_size / rps * 1000
+    wait = min(fill_ms, max_wait_ms)
+    formed = min(batch_size, max(1, int(rps * max_wait_ms / 1000)))
+    batch_compute = batch_row_ms * formed
+    cap_batched = cores * 1000 / (batch_compute / formed) * util
+    inst_batched = max(1, int(-(-rps // cap_batched)))
+    lat_batched = feature_ms + wait + batch_compute
+
+    print(f"feature store p99 {feature_ms:5.1f} ms")
+    print(f"  no batching : {inst_single:4} instances | p99 ~{lat_single:6.1f} ms | "
+          f"{'FITS' if lat_single < budget_ms else 'OVER BUDGET'}")
+    print(f"  batched({formed:3}): {inst_batched:4} instances | p99 ~{lat_batched:6.1f} ms | "
+          f"{'FITS' if lat_batched < budget_ms else 'OVER BUDGET'}")
+
+design(3_000, per_row_ms=8, batch_row_ms=0.4, batch_size=32, feature_ms=20, budget_ms=150)
+print()
+design(3_000, per_row_ms=8, batch_row_ms=0.4, batch_size=32, feature_ms=200, budget_ms=150)
+```
+
+```output
+feature store p99  20.0 ms
+  no batching :    5 instances | p99 ~  28.0 ms | FITS
+  batched( 15):    1 instances | p99 ~  31.0 ms | FITS
+
+feature store p99 200.0 ms
+  no batching :    5 instances | p99 ~ 208.0 ms | OVER BUDGET
+  batched( 15):    1 instances | p99 ~ 211.0 ms | OVER BUDGET
+```
+
+The insight: batching cuts the fleet fivefold and *adds* only three milliseconds of latency,
+because at 3,000 rps a batch of 15 forms inside the 5 ms window — the queue is never the problem
+when you are busy. But look at the second block: when the feature store degrades to
+200 ms, both designs blow the budget identically, because **the model was never the bottleneck**.
+That is the general lesson of this chapter. Model latency is the part everyone optimizes and
+rarely the part that fails; the feature fetch is a network call to a stateful system, which
+means it needs the timeout, the circuit breaker, the bulkhead, and the fallback from ch. 22 —
+and a defined answer to "what do we predict when features are unavailable?" (usually: a
+conservative default, and never a silent zero, which the model will read as a meaningful value).
+</details>

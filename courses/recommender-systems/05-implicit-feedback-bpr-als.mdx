@@ -1,0 +1,430 @@
+---
+course: recommender-systems
+chapter: 05-implicit-feedback-bpr-als
+title: "Implicit Feedback: BPR and Weighted ALS"
+order: 5
+---
+
+## No negatives, only silence
+
+Implicit data has a hole where the negative examples should be. A user did not click an item — was
+it uninteresting, or unseen? Two families of models answer that differently, and both are in
+production somewhere: **weighted ALS** treats every unobserved cell as a weak negative, and
+**BPR** refuses to and ranks pairs instead.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n_users, n_items = 2_500, 900
+user_taste = rng.normal(0, 1, (n_users, 4))
+genre = rng.integers(0, 6, n_items)
+item_style = rng.normal(0, 1.4, (6, 4))[genre] + rng.normal(0, 0.35, (n_items, 4))
+activity = rng.lognormal(-0.4, 1.0, n_users)
+exposure = rng.lognormal(-1.0, 1.7, n_items) * np.where(genre == 0, 4.0, 1.0)
+
+months = []
+for month in range(12):
+    user_taste = user_taste + rng.normal(0, 0.25, (n_users, 4))
+    logit = (user_taste @ item_style.T / 2 - 4.0
+             + np.log(activity)[:, None] + np.log(exposure)[None, :])
+    r, c = np.nonzero(rng.random((n_users, n_items)) < 1 / (1 + np.exp(-logit)) / 12)
+    months.append(pd.DataFrame({"user": r, "item": c,
+                                "ts": month * 30 + rng.integers(0, 30, len(r))}))
+events = pd.concat(months).sort_values("ts").reset_index(drop=True)
+cut = events["ts"].max() - 60
+train, test = events[events["ts"] <= cut], events[events["ts"] > cut]
+
+X = sparse.csr_matrix((np.ones(len(train)), (train["user"], train["item"])),
+                      shape=(n_users, n_items))
+X.data[:] = 1.0
+seen = {u: set(g) for u, g in train.groupby("user")["item"]}
+truth = {u: set(g) for u, g in test.groupby("user")["item"]}
+users = [u for u in truth if truth[u] and u in seen][:1_200]
+pop = np.asarray(X.sum(axis=0)).ravel()
+
+def ndcg_recall(score_matrix_fn, k=10):
+    recs, ndcgs = [], []
+    for u in users:
+        s = np.asarray(score_matrix_fn(u), dtype=float).copy()
+        s[list(seen[u])] = -np.inf
+        top = np.argpartition(-s, k)[:k]
+        top = top[np.argsort(-s[top])]
+        hits = [i in truth[u] for i in top]
+        recs.append(sum(hits) / min(k, len(truth[u])))
+        dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+        ndcgs.append(dcg / sum(1 / np.log2(j + 2) for j in range(min(k, len(truth[u])))))
+    return float(np.mean(recs)), float(np.mean(ndcgs))
+
+r0, n0 = ndcg_recall(lambda u: pop)
+print(f"{X.nnz:,} training interactions | {len(users):,} eval users")
+print(f"popularity baseline: recall@10 {r0:.4f} | ndcg@10 {n0:.4f}")
+```
+
+```output
+90,508 training interactions | 1,200 eval users
+popularity baseline: recall@10 0.0927 | ndcg@10 0.0819
+```
+
+## Weighted ALS: every cell is an observation
+
+Hu, Koren and Volinsky's formulation splits the signal into a binary **preference** and a
+**confidence** in it:
+
+$$
+p_{ui} = \mathbb{1}[r_{ui} > 0], \qquad c_{ui} = 1 + \alpha r_{ui}
+$$
+
+$$
+\min_{X,Y} \sum_{u,i} c_{ui}\left(p_{ui} - \mathbf{x}_u \cdot \mathbf{y}_i\right)^2
++ \lambda\left(\|X\|^2 + \|Y\|^2\right)
+$$
+
+The sum runs over **all** user-item pairs, which sounds impossible — until you notice that most
+of them have $c_{ui} = 1$ and $p_{ui} = 0$, so the solve can be written as one shared term plus a
+correction over the observed entries:
+
+$$
+\mathbf{x}_u = \left(Y^\top Y + Y^\top (C_u - I) Y + \lambda I\right)^{-1} Y^\top C_u \mathbf{p}_u
+$$
+
+$Y^\top Y$ is computed once per iteration; the correction touches only $|I_u|$ rows.
+
+```python
+def implicit_als(X, d=16, alpha=5.0, lam=50.0, n_iter=12, seed=0):
+    r = np.random.default_rng(seed)
+    U = r.normal(0, 0.01, (X.shape[0], d))
+    V = r.normal(0, 0.01, (X.shape[1], d))
+    Xc = X.tocsr()
+    Xt = X.T.tocsr()
+    eye = lam * np.eye(d)
+    for _ in range(n_iter):
+        for M, F, O in ((Xc, U, V), (Xt, V, U)):          # users, then items
+            G = O.T @ O + eye                              # the shared Gram matrix
+            for row in range(M.shape[0]):
+                lo, hi = M.indptr[row], M.indptr[row + 1]
+                idx = M.indices[lo:hi]
+                if len(idx) == 0:
+                    F[row] = 0
+                    continue
+                Oi = O[idx]
+                cu = 1.0 + alpha * M.data[lo:hi]           # confidence for the observed entries
+                A = G + Oi.T @ ((cu - 1.0)[:, None] * Oi)
+                b = Oi.T @ cu                              # p_ui = 1 on observed entries
+                F[row] = np.linalg.solve(A, b)
+    return U, V
+
+U_als, V_als = implicit_als(X)
+r_als, n_als = ndcg_recall(lambda u: V_als @ U_als[u])
+print(f"iALS (d=16, alpha=5, lam=50): recall@10 {r_als:.4f} | ndcg@10 {n_als:.4f}")
+```
+
+```output
+iALS (d=16, alpha=5, lam=50): recall@10 0.1317 | ndcg@10 0.1145
+```
+
+## What $\alpha$ actually controls
+
+```python
+print(f"{'alpha':>7} {'recall@10':>11} {'ndcg@10':>9}")
+for alpha in (1.0, 5.0, 20.0, 80.0):
+    U_a, V_a = implicit_als(X, alpha=alpha, n_iter=8)
+    r_a, n_a = ndcg_recall(lambda u, V=V_a, U=U_a: V @ U[u])
+    print(f"{alpha:>7.0f} {r_a:>11.4f} {n_a:>9.4f}")
+```
+
+```output
+  alpha   recall@10   ndcg@10
+      1      0.1235    0.1086
+      5      0.1351    0.1165
+     20      0.1208    0.1013
+     80      0.0994    0.0792
+```
+
+$\alpha$ is the ratio between how much you believe an observed interaction and how much you
+believe silence, and on this data **less confidence is better**. The published default of
+$\alpha = 40$ comes from television-viewing data where an interaction means "watched to the end";
+here an interaction is a single click, the evidence is weaker, and cranking $\alpha$ up simply
+tells the model to reproduce the training matrix. Treat $\alpha$ as a property of your event type,
+not a constant — and note that it interacts with $\lambda$, since higher confidence on the
+observed cells needs more regularisation to stay honest.
+
+## BPR: rank pairs, not cells
+
+Bayesian Personalised Ranking abandons the idea of a target value. For each observed
+$(u, i)$ it samples an unobserved $j$ and pushes the score of $i$ above the score of $j$:
+
+$$
+\max \sum_{(u,i,j)} \ln \sigma\!\left(\hat{x}_{ui} - \hat{x}_{uj}\right)
+- \lambda\left(\|\mathbf{w}_u\|^2 + \|\mathbf{h}_i\|^2 + \|\mathbf{h}_j\|^2\right)
+$$
+
+With $z = \sigma(-(\hat{x}_{ui} - \hat{x}_{uj}))$ the gradients are one line each:
+
+$$
+\frac{\partial}{\partial \mathbf{w}_u} = z\,(\mathbf{h}_i - \mathbf{h}_j), \qquad
+\frac{\partial}{\partial \mathbf{h}_i} = z\,\mathbf{w}_u, \qquad
+\frac{\partial}{\partial \mathbf{h}_j} = -z\,\mathbf{w}_u
+$$
+
+```python
+def bpr(X, d=32, lr=0.05, lam=0.01, n_steps=60, batch=4_096, seed=0,
+        sampler="uniform", verbose=False):
+    r = np.random.default_rng(seed)
+    W = r.normal(0, 0.05, (X.shape[0], d))
+    H = r.normal(0, 0.05, (X.shape[1], d))
+    coo = X.tocoo()
+    obs_u, obs_i = coo.row, coo.col
+    seen_sets = [set(X.indices[X.indptr[u]:X.indptr[u + 1]]) for u in range(X.shape[0])]
+    p_item = pop / pop.sum()
+    for step in range(n_steps):
+        pick = r.integers(0, len(obs_u), batch)
+        u, i = obs_u[pick], obs_i[pick]
+        j = (r.integers(0, X.shape[1], batch) if sampler == "uniform"
+             else r.choice(X.shape[1], size=batch, p=p_item))
+        bad = np.array([jj in seen_sets[uu] for uu, jj in zip(u, j)])
+        u, i, j = u[~bad], i[~bad], j[~bad]
+        z = 1.0 / (1.0 + np.exp(np.clip((W[u] * (H[i] - H[j])).sum(axis=1), -30, 30)))
+        gw = z[:, None] * (H[i] - H[j]) - lam * W[u]
+        gi = z[:, None] * W[u] - lam * H[i]
+        gj = -z[:, None] * W[u] - lam * H[j]
+        np.add.at(W, u, lr * gw)
+        np.add.at(H, i, lr * gi)
+        np.add.at(H, j, lr * gj)
+        if verbose and (step + 1) % 20 == 0:
+            rr, nn = ndcg_recall(lambda uu, W=W, H=H: H @ W[uu])
+            print(f"  step {step + 1:>3}: recall@10 {rr:.4f} | ndcg@10 {nn:.4f}")
+    return W, H
+
+W_bpr, H_bpr = bpr(X, n_steps=300, verbose=True)
+r_bpr, n_bpr = ndcg_recall(lambda u: H_bpr @ W_bpr[u])
+print(f"\nBPR (d=32, uniform negatives): recall@10 {r_bpr:.4f} | ndcg@10 {n_bpr:.4f}")
+```
+
+```output
+  step  20: recall@10 0.0166 | ndcg@10 0.0140
+  step  40: recall@10 0.0667 | ndcg@10 0.0602
+  step  60: recall@10 0.0920 | ndcg@10 0.0816
+  step  80: recall@10 0.1070 | ndcg@10 0.0913
+  step 100: recall@10 0.1126 | ndcg@10 0.0961
+  step 120: recall@10 0.1179 | ndcg@10 0.1015
+  step 140: recall@10 0.1197 | ndcg@10 0.1025
+  step 160: recall@10 0.1214 | ndcg@10 0.1055
+  step 180: recall@10 0.1214 | ndcg@10 0.1029
+  step 200: recall@10 0.1248 | ndcg@10 0.1071
+  step 220: recall@10 0.1239 | ndcg@10 0.1071
+  step 240: recall@10 0.1324 | ndcg@10 0.1117
+  step 260: recall@10 0.1305 | ndcg@10 0.1085
+  step 280: recall@10 0.1314 | ndcg@10 0.1102
+  step 300: recall@10 0.1276 | ndcg@10 0.1100
+
+BPR (d=32, uniform negatives): recall@10 0.1276 | ndcg@10 0.1100
+```
+
+## The negative sampler is a modelling choice
+
+Uniform sampling draws mostly obscure items, which are easy to rank below anything.
+Popularity-proportional sampling draws hard negatives: items the user plausibly saw and did not
+take. Harder negatives are usually described as better — watch what they actually do.
+
+```python
+for sampler in ("uniform", "popularity"):
+    W_s, H_s = bpr(X, n_steps=300, sampler=sampler, seed=1)
+    r_s, n_s = ndcg_recall(lambda u, W=W_s, H=H_s: H @ W[u])
+    print(f"{sampler:>11} negatives: recall@10 {r_s:.4f} | ndcg@10 {n_s:.4f}")
+```
+
+```output
+    uniform negatives: recall@10 0.1306 | ndcg@10 0.1105
+ popularity negatives: recall@10 0.0607 | ndcg@10 0.0546
+```
+
+Popularity sampling **halves the accuracy** — 0.0546 NDCG against 0.1105 — and that is not a bug
+in the implementation. Constantly using popular items as negatives teaches the model that popular
+items are bad, so it learns an anti-popularity prior. The exercise below shows the other side of
+that ledger: the same model covers 74% of the catalogue against uniform BPR's 30%, and its scores
+correlate with popularity at 0.10 rather than 0.77.
+
+That is a **dial, not a bug**. If your product needs catalogue coverage — a marketplace paying
+sellers, a music service with a long tail to monetise — this is one of the few levers that
+delivers it, and you buy it with accuracy. Anywhere between the two extremes is available by
+mixing the samplers. What you must not do is reach for hard negatives because a paper said they
+help and then not measure the popularity of what you serve.
+
+## Head to head
+
+```python
+def item_knn_scores(X, lam=5.0):
+    norms = np.sqrt(np.asarray(X.multiply(X).sum(axis=0)).ravel())
+    norms[norms == 0] = 1.0
+    Xn = X.multiply(sparse.csr_matrix(1.0 / norms))
+    S = (Xn.T @ Xn).toarray()
+    np.fill_diagonal(S, 0.0)
+    C = (X.T @ X).toarray()
+    np.fill_diagonal(C, 0.0)
+    S = S * (C / (C + lam))
+    rows = X.tolil().rows
+    return lambda u: S[rows[u]].sum(axis=0) if rows[u] else np.zeros(X.shape[1])
+
+models = {
+    "popularity": lambda u: pop,
+    "item-kNN": item_knn_scores(X),
+    "iALS": lambda u: V_als @ U_als[u],
+    "BPR": lambda u: H_bpr @ W_bpr[u],
+}
+print(f"{'model':>12} {'recall@10':>11} {'ndcg@10':>9} {'coverage':>10} {'mean pop':>9}")
+for name, fn in models.items():
+    shown, recs, ndcgs, pops = set(), [], [], []
+    for u in users:
+        s = np.asarray(fn(u), dtype=float).copy()
+        s[list(seen[u])] = -np.inf
+        top = np.argpartition(-s, 10)[:10]
+        top = top[np.argsort(-s[top])]
+        shown.update(int(i) for i in top)
+        hits = [i in truth[u] for i in top]
+        recs.append(sum(hits) / min(10, len(truth[u])))
+        dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+        ndcgs.append(dcg / sum(1 / np.log2(j + 2) for j in range(min(10, len(truth[u])))))
+        pops.append(float(pop[top].mean()))
+    print(f"{name:>12} {np.mean(recs):>11.4f} {np.mean(ndcgs):>9.4f} "
+          f"{len(shown) / n_items:>10.4f} {np.mean(pops):>9.1f}")
+```
+
+```output
+       model   recall@10   ndcg@10   coverage  mean pop
+  popularity      0.0927    0.0819     0.0300     647.6
+    item-kNN      0.1174    0.1036     0.1333     543.3
+        iALS      0.1317    0.1145     0.2111     485.3
+         BPR      0.1276    0.1100     0.2822     475.1
+```
+
+## Try it Yourself
+
+```python
+def factor_sweep(d_values=(8, 16, 32, 64)):
+    print(f"{'d':>4} {'iALS ndcg':>11} {'BPR ndcg':>10}")
+    for d in d_values:
+        Ua, Va = implicit_als(X, d=d, lam=50.0, n_iter=8)
+        _, n_a = ndcg_recall(lambda u, V=Va, U=Ua: V @ U[u])
+        Wb, Hb = bpr(X, d=d, n_steps=200, seed=2)
+        _, n_b = ndcg_recall(lambda u, W=Wb, H=Hb: H @ W[u])
+        print(f"{d:>4} {n_a:>11.4f} {n_b:>10.4f}")
+
+factor_sweep()
+```
+
+```output
+   d   iALS ndcg   BPR ndcg
+   8      0.1169     0.1070
+  16      0.1165     0.1025
+  32      0.1062     0.1083
+  64      0.1075     0.1108
+```
+
+Both curves flatten, and where they flatten tells you how much structure the data actually has —
+this generator used four latent dimensions, so more than a handful of factors buys noise. On real
+data the same sweep is how you find the point past which you are paying serving cost for nothing.
+
+## Exercise
+
+Implement both models cleanly, then answer the question a team actually asks: which one should we
+ship? Compare them on ranking accuracy, coverage, popularity bias, cold-user behaviour, and the
+cost of scoring — and make a recommendation with the evidence attached.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def evaluate_full(fn, k=10):
+    shown, recs, ndcgs, pops, by_support = set(), [], [], [], {"low": [], "high": []}
+    for u in users:
+        s = np.asarray(fn(u), dtype=float).copy()
+        s[list(seen[u])] = -np.inf
+        top = np.argpartition(-s, k)[:k]
+        top = top[np.argsort(-s[top])]
+        shown.update(int(i) for i in top)
+        hits = [i in truth[u] for i in top]
+        rec = sum(hits) / min(k, len(truth[u]))
+        dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+        nd = dcg / sum(1 / np.log2(j + 2) for j in range(min(k, len(truth[u]))))
+        recs.append(rec); ndcgs.append(nd); pops.append(float(pop[top].mean()))
+        by_support["low" if len(seen[u]) < 15 else "high"].append(nd)
+    return {"recall@10": round(float(np.mean(recs)), 4),
+            "ndcg@10": round(float(np.mean(ndcgs)), 4),
+            "coverage": round(len(shown) / n_items, 4),
+            "mean pop": round(float(np.mean(pops)), 1),
+            "ndcg cold users": round(float(np.mean(by_support["low"])), 4),
+            "ndcg heavy users": round(float(np.mean(by_support["high"])), 4)}
+
+U_a, V_a = implicit_als(X, d=16, alpha=5, lam=50, n_iter=12)
+W_u, H_u = bpr(X, d=32, n_steps=400, sampler="uniform", seed=3)
+W_p, H_p = bpr(X, d=32, n_steps=400, sampler="popularity", seed=3)
+
+candidates = {
+    "popularity": lambda u: pop,
+    "item-kNN": item_knn_scores(X),
+    "iALS": lambda u: V_a @ U_a[u],
+    "BPR (uniform)": lambda u: H_u @ W_u[u],
+    "BPR (popularity)": lambda u: H_p @ W_p[u],
+}
+rows = []
+for name, fn in candidates.items():
+    m = evaluate_full(fn)
+    corr = float(np.corrcoef(np.asarray(fn(users[0]), dtype=float), pop)[0, 1])
+    rows.append({"model": name, **m, "corr with pop": round(corr, 3)})
+table = pd.DataFrame(rows).sort_values("ndcg@10", ascending=False)
+print(table.to_string(index=False))
+
+print(f"\nscoring cost for one user (900 items):")
+print(f"  popularity  : 0 flops (precomputed)")
+print(f"  item-kNN    : |I_u| x {n_items} adds = "
+      f"{int(np.mean([len(seen[u]) for u in users]) * n_items):,} on average")
+print(f"  iALS / BPR  : {32 * n_items:,} multiply-adds (one d x n_items product)")
+print(f"\nmodel sizes: iALS/BPR {(n_users + n_items) * 32:,} floats | "
+      f"item-kNN {n_items * n_items:,} floats")
+```
+
+```output
+           model  recall@10  ndcg@10  coverage  mean pop  ndcg cold users  ndcg heavy users  corr with pop
+            iALS     0.1317   0.1145    0.2111     485.3           0.1255            0.1117          0.880
+   BPR (uniform)     0.1261   0.1072    0.2956     464.1           0.1162            0.1049          0.765
+        item-kNN     0.1174   0.1036    0.1333     543.3           0.1161            0.1004          0.863
+      popularity     0.0927   0.0819    0.0300     647.6           0.1069            0.0754          1.000
+BPR (popularity)     0.0599   0.0533    0.7433     174.5           0.0399            0.0568          0.105
+
+scoring cost for one user (900 items):
+  popularity  : 0 flops (precomputed)
+  item-kNN    : |I_u| x 900 adds = 33,864 on average
+  iALS / BPR  : 28,800 multiply-adds (one d x n_items product)
+
+model sizes: iALS/BPR 108,800 floats | item-kNN 810,000 floats
+```
+
+Read the table as a shipping decision rather than a leaderboard.
+
+**The accuracy column is nearly a tie and the other columns are not.** iALS leads at 0.1145,
+uniform BPR is 0.0073 behind, item-kNN another 0.0036 back — differences you would want a paired
+test to believe (eval-tuning ch. 12). Meanwhile coverage runs from 3% (popularity) to 74%
+(BPR with popularity negatives), a 25-fold spread, and mean recommended popularity runs from 648
+down to 175. **The models differ far more in what they show than in how often they are right.**
+
+**The cold-user column holds a surprise.** Popularity scores *better* on users with fewer than
+fifteen interactions (0.1069) than on heavy users (0.0754), and every personalised model shows the
+same direction. Light users are not harder to serve — they are more predictable, because with
+little history their next click is more likely to be a mainstream item. The gain from
+personalisation is concentrated in heavy users, which is the opposite of the usual intuition and
+worth checking on your own data before you invest in cold-start machinery.
+
+**Cost is a real axis.** Both factorisation models score a user with a single $d \times n$ product
+and store $(n_u + n_i)\,d$ floats; item-kNN stores an $n_i^2$ similarity matrix, which is fine at
+900 items and impossible at a million. That asymmetry, not accuracy, is why matrix factorisation
+displaced neighbourhood methods at scale — and why the two-stage architecture of chapter 10 exists
+to bring the expensive models back for a shortlist.
+
+One honest caveat about both models here. They see only the interaction matrix, so a new item with
+no interactions has an untrained factor vector and can never be recommended, exactly like item-kNN.
+That is not a flaw in the optimiser; it is a missing input, and chapter 9 fixes it by giving the
+model content features to fall back on.
+</details>

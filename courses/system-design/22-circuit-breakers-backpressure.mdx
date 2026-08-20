@@ -1,0 +1,422 @@
+---
+course: system-design
+chapter: 22-circuit-breakers-backpressure
+title: "Circuit Breakers, Bulkheads, and Backpressure"
+order: 22
+---
+
+## Cascading failure: how one slow dependency takes down everything
+
+A dependency slows from 20 ms to 2 s. Your threads or connections stay occupied 100x longer, the
+pool fills, requests that need *other* dependencies queue behind them, and a service that was
+only 5% dependent on the slow thing is now entirely down.
+
+```python
+def pool_saturation(pool_size, rps, share_slow, normal_ms, slow_ms):
+    """Little's law: concurrency = arrival rate x holding time."""
+    normal_conc = rps * (1 - share_slow) * normal_ms / 1000
+    slow_conc   = rps * share_slow * slow_ms / 1000
+    total = normal_conc + slow_conc
+    print(f"slow calls {share_slow:4.0%} at {slow_ms:5} ms -> concurrency needed "
+          f"{total:7.1f} (pool {pool_size}) "
+          f"{'OK' if total <= pool_size else 'SATURATED: healthy requests now queue'}")
+
+for slow_ms in (20, 200, 2000):
+    pool_saturation(pool_size=100, rps=1000, share_slow=0.05, normal_ms=20, slow_ms=slow_ms)
+```
+
+```output
+slow calls   5% at    20 ms -> concurrency needed    20.0 (pool 100) OK
+slow calls   5% at   200 ms -> concurrency needed    29.0 (pool 100) OK
+slow calls   5% at  2000 ms -> concurrency needed   119.0 (pool 100) SATURATED: healthy requests now queue
+```
+
+Five percent of traffic, slowed 100x, consumed the entire pool. Everything in this chapter is a
+defence against that one mechanism, and they compose: **timeouts** bound the damage per call,
+**bulkheads** contain it to one pool, **circuit breakers** stop calling the failed thing, and
+**backpressure** pushes the problem back to the caller instead of absorbing it.
+
+## Timeouts: the first and most-often-missing defence
+
+| Timeout choice | What it does to you |
+|---|---|
+| none | the OS TCP timeout applies: two minutes or more, effectively infinite |
+| longer than user patience | holds a pool slot long after the user has left |
+| p99.9 plus margin | the correct default: it fires only on genuine outliers |
+| below p99 | fails healthy requests and manufactures retry load (ch. 21) |
+
+```python
+p99_9, budget = 180, 300
+print(f"measured p99.9 {p99_9} ms, user budget {budget} ms -> "
+      f"set the request timeout to {min(int(p99_9 * 1.5), budget)} ms")
+print("set a CONNECT timeout separately (much shorter: 100-200 ms) —")
+print("a connect that hangs means the host is gone, not that the work is slow")
+```
+
+```output
+measured p99.9 180 ms, user budget 300 ms -> set the request timeout to 270 ms
+set a CONNECT timeout separately (much shorter: 100-200 ms) —
+a connect that hangs means the host is gone, not that the work is slow
+```
+
+Every client library has a default timeout, and the default is almost always wrong: either
+absent or measured in minutes. Auditing timeouts across a service's dependencies is the single
+highest-value hour of reliability work available.
+
+## The circuit breaker
+
+A breaker watches the failure rate of one dependency and, past a threshold, **stops sending
+calls at all** — failing instantly instead of waiting for a timeout. After a cooldown it lets a
+few probes through to see whether the dependency recovered.
+
+```python
+class CircuitBreaker:
+    def __init__(self, threshold=0.5, window=20, cooldown=5.0, probes=3):
+        self.threshold, self.window, self.cooldown, self.probes = threshold, window, cooldown, probes
+        self.results, self.state, self.opened_at, self.half_ok = [], "closed", None, 0
+
+    def _rate(self):
+        return (self.results.count(False) / len(self.results)) if self.results else 0.0
+
+    def allow(self, now):
+        if self.state == "open":
+            if now - self.opened_at >= self.cooldown:
+                self.state, self.half_ok = "half-open", 0
+            else:
+                return False, "fail fast (open)"
+        return True, f"call ({self.state})"
+
+    def record(self, ok, now):
+        self.results = (self.results + [ok])[-self.window:]
+        if self.state == "half-open":
+            if not ok:
+                self.state, self.opened_at, self.results = "open", now, []
+                return "probe failed -> OPEN again"
+            self.half_ok += 1
+            if self.half_ok >= self.probes:
+                self.state, self.results = "closed", []      # forget the outage's failures
+                return "probes passed -> CLOSED"
+            return f"probe {self.half_ok}/{self.probes} ok"
+        if self.state == "closed" and len(self.results) >= 10 and self._rate() > self.threshold:
+            self.state, self.opened_at = "open", now
+            return f"failure rate {self._rate():.0%} > {self.threshold:.0%} -> OPEN"
+        return f"{self.state} (failure rate {self._rate():.0%})"
+
+cb = CircuitBreaker()
+now = 0.0
+for i in range(14):                       # dependency is failing
+    allowed, why = cb.allow(now)
+    note = cb.record(False, now) if allowed else "skipped"
+    print(f"t={now:4.1f} {why:18} {note}")
+    now += 0.5
+```
+
+```output
+t= 0.0 call (closed)      closed (failure rate 100%)
+t= 0.5 call (closed)      closed (failure rate 100%)
+t= 1.0 call (closed)      closed (failure rate 100%)
+t= 1.5 call (closed)      closed (failure rate 100%)
+t= 2.0 call (closed)      closed (failure rate 100%)
+t= 2.5 call (closed)      closed (failure rate 100%)
+t= 3.0 call (closed)      closed (failure rate 100%)
+t= 3.5 call (closed)      closed (failure rate 100%)
+t= 4.0 call (closed)      closed (failure rate 100%)
+t= 4.5 call (closed)      failure rate 100% > 50% -> OPEN
+t= 5.0 fail fast (open)   skipped
+t= 5.5 fail fast (open)   skipped
+t= 6.0 fail fast (open)   skipped
+t= 6.5 fail fast (open)   skipped
+```
+
+Look at what happened after the tenth call: the breaker opened and every subsequent call
+returned **instantly** instead of burning a timeout. That is the point — a breaker does not fix
+the dependency, it stops your service from dying alongside it, and it frees the pool for
+requests that do not need the broken thing.
+
+```python
+now = 10.0                                 # more than one cooldown after it opened
+for i in range(4):                         # the dependency has recovered
+    allowed, why = cb.allow(now)
+    note = cb.record(True, now) if allowed else "skipped"
+    print(f"t={now:5.1f} {why:18} {note}")
+    now += 0.2
+```
+
+```output
+t= 10.0 call (half-open)   probe 1/3 ok
+t= 10.2 call (half-open)   probe 2/3 ok
+t= 10.4 call (half-open)   probes passed -> CLOSED
+t= 10.6 call (closed)      closed (failure rate 0%)
+```
+
+Three states, and each exists for a reason: **closed** (normal, counting failures), **open** (fail
+fast, protect both sides), **half-open** (one careful probe — because slamming a recovering
+dependency with full traffic re-opens the breaker immediately).
+
+### What to count, and the fallback question
+
+```python
+policies = [
+    ("count timeouts and 5xx",   "yes — these mean the dependency is unhealthy"),
+    ("count 4xx",                "no — a 400 is your bug, not their outage (ch. 21)"),
+    ("count slow-but-successful","yes, above a latency threshold: slow is the real killer"),
+]
+for what, verdict in policies:
+    print(f"{what:28} {verdict}")
+
+def fallback(dependency, breaker_open):
+    plans = {
+        "recommendations": "serve a static popular-items list",
+        "user avatar":     "serve a default image",
+        "fraud check":     "FAIL THE REQUEST — never fall back to 'approved'",
+        "price lookup":    "serve the last cached price, marked stale",
+    }
+    return f"{dependency:16} breaker open -> {plans[dependency]}" if breaker_open else "ok"
+
+print()
+for d in ("recommendations", "user avatar", "fraud check", "price lookup"):
+    print(fallback(d, True))
+```
+
+```output
+count timeouts and 5xx       yes — these mean the dependency is unhealthy
+count 4xx                    no — a 400 is your bug, not their outage (ch. 21)
+count slow-but-successful    yes, above a latency threshold: slow is the real killer
+
+recommendations  breaker open -> serve a static popular-items list
+user avatar      breaker open -> serve a default image
+fraud check      breaker open -> FAIL THE REQUEST — never fall back to 'approved'
+price lookup     breaker open -> serve the last cached price, marked stale
+```
+
+A breaker forces you to answer "what do we do without this?" for every dependency — and
+sometimes the honest answer is *fail*, because a fallback that silently approves fraud is worse
+than an error page.
+
+## Bulkheads: contain the damage
+
+Named after ship compartments: partition your resources so one flooded compartment cannot sink
+the vessel. In practice, a separate connection pool, thread pool, or concurrency limit per
+dependency.
+
+```python
+def with_bulkheads(pool_total, deps, rps, latency_ms, isolated):
+    need = {d: rps[d] * latency_ms[d] / 1000 for d in deps}    # Little's law, per dependency
+    total = sum(need.values())
+    print(f"{'dependency':14}{'rps':>7}{'ms':>7}{'concurrency':>13}{'limit':>8}  status")
+    for d in deps:
+        limit = pool_total // len(deps) if isolated else pool_total
+        if isolated:
+            status = "ok" if need[d] <= limit else "throttled HERE ONLY"
+        else:
+            status = "ok" if total <= pool_total else "POOL EXHAUSTED — everyone queues"
+        print(f"{d:14}{rps[d]:>7}{latency_ms[d]:>7}{need[d]:>13.1f}{limit:>8}  {status}")
+    print(f"{'TOTAL':14}{'':7}{'':7}{total:>13.1f}{pool_total:>8}")
+
+deps = ["search", "profile", "recommend"]
+rps = {"search": 200, "profile": 250, "recommend": 50}
+lat = {"search": 30, "profile": 20, "recommend": 2000}     # recommend has gone bad
+print("shared pool of 100:")
+with_bulkheads(100, deps, rps, lat, isolated=False)
+print("\nbulkheaded, ~33 each:")
+with_bulkheads(100, deps, rps, lat, isolated=True)
+```
+
+```output
+shared pool of 100:
+dependency        rps     ms  concurrency   limit  status
+search            200     30          6.0     100  POOL EXHAUSTED — everyone queues
+profile           250     20          5.0     100  POOL EXHAUSTED — everyone queues
+recommend          50   2000        100.0     100  POOL EXHAUSTED — everyone queues
+TOTAL                               111.0     100
+
+bulkheaded, ~33 each:
+dependency        rps     ms  concurrency   limit  status
+search            200     30          6.0      33  ok
+profile           250     20          5.0      33  ok
+recommend          50   2000        100.0      33  throttled HERE ONLY
+TOTAL                               111.0     100
+```
+
+Without bulkheads, the sick dependency's 100 units of concurrency starve the two healthy ones.
+With them, `recommend` saturates its own compartment and is throttled there — `search` and
+`profile` never notice. The cost is utilization: partitioned pools are less efficient than one
+shared pool, which is exactly the insurance premium you are paying.
+
+## Backpressure: say no instead of queueing forever
+
+An unbounded queue is a latency bomb. It never rejects anything, so under overload it grows
+until every request in it has already timed out — and you spend the entire capacity of the
+service producing responses nobody is waiting for.
+
+```python
+def queue_behaviour(bounded, arrival_rate, service_rate, seconds, timeout_s=2.0, cap=200):
+    depth, dropped, wasted = 0, 0, 0
+    for t in range(seconds):
+        depth += arrival_rate
+        if bounded and depth > cap:
+            dropped += depth - cap
+            depth = cap
+        served = min(depth, service_rate)
+        depth -= served
+        wait = depth / service_rate
+        if wait > timeout_s:
+            wasted += served              # these responses arrive after the client gave up
+    return depth, dropped, wasted
+
+for bounded in (False, True):
+    depth, dropped, wasted = queue_behaviour(bounded, arrival_rate=150, service_rate=100,
+                                             seconds=60)
+    print(f"{'bounded  ' if bounded else 'unbounded'} queue -> final depth {depth:6,} | "
+          f"rejected fast {dropped:6,} | responses nobody waited for {wasted:6,}")
+```
+
+```output
+unbounded queue -> final depth  3,000 | rejected fast      0 | responses nobody waited for  5,600
+bounded   queue -> final depth    100 | rejected fast  2,900 | responses nobody waited for      0
+```
+
+The bounded queue rejects 3,000 requests immediately and wastes almost nothing; the unbounded
+one accepts everything and then produces thousands of useless responses while the queue grows
+without limit. **Rejecting fast is a feature.** Every layer needs a bound: queue length, in-flight
+requests, connection count, message backlog (ch. 8).
+
+### Load shedding by priority
+
+```python
+def shed(load_factor, request):
+    """Under overload, drop the least valuable work first."""
+    priority = {"payment": 0, "login": 1, "read": 2, "recommendation": 3, "analytics": 4}
+    if   load_factor <= 1.0: cutoff = 5      # everything is served
+    elif load_factor <= 1.2: cutoff = 4      # drop analytics
+    elif load_factor <= 1.5: cutoff = 3      # drop recommendations too
+    elif load_factor <= 2.0: cutoff = 2      # reads go next
+    else:                    cutoff = 1      # only payments survive
+    return "served" if priority[request] < cutoff else "SHED (503 + Retry-After)"
+
+for lf in (1.0, 1.2, 1.5, 2.0, 3.0):
+    results = {r: shed(lf, r) for r in ("payment", "login", "read", "recommendation", "analytics")}
+    kept = [r for r, v in results.items() if v == "served"]
+    print(f"load {lf:3.1f}x capacity -> serving {kept}")
+```
+
+```output
+load 1.0x capacity -> serving ['payment', 'login', 'read', 'recommendation', 'analytics']
+load 1.2x capacity -> serving ['payment', 'login', 'read', 'recommendation']
+load 1.5x capacity -> serving ['payment', 'login', 'read']
+load 2.0x capacity -> serving ['payment', 'login']
+load 3.0x capacity -> serving ['payment']
+```
+
+Graceful degradation is a *product* decision encoded in code: at 3x capacity you still take
+payments and logins, and everything else waits. A system without an explicit shedding policy
+sheds anyway — randomly, and usually starting with whatever is most expensive, which is often
+the thing that earns money.
+
+## Try it Yourself
+
+```python
+def cascade(depth, base_failure=0.001, timeout_s=5.0, breaker=False, bulkhead=False):
+    """Failure probability of a chain, and how long a user waits for the failure."""
+    p_fail = 1 - (1 - base_failure) ** depth
+    wait = timeout_s * depth
+    if breaker:
+        wait = min(wait, timeout_s + 0.001 * depth)      # open breakers fail instantly
+    blast = 1.0 if not bulkhead else 1.0 / depth         # share of the fleet affected
+    print(f"depth {depth}: p(fail) {p_fail:6.3%} | user waits {wait:6.2f}s | "
+          f"blast radius {blast:5.0%}"
+          f"{'  [breaker]' if breaker else ''}{'  [bulkhead]' if bulkhead else ''}")
+
+for d in (1, 3, 5, 10):
+    cascade(d)
+print()
+cascade(10, breaker=True)
+cascade(10, breaker=True, bulkhead=True)
+```
+
+```output
+depth 1: p(fail) 0.100% | user waits   5.00s | blast radius  100%
+depth 3: p(fail) 0.300% | user waits  15.00s | blast radius  100%
+depth 5: p(fail) 0.499% | user waits  25.00s | blast radius  100%
+depth 10: p(fail) 0.996% | user waits  50.00s | blast radius  100%
+
+depth 10: p(fail) 0.996% | user waits   5.01s | blast radius  100%  [breaker]
+depth 10: p(fail) 0.996% | user waits   5.01s | blast radius   10%  [breaker]  [bulkhead]
+```
+
+Ten hops deep, a user waits fifty seconds to be told no. Add a breaker and the same failure is
+reported in five. Raise `base_failure` to 0.01 and watch the chain's reliability collapse — the
+argument for shallow call graphs, made numerically.
+
+## Exercise
+
+Combine the mechanisms: build a service simulator with a bounded queue, a per-dependency
+concurrency limit (bulkhead), a circuit breaker, and priority-based shedding. Drive it with a
+2-minute overload where one of three dependencies degrades to 3-second latency, and report for
+each configuration: requests served, requests shed, p99 wait, and whether healthy dependencies
+kept working.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def run(bulkhead=False, breaker=False, seconds=120, rps=300, capacity=200,
+        degrade=(30, 90), breaker_trips_after=5):
+    deps = ["search", "profile", "recommend"]
+    base_lat = {"search": 0.03, "profile": 0.02, "recommend": 0.05}
+    served = {d: 0.0 for d in deps}
+    shed = {d: 0.0 for d in deps}
+    fallback, arrivals = 0.0, rps / 3
+
+    for t in range(seconds):
+        lat = dict(base_lat)
+        degraded = degrade[0] <= t < degrade[1]
+        if degraded:
+            lat["recommend"] = 3.0                       # the dependency goes bad
+        tripped = breaker and degraded and t >= degrade[0] + breaker_trips_after
+        if tripped:
+            lat["recommend"] = 0.001                     # breaker open: fail fast to a fallback
+
+        demand = {d: arrivals * lat[d] for d in deps}    # slot-seconds needed each second
+        if bulkhead:
+            alloc = {d: min(demand[d], capacity / 3) for d in deps}
+        else:                                            # one shared pool, split by demand
+            total = sum(demand.values())
+            alloc = {d: demand[d] * min(1.0, capacity / total) for d in deps}
+
+        for d in deps:
+            done = alloc[d] / lat[d]
+            if d == "recommend" and tripped:
+                fallback += done                         # degraded, but answered
+                continue
+            served[d] += done
+            shed[d] += arrivals - done
+    return served, shed, fallback
+
+for label, kw in [("no protection", {}), ("bulkhead only", dict(bulkhead=True)),
+                  ("breaker only", dict(breaker=True)),
+                  ("bulkhead + breaker", dict(bulkhead=True, breaker=True))]:
+    served, shed, fb = run(**kw)
+    healthy = served["search"] + served["profile"]
+    lost = shed["search"] + shed["profile"]
+    print(f"{label:20} healthy served {healthy:8,.0f} | healthy shed {lost:7,.0f} "
+          f"| recommend served {served['recommend']:7,.0f} | fallback {fb:7,.0f}")
+```
+
+```output
+no protection        healthy served   19,869 | healthy shed   4,131 | recommend served   9,934 | fallback       0
+bulkhead only        healthy served   24,000 | healthy shed       0 | recommend served   7,333 | fallback       0
+breaker only         healthy served   23,656 | healthy shed     344 | recommend served   6,328 | fallback   5,500
+bulkhead + breaker   healthy served   24,000 | healthy shed       0 | recommend served   6,111 | fallback   5,500
+```
+
+The insight: the two mechanisms fix different halves of the same failure. The **bulkhead** is
+what keeps `search` and `profile` healthy — it caps how much concurrency the sick dependency can
+take, so the blast radius is one third of the service instead of all of it. The **breaker** is
+what stops the sick calls from being made at all, which converts three-second timeouts into
+instant failures and lets that third of traffic degrade to a fallback rather than queue. Neither
+alone gives you both properties, which is why every mature RPC stack (Hystrix, resilience4j,
+Envoy, gRPC's built-in limits) ships all of them together with timeouts and retries. The shed
+counter is the one to watch in production: shedding is not a failure of the design, it is the
+design working — the alternative is a queue full of requests whose users left minutes ago.
+</details>

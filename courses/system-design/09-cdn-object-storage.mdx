@@ -1,0 +1,388 @@
+---
+course: system-design
+chapter: 09-cdn-object-storage
+title: "CDNs and Object Storage"
+order: 9
+---
+
+## A CDN is a cache you rent, placed near the user
+
+Two things make it worth the money: **distance** and **offload**. Distance is physics — light
+in fibre travels about 200,000 km/s, so a round trip to a datacenter 8,000 km away cannot go
+below ~80 ms no matter how good your code is. Offload is arithmetic: bytes served at the edge
+are bytes your origin never sends.
+
+```python
+C_FIBRE_KM_PER_MS = 200          # ~2/3 c in glass
+
+def rtt_ms(km, hops=3, per_hop_ms=1.5):
+    return 2 * km / C_FIBRE_KM_PER_MS + hops * per_hop_ms
+
+for label, km in [("same city", 50), ("same country", 800),
+                  ("cross-continent", 4_000), ("intercontinental", 12_000)]:
+    print(f"{label:18} {km:6,} km -> floor {rtt_ms(km):6.1f} ms RTT "
+          f"| TLS handshake (2 RTT) {2*rtt_ms(km):6.1f} ms")
+```
+
+```output
+same city              50 km -> floor    5.0 ms RTT | TLS handshake (2 RTT)   10.0 ms
+same country          800 km -> floor   12.5 ms RTT | TLS handshake (2 RTT)   25.0 ms
+cross-continent     4,000 km -> floor   44.5 ms RTT | TLS handshake (2 RTT)   89.0 ms
+intercontinental   12,000 km -> floor  124.5 ms RTT | TLS handshake (2 RTT)  249.0 ms
+```
+
+A cold HTTPS connection costs two round trips before a byte of content moves. Serving from an
+edge 50 km away instead of 12,000 km away saves more than the entire time your application
+spends generating the response.
+
+## The cache key decides your hit rate
+
+An edge caches per **cache key**, and the default key is the full URL plus a few headers. Every
+distinct key is a separate object with its own TTL and its own miss. The single most common
+CDN failure is a key that varies on something irrelevant.
+
+```python
+from urllib.parse import urlsplit, parse_qsl, urlencode
+
+TRACKING = {"utm_source", "utm_medium", "utm_campaign", "gclid", "fbclid", "ref"}
+
+def cache_key(url, headers, vary=("accept-encoding",), normalize=True):
+    parts = urlsplit(url)
+    q = parse_qsl(parts.query, keep_blank_values=True)
+    if normalize:
+        q = sorted((k, v) for k, v in q if k not in TRACKING)
+    key = f"{parts.netloc}{parts.path}?{urlencode(q)}"
+    for h in vary:
+        key += f"|{h}={headers.get(h, '')}"
+    return key
+
+requests = [
+    ("https://cdn.example.com/img/logo.png?utm_source=twitter", {"accept-encoding": "gzip"}),
+    ("https://cdn.example.com/img/logo.png?utm_source=email",   {"accept-encoding": "gzip"}),
+    ("https://cdn.example.com/img/logo.png",                    {"accept-encoding": "gzip"}),
+    ("https://cdn.example.com/img/logo.png",                    {"accept-encoding": "br"}),
+]
+for norm in (False, True):
+    keys = {cache_key(u, h, normalize=norm) for u, h in requests}
+    print(f"normalize={norm!s:5} -> {len(keys)} distinct cache entries")
+    for k in sorted(keys):
+        print("   ", k)
+```
+
+```output
+normalize=False -> 4 distinct cache entries
+    cdn.example.com/img/logo.png?utm_source=email|accept-encoding=gzip
+    cdn.example.com/img/logo.png?utm_source=twitter|accept-encoding=gzip
+    cdn.example.com/img/logo.png?|accept-encoding=br
+    cdn.example.com/img/logo.png?|accept-encoding=gzip
+normalize=True  -> 2 distinct cache entries
+    cdn.example.com/img/logo.png?|accept-encoding=br
+    cdn.example.com/img/logo.png?|accept-encoding=gzip
+```
+
+Four requests for one image become four cached objects — a 25% hit rate — until you strip
+tracking parameters. Normalization moves it to two, which is correct: gzip and brotli really
+are different bytes.
+
+### Vary is a hit-rate multiplier
+
+Every header you vary on multiplies the number of cached copies. `Vary: Accept-Encoding` costs
+you 2–3x. `Vary: User-Agent` costs you thousands and effectively disables the cache.
+
+```python
+def variants(vary_dims):
+    n = 1
+    for name, cardinality in vary_dims:
+        n *= cardinality
+    return n
+
+dims = [("Accept-Encoding", 3), ("Accept-Language", 12), ("User-Agent", 5000), ("Cookie", 10**6)]
+running = []
+for name, card in dims:
+    running.append((name, card))
+    print(f"Vary on {', '.join(n for n, _ in running):50} -> {variants(running):>12,} copies per URL")
+```
+
+```output
+Vary on Accept-Encoding                                    ->            3 copies per URL
+Vary on Accept-Encoding, Accept-Language                   ->           36 copies per URL
+Vary on Accept-Encoding, Accept-Language, User-Agent       ->      180,000 copies per URL
+Vary on Accept-Encoding, Accept-Language, User-Agent, Cookie -> 180,000,000,000 copies per URL
+```
+
+The rule: cache-key inputs must be things that genuinely change the bytes. If personalization
+depends on a cookie, do not cache that response at the edge — cache the shell and fetch the
+personal part from the origin (or from an edge function).
+
+## TTLs, revalidation, and purge
+
+```python
+policies = [
+    ("/static/app.a91f3c.js",  "immutable content-hashed asset", "max-age=31536000, immutable"),
+    ("/img/product-42.jpg",    "rarely changes, cheap to purge", "max-age=86400"),
+    ("/api/prices",            "changes often, must be fresh",   "max-age=5, stale-while-revalidate=30"),
+    ("/account",               "per-user, never shared",         "private, no-store"),
+]
+for path, why, header in policies:
+    print(f"{path:26} {why:32} Cache-Control: {header}")
+```
+
+```output
+/static/app.a91f3c.js      immutable content-hashed asset   Cache-Control: max-age=31536000, immutable
+/img/product-42.jpg        rarely changes, cheap to purge   Cache-Control: max-age=86400
+/api/prices                changes often, must be fresh     Cache-Control: max-age=5, stale-while-revalidate=30
+/account                   per-user, never shared           Cache-Control: private, no-store
+```
+
+**Content-hashed filenames plus a one-year TTL** is the strongest pattern in web performance:
+the URL changes when the bytes change, so invalidation is free and the cache never serves the
+wrong version. Reach for purge APIs only for content whose URL is stable — and remember purge
+is a global operation with a propagation delay measured in seconds.
+
+### Origin shield: cascading caches
+
+At a global CDN, hundreds of edge PoPs miss independently, and each miss hits your origin —
+a distributed stampede (ch. 6). A **shield** is a mid-tier cache that all PoPs miss *through*,
+so the origin sees one request instead of hundreds.
+
+```python
+def origin_requests(pops, objects, ttl_s, window_s=3600, shield=False):
+    fetches_per_object = window_s / ttl_s
+    return int(objects * fetches_per_object * (1 if shield else pops))
+
+for shield in (False, True):
+    n = origin_requests(pops=120, objects=50_000, ttl_s=600, shield=shield)
+    print(f"shield={shield!s:5} -> {n:>12,} origin requests/hour ({n/3600:9,.0f} rps)")
+```
+
+```output
+shield=False ->   36,000,000 origin requests/hour (   10,000 rps)
+shield=True  ->      300,000 origin requests/hour (       83 rps)
+```
+
+A 120-fold reduction, for one extra cache layer. Shielding is also what makes long-tail
+content viable: objects too unpopular to stay hot at any single PoP are still hot at the
+shield.
+
+## Object storage is not a filesystem
+
+S3, GCS, R2, and Azure Blob share one data model: a flat namespace of immutable objects keyed
+by a string, with HTTP verbs on top. What they do *not* give you matters more than what they
+do.
+
+```python
+facts = [
+    ("no in-place update",  "PUT replaces the whole object; there is no fseek+write"),
+    ("no rename",           "'rename' is copy + delete, and it costs a full data copy"),
+    ("flat namespace",      "'directories' are just key prefixes; listing scans an index"),
+    ("strong read-after-write", "modern S3/GCS: a PUT is immediately visible by key"),
+    ("eventual listings",   "a LIST may not show a just-written key immediately"),
+    ("per-prefix throughput", "throughput scales with key prefix spread, not bucket count"),
+]
+for k, v in facts:
+    print(f"{k:26} {v}")
+```
+
+```output
+no in-place update         PUT replaces the whole object; there is no fseek+write
+no rename                  'rename' is copy + delete, and it costs a full data copy
+flat namespace             'directories' are just key prefixes; listing scans an index
+strong read-after-write    modern S3/GCS: a PUT is immediately visible by key
+eventual listings          a LIST may not show a just-written key immediately
+per-prefix throughput      throughput scales with key prefix spread, not bucket count
+```
+
+The consequence for design: use object storage for **whole-file, write-once, read-many** data —
+uploads, images, video segments, backups, Parquet files — and never as a mutable database. A
+"database" whose only update primitive is rewriting the file is a table you can only append to
+(which is exactly what a data lake is, ch. 18).
+
+### Big files: multipart upload and range reads
+
+```python
+def multipart_plan(file_bytes, part_mb=8, parallel=8):
+    part = part_mb * 1024**2
+    parts = -(-file_bytes // part)                     # ceil division
+    rounds = -(-parts // parallel)
+    return parts, rounds
+
+for gb in (0.5, 5, 200):
+    b = int(gb * 1024**3)
+    parts, rounds = multipart_plan(b)
+    print(f"{gb:6.1f} GB -> {parts:6,} parts of 8 MB, {rounds:4,} parallel rounds; "
+          f"a failed part retries {8} MB, not {gb*1024:,.0f} MB")
+
+# A range read fetches one video segment without downloading the file
+start, end = 10 * 1024**2, 12 * 1024**2 - 1
+print(f"\nRange: bytes={start}-{end}  -> {(end-start+1)/1024**2:.0f} MB of a 200 GB object")
+```
+
+```output
+   0.5 GB ->     64 parts of 8 MB,    8 parallel rounds; a failed part retries 8 MB, not 512 MB
+   5.0 GB ->    640 parts of 8 MB,   80 parallel rounds; a failed part retries 8 MB, not 5,120 MB
+ 200.0 GB -> 25,600 parts of 8 MB, 3,200 parallel rounds; a failed part retries 8 MB, not 204,800 MB
+
+Range: bytes=10485760-12582911  -> 2 MB of a 200 GB object
+```
+
+Multipart upload is what makes large uploads survivable on bad networks, and range reads are
+what make streaming work: a player fetches 2–10 second segments, so seeking costs one request
+rather than a full download.
+
+## The economics: storage is cheap, egress is not
+
+```python
+GB = 1
+prices = {                       # USD, order-of-magnitude list prices; check your provider
+    "object storage /GB-month": 0.023,
+    "origin egress /GB":        0.09,
+    "CDN egress /GB":           0.02,
+    "requests /10k":            0.004,
+}
+
+stored_tb, egress_tb, requests_m = 50, 400, 2_000
+
+storage_cost = stored_tb * 1024 * prices["object storage /GB-month"]
+origin_only  = egress_tb * 1024 * prices["origin egress /GB"]
+with_cdn_95  = (egress_tb * 1024 * 0.05 * prices["origin egress /GB"]
+                + egress_tb * 1024 * 0.95 * prices["CDN egress /GB"])
+
+print(f"storage  {stored_tb} TB          ${storage_cost:10,.0f}/month")
+print(f"egress   {egress_tb} TB, no CDN  ${origin_only:10,.0f}/month")
+print(f"egress   {egress_tb} TB, 95% CDN ${with_cdn_95:10,.0f}/month  "
+      f"(saves ${origin_only - with_cdn_95:,.0f})")
+print(f"requests {requests_m}M           ${requests_m * 1e6 / 10_000 * prices['requests /10k']:10,.0f}/month")
+```
+
+```output
+storage  50 TB          $     1,178/month
+egress   400 TB, no CDN  $    36,864/month
+egress   400 TB, 95% CDN $     9,626/month  (saves $27,238)
+requests 2000M           $       800/month
+```
+
+Storing 50 TB costs less than serving 400 TB by an order of magnitude. This asymmetry drives
+real architecture: keep data where it is generated, push compute to the data, and put a CDN in
+front of anything the public reads more than once.
+
+## Signed URLs: private objects without a proxy
+
+```python
+import hmac, hashlib, base64
+
+SECRET = b"demo-signing-key"
+
+def sign(path, expires_at):
+    msg = f"{path}:{expires_at}".encode()
+    sig = hmac.new(SECRET, msg, hashlib.sha256).digest()
+    return f"{path}?exp={expires_at}&sig={base64.urlsafe_b64encode(sig).decode()[:22]}"
+
+def verify(url, now):
+    path, _, query = url.partition("?")
+    params = dict(kv.split("=", 1) for kv in query.split("&"))
+    exp = int(params["exp"])
+    if now > exp:
+        return "expired"
+    expected = sign(path, exp).split("sig=")[1]
+    return "ok" if hmac.compare_digest(expected, params["sig"]) else "bad signature"
+
+url = sign("/private/report-2026.pdf", expires_at=1_700_000_300)
+print(url)
+print("at t=1700000200:", verify(url, 1_700_000_200))
+print("at t=1700000400:", verify(url, 1_700_000_400))
+print("tampered path:  ", verify(url.replace("report-2026", "report-2027"), 1_700_000_200))
+```
+
+```output
+/private/report-2026.pdf?exp=1700000300&sig=SdoeFrpQZAlOSPfADYt-i9
+at t=1700000200: ok
+at t=1700000400: expired
+tampered path:   bad signature
+```
+
+The client talks directly to the storage system; your application never touches the bytes. It
+only issues a short-lived, path-bound capability. This is how upload and download endpoints
+stay cheap at any scale — and it is the same mechanism behind CDN token authentication.
+
+## Try it Yourself
+
+```python
+def offload(total_gb, hit_rate, cdn_price=0.02, origin_price=0.09):
+    cdn_gb = total_gb * hit_rate
+    origin_gb = total_gb - cdn_gb
+    cost = cdn_gb * cdn_price + origin_gb * origin_price
+    baseline = total_gb * origin_price
+    print(f"hit rate {hit_rate:5.1%} | origin serves {origin_gb:9,.0f} GB "
+          f"| cost ${cost:9,.0f} | saved ${baseline - cost:9,.0f} ({1 - cost/baseline:5.1%})")
+
+for h in (0.0, 0.5, 0.9, 0.95, 0.99):
+    offload(400 * 1024, h)
+```
+
+```output
+hit rate  0.0% | origin serves   409,600 GB | cost $   36,864 | saved $        0 ( 0.0%)
+hit rate 50.0% | origin serves   204,800 GB | cost $   22,528 | saved $   14,336 (38.9%)
+hit rate 90.0% | origin serves    40,960 GB | cost $   11,059 | saved $   25,805 (70.0%)
+hit rate 95.0% | origin serves    20,480 GB | cost $    9,626 | saved $   27,238 (73.9%)
+hit rate 99.0% | origin serves     4,096 GB | cost $    8,479 | saved $   28,385 (77.0%)
+```
+
+Now compute what one bad `Vary` header costs: if `Vary: User-Agent` drops your hit rate from
+0.95 to 0.60, run `offload(400*1024, 0.60)` and read the difference. That number is why cache
+keys get code review.
+
+## Exercise
+
+Design the cache-control strategy for a product page that contains: the HTML shell, a
+content-hashed JS bundle, product images, a live price fragment, and a personalized
+"recommended for you" strip. For each, state the cache key, where it should be cached
+(browser, CDN, origin only), the TTL, and how it is invalidated. Then write code that computes
+the origin request rate for 10,000 page views per second under your policy.
+
+<details>
+<summary>Solution</summary>
+
+```python
+plan = [
+    # name,                 cacheable_at, ttl_s, share_of_requests, invalidation
+    ("HTML shell",          "cdn",        60,    1.0,  "TTL + purge on publish"),
+    ("JS/CSS bundle",       "browser+cdn",31536000, 0.2, "content hash in filename"),
+    ("product images",      "cdn",        86400, 3.0,  "purge on image replace"),
+    ("price fragment",      "cdn",        5,     1.0,  "short TTL + stale-while-revalidate"),
+    ("recommendation strip","origin",     0,     1.0,  "personalized: never shared"),
+]
+
+PAGE_VIEWS = 10_000       # per second
+print(f"{'component':22}{'cached at':13}{'ttl':>9}  origin rps")
+total = 0.0
+for name, where, ttl, share, how in plan:
+    reqs = PAGE_VIEWS * share
+    if where == "origin" or ttl == 0:
+        origin = reqs                                  # every request goes through
+    else:
+        # with one shielded cache, origin sees ~1 fetch per object per TTL
+        objects = 1 if "fragment" in name or "shell" in name else 50_000
+        origin = objects / ttl
+    total += origin
+    print(f"{name:22}{where:13}{ttl:>9,}  {origin:10,.1f}")
+print(f"{'TOTAL':22}{'':13}{'':>9}  {total:10,.1f} rps to origin "
+      f"(vs {PAGE_VIEWS * sum(p[3] for p in plan):,.0f} rps without caching)")
+```
+
+```output
+component             cached at          ttl  origin rps
+HTML shell            cdn                 60         0.0
+JS/CSS bundle         browser+cdn  31,536,000         0.0
+product images        cdn             86,400         0.6
+price fragment        cdn                  5         0.2
+recommendation strip  origin               0    10,000.0
+TOTAL                                           10,000.8 rps to origin (vs 62,000 rps without caching)
+```
+
+The insight: the personalized strip dominates, and it is the only component that *must* reach
+the origin. That is the design lever — split the page so the personalized part is a separate,
+small, cheap request (or an edge-side include) while everything else is shared and cacheable.
+Notice too that TTL beats hit-rate intuition for shared objects: one object with a 5-second TTL
+costs 0.2 origin rps no matter whether 10 or 10 million people load it, because the edge
+collapses them all into one revalidation.
+</details>

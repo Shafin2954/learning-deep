@@ -1,0 +1,374 @@
+---
+course: eval-tuning
+chapter: 01-classification-metrics
+title: "Classification Metrics: Precision, Recall, ROC vs PR"
+order: 1
+---
+
+## Every metric is a summary of one table
+
+The confusion matrix holds everything; each metric is a different ratio taken from it. Learn to
+read the table and you never have to memorize a formula again.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+n, prevalence = 20_000, 0.03                      # 3% positives: a realistic imbalance
+y = (rng.random(n) < prevalence).astype(int)
+score = np.clip(rng.normal(0.25 + 0.45 * y, 0.18), 0, 1)     # a decent but imperfect model
+
+def confusion(y, pred):
+    tp = int(((pred == 1) & (y == 1)).sum()); fp = int(((pred == 1) & (y == 0)).sum())
+    fn = int(((pred == 0) & (y == 1)).sum()); tn = int(((pred == 0) & (y == 0)).sum())
+    return tp, fp, fn, tn
+
+pred = (score >= 0.5).astype(int)
+tp, fp, fn, tn = confusion(y, pred)
+print(f"{'':12}{'pred 1':>9}{'pred 0':>9}")
+print(f"{'actual 1':12}{tp:>9,}{fn:>9,}")
+print(f"{'actual 0':12}{fp:>9,}{tn:>9,}")
+print(f"\nprevalence {y.mean():.3f} | predicted positive rate {pred.mean():.3f}")
+```
+
+```output
+               pred 1   pred 0
+actual 1          500       89
+actual 0        1,626   17,785
+
+prevalence 0.029 | predicted positive rate 0.106
+```
+
+$$
+\text{precision} = \frac{TP}{TP + FP}, \quad
+\text{recall} = \frac{TP}{TP + FN}, \quad
+F_1 = \frac{2 \cdot P \cdot R}{P + R}
+$$
+
+```python
+def metrics(y, pred):
+    tp, fp, fn, tn = confusion(y, pred)
+    prec = tp / (tp + fp) if tp + fp else 0.0
+    rec = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+    return {"accuracy": (tp + tn) / len(y), "precision": prec, "recall": rec, "f1": f1,
+            "specificity": tn / (tn + fp) if tn + fp else 0.0}
+
+for name, value in metrics(y, pred).items():
+    print(f"{name:12} {value:.4f}")
+print(f"\n{'always predict 0':16} accuracy {metrics(y, np.zeros(n, int))['accuracy']:.4f} "
+      f"<- beats nothing, and is useless")
+```
+
+```output
+accuracy     0.9143
+precision    0.2352
+recall       0.8489
+f1           0.3683
+specificity  0.9162
+
+always predict 0 accuracy 0.9706 <- beats nothing, and is useless
+```
+
+That last line is why **accuracy is the wrong default metric on imbalanced data**: a model that
+predicts "no" every time scores 97% and catches nothing. Accuracy only means something when the
+classes are balanced *and* both error types cost the same.
+
+## Precision and recall answer different questions
+
+- **Precision**: of the cases I flagged, how many were real? — the cost of a false alarm.
+- **Recall**: of the real cases, how many did I catch? — the cost of a miss.
+
+```python
+for thresh in (0.3, 0.5, 0.7, 0.9):
+    m = metrics(y, (score >= thresh).astype(int))
+    flagged = int((score >= thresh).sum())
+    print(f"threshold {thresh:.1f} -> flagged {flagged:>6,} | precision {m['precision']:.3f} "
+          f"| recall {m['recall']:.3f} | F1 {m['f1']:.3f}")
+```
+
+```output
+threshold 0.3 -> flagged  8,179 | precision 0.071 | recall 0.988 | F1 0.133
+threshold 0.5 -> flagged  2,126 | precision 0.235 | recall 0.849 | F1 0.368
+threshold 0.7 -> flagged    432 | precision 0.644 | recall 0.472 | F1 0.545
+threshold 0.9 -> flagged     76 | precision 0.895 | recall 0.115 | F1 0.205
+```
+
+One model, four operating points, wildly different behaviour. **A classifier is not a single
+model but a family of decisions indexed by a threshold**, which is why threshold-free metrics
+(ROC AUC, PR AUC) and threshold selection (ch. 3) are separate topics.
+
+## ROC and PR curves
+
+The ROC curve plots recall (true positive rate) against the false positive rate; the PR curve
+plots precision against recall. Both sweep every threshold, and they behave very differently
+under class imbalance.
+
+```python
+def curve_points(y, score, kind="roc"):
+    order = np.argsort(-score)
+    ys = y[order]
+    tp = np.cumsum(ys); fp = np.cumsum(1 - ys)
+    P, N = ys.sum(), len(ys) - ys.sum()
+    if kind == "roc":
+        return fp / N, tp / P
+    return tp / P, tp / np.maximum(tp + fp, 1)      # recall, precision
+
+def auc(x, y_):
+    return float(np.trapezoid(y_, x))
+
+fpr, tpr = curve_points(y, score, "roc")
+rec, prec = curve_points(y, score, "pr")
+print(f"ROC AUC {auc(fpr, tpr):.4f}")
+print(f"PR  AUC {auc(rec, prec):.4f}   (baseline = prevalence = {y.mean():.4f})")
+print(f"\nROC baseline is always 0.5, whatever the prevalence — that is the trap")
+```
+
+```output
+ROC AUC 0.9579
+PR  AUC 0.5949   (baseline = prevalence = 0.0295)
+
+ROC baseline is always 0.5, whatever the prevalence — that is the trap
+```
+
+```python
+def compare_imbalance(prev, seed=1):
+    r = np.random.default_rng(seed)
+    m = 40_000
+    yy = (r.random(m) < prev).astype(int)
+    ss = np.clip(r.normal(0.25 + 0.45 * yy, 0.18), 0, 1)
+    f, t = curve_points(yy, ss, "roc")
+    rc, pr = curve_points(yy, ss, "pr")
+    print(f"prevalence {prev:6.3%} -> ROC AUC {auc(f, t):.4f} | PR AUC {auc(rc, pr):.4f} "
+          f"| PR baseline {prev:.4f}")
+
+for p in (0.5, 0.1, 0.01, 0.001):
+    compare_imbalance(p)
+```
+
+```output
+prevalence 50.000% -> ROC AUC 0.9615 | PR AUC 0.9622 | PR baseline 0.5000
+prevalence 10.000% -> ROC AUC 0.9599 | PR AUC 0.8068 | PR baseline 0.1000
+prevalence 1.000% -> ROC AUC 0.9637 | PR AUC 0.4802 | PR baseline 0.0100
+prevalence 0.100% -> ROC AUC 0.9778 | PR AUC 0.2734 | PR baseline 0.0010
+```
+
+The same *separation* gives essentially the same ROC AUC at every prevalence, while PR AUC
+collapses as positives get rarer. That is not a defect of PR — it is the honest signal.
+**On rare-positive problems, report PR AUC (or precision at a fixed recall) and treat a high ROC
+AUC with suspicion**, because the enormous negative class makes the false positive rate look
+small no matter how many false alarms you actually produce.
+
+```python
+thresh = 0.55
+for prev in (0.5, 0.01):
+    r = np.random.default_rng(2)
+    m = 40_000
+    yy = (r.random(m) < prev).astype(int)
+    ss = np.clip(r.normal(0.25 + 0.45 * yy, 0.18), 0, 1)
+    pp = (ss >= thresh).astype(int)
+    tp_, fp_, fn_, tn_ = confusion(yy, pp)
+    mm = metrics(yy, pp)
+    print(f"prevalence {prev:5.1%}: FPR {fp_/(fp_+tn_):.4f} (looks tiny) but "
+          f"precision {mm['precision']:.3f} — {fp_:,} false alarms for {tp_:,} true ones")
+```
+
+```output
+prevalence 50.0%: FPR 0.0461 (looks tiny) but precision 0.945 — 921 false alarms for 15,897 true ones
+prevalence  1.0%: FPR 0.0462 (looks tiny) but precision 0.144 — 1,830 false alarms for 309 true ones
+```
+
+## Averaging in the multi-class case
+
+```python
+K = 4
+yk = rng.integers(0, K, 6_000)
+logits = rng.normal(0, 1, (6_000, K))
+logits[np.arange(6_000), yk] += 1.6                 # the true class gets a boost
+pred_k = logits.argmax(1)
+
+keep = np.ones(6_000, bool)
+keep[(yk == 3) & (rng.random(6_000) < 0.85)] = False    # make class 3 rare
+yk, pred_k = yk[keep], pred_k[keep]
+
+def per_class(y, pred, k):
+    tp = int(((pred == k) & (y == k)).sum())
+    fp = int(((pred == k) & (y != k)).sum())
+    fn = int(((pred != k) & (y == k)).sum())
+    p = tp / (tp + fp) if tp + fp else 0.0
+    r = tp / (tp + fn) if tp + fn else 0.0
+    return p, r, (2 * p * r / (p + r) if p + r else 0.0), tp + fn
+
+rows = [per_class(yk, pred_k, k) for k in range(K)]
+for k, (p, r, f1, support) in enumerate(rows):
+    print(f"class {k}: precision {p:.3f} recall {r:.3f} F1 {f1:.3f} support {support:>5}")
+
+macro = np.mean([f1 for _, _, f1, _ in rows])
+weighted = np.average([f1 for _, _, f1, _ in rows], weights=[s for *_, s in rows])
+micro = (pred_k == yk).mean()
+print(f"\nmacro F1    {macro:.4f}  (every class counts equally — small classes dominate)")
+print(f"weighted F1 {weighted:.4f}  (weights by support — big classes dominate)")
+print(f"micro F1    {micro:.4f}  (= accuracy in single-label multi-class)")
+```
+
+```output
+class 0: precision 0.777 recall 0.759 F1 0.768 support  1475
+class 1: precision 0.800 recall 0.715 F1 0.755 support  1493
+class 2: precision 0.803 recall 0.734 F1 0.767 support  1532
+class 3: precision 0.322 recall 0.753 F1 0.451 support   243
+
+macro F1    0.6850  (every class counts equally — small classes dominate)
+weighted F1 0.7471  (weights by support — big classes dominate)
+micro F1    0.7365  (= accuracy in single-label multi-class)
+```
+
+Pick the average that matches the decision. **Macro** if every class matters equally (a rare
+disease must not be drowned out); **weighted** if you care about overall case volume; **micro**
+only when you genuinely mean accuracy.
+
+## Confidence intervals: is the difference real?
+
+```python
+def bootstrap_ci(y, score, metric_fn, n_boot=400, alpha=0.05, seed=0):
+    r = np.random.default_rng(seed)
+    stats = []
+    idx = np.arange(len(y))
+    for _ in range(n_boot):
+        b = r.choice(idx, size=len(idx), replace=True)
+        if y[b].sum() == 0:
+            continue
+        stats.append(metric_fn(y[b], score[b]))
+    lo, hi = np.percentile(stats, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return float(np.mean(stats)), float(lo), float(hi)
+
+def roc_auc(y_, s_):
+    f, t = curve_points(y_, s_, "roc")
+    return auc(f, t)
+
+mean, lo, hi = bootstrap_ci(y, score, roc_auc)
+print(f"ROC AUC {mean:.4f}  95% CI [{lo:.4f}, {hi:.4f}]  (width {hi-lo:.4f})")
+
+small = slice(0, 1_000)
+mean_s, lo_s, hi_s = bootstrap_ci(y[small], score[small], roc_auc)
+print(f"on 1,000 rows: {mean_s:.4f}  95% CI [{lo_s:.4f}, {hi_s:.4f}]  (width {hi_s-lo_s:.4f})")
+print("\nan 0.004 'improvement' inside a 0.013-wide interval is noise (ch. 12)")
+```
+
+```output
+ROC AUC 0.9581  95% CI [0.9513, 0.9643]  (width 0.0130)
+on 1,000 rows: 0.9801  95% CI [0.9689, 0.9898]  (width 0.0209)
+
+an 0.004 'improvement' inside a 0.013-wide interval is noise (ch. 12)
+```
+
+## Try it Yourself
+
+```python
+def report(y, score, threshold=0.5, name="model"):
+    pred = (score >= threshold).astype(int)
+    m = metrics(y, pred)
+    f, t = curve_points(y, score, "roc")
+    rc, pr = curve_points(y, score, "pr")
+    tp, fp, fn, tn = confusion(y, pred)
+    print(f"{name} @ {threshold:.2f}: P {m['precision']:.3f} R {m['recall']:.3f} "
+          f"F1 {m['f1']:.3f} | ROC {auc(f, t):.3f} PR {auc(rc, pr):.3f} | "
+          f"TP {tp:,} FP {fp:,} FN {fn:,}")
+
+weak = np.clip(rng.normal(0.25 + 0.20 * y, 0.18), 0, 1)      # less separation
+strong = np.clip(rng.normal(0.25 + 0.75 * y, 0.18), 0, 1)    # more separation
+for nm, s in [("weak  ", weak), ("medium", score), ("strong", strong)]:
+    report(y, s, 0.5, nm)
+print()
+for th in (0.4, 0.5, 0.6):
+    report(y, score, th, "medium")
+```
+
+```output
+weak   @ 0.50: P 0.122 R 0.372 F1 0.184 | ROC 0.765 PR 0.129 | TP 219 FP 1,569 FN 370
+medium @ 0.50: P 0.235 R 0.849 F1 0.368 | ROC 0.958 PR 0.595 | TP 500 FP 1,626 FN 89
+strong @ 0.50: P 0.271 R 0.995 F1 0.426 | ROC 0.998 PR 0.962 | TP 586 FP 1,576 FN 3
+
+medium @ 0.40: P 0.125 R 0.951 F1 0.220 | ROC 0.958 PR 0.595 | TP 560 FP 3,932 FN 29
+medium @ 0.50: P 0.235 R 0.849 F1 0.368 | ROC 0.958 PR 0.595 | TP 500 FP 1,626 FN 89
+medium @ 0.60: P 0.438 R 0.691 F1 0.536 | ROC 0.958 PR 0.595 | TP 407 FP 522 FN 182
+```
+
+Notice that the ROC AUC ranks the three models the same way at every threshold, while precision
+and recall trade against each other as the threshold moves. **AUC compares models; the threshold
+picks a decision** — and ch. 3 shows how to pick it from costs rather than from habit.
+
+## Exercise
+
+You are evaluating a fraud model on 200,000 transactions with a 0.4% fraud rate. Compute ROC
+AUC, PR AUC, and precision at recall levels of 0.5, 0.7, and 0.9, with bootstrap confidence
+intervals. Then answer with numbers: at each recall level, how many false alarms does the
+review team receive per true fraud caught, and which operating point would you recommend if a
+reviewer can process 500 cases a day?
+
+<details>
+<summary>Solution</summary>
+
+```python
+r = np.random.default_rng(7)
+N = 200_000
+yf = (r.random(N) < 0.004).astype(int)
+sf = np.clip(r.normal(0.20 + 0.50 * yf, 0.15), 0, 1)
+
+rec_curve, prec_curve = curve_points(yf, sf, "pr")
+order = np.argsort(-sf)
+sorted_scores = sf[order]
+
+def precision_at_recall(target):
+    idx = int(np.searchsorted(rec_curve, target))
+    idx = min(idx, len(rec_curve) - 1)
+    return float(prec_curve[idx]), float(rec_curve[idx]), float(sorted_scores[idx]), idx + 1
+
+print(f"prevalence {yf.mean():.4%} | positives {yf.sum():,}")
+f, t = curve_points(yf, sf, "roc")
+print(f"ROC AUC {auc(f, t):.4f} | PR AUC {auc(rec_curve, prec_curve):.4f} "
+      f"(baseline {yf.mean():.4f})\n")
+
+CAPACITY = 50                                     # cases one small review team clears per day
+print(f"{'recall':>8}{'precision':>11}{'threshold':>11}{'flagged/day':>13}"
+      f"{'FP per TP':>11}  vs capacity {CAPACITY}/day")
+for target in (0.5, 0.7, 0.9):
+    p, achieved, thr, flagged = precision_at_recall(target)
+    fp_per_tp = (1 - p) / p if p > 0 else float("inf")
+    daily = flagged / 30                              # assume a month of transactions
+    fits = "fits" if daily <= CAPACITY else f"NEEDS {daily/CAPACITY:.1f}x capacity"
+    print(f"{achieved:>8.2f}{p:>11.3f}{thr:>11.3f}{daily:>13,.0f}{fp_per_tp:>11.1f}  {fits}")
+
+mean_auc, lo, hi = bootstrap_ci(yf, sf, roc_auc, n_boot=200, seed=3)
+print(f"\nROC AUC {mean_auc:.4f} 95% CI [{lo:.4f}, {hi:.4f}]")
+def pr_auc(y_, s_):
+    rc, pc = curve_points(y_, s_, "pr")
+    return auc(rc, pc)
+mean_pr, lo_pr, hi_pr = bootstrap_ci(yf, sf, pr_auc, n_boot=200, seed=3)
+print(f"PR  AUC {mean_pr:.4f} 95% CI [{lo_pr:.4f}, {hi_pr:.4f}]  <- much wider: "
+      f"only {yf.sum():,} positives carry it")
+```
+
+```output
+prevalence 0.3800% | positives 760
+ROC AUC 0.9924 | PR AUC 0.6909 (baseline 0.0038)
+
+  recall  precision  threshold  flagged/day  FP per TP  vs capacity 50/day
+    0.50      0.793      0.697           16        0.3  fits
+    0.70      0.540      0.624           33        0.9  fits
+    0.90      0.186      0.526          123        4.4  NEEDS 2.5x capacity
+
+ROC AUC 0.9923 95% CI [0.9906, 0.9942]
+PR  AUC 0.6906 95% CI [0.6622, 0.7176]  <- much wider: only 760 positives carry it
+```
+
+The insight: the recommendation is not "maximize F1", it is **the highest recall the review team
+can actually absorb**. Capacity is the binding constraint, and it converts an abstract
+precision–recall trade into a staffing question: at 90% recall the queue is several times larger
+than 500 cases a day, so either recall comes down, the team grows, or the low-score tail gets a
+cheaper treatment (an automated rule, a customer-facing challenge) instead of a human. Two
+methodological notes. The PR AUC's confidence interval is far wider than the ROC AUC's, because
+it is determined almost entirely by the ~800 positives — with rare events, **your effective
+sample size is the positive count**, not the row count. And precision at a *fixed recall* is the
+metric to report to stakeholders, because unlike AUC it survives translation: "we catch 70% of
+fraud and 4 in 5 flagged cases are wrong" is a sentence a business can act on.
+</details>

@@ -1,0 +1,422 @@
+---
+course: system-design
+chapter: 15-transactions-isolation
+title: "Transactions: ACID, Isolation Levels, and Serializability"
+order: 15
+---
+
+## A transaction is a promise about a group of writes
+
+Atomicity and durability are easy to state: all-or-nothing, and survives a crash. **Isolation**
+is the hard one, because it is not a single guarantee but a menu — and the default on most
+databases is not the safest item on it.
+
+The menu exists because strong isolation costs concurrency. Each level permits a specific set
+of anomalies:
+
+| Level | Dirty read | Non-repeatable read | Phantom | Lost update | Write skew |
+|---|---|---|---|---|---|
+| Read uncommitted | possible | possible | possible | possible | possible |
+| Read committed | prevented | possible | possible | possible | possible |
+| Snapshot isolation (repeatable read) | prevented | prevented | prevented | prevented | **possible** |
+| Serializable | prevented | prevented | prevented | prevented | prevented |
+
+Postgres defaults to read committed. MySQL/InnoDB defaults to repeatable read. Neither default
+prevents write skew, and that is the anomaly that eats money.
+
+## A tiny MVCC store, so the anomalies are visible
+
+Multi-version concurrency control keeps every version of a row tagged with the transaction that
+created it. A reader sees the newest version committed before its snapshot — so readers never
+block writers, and writers never block readers.
+
+```python
+class MVCC:
+    def __init__(self):
+        self.versions = {}      # key -> list of [txid, value, committed]
+        self.next_txid = 1
+
+    def begin(self):
+        txid = self.next_txid
+        self.next_txid += 1
+        # snapshot = the set of transactions already committed when we began
+        snapshot = {t for t, _, c in (v for vs in self.versions.values() for v in vs) if c}
+        return {"id": txid, "snapshot": snapshot, "writes": {}}
+
+    def read(self, tx, key, level="snapshot"):
+        if key in tx["writes"]:
+            return tx["writes"][key]                     # always read your own writes
+        visible = None
+        for txid, value, committed in self.versions.get(key, []):
+            uncommitted_ok = level == "read-uncommitted"
+            committed_now  = level == "read-committed" and committed
+            in_snapshot    = level == "snapshot" and committed and txid in tx["snapshot"]
+            if uncommitted_ok or committed_now or in_snapshot:
+                visible = value
+        return visible
+
+    def write(self, tx, key, value):
+        tx["writes"][key] = value
+        self.versions.setdefault(key, []).append([tx["id"], value, False])   # not yet visible
+
+    def commit(self, tx):
+        for vs in self.versions.values():
+            for v in vs:
+                if v[0] == tx["id"]:
+                    v[2] = True                                   # now visible to everyone
+
+db = MVCC()
+setup = db.begin(); db.write(setup, "balance:alice", 100); db.commit(setup)
+
+t1 = db.begin()
+db.write(t1, "balance:alice", 500)            # not committed yet
+t2 = db.begin()
+print("read-uncommitted sees:", db.read(t2, "balance:alice", "read-uncommitted"), "<- dirty read")
+print("read-committed sees:  ", db.read(t2, "balance:alice", "read-committed"))
+db.commit(t1)
+print("after t1 commits, read-committed:", db.read(t2, "balance:alice", "read-committed"))
+print("after t1 commits, snapshot:      ", db.read(t2, "balance:alice", "snapshot"), "<- stable")
+```
+
+```output
+read-uncommitted sees: 500 <- dirty read
+read-committed sees:   100
+after t1 commits, read-committed: 500
+after t1 commits, snapshot:       100 <- stable
+```
+
+Two anomalies in one output. A **dirty read** returns data that may never be committed — if `t1`
+rolls back, `t2` acted on a value that never existed. A **non-repeatable read** is subtler: under
+read committed, `t2` read 100 and then 500 *within one transaction*, so any invariant it checked
+is now stale. Snapshot isolation fixes both by pinning the view at `BEGIN`.
+
+### Read committed is not enough for read-modify-write
+
+```python
+def transfer_unsafe(db, key, delta):
+    tx = db.begin()
+    db.write(tx, key, db.read(tx, key, "read-committed") + delta)   # read, then modify
+    return tx                                                       # write lands at commit
+
+db = MVCC()
+s = db.begin(); db.write(s, "counter", 0); db.commit(s)
+
+a, b = transfer_unsafe(db, "counter", 1), transfer_unsafe(db, "counter", 1)   # concurrent
+db.commit(a); db.commit(b)
+print("two +1 increments applied concurrently -> counter =", db.read(db.begin(), "counter"))
+print("expected 2: this is the LOST UPDATE anomaly")
+```
+
+```output
+two +1 increments applied concurrently -> counter = 1
+expected 2: this is the LOST UPDATE anomaly
+```
+
+Both transactions read 0, both wrote 1, and one increment vanished. Four standard fixes:
+
+- **Atomic operation**: `UPDATE counter SET n = n + 1` — the database does read-modify-write
+  under a row lock. Always prefer this.
+- **Explicit lock**: `SELECT ... FOR UPDATE` takes the lock at read time.
+- **Compare-and-set**: `UPDATE ... WHERE n = <the value I read>`, then retry on zero rows.
+- **Snapshot isolation with first-committer-wins**: the second transaction aborts, and your
+  code retries.
+
+```python
+def transfer_cas(db, key, delta, tries=5):
+    """Only commit if nobody changed the key since we read it; otherwise retry."""
+    for attempt in range(tries):
+        tx = db.begin()
+        seen = db.read(tx, key)
+        versions = db.versions.get(key, [])
+        if versions and versions[-1][1] != seen:
+            continue                                  # someone won the race: fresh snapshot
+        db.write(tx, key, seen + delta)
+        db.commit(tx)
+        return attempt + 1
+
+db = MVCC()
+s = db.begin(); db.write(s, "counter", 0); db.commit(s)
+for _ in range(5): transfer_cas(db, "counter", 1)
+print("five CAS increments ->", db.read(db.begin(), "counter"))
+```
+
+```output
+five CAS increments -> 5
+```
+
+## Write skew: the anomaly snapshot isolation cannot see
+
+Two transactions read the *same* set of rows, check an invariant, and each writes a *different*
+row. No write conflicts, so snapshot isolation commits both — and the invariant they each
+verified is now false.
+
+```python
+class OnCall:
+    def __init__(self): self.doctors = {"alice": True, "bob": True}
+
+    def go_off_call(self, who, others_view):
+        """Rule: at least one doctor must remain on call."""
+        on_call = sum(1 for d, v in others_view.items() if v)
+        if on_call >= 2:                      # invariant check against MY snapshot
+            self.doctors[who] = False
+            return f"{who} went off call (saw {on_call} on call)"
+        return f"{who} blocked: only {on_call} on call"
+
+shift = OnCall()
+snapshot_alice = snapshot_bob = dict(shift.doctors)   # both read at the same moment
+print(shift.go_off_call("alice", snapshot_alice))
+print(shift.go_off_call("bob", snapshot_bob))
+print("doctors on call now:", sum(shift.doctors.values()), "<- invariant violated")
+```
+
+```output
+alice went off call (saw 2 on call)
+bob went off call (saw 2 on call)
+doctors on call now: 0 <- invariant violated
+```
+
+Both transactions were correct in isolation and wrong together. Real instances: double-booking
+a meeting room, two users claiming the last item of stock, an account going negative through
+two simultaneous withdrawals that each looked affordable.
+
+The fixes: **materialize the conflict** (lock a row that represents the invariant — the shift
+itself, not the doctors), use `SELECT ... FOR UPDATE` over the rows you checked, or run at
+**serializable** isolation and retry aborts.
+
+## How databases actually implement serializable
+
+| Strategy | How it works | What it costs |
+|---|---|---|
+| Actual serial execution | one transaction at a time, in memory (Redis, VoltDB) | no concurrency control at all; needs tiny, fast transactions |
+| Two-phase locking (2PL) | shared/exclusive locks held until commit | correct and slow: readers block writers, and deadlocks need detection |
+| Serializable snapshot isolation (SSI) | run on a snapshot, abort at commit if the read set changed | fast at low contention; throughput collapses when contention is high |
+
+Postgres's `SERIALIZABLE` is SSI: it tracks which rows each transaction read, and if another
+transaction wrote one of them before commit, it aborts yours with a serialization failure.
+**That means your application must be able to retry a transaction**, which is the real price of
+serializable isolation — not slowness, but a code requirement.
+
+```python
+class SSI(MVCC):
+    """Snapshot isolation plus read-set tracking: abort if what we read has changed."""
+    def begin(self):
+        tx = super().begin(); tx["reads"] = {}
+        return tx
+
+    def read(self, tx, key, level="snapshot"):
+        v = super().read(tx, key, level)
+        tx["reads"][key] = len(self.versions.get(key, []))     # remember what we saw
+        return v
+
+    def commit(self, tx):
+        for key, seen_len in tx["reads"].items():
+            if len(self.versions.get(key, [])) != seen_len:
+                return f"ABORT tx{tx['id']}: read set changed (key {key})"
+        super().commit(tx); return f"commit tx{tx['id']}"
+
+db = SSI()
+s = db.begin(); db.write(s, "alice_oncall", 1); db.write(s, "bob_oncall", 1); db.commit(s)
+
+t1, t2 = db.begin(), db.begin()
+db.read(t1, "alice_oncall"); db.read(t1, "bob_oncall"); db.write(t1, "alice_oncall", 0)
+db.read(t2, "alice_oncall"); db.read(t2, "bob_oncall"); db.write(t2, "bob_oncall", 0)
+print(db.commit(t1))
+print(db.commit(t2), "<- write skew prevented, application must retry")
+```
+
+```output
+ABORT tx2: read set changed (key alice_oncall)
+ABORT tx3: read set changed (key bob_oncall) <- write skew prevented, application must retry
+```
+
+## Deadlocks are normal; plan for them
+
+```python
+def take(order_a, order_b):
+    """Two transactions, two rows, locks acquired in the given orders."""
+    held = {order_a[0]: "A"}
+    if order_b[0] in held:
+        return (f"B waits for {order_b[0]}, held by A — no cycle, so B simply "
+                f"blocks until A commits")
+    held[order_b[0]] = "B"
+    waits = {}
+    for tx, order in (("A", order_a), ("B", order_b)):
+        owner = held.get(order[1])
+        if owner and owner != tx:
+            waits[tx] = order[1]
+        else:
+            held[order[1]] = tx
+    if len(waits) == 2:
+        return f"DEADLOCK: A waits for {waits['A']}, B waits for {waits['B']} — a cycle"
+    return "both completed without waiting"
+
+print("same order    :", take(["row1", "row2"], ["row1", "row2"]))
+print("opposite order:", take(["row1", "row2"], ["row2", "row1"]))
+```
+
+```output
+same order    : B waits for row1, held by A — no cycle, so B simply blocks until A commits
+opposite order: DEADLOCK: A waits for row2, B waits for row1 — a cycle
+```
+
+Databases detect deadlocks and kill one victim, so a deadlock is an error you retry, not a
+hang. Reduce them by **always acquiring locks in a consistent order** (sort the ids before
+locking), keeping transactions short, and never holding a lock across a network call to another
+service.
+
+## Transactions across services: sagas
+
+You cannot run a database transaction across two services. The replacement is a **saga**: a
+sequence of local transactions, each with a compensating action that undoes it.
+
+```python
+def saga(steps, fail_at=None):
+    done = []
+    for name, compensate in steps:
+        if name == fail_at:
+            print(f"  {name}: FAILED")
+            for undone, comp in reversed(done):
+                print(f"  compensating {undone} -> {comp}")
+            return "rolled back via compensation"
+        print(f"  {name}: ok"); done.append((name, compensate))
+    return "saga completed"
+
+steps = [("reserve inventory", "release inventory"), ("charge card", "refund card"),
+         ("create shipment", "cancel shipment")]
+print("happy path:");           print(" ", saga(steps))
+print("failure at shipment:");  print(" ", saga(steps, fail_at="create shipment"))
+```
+
+```output
+happy path:
+  reserve inventory: ok
+  charge card: ok
+  create shipment: ok
+  saga completed
+failure at shipment:
+  reserve inventory: ok
+  charge card: ok
+  create shipment: FAILED
+  compensating charge card -> refund card
+  compensating reserve inventory -> release inventory
+  rolled back via compensation
+```
+
+A saga is **not** atomic: there is a window where inventory is reserved and the card is charged
+but the shipment failed, and any observer during that window sees an inconsistent world.
+Compensation is also not always possible — you cannot un-send an email. Design sagas so the
+irreversible step is **last**.
+
+## Try it Yourself
+
+```python
+def contention(n_tx, conflict_prob, retries=3, seed=0):
+    """SSI throughput under contention: aborts turn into retries turn into more contention."""
+    import random
+    rng = random.Random(seed)
+    committed = aborted = attempts = 0
+    for _ in range(n_tx):
+        for attempt in range(retries):
+            attempts += 1
+            if rng.random() < conflict_prob:
+                aborted += 1
+                continue
+            committed += 1
+            break
+    print(f"conflict rate {conflict_prob:5.0%} -> committed {committed:4}/{n_tx}, "
+          f"aborts {aborted:4}, work done {attempts/n_tx:4.2f}x per transaction")
+
+for p in (0.0, 0.1, 0.4, 0.8):
+    contention(1_000, p)
+```
+
+```output
+conflict rate    0% -> committed 1000/1000, aborts    0, work done 1.00x per transaction
+conflict rate   10% -> committed  998/1000, aborts  127, work done 1.12x per transaction
+conflict rate   40% -> committed  936/1000, aborts  619, work done 1.55x per transaction
+conflict rate   80% -> committed  496/1000, aborts 1917, work done 2.41x per transaction
+```
+
+At an 80% conflict rate the system does nearly three times the work per successful transaction —
+optimistic concurrency inverts under contention. That is the moment to switch strategy: shrink
+the transaction, partition the hot row (sharded counters), or take a pessimistic lock instead.
+
+## Exercise
+
+Implement **two-phase locking** with deadlock detection: a lock manager with shared and
+exclusive locks, a wait-for graph, and cycle detection that aborts the youngest transaction in
+a cycle. Demonstrate it on two transactions that take the same two rows in opposite orders.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class LockManager:
+    def __init__(self):
+        self.holders = {}        # key -> (mode, {txids})
+        self.waits = {}          # txid -> key it is blocked on
+
+    def acquire(self, tx, key, mode="X"):
+        cur = self.holders.get(key)
+        if cur is None:
+            self.holders[key] = (mode, {tx})
+            return "granted"
+        cur_mode, owners = cur
+        if owners == {tx}:
+            self.holders[key] = (mode, owners)      # upgrade
+            return "granted (upgrade)"
+        if mode == "S" and cur_mode == "S":
+            owners.add(tx)
+            return "granted (shared)"
+        self.waits[tx] = key
+        victim = self._detect_deadlock(tx)
+        if victim:
+            return f"DEADLOCK -> abort tx{victim}"
+        return f"waiting for {key}"
+
+    def _detect_deadlock(self, start):
+        """Walk the wait-for graph; a cycle means deadlock. Abort the youngest tx."""
+        seen, tx = [], start
+        while tx in self.waits:
+            key = self.waits[tx]
+            owners = self.holders.get(key, (None, set()))[1] - {tx}
+            if not owners:
+                return None
+            nxt = max(owners)
+            if nxt in seen or nxt == start:
+                return max(seen + [start, nxt])      # youngest = highest txid
+            seen.append(nxt)
+            tx = nxt
+        return None
+
+    def release_all(self, tx):
+        for key, (mode, owners) in list(self.holders.items()):
+            owners.discard(tx)
+            if not owners: del self.holders[key]
+        self.waits.pop(tx, None)
+
+lm = LockManager()
+print("tx1 locks row1:", lm.acquire(1, "row1"))
+print("tx2 locks row2:", lm.acquire(2, "row2"))
+print("tx1 wants row2:", lm.acquire(1, "row2"))
+print("tx2 wants row1:", lm.acquire(2, "row1"))
+lm.release_all(2)
+print("after aborting tx2, tx1 wants row2:", lm.acquire(1, "row2"))
+```
+
+```output
+tx1 locks row1: granted
+tx2 locks row2: granted
+tx1 wants row2: waiting for row2
+tx2 wants row1: DEADLOCK -> abort tx2
+after aborting tx2, tx1 wants row2: granted
+```
+
+The insight: 2PL is *two* phases — a growing phase where locks are acquired and a shrinking
+phase where they are released, and the rule that makes it serializable is that **no lock is
+released before the last one is acquired** (strict 2PL releases everything at commit). Deadlock
+is not a bug in the protocol; it is an unavoidable consequence of letting transactions take
+locks in any order, which is why every 2PL database ships a detector and a victim policy.
+Choosing the youngest transaction as the victim guarantees progress: the oldest transaction can
+never starve, because it is never the victim.
+</details>

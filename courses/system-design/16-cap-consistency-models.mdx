@@ -1,0 +1,373 @@
+---
+course: system-design
+chapter: 16-cap-consistency-models
+title: "CAP, Linearizability, and Causal Consistency"
+order: 16
+---
+
+## CAP, stated precisely
+
+The theorem is narrower than its reputation. It says: when a **network partition** splits your
+replicas, a system that must respond can either
+
+- refuse to answer until the partition heals, preserving one global view of the data
+  (**CP** — consistent, not available), or
+- answer from whichever replica it can reach, accepting divergent views
+  (**AP** — available, not consistent).
+
+That is the whole theorem. "Pick two of three" is a slogan: **P is not optional** — networks
+partition — so you are choosing between C and A *during a partition*, and that is a runtime
+behaviour, not a database category.
+
+```python
+class Node:
+    def __init__(self, name, value=0):
+        self.name, self.value, self.reachable = name, value, set()
+
+def request(node, peers, quorum, op, value=None):
+    """CP: a write or read needs a quorum of reachable peers. AP: local is enough."""
+    visible = {p for p in peers if p in node.reachable} | {node}
+    if quorum and len(visible) < (len(peers) + 1) // 2 + 1:
+        return f"{op} on {node.name}: REFUSED (only {len(visible)} nodes reachable)"
+    if op == "write":
+        for n in visible: n.value = value
+        return f"write on {node.name}: ok, applied to {sorted(n.name for n in visible)}"
+    return f"read on {node.name}: {node.value}"
+
+a, b, c = Node("a", 1), Node("b", 1), Node("c", 1)
+peers = [a, b, c]
+a.reachable = {b, c}; b.reachable = {a, c}; c.reachable = {a, b}
+print("healthy cluster:")
+print("  ", request(a, peers, quorum=True, op="write", value=2))
+
+# Partition: {a} | {b, c}
+a.reachable = set(); b.reachable = {c}; c.reachable = {b}
+print("partitioned, minority side (a):")
+print("   CP:", request(a, peers, quorum=True,  op="write", value=3))
+print("   AP:", request(a, peers, quorum=False, op="write", value=3))
+print("   AP read on majority side:", request(b, peers, quorum=False, op="read"))
+```
+
+```output
+healthy cluster:
+   write on a: ok, applied to ['a', 'b', 'c']
+partitioned, minority side (a):
+   CP: write on a: REFUSED (only 1 nodes reachable)
+   AP: write on a: ok, applied to ['a']
+   AP read on majority side: read on b: 2
+```
+
+The minority side under CP returns an error; under AP it accepts the write and now disagrees
+with the majority. Neither is "correct" — a shopping cart should take the write, a bank ledger
+should refuse it.
+
+### PACELC: the half of the trade-off people forget
+
+Partitions are rare. The trade-off you pay for *every day* is the one PACELC adds: **else**,
+when the network is fine, you still choose between latency and consistency.
+
+$$
+\text{if } P \text{ then } (A \text{ or } C) \text{ else } (L \text{ or } C)
+$$
+
+```python
+systems = [
+    ("Postgres, single node",     "n/a",  "C", "no distribution: no trade to make"),
+    ("Postgres + sync replica",   "PC",   "EC", "waits for the replica even when healthy"),
+    ("MongoDB (majority write)",  "PC",   "EC", "quorum on every write"),
+    ("Cassandra (QUORUM)",        "PA/PC","EL/EC", "tunable per query, W+R decides"),
+    ("DynamoDB (eventual read)",  "PA",   "EL", "answers from the nearest replica"),
+    ("Spanner",                   "PC",   "EC", "TrueTime waits out clock uncertainty"),
+]
+print(f"{'system':28}{'partition':10}{'else':8}note")
+for name, p, e, note in systems:
+    print(f"{name:28}{p:10}{e:8}{note}")
+```
+
+```output
+system                      partition else    note
+Postgres, single node       n/a       C       no distribution: no trade to make
+Postgres + sync replica     PC        EC      waits for the replica even when healthy
+MongoDB (majority write)    PC        EC      quorum on every write
+Cassandra (QUORUM)          PA/PC     EL/EC   tunable per query, W+R decides
+DynamoDB (eventual read)    PA        EL      answers from the nearest replica
+Spanner                     PC        EC      TrueTime waits out clock uncertainty
+```
+
+Spanner is the instructive case: it is CP *and* low-latency-ish, achieved by spending money on
+atomic clocks and then **deliberately waiting** out the clock uncertainty interval on every
+commit. There is no free lunch, only a bill paid in a different currency.
+
+## The consistency ladder
+
+From strongest to weakest, each level allows strictly more behaviours than the one above:
+
+| Model | Guarantee | Typical cost |
+|---|---|---|
+| Linearizable | every operation appears to happen at one instant, in real-time order | consensus round trip per write |
+| Sequential | all nodes see the same order; not necessarily real-time order | still requires agreement on order |
+| Causal | operations that *caused* each other are seen in order; concurrent ones may differ | metadata (vector clocks), no coordination |
+| Read-your-writes / monotonic | per-session guarantees only | routing or sticky sessions |
+| Eventual | replicas converge if writes stop | nothing |
+
+### Linearizability, made concrete
+
+A history is linearizable if you can pick one instant inside each operation's interval such
+that the resulting sequential order is legal for the data type and respects real time.
+
+```python
+def linearizable(history):
+    """history: list of (op, value, start, end). Brute force over orderings."""
+    from itertools import permutations
+    n = len(history)
+    for order in permutations(range(n)):
+        # real-time constraint: if op i finished before op j started, i must come first
+        ok = all(not (history[a][3] < history[b][2] and order.index(a) > order.index(b))
+                 for a in range(n) for b in range(n) if a != b)
+        if not ok:
+            continue
+        reg = None
+        for i in order:
+            op, val, _, _ = history[i]
+            if op == "write":
+                reg = val
+            elif val != reg:
+                break
+        else:
+            return True, [history[i][:2] for i in order]
+    return False, None
+
+# Reader B's read overlaps A's write, so either value is legal.
+h1 = [("write", 1, 0, 10), ("read", 1, 5, 12)]
+# Here the read starts after the write completed, but returns the old value: illegal.
+h2 = [("write", 1, 0, 10), ("read", 0, 11, 12)]
+# Two reads that overlap the same write may disagree — but not go backwards in real time.
+h3 = [("write", 1, 0, 10), ("read", 1, 4, 6), ("read", 0, 7, 9)]
+
+for name, h in [("overlapping read", h1), ("stale read after write", h2), ("read goes backwards", h3)]:
+    ok, order = linearizable(h)
+    print(f"{name:24} linearizable={ok}  {order if ok else ''}")
+```
+
+```output
+overlapping read         linearizable=True  [('write', 1), ('read', 1)]
+stale read after write   linearizable=False  
+read goes backwards      linearizable=False  
+```
+
+The second history is the one your users complain about: they refreshed *after* seeing a
+success message and the old value came back. The third is worse — the value moved forward and
+then backward while nobody wrote it.
+
+### Causal consistency: the useful middle
+
+Linearizability requires coordination on every operation, which costs a round trip and is
+impossible to keep during a partition. **Causal consistency** is the strongest model that stays
+available: it only orders operations that are causally related — and it is enough to prevent
+the anomalies users actually notice.
+
+```python
+class CausalStore:
+    """Deliver a write only after its dependencies have been applied."""
+    def __init__(self, name): self.name, self.applied, self.pending = name, {}, []
+
+    def apply(self, write):
+        key, value, deps = write
+        if all(self.applied.get(k) == v for k, v in deps.items()):
+            self.applied[key] = value
+            return True
+        self.pending.append(write)
+        return False
+
+    def retry_pending(self):
+        again, self.pending = self.pending, []
+        return [w for w in again if not self.apply(w)]
+
+# Alice posts; Bob replies (his reply causally depends on seeing the post).
+post  = ("post:1", "I lost my dog", {})
+reply = ("reply:1", "So sorry!", {"post:1": "I lost my dog"})
+
+replica = CausalStore("r2")
+print("reply arrives first:", replica.apply(reply), "-> buffered, not shown out of order")
+print("post arrives      :", replica.apply(post))
+replica.retry_pending()
+print("state:", replica.applied)
+```
+
+```output
+reply arrives first: False -> buffered, not shown out of order
+post arrives      : True
+state: {'post:1': 'I lost my dog', 'reply:1': 'So sorry!'}
+```
+
+Without causal delivery, a replica can show "So sorry!" above a post nobody has seen yet — the
+canonical example of why *eventual* consistency alone is not a usable user experience.
+
+## Where consistency choices actually appear in a design
+
+```python
+decisions = [
+    ("username uniqueness",     "linearizable", "a unique constraint IS consensus"),
+    ("payment / ledger",        "linearizable", "double spend is unacceptable"),
+    ("inventory decrement",     "linearizable", "or oversell and compensate (ch. 15 saga)"),
+    ("social feed",             "causal",       "replies must follow posts"),
+    ("view / like counters",    "eventual",     "off by a few for a second is fine"),
+    ("session store",           "read-your-writes", "the user must see their own login"),
+    ("analytics dashboards",    "eventual",     "minutes of lag are expected"),
+]
+for what, model, why in decisions:
+    print(f"{what:24} {model:18} {why}")
+```
+
+```output
+username uniqueness      linearizable       a unique constraint IS consensus
+payment / ledger         linearizable       double spend is unacceptable
+inventory decrement      linearizable       or oversell and compensate (ch. 15 saga)
+social feed              causal             replies must follow posts
+view / like counters     eventual           off by a few for a second is fine
+session store            read-your-writes   the user must see their own login
+analytics dashboards     eventual           minutes of lag are expected
+```
+
+Most systems need exactly one or two linearizable pieces — usually an ID allocator, a uniqueness
+constraint, or a lock — and everything else can be weaker. **Isolate the strong part**: put it in
+one small consensus-backed service (ch. 17) rather than paying for coordination across the whole
+system.
+
+## The cost of strong consistency, in milliseconds
+
+```python
+def write_latency(model, rtt_ms, replicas=3, regions=1):
+    if model == "eventual":       return rtt_ms * 0            # local write, replicate later
+    if model == "quorum":         return rtt_ms                # one round trip to a quorum
+    if model == "linearizable":   return rtt_ms * 2            # propose + commit (ch. 17)
+    if model == "global-lin":     return rtt_ms * 2 * regions  # cross-region consensus
+    return None
+
+for model in ("eventual", "quorum", "linearizable"):
+    print(f"{model:14} same-DC (rtt 1 ms): {write_latency(model, 1):5.1f} ms | "
+          f"cross-region (rtt 80 ms): {write_latency(model, 80):6.1f} ms")
+print(f"{'global-lin':14} 3 regions, rtt 80 ms: {write_latency('global-lin', 80, regions=3):.0f} ms per write")
+```
+
+```output
+eventual       same-DC (rtt 1 ms):   0.0 ms | cross-region (rtt 80 ms):    0.0 ms
+quorum         same-DC (rtt 1 ms):   1.0 ms | cross-region (rtt 80 ms):   80.0 ms
+linearizable   same-DC (rtt 1 ms):   2.0 ms | cross-region (rtt 80 ms):  160.0 ms
+global-lin     3 regions, rtt 80 ms: 480 ms per write
+```
+
+A 480 ms write is a product decision, not a technical detail — it decides whether the user
+watches a spinner. This is why global systems partition data by region and keep consensus
+*inside* a region wherever the business rules allow.
+
+## Try it Yourself
+
+```python
+def availability_under_partition(nodes, quorum_size, partition_sizes):
+    """Which sides of a partition can still serve writes?"""
+    print(f"cluster of {nodes}, quorum = {quorum_size}")
+    for sizes in partition_sizes:
+        alive = [s for s in sizes if s >= quorum_size]
+        verdict = ("one side keeps writing" if len(alive) == 1
+                   else "NOBODY can write (full outage)" if not alive
+                   else "SPLIT BRAIN — impossible with a majority quorum")
+        print(f"   partition {sizes} -> writable sides: {alive or '-'}  ({verdict})")
+
+availability_under_partition(3, 2, [[3], [2, 1], [1, 1, 1]])
+availability_under_partition(5, 3, [[5], [3, 2], [2, 2, 1], [4, 1]])
+availability_under_partition(4, 3, [[2, 2], [3, 1]])
+```
+
+```output
+cluster of 3, quorum = 2
+   partition [3] -> writable sides: [3]  (one side keeps writing)
+   partition [2, 1] -> writable sides: [2]  (one side keeps writing)
+   partition [1, 1, 1] -> writable sides: -  (NOBODY can write (full outage))
+cluster of 5, quorum = 3
+   partition [5] -> writable sides: [5]  (one side keeps writing)
+   partition [3, 2] -> writable sides: [3]  (one side keeps writing)
+   partition [2, 2, 1] -> writable sides: -  (NOBODY can write (full outage))
+   partition [4, 1] -> writable sides: [4]  (one side keeps writing)
+cluster of 4, quorum = 3
+   partition [2, 2] -> writable sides: -  (NOBODY can write (full outage))
+   partition [3, 1] -> writable sides: [3]  (one side keeps writing)
+```
+
+Note the last case: an **even cluster size is strictly worse** — a 2/2 split leaves nobody able to
+write, while a 5-node cluster survives any 3/2 split. That is why consensus clusters are always
+sized 3, 5, or 7, and why adding a fourth node to a three-node cluster buys you nothing.
+
+## Exercise
+
+Build a **linearizability checker** for a compare-and-set register and use it to classify three
+histories from a simulated cluster. Your checker should take a history of concurrent operations
+with start and end times and decide whether some sequential order exists that respects real-time
+ordering and the CAS semantics. Then explain why exhaustive checking is impractical for long
+histories and what real tools (Jepsen's Knossos, Elle) do instead.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from itertools import permutations
+
+def check_cas(history):
+    """history: (op, arg, ret, start, end); ops: read, cas(old,new) -> True/False."""
+    n = len(history)
+    for order in permutations(range(n)):
+        if any(history[a][4] < history[b][3] and order.index(a) > order.index(b)
+               for a in range(n) for b in range(n) if a != b):
+            continue                                    # violates real-time order
+        reg, ok = 0, True
+        for i in order:
+            op, arg, ret, _, _ = history[i]
+            if op == "read":
+                if ret != reg: ok = False; break
+            else:
+                old, new = arg
+                succeeded = (reg == old)
+                if succeeded != ret: ok = False; break
+                if succeeded: reg = new
+        if ok:
+            return True, [(history[i][0], history[i][1], history[i][2]) for i in order]
+    return False, None
+
+histories = {
+    "both CAS overlap, one wins": [
+        ("cas", (0, 1), True,  0, 10),
+        ("cas", (0, 2), False, 2, 11),
+        ("read", None, 1,      12, 13)],
+    "both CAS report success":   [
+        ("cas", (0, 1), True,  0, 10),
+        ("cas", (0, 2), True,  2, 11),
+        ("read", None, 2,      12, 13)],
+    "read sees a value nobody wrote": [
+        ("cas", (0, 1), True,  0, 5),
+        ("read", None, 7,      6, 8)],
+}
+for name, h in histories.items():
+    ok, order = check_cas(h)
+    print(f"{name:32} linearizable={ok}")
+    if ok:
+        print(f"    witness order: {order}")
+```
+
+```output
+both CAS overlap, one wins       linearizable=True
+    witness order: [('cas', (0, 1), True), ('cas', (0, 2), False), ('read', None, 1)]
+both CAS report success          linearizable=False
+read sees a value nobody wrote   linearizable=False
+```
+
+The insight: the checker is a search over $n!$ orderings, so it is fine for 8 operations and
+hopeless for 8,000. Real tools attack this from two directions. **Knossos** (Jepsen) prunes the
+search with the Wing-Gong algorithm — linearize the earliest completed operation, recurse, and
+backtrack — which is still exponential in the worst case but tractable for real histories.
+**Elle** changes the question: instead of searching orderings, it builds a dependency graph from
+observed reads and writes and looks for a *cycle*, which is a polynomial-time test and yields a
+human-readable explanation of exactly which transactions form the anomaly. The practical lesson
+for designers is the same either way: consistency violations are found by checking histories
+against a model, not by reasoning about the code — which is why "we tested it and saw no bugs"
+means nothing about a distributed system until someone injected partitions while checking.
+</details>

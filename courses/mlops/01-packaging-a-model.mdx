@@ -1,0 +1,382 @@
+---
+course: mlops
+chapter: 01-packaging-a-model
+title: "Packaging a Model: Artifacts, Schemas, and Versioning"
+order: 1
+---
+
+## "The model" is never just the weights
+
+A deployable model is a bundle: the fitted parameters, the preprocessing that produced the
+features those parameters expect, the input and output schema, and enough metadata to reproduce
+the whole thing. Ship any one of them separately and you have shipped a bug.
+
+```python
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+X = np.column_stack([rng.normal(50, 12, 4_000),        # age
+                     rng.lognormal(7, 0.6, 4_000),     # income, wildly different scale
+                     rng.integers(0, 5, 4_000)])       # prior claims
+y = (0.03 * X[:, 0] + 0.000004 * X[:, 1] + 0.4 * X[:, 2]
+     + rng.normal(0, 1, 4_000) > 3.2).astype(int)
+
+pipe = Pipeline([("scale", StandardScaler()),
+                 ("clf", LogisticRegression(max_iter=1000))]).fit(X, y)
+
+raw = np.array([[42.0, 1500.0, 2]])
+print("pipeline prediction   :", pipe.predict_proba(raw)[0, 1].round(4))
+print("estimator alone       :", pipe.named_steps["clf"].predict_proba(raw)[0, 1].round(4))
+print("same input, two answers — the second forgot the scaler")
+```
+
+```output
+pipeline prediction   : 0.1206
+estimator alone       : 0.9995
+same input, two answers — the second forgot the scaler
+```
+
+That is the most common packaging failure in production, and it is silent: the second call
+returns a number, not an error. Whatever you save must include every transformation between the
+raw request and the model's input.
+
+## The artifact inventory
+
+```python
+import json, hashlib, sklearn, sys, platform
+
+def build_artifact(pipeline, feature_names, metrics):
+    return {
+        "name": "claims-risk",
+        "version": "1.4.0",
+        "features": feature_names,               # order matters, and it is part of the contract
+        "target": "will_claim",
+        "metrics": metrics,
+        "env": {
+            "python": platform.python_version(),
+            "sklearn": sklearn.__version__,
+            "numpy": np.__version__,
+        },
+        "training_data": "warehouse://claims?snapshot=2026-05-01",
+        "code_commit": "a91f3c2",
+    }
+
+meta = build_artifact(pipe, ["age", "income", "prior_claims"], {"auc": 0.883})
+meta["fingerprint"] = hashlib.sha256(
+    json.dumps(meta, sort_keys=True).encode()).hexdigest()[:12]
+for k, v in meta.items():
+    print(f"{k:14} {v}")
+```
+
+```output
+name           claims-risk
+version        1.4.0
+features       ['age', 'income', 'prior_claims']
+target         will_claim
+metrics        {'auc': 0.883}
+env            {'python': '3.11.15', 'sklearn': '1.9.0', 'numpy': '2.4.6'}
+training_data  warehouse://claims?snapshot=2026-05-01
+code_commit    a91f3c2
+fingerprint    4f4a636898c0
+```
+
+Each field earns its place by answering a question you will actually be asked. *Which data?* —
+`training_data`. *Which code?* — `code_commit`. *Why did it stop working after the upgrade?* —
+`env`. *Is this the same model we tested?* — `fingerprint`.
+
+## Serialize the pipeline, not the estimator
+
+```python
+import tempfile, os, joblib, pathlib
+
+d = pathlib.Path(tempfile.mkdtemp())
+joblib.dump(pipe, d / "model.joblib")
+(d / "metadata.json").write_text(json.dumps(meta, indent=2))
+
+loaded = joblib.load(d / "model.joblib")
+print("files in the artifact:", sorted(p.name for p in d.iterdir()))
+print("reload matches original:",
+      np.allclose(loaded.predict_proba(raw), pipe.predict_proba(raw)))
+print(f"model.joblib size: {(d / 'model.joblib').stat().st_size / 1024:.1f} KB "
+      f"(varies with library version)")
+```
+
+```output
+files in the artifact: ['metadata.json', 'model.joblib']
+reload matches original: True
+model.joblib size: 1.4 KB (varies with library version)
+```
+
+Two properties to insist on. The artifact **round-trips exactly** — assert it in your build, not
+in your head. And the artifact is **immutable and content-addressed**: never overwrite
+`model.joblib`; write `models/claims-risk/1.4.0/model.joblib` and let the version be part of the
+path (ch. 6).
+
+### Formats, and when each is right
+
+| Format | Good for | Watch out for |
+|---|---|---|
+| `pickle` / `joblib` | any Python object, fastest to adopt | executes arbitrary code on load; version-fragile |
+| plain JSON parameters | linear models, trees you export yourself | you must reimplement inference |
+| ONNX | cross-language, cross-runtime serving | operator coverage gaps; a conversion step to test |
+| SavedModel / TorchScript | deep models with their compute graph | large; framework-version sensitive |
+| Safetensors | model weights only, memory-mapped, no code execution | weights only: no preprocessing, no graph |
+
+```python
+coefs = {"intercept": float(pipe.named_steps["clf"].intercept_[0]),
+         "coef": pipe.named_steps["clf"].coef_[0].round(6).tolist(),
+         "mean": pipe.named_steps["scale"].mean_.round(6).tolist(),
+         "scale": pipe.named_steps["scale"].scale_.round(6).tolist()}
+blob = json.dumps(coefs)
+
+def predict_from_json(row, p):
+    z = (np.asarray(row) - p["mean"]) / p["scale"]
+    logit = p["intercept"] + float(np.dot(z, p["coef"]))
+    return 1 / (1 + np.exp(-logit))
+
+print(f"json parameter blob: {len(blob)} bytes")
+print("pickle prediction:", pipe.predict_proba(raw)[0, 1].round(6))
+print("json   prediction:", round(predict_from_json(raw[0], json.loads(blob)), 6))
+```
+
+```output
+json parameter blob: 162 bytes
+pickle prediction: 0.120603
+json   prediction: 0.120603
+```
+
+For a linear model the entire deployable artifact is a few hundred bytes of JSON and four lines
+of arithmetic — no pickle, no version coupling, no code execution on load. That is worth
+remembering before you containerize 800 MB of scikit-learn to serve a logistic regression.
+
+## The schema is the contract
+
+Everything about the request that the model depends on — field names, types, ranges, units,
+required-ness — belongs in a declared schema that runs *before* the model does.
+
+```python
+from pydantic import BaseModel, Field, ValidationError
+
+class ClaimRequest(BaseModel):
+    age: float = Field(ge=18, le=110)
+    income: float = Field(gt=0)
+    prior_claims: int = Field(ge=0, le=20)
+
+    def to_row(self):
+        return [[self.age, self.income, self.prior_claims]]
+
+good = {"age": 42, "income": 1500.0, "prior_claims": 2}
+bad_cases = [
+    {"age": 8, "income": 1500.0, "prior_claims": 2},          # out of range
+    {"age": 42, "income": -5, "prior_claims": 2},             # impossible value
+    {"age": 42, "income": 1500.0},                            # missing field
+    {"age": "forty-two", "income": 1500.0, "prior_claims": 2} # wrong type
+]
+
+req = ClaimRequest(**good)
+print("valid request ->", pipe.predict_proba(req.to_row())[0, 1].round(4))
+for case in bad_cases:
+    try:
+        ClaimRequest(**case)
+    except ValidationError as e:
+        err = e.errors()[0]
+        print(f"rejected {str(case)[:44]:46} {err['loc'][0]}: {err['msg'][:38]}")
+```
+
+```output
+valid request -> 0.1206
+rejected {'age': 8, 'income': 1500.0, 'prior_claims':   age: Input should be greater than or equal 
+rejected {'age': 42, 'income': -5, 'prior_claims': 2}   income: Input should be greater than 0
+rejected {'age': 42, 'income': 1500.0}                  prior_claims: Field required
+rejected {'age': 'forty-two', 'income': 1500.0, 'prio   age: Input should be a valid number, unable
+```
+
+A rejected request is a **422 with a precise message**, not a prediction from garbage. Note what
+the schema is not: it is not a substitute for training/serving skew checks, because a request can
+be perfectly valid and still be outside the distribution the model was trained on (ch. 7).
+
+### Feature order is part of the contract
+
+```python
+def predict_by_position(model, row):
+    return model.predict_proba([row])[0, 1]
+
+correct = [42.0, 1500.0, 2]
+swapped = [1500.0, 42.0, 2]                  # a caller reordered two fields
+print(f"correct order : {predict_by_position(pipe, correct):.4f}")
+print(f"swapped order : {predict_by_position(pipe, swapped):.4f}  <- no error, just wrong")
+
+def predict_by_name(model, payload, names):
+    missing = [n for n in names if n not in payload]
+    if missing:
+        raise KeyError(f"missing features: {missing}")
+    return model.predict_proba([[payload[n] for n in names]])[0, 1]
+
+print("by name       :",
+      round(predict_by_name(pipe, {"income": 1500.0, "age": 42.0, "prior_claims": 2},
+                            meta["features"]), 4))
+```
+
+```output
+correct order : 0.1206
+swapped order : 1.0000  <- no error, just wrong
+by name       : 0.1206
+```
+
+Positional feature vectors are a silent failure waiting for a refactor. **Accept a mapping,
+order it yourself from the artifact's `features` list**, and the caller can never get it wrong.
+
+## Version pinning, and what breaks without it
+
+```python
+def load_guard(artifact_env, runtime_env, strict=("sklearn",)):
+    problems = []
+    for lib, trained_with in artifact_env.items():
+        running = runtime_env.get(lib)
+        if running is None:
+            problems.append(f"{lib}: not installed")
+        elif running != trained_with:
+            level = "ERROR" if lib in strict else "warn"
+            problems.append(f"{level} {lib}: trained on {trained_with}, running {running}")
+    return problems or ["environment matches the artifact"]
+
+runtime_now = {"python": platform.python_version(), "sklearn": sklearn.__version__,
+               "numpy": np.__version__}
+for line in load_guard(meta["env"], runtime_now):
+    print(line)
+print()
+for line in load_guard(meta["env"], {**runtime_now, "sklearn": "1.2.0", "numpy": "1.24.0"}):
+    print(line)
+```
+
+```output
+environment matches the artifact
+
+ERROR sklearn: trained on 1.9.0, running 1.2.0
+warn numpy: trained on 2.4.6, running 1.24.0
+```
+
+Unpickling a scikit-learn estimator saved by a different minor version may work, may warn, or may
+produce **subtly different numbers** — the worst of the three. The rule: pin exact versions in the
+serving image (ch. 3), record them in the artifact, and check them at load time so a mismatch is
+a startup failure rather than a slow drift in predictions.
+
+## Try it Yourself
+
+```python
+def package(pipeline, features, version, metrics, directory=None):
+    """One function that writes a complete, self-describing artifact."""
+    d = pathlib.Path(directory or tempfile.mkdtemp()) / version
+    d.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pipeline, d / "model.joblib")
+    m = build_artifact(pipeline, features, metrics)
+    m["version"] = version
+    m["fingerprint"] = hashlib.sha256(
+        json.dumps(m, sort_keys=True).encode()).hexdigest()[:12]
+    (d / "metadata.json").write_text(json.dumps(m, indent=2))
+    (d / "requirements.txt").write_text(
+        f"scikit-learn=={sklearn.__version__}\nnumpy=={np.__version__}\n")
+    # the smoke test travels WITH the artifact
+    example = {"input": raw.tolist(), "output": float(pipeline.predict_proba(raw)[0, 1])}
+    (d / "example.json").write_text(json.dumps(example))
+    return d
+
+art = package(pipe, ["age", "income", "prior_claims"], "1.4.0", {"auc": 0.883})
+print("artifact contents:", sorted(p.name for p in art.iterdir()))
+
+def verify(directory):
+    m = json.loads((directory / "metadata.json").read_text())
+    ex = json.loads((directory / "example.json").read_text())
+    model = joblib.load(directory / "model.joblib")
+    got = float(model.predict_proba(np.array(ex["input"]))[0, 1])
+    ok = abs(got - ex["output"]) < 1e-9
+    print(f"loaded {m['name']} {m['version']} ({m['fingerprint']}) -> "
+          f"smoke test {'PASS' if ok else 'FAIL'} ({got:.6f} vs {ex['output']:.6f})")
+
+verify(art)
+```
+
+```output
+artifact contents: ['example.json', 'metadata.json', 'model.joblib', 'requirements.txt']
+loaded claims-risk 1.4.0 (4f4a636898c0) -> smoke test PASS (0.120603 vs 0.120603)
+```
+
+Change the model between `package` and `verify` — retrain with a different seed — and the smoke
+test fails immediately. An artifact that carries its own expected output is the cheapest
+regression test in MLOps, and it costs one JSON file.
+
+## Exercise
+
+Write a `ModelBundle` class that loads an artifact directory and exposes a single
+`predict(payload: dict) -> dict` method. It must: validate the payload against the schema, order
+features by name from the metadata, refuse to load if the runtime library versions differ from
+the artifact's, run the packaged smoke test at load time, and return the prediction together with
+the model version and fingerprint so every response is traceable.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class ModelBundle:
+    def __init__(self, directory, strict_libs=("sklearn",)):
+        self.dir = pathlib.Path(directory)
+        self.meta = json.loads((self.dir / "metadata.json").read_text())
+        runtime = {"python": platform.python_version(),
+                   "sklearn": sklearn.__version__, "numpy": np.__version__}
+        for lib in strict_libs:
+            if runtime.get(lib) != self.meta["env"].get(lib):
+                raise RuntimeError(
+                    f"refusing to load: {lib} {runtime.get(lib)} != "
+                    f"artifact {self.meta['env'].get(lib)}")
+        self.model = joblib.load(self.dir / "model.joblib")
+        ex = json.loads((self.dir / "example.json").read_text())
+        got = float(self.model.predict_proba(np.array(ex["input"]))[0, 1])
+        if abs(got - ex["output"]) > 1e-9:
+            raise RuntimeError(f"smoke test failed at load: {got} != {ex['output']}")
+        self.features = self.meta["features"]
+
+    def predict(self, payload):
+        req = ClaimRequest(**payload)                       # schema validation first
+        row = [[getattr(req, name) for name in self.features]]   # order from the artifact
+        p = float(self.model.predict_proba(row)[0, 1])
+        return {"probability": round(p, 6),
+                "model": f"{self.meta['name']}:{self.meta['version']}",
+                "fingerprint": self.meta["fingerprint"]}
+
+bundle = ModelBundle(art)
+print(bundle.predict({"income": 1500.0, "age": 42, "prior_claims": 2}))
+print(bundle.predict({"age": 61, "income": 900.0, "prior_claims": 0}))
+
+try:
+    bundle.predict({"age": 8, "income": 900.0, "prior_claims": 0})
+except ValidationError as e:
+    print("rejected before touching the model:", e.errors()[0]["msg"])
+
+bad_meta = dict(bundle.meta, env=dict(bundle.meta["env"], sklearn="0.24.2"))
+(art / "metadata.json").write_text(json.dumps(bad_meta))
+try:
+    ModelBundle(art)
+except RuntimeError as e:
+    print("startup refused:", e)
+```
+
+```output
+{'probability': 0.120603, 'model': 'claims-risk:1.4.0', 'fingerprint': '4f4a636898c0'}
+{'probability': 0.073679, 'model': 'claims-risk:1.4.0', 'fingerprint': '4f4a636898c0'}
+rejected before touching the model: Input should be greater than or equal to 18
+startup refused: refusing to load: sklearn 1.9.0 != artifact 0.24.2
+```
+
+The insight: every one of those checks converts a *silent wrong answer* into a *loud failure*,
+and that trade is the whole discipline. A version mismatch becomes a startup crash instead of
+predictions that drift by a few percent; a reordered field becomes a `KeyError` instead of a
+plausible number; an out-of-range input becomes a 422 instead of an extrapolation. Note where the
+checks live: version and smoke-test checks run **once at load**, so they cost nothing per request
+and fail the deploy rather than the user; schema and ordering run **per request**, because that is
+where untrusted input enters. Returning the version and fingerprint with every prediction closes
+the loop — when someone asks why a decision was made six months from now, the response itself
+names the exact artifact (ch. 6).
+</details>

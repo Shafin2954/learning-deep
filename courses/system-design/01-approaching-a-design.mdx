@@ -1,0 +1,262 @@
+---
+course: system-design
+chapter: 01-approaching-a-design
+title: "How to Approach a Design: Requirements, API, Data, Scale"
+order: 1
+---
+
+## Four passes, always in this order
+
+A design interview and a real design doc have the same shape. You make four passes over the
+problem, and each pass constrains the next:
+
+1. **Requirements** — what must it do (functional), and how well (non-functional).
+2. **API** — the smallest set of operations that satisfies the functional requirements.
+3. **Data** — what you store, how it is keyed, and how it is read.
+4. **Scale** — replication, partitioning, caching, queues. Boxes on the whiteboard.
+
+People fail by starting at 4. They draw a load balancer and three shards before knowing
+whether the system does 50 writes a second or 50 thousand. Every box you add must be
+*forced* by a number from pass 1.
+
+## Requirements are numbers, not adjectives
+
+"Fast", "highly available", and "scalable" are not requirements. They become requirements
+when you attach a number and a percentile to them.
+
+```python
+# The whole design brief, as numbers. Everything downstream derives from this.
+reqs = {
+    "daily_active_users":        2_000_000,
+    "posts_per_user_per_day":    0.2,     # most users read, few write
+    "feed_opens_per_user_per_day": 8,
+    "p99_read_latency_ms":       200,
+    "availability":              0.999,   # three nines
+}
+
+writes_per_day = reqs["daily_active_users"] * reqs["posts_per_user_per_day"]
+reads_per_day  = reqs["daily_active_users"] * reqs["feed_opens_per_user_per_day"]
+
+print(f"writes/day      {writes_per_day:>12,.0f}")
+print(f"reads/day       {reads_per_day:>12,.0f}")
+print(f"read:write      {reads_per_day / writes_per_day:>12.0f} : 1")
+print(f"downtime budget {(1 - reqs['availability']) * 365 * 24 * 60:>12.0f} min/year")
+```
+
+```output
+writes/day           400,000
+reads/day         16,000,000
+read:write                40 : 1
+downtime budget          526 min/year
+```
+
+A 40:1 read-to-write ratio is the single most important number on the page. It says: this is
+a **read-heavy** system, so caching and read replicas will buy you more than write
+optimization ever will. A 1:1 ratio would have pushed you to a completely different design.
+
+## Average load is a lie; design for peak
+
+Traffic is not uniform over 24 hours. A consumer app typically sees its busy hour carry
+2–4x the average rate. You size for peak, not for average.
+
+```python
+SEC_PER_DAY = 86_400
+PEAK_FACTOR = 3.0     # busy-hour multiplier; measure it, don't guess it forever
+
+avg_write_qps = writes_per_day / SEC_PER_DAY
+avg_read_qps  = reads_per_day / SEC_PER_DAY
+
+print(f"avg  write {avg_write_qps:8.1f} qps   read {avg_read_qps:8.1f} qps")
+print(f"peak write {avg_write_qps * PEAK_FACTOR:8.1f} qps   read {avg_read_qps * PEAK_FACTOR:8.1f} qps")
+```
+
+```output
+avg  write      4.6 qps   read    185.2 qps
+peak write     13.9 qps   read    555.6 qps
+```
+
+Peak reads near 555 qps is *small*. One well-tuned Postgres box serves that. Knowing this
+early stops you from designing a Kafka-and-Cassandra cathedral for a problem that fits on a
+laptop — and it is the honest answer that senior engineers give.
+
+## The API is the contract that pins down everything else
+
+Write the operations before the architecture. Each endpoint carries a share of the traffic,
+and that share tells you which one deserves engineering.
+
+```python
+api = [
+    # (method, path, qps_share_of_reads, qps_share_of_writes)
+    ("POST",   "/v1/posts",             0.0, 1.0),
+    ("GET",    "/v1/feed?cursor=…",     0.9, 0.0),
+    ("GET",    "/v1/users/{id}/posts",  0.1, 0.0),
+]
+peak_r, peak_w = avg_read_qps * PEAK_FACTOR, avg_write_qps * PEAK_FACTOR
+
+for method, path, rs, ws in api:
+    qps = peak_r * rs + peak_w * ws
+    print(f"{method:5} {path:24} {qps:7.1f} qps at peak")
+```
+
+```output
+POST  /v1/posts                   13.9 qps at peak
+GET   /v1/feed?cursor=…          500.0 qps at peak
+GET   /v1/users/{id}/posts        55.6 qps at peak
+```
+
+Ninety percent of your read traffic goes through one endpoint. That endpoint is the system.
+`GET /v1/feed` is where the cache goes, where the pagination design matters, and where you
+will spend your latency budget.
+
+### Cursors, not offsets
+
+Any list endpoint gets a `cursor` parameter, never `page=7`. Offset pagination re-scans rows
+the database has already returned and produces duplicates when items are inserted mid-scroll.
+A cursor is an opaque encoding of the last item's sort key — `(created_at, id)` — so the next
+query is a range scan starting exactly where the last one stopped (ch. 12).
+
+## The data model, then the storage engine
+
+For each entity: what is the key, what is the access pattern, and how big does it get?
+
+```python
+row_bytes = {"post_id": 8, "user_id": 8, "created_at": 8, "text": 280, "media_url": 100}
+per_row = sum(row_bytes.values())
+posts_year = writes_per_day * 365
+
+print(f"row size        {per_row} B")
+print(f"posts/year      {posts_year:,.0f}")
+print(f"raw data/year   {posts_year * per_row / 1e9:.1f} GB")
+print(f"with 3x replication + indexes (~2x): {posts_year * per_row * 6 / 1e9:.1f} GB")
+```
+
+```output
+row size        404 B
+posts/year      146,000,000
+raw data/year   59.0 GB
+with 3x replication + indexes (~2x): 353.9 GB
+```
+
+Under a terabyte a year, replicated. That fits on a single node's disk, so **you do not need
+sharding yet** (ch. 14). Say that out loud in a design review — knowing when *not* to shard is
+worth more than knowing how.
+
+## Only now, scale
+
+Pass 4 adds machinery, and each piece must cite a number from passes 1–3:
+
+- Read:write is 40:1, so **read replicas** and a **cache** in front of the feed endpoint (ch. 5).
+- 0.1% error budget, so **health checks and a load balancer**; no single-instance services (ch. 3).
+- Fan-out on write is expensive for celebrity accounts, so **queue** the fan-out (ch. 8).
+- Data under 1 TB, so **no sharding**: one primary, revisit at 10x.
+
+```python
+decisions = [
+    ("cache the feed endpoint",   "read:write = 40:1"),
+    ("2 read replicas",           "555 peak read qps, 1 primary is a SPOF"),
+    ("async fan-out via queue",   "p99 write must stay under budget"),
+    ("no sharding (yet)",         "59 GB/year raw fits one node"),
+]
+for what, because in decisions:
+    print(f"{what:26} <- {because}")
+```
+
+```output
+cache the feed endpoint    <- read:write = 40:1
+2 read replicas            <- 555 peak read qps, 1 primary is a SPOF
+async fan-out via queue    <- p99 write must stay under budget
+no sharding (yet)          <- 59 GB/year raw fits one node
+```
+
+Every line has a "because". A design with no numbers behind it is a drawing, not a design.
+
+## Non-functional requirements you must ask about
+
+- **Consistency**: must a user see their own write immediately? Others' writes? (ch. 16)
+- **Durability**: is losing the last second of writes acceptable? Never?
+- **Latency target and percentile**: p50 or p99 changes the design (ch. 2).
+- **Traffic shape**: steady, spiky, or seasonal? Spikes force rate limiting (ch. 20).
+- **Growth**: 10x in a year means design for 10x, not 100x.
+
+## Try it Yourself
+
+```python
+def brief(dau, writes_pu, reads_pu, row_bytes=404, peak=3.0, repl=6):
+    """Turn a one-line product brief into the numbers that force the design."""
+    w, r = dau * writes_pu, dau * reads_pu
+    wq, rq = w / 86_400 * peak, r / 86_400 * peak
+    tb = w * 365 * row_bytes * repl / 1e12
+    print(f"read:write {r / w:6.1f}:1 | peak {wq:8.1f} w/s {rq:9.1f} r/s | {tb:6.2f} TB/yr")
+    print("  shard now" if tb > 2 else "  single primary is fine")
+    print("  cache is mandatory" if r / w > 10 else "  cache is optional")
+
+brief(2_000_000, 0.2, 8)            # the social feed above
+brief(500_000, 40, 45, row_bytes=1200)   # a chat app: write-heavy, chatty
+brief(50_000_000, 0.001, 30)        # a news site: almost pure read
+```
+
+```output
+read:write   40.0:1 | peak     13.9 w/s     555.6 r/s |   0.35 TB/yr
+  single primary is fine
+  cache is mandatory
+read:write    1.1:1 | peak    694.4 w/s     781.2 r/s |  52.56 TB/yr
+  shard now
+  cache is optional
+read:write 30000.0:1 | peak      1.7 w/s   52083.3 r/s |   0.04 TB/yr
+  single primary is fine
+  cache is mandatory
+```
+
+Change `peak` to 10 (a system with a daily cron spike) and watch which line flips. That is
+the whole method: turn the brief into numbers, let the numbers pick the boxes.
+
+## Exercise
+
+You are asked to design a URL shortener. Requirements: 100 million new short links per
+month, each link read on average 50 times over its life, links never expire, the short code
+must be at most 7 characters, and redirects must be under 50 ms at p99.
+
+Compute: the read:write ratio, peak write and read QPS at a 3x peak factor, and five years of
+storage assuming 500 bytes per row with 3x replication. Then decide whether the design needs
+sharding, and how many characters the short code actually needs if the alphabet is
+`[0-9a-zA-Z]`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import math
+
+links_per_month = 100e6
+reads_per_link = 50
+writes_per_day = links_per_month / 30
+reads_per_day = writes_per_day * reads_per_link
+peak = 3.0
+
+print(f"read:write      {reads_per_day / writes_per_day:.0f}:1")
+print(f"peak write qps  {writes_per_day / 86_400 * peak:,.0f}")
+print(f"peak read  qps  {reads_per_day / 86_400 * peak:,.0f}")
+
+five_year_rows = links_per_month * 12 * 5
+tb = five_year_rows * 500 * 3 / 1e12
+print(f"5-year storage  {tb:.1f} TB replicated -> {'shard' if tb > 2 else 'single node'}")
+
+alphabet = 62
+need = five_year_rows * 10          # 10x headroom against collisions
+chars = math.ceil(math.log(need, alphabet))
+print(f"codes needed    {need:.0e} -> {chars} chars (62^{chars} = {alphabet ** chars:.2e})")
+```
+
+```output
+read:write      50:1
+peak write qps  116
+peak read  qps  5,787
+5-year storage  9.0 TB replicated -> shard
+codes needed    6e+10 -> 7 chars (62^7 = 3.52e+12)
+```
+
+The key insight: it is a **50:1 read-heavy** system with tiny rows, so the redirect path is
+pure cache-and-CDN work (ch. 5, 9), while 9 TB over five years forces partitioning (ch. 14).
+Seven characters give $62^7 \approx 3.5 \times 10^{12}$ codes — roughly 60x more than the
+$6 \times 10^{10}$ you need, which is the headroom that keeps random-code collisions rare.
+</details>

@@ -1,0 +1,420 @@
+---
+course: competition-ml
+chapter: 04-feature-engineering-patterns
+title: "Feature Engineering Patterns That Pay Off"
+order: 4
+---
+
+## Six patterns cover most of the gains
+
+Feature engineering in tabular competitions is not creativity, it is coverage. The same handful of
+transformations pay repeatedly: group aggregations, deviations from a group, ratios, frequency
+counts, date decomposition, and lags. This chapter builds each one, measures what it adds, and
+keeps only what pays.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n_customers, n_rows = 1_200, 18_000
+cust = rng.integers(0, n_customers, n_rows)
+day = np.sort(rng.integers(0, 365, n_rows))
+merchant = rng.integers(0, 60, n_rows)
+cust_scale = rng.lognormal(0, 0.6, n_customers)[cust]           # each customer has a spend level
+amount = np.round(rng.gamma(2.0, 30.0, n_rows) * cust_scale, 2)
+
+# fraud depends on the amount RELATIVE to the customer's own habit, and on the weekday
+rel = amount / (60 * cust_scale)
+logit = -3.4 + 1.15 * np.log(rel) + 0.8 * ((day % 7) >= 5) - 0.004 * day
+fraud = (rng.random(n_rows) < 1 / (1 + np.exp(-logit))).astype(int)
+
+tx = pd.DataFrame({"customer": cust, "day": day, "merchant": merchant,
+                   "amount": amount, "fraud": fraud})
+print(f"{len(tx):,} transactions | {tx['customer'].nunique()} customers | "
+      f"fraud rate {tx['fraud'].mean():.4f}")
+print(tx.head(3).to_string(index=False))
+```
+
+```output
+18,000 transactions | 1200 customers | fraud rate 0.0221
+ customer  day  merchant  amount  fraud
+     1020    0        30   19.90      0
+      764    0        25   27.52      0
+      613    0        34  125.98      0
+```
+
+The signal is deliberately *relative*: a 200-unit charge is unremarkable for one customer and
+alarming for another. No raw column contains that comparison — you have to build it.
+
+## A harness that measures every block the same way
+
+```python
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+def cv_auc(frame, y, k=4, seed=0):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    scores = []
+    for tr, va in cv.split(frame, y):
+        m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+            frame.iloc[tr], y[tr])
+        scores.append(roc_auc_score(y[va], m.predict_proba(frame.iloc[va])[:, 1]))
+    return float(np.mean(scores))
+
+y = tx["fraud"].values
+base = tx[["amount", "day", "merchant"]].copy()
+base_score = cv_auc(base, y)
+print(f"raw columns only: AUC {base_score:.4f}")
+```
+
+```output
+raw columns only: AUC 0.6369
+```
+
+Every block below is measured against that number, with the same folds and the same model. A
+feature idea that cannot beat this harness does not go in the submission.
+
+## Pattern 1: group aggregations
+
+Summaries of an entity computed from *features only* — never the target (ch. 5 covers what
+changes when the target is involved).
+
+```python
+def add_group_aggs(frame, source, keys=("customer",), col="amount"):
+    out = frame.copy()
+    for key in keys:
+        g = source.groupby(key)[col]
+        stats = g.agg(["mean", "std", "max", "count"]).add_prefix(f"{key}_{col}_")
+        out = out.join(stats, on=key)
+    return out
+
+with_aggs = add_group_aggs(tx[["amount", "day", "merchant", "customer"]], tx)
+agg_score = cv_auc(with_aggs.drop(columns=["customer"]), y)
+print(f"+ customer aggregations: AUC {agg_score:.4f}  ({agg_score - base_score:+.4f})")
+print(f"  added: {[c for c in with_aggs.columns if c.startswith('customer_')]}")
+```
+
+```output
++ customer aggregations: AUC 0.6709  (+0.0339)
+  added: ['customer_amount_mean', 'customer_amount_std', 'customer_amount_max', 'customer_amount_count']
+```
+
+## Pattern 2: deviation from the group
+
+The aggregation alone is not the signal — the *distance from it* is. This one line is the single
+highest-yield transformation in transactional competitions.
+
+```python
+dev = with_aggs.copy()
+dev["amount_vs_cust_mean"] = dev["amount"] / dev["customer_amount_mean"]
+dev["amount_minus_cust_mean"] = dev["amount"] - dev["customer_amount_mean"]
+dev["amount_z_in_cust"] = ((dev["amount"] - dev["customer_amount_mean"])
+                           / dev["customer_amount_std"].replace(0, np.nan))
+dev_score = cv_auc(dev.drop(columns=["customer"]), y)
+print(f"+ deviation features: AUC {dev_score:.4f}  ({dev_score - agg_score:+.4f} over aggs, "
+      f"{dev_score - base_score:+.4f} over raw)")
+```
+
+```output
++ deviation features: AUC 0.6941  (+0.0232 over aggs, +0.0571 over raw)
+```
+
+A gradient-boosted tree can *in principle* learn a ratio from `amount` and `customer_amount_mean`,
+but it would need a deep, axis-aligned staircase to approximate a diagonal. Handing it the ratio
+directly converts an impossible split into a single threshold.
+
+## Pattern 3: frequency and count encoding
+
+Replace a categorical with how often it occurs. It is cheap, leak-free (no target involved), and
+often beats one-hot for high-cardinality columns.
+
+```python
+freq = dev.copy()
+for col in ("merchant", "customer"):
+    counts = tx[col].value_counts()
+    freq[f"{col}_freq"] = tx[col].map(counts).values
+    freq[f"{col}_freq_norm"] = freq[f"{col}_freq"] / len(tx)
+freq_score = cv_auc(freq.drop(columns=["customer"]), y)
+print(f"+ frequency encoding: AUC {freq_score:.4f}  ({freq_score - dev_score:+.4f})")
+```
+
+```output
++ frequency encoding: AUC 0.6910  (-0.0030)
+```
+
+Frequency encoding *cost* 0.0030 AUC here. That is the expected outcome when the categorical is
+genuinely uninformative — `merchant` was generated as noise — and it is why every block gets
+measured. Keep the pattern in your toolkit and keep the measurement next to it.
+
+## Pattern 4: date decomposition, including the cyclical trick
+
+```python
+dated = freq.copy()
+dated["dow"] = dated["day"] % 7
+dated["is_weekend"] = (dated["dow"] >= 5).astype(int)
+dated["week"] = dated["day"] // 7
+dated["dow_sin"] = np.sin(2 * np.pi * dated["dow"] / 7)
+dated["dow_cos"] = np.cos(2 * np.pi * dated["dow"] / 7)
+date_score = cv_auc(dated.drop(columns=["customer"]), y)
+print(f"+ date parts: AUC {date_score:.4f}  ({date_score - freq_score:+.4f})")
+```
+
+```output
++ date parts: AUC 0.7086  (+0.0176)
+```
+
+Two notes on the sine/cosine pair. It exists so that day 6 and day 0 are *close*, which a raw
+integer cannot express — but trees split on thresholds and do not care about circular distance, so
+the pair earns its place in linear models and neural nets far more than in a GBDT. Include it when
+you plan to blend a linear model in (ch. 7); skip it when trees are all you will fit.
+
+## Pattern 5: lags and expanding history
+
+For panel data — repeated rows per entity, ordered in time — the previous row is a feature.
+
+```python
+lagged = dated.copy()
+tx_sorted = tx.sort_values(["customer", "day"], kind="stable")
+grp = tx_sorted.groupby("customer")["amount"]
+prev = grp.shift(1)
+lagged["prev_amount"] = prev.reindex(tx.index).values
+lagged["amount_over_prev"] = lagged["amount"] / lagged["prev_amount"]
+lagged["days_since_prev"] = (tx_sorted["day"] - tx_sorted.groupby("customer")["day"].shift(1)
+                             ).reindex(tx.index).values
+# shift FIRST, then expand: the mean must cover only the rows before this one
+lagged["cust_expanding_mean"] = (grp.shift(1).groupby(tx_sorted["customer"])
+                                 .expanding().mean().reset_index(level=0, drop=True)
+                                 .reindex(tx.index).values)
+lag_score = cv_auc(lagged.drop(columns=["customer"]), y)
+print(f"+ lag features: AUC {lag_score:.4f}  ({lag_score - date_score:+.4f})")
+```
+
+```output
++ lag features: AUC 0.7022  (-0.0064)
+```
+
+Lags cost 0.0064 here, for a specific reason worth internalising: this generator has no
+autocorrelation in fraud, so a customer's previous amount carries nothing. On a competition where
+fraud comes in bursts, this block is usually the largest single win. The pattern's value is
+data-dependent; the harness is what tells you which world you are in.
+
+Expanding and rolling statistics must be computed **causally** — `expanding()` after a sort, never
+a full-column `groupby().transform("mean")` — or you have leaked the future into every row and
+your CV will be beautiful and worthless.
+
+## Pattern 6: ratios and differences between columns
+
+```python
+ratios = lagged.copy()
+ratios["amount_per_txn_of_cust"] = ratios["amount"] / ratios["customer_amount_count"]
+ratios["amount_over_cust_max"] = ratios["amount"] / ratios["customer_amount_max"]
+ratios["spread_in_cust"] = (ratios["customer_amount_max"] - ratios["customer_amount_mean"])
+ratio_score = cv_auc(ratios.drop(columns=["customer"]), y)
+print(f"+ ratios: AUC {ratio_score:.4f}  ({ratio_score - lag_score:+.4f})")
+print(f"\ntotal: {base.shape[1]} -> {ratios.shape[1] - 1} columns, "
+      f"AUC {base_score:.4f} -> {ratio_score:.4f} ({ratio_score - base_score:+.4f})")
+```
+
+```output
++ ratios: AUC 0.6959  (-0.0063)
+
+total: 3 -> 26 columns, AUC 0.6369 -> 0.6959 (+0.0590)
+```
+
+## Keeping only what pays
+
+Adding blocks in sequence tells you the *marginal* value of each, in the order you happened to add
+them. Removing one block at a time tells you what it is worth *given everything else*, which is
+the number that decides whether to keep it (eval-tuning ch. 8).
+
+```python
+blocks = {
+    "aggregations": [c for c in ratios if c.startswith("customer_amount_")],
+    "deviations": ["amount_vs_cust_mean", "amount_minus_cust_mean", "amount_z_in_cust"],
+    "frequency": [c for c in ratios if c.endswith("_freq") or c.endswith("_freq_norm")],
+    "dates": ["dow", "is_weekend", "week", "dow_sin", "dow_cos"],
+    "lags": ["prev_amount", "amount_over_prev", "days_since_prev", "cust_expanding_mean"],
+    "ratios": ["amount_per_txn_of_cust", "amount_over_cust_max", "spread_in_cust"],
+}
+full = ratios.drop(columns=["customer"])
+full_score = cv_auc(full, y)
+print(f"{'block':>14} {'cols':>5} {'AUC without it':>16} {'cost of removal':>17}")
+for name, cols in blocks.items():
+    keep = [c for c in full.columns if c not in cols]
+    s = cv_auc(full[keep], y)
+    print(f"{name:>14} {len(cols):>5} {s:>16.4f} {full_score - s:>+17.4f}")
+```
+
+```output
+         block  cols   AUC without it   cost of removal
+  aggregations     4           0.7003           -0.0044
+    deviations     3           0.7120           -0.0161
+     frequency     4           0.7051           -0.0092
+         dates     5           0.6839           +0.0121
+          lags     4           0.7090           -0.0131
+        ratios     3           0.7022           -0.0063
+```
+
+Only one block survives its own ablation. `dates` costs +0.0121 to remove, so nothing else in the
+frame substitutes for the weekday effect. Every other block — including `deviations`, which was
+worth +0.0232 on the way in — scores *better* when deleted: with 26 columns fitted on 18,000 rows
+and a 2.2% positive rate, the redundant ones are contributing variance rather than signal.
+
+**Ablation and marginal addition are different questions.** The order of addition tells you where
+the signal first appeared; ablation tells you what is still carrying it once everything else is
+present. It is the ablation column that decides what ships, and here it says the 26-column frame
+should be cut back hard — which is exactly what the greedy selector in the exercise does,
+arriving at 11 columns and a *better* score.
+
+## Try it Yourself
+
+```python
+def try_block(new_cols_fn, frame, y, name, current_score):
+    """Add a block, measure it, and report whether it earns its columns."""
+    candidate = new_cols_fn(frame.copy())
+    score = cv_auc(candidate.drop(columns=["customer"], errors="ignore"), y)
+    delta = score - current_score
+    added = candidate.shape[1] - frame.shape[1]
+    verdict = "keep" if delta > 0.001 else "drop"
+    print(f"{name:26} {added:>2} cols | AUC {score:.4f} | {delta:+.4f} | "
+          f"{delta / max(added, 1):+.5f} per col | {verdict}")
+    return candidate if verdict == "keep" else frame, max(score, current_score)
+
+state, score = ratios, ratio_score
+state, score = try_block(lambda f: f.assign(
+    log_amount=np.log1p(f["amount"])), state, y, "log(amount)", score)
+state, score = try_block(lambda f: f.assign(
+    merchant_x_weekend=f["merchant"] * f["is_weekend"]), state, y, "merchant x weekend", score)
+state, score = try_block(lambda f: f.assign(
+    amount_rank_in_cust=f.groupby("customer")["amount"].rank(pct=True)),
+    state, y, "amount percentile in cust", score)
+```
+
+```output
+log(amount)                 1 cols | AUC 0.6959 | +0.0000 | +0.00000 per col | drop
+merchant x weekend          1 cols | AUC 0.7084 | +0.0124 | +0.01242 per col | keep
+amount percentile in cust   1 cols | AUC 0.7073 | -0.0011 | -0.00108 per col | drop
+```
+
+One of the three ideas lands: `merchant x weekend` adds +0.0124 from a single column, while
+`log(amount)` changes nothing (a monotone transform, invisible to a tree) and the within-customer
+percentile duplicates what the deviation features already carry. That hit rate — one in three, and
+the winner being an interaction rather than a transform — is typical. The "per col" column is the
+one to watch: a block that adds 0.002 AUC across twenty columns is a
+worse deal than one that adds 0.001 with a single column, because every column costs you variance,
+training time, and a chance to overfit the fold structure. Try adding your own blocks — a
+merchant-level aggregation, a rolling 7-day count, an amount rounded to the nearest 10 (round
+numbers are suspicious in fraud data).
+
+## Exercise
+
+Turn the ad-hoc sequence into a **greedy block selector**: given a dictionary of candidate blocks,
+evaluate each against the current feature set, add the best one if it clears a threshold, and
+repeat until nothing does. Report the order in which blocks were chosen, the marginal gain of
+each, and the total cost in columns — then compare the greedy set against using every block at
+once.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def build_blocks(frame, source):
+    """All candidate blocks as functions of the base frame."""
+    def aggs(f):
+        g = source.groupby("customer")["amount"].agg(["mean", "std", "max", "count"])
+        return f.join(g.add_prefix("cust_"), on="customer")
+
+    def devs(f):
+        g = source.groupby("customer")["amount"].transform("mean")
+        return f.assign(dev_ratio=f["amount"] / g.values,
+                        dev_diff=f["amount"] - g.values)
+
+    def freqs(f):
+        return f.assign(merchant_freq=source["merchant"].map(
+            source["merchant"].value_counts()).values)
+
+    def dates(f):
+        return f.assign(dow=f["day"] % 7, is_weekend=((f["day"] % 7) >= 5).astype(int))
+
+    def lags(f):
+        s = source.sort_values(["customer", "day"], kind="stable")
+        prev = s.groupby("customer")["amount"].shift(1).reindex(source.index)
+        return f.assign(prev_amount=prev.values,
+                        amount_over_prev=(f["amount"] / prev.reindex(f.index)).values)
+
+    def ranks(f):
+        return f.assign(amount_rank_in_cust=f.groupby("customer")["amount"].rank(pct=True))
+
+    return {"aggregations": aggs, "deviations": devs, "frequency": freqs,
+            "dates": dates, "lags": lags, "ranks": ranks}
+
+def greedy_blocks(base_frame, y, candidates, min_gain=0.001):
+    state = base_frame.copy()
+    score = cv_auc(state.drop(columns=["customer"], errors="ignore"), y)
+    print(f"start: {state.shape[1] - 1} cols, AUC {score:.4f}")
+    remaining = dict(candidates)
+    order = []
+    while remaining:
+        trials = {}
+        for name, fn in remaining.items():
+            cand = fn(state.copy())
+            trials[name] = (cv_auc(cand.drop(columns=["customer"], errors="ignore"), y), cand)
+        name, (best_score, best_frame) = max(trials.items(), key=lambda kv: kv[1][0])
+        gain = best_score - score
+        added = best_frame.shape[1] - state.shape[1]
+        if gain < min_gain:
+            print(f"stop: best remaining block '{name}' only adds {gain:+.4f}")
+            break
+        order.append((name, round(gain, 4), added))
+        print(f"  + {name:14} {added:>2} cols | AUC {best_score:.4f} ({gain:+.4f})")
+        state, score = best_frame, best_score
+        del remaining[name]
+    return state, score, order
+
+base_frame = tx[["amount", "day", "merchant", "customer"]].copy()
+cands = build_blocks(base_frame, tx)
+greedy_state, greedy_score, order = greedy_blocks(base_frame, y, cands)
+
+all_state = base_frame.copy()
+for fn in cands.values():
+    all_state = fn(all_state)
+all_score = cv_auc(all_state.drop(columns=["customer"]), y)
+
+print(f"\ngreedy : {greedy_state.shape[1] - 1:>2} cols, AUC {greedy_score:.4f}, "
+      f"order {[o[0] for o in order]}")
+print(f"all-in : {all_state.shape[1] - 1:>2} cols, AUC {all_score:.4f}")
+print(f"difference: {greedy_score - all_score:+.4f} AUC with "
+      f"{all_state.shape[1] - greedy_state.shape[1]} fewer columns")
+```
+
+```output
+start: 3 cols, AUC 0.6369
+  + deviations      2 cols | AUC 0.6855 (+0.0485)
+  + dates           2 cols | AUC 0.7049 (+0.0195)
+  + aggregations    4 cols | AUC 0.7069 (+0.0020)
+stop: best remaining block 'frequency' only adds -0.0050
+
+greedy : 11 cols, AUC 0.7069, order ['deviations', 'dates', 'aggregations']
+all-in : 15 cols, AUC 0.6978
+difference: +0.0091 AUC with 4 fewer columns
+```
+
+Greedy selection buys you a smaller feature set at a similar score, and — more usefully — it
+prints the *order*, which is a map of where the signal lives. The block chosen first is the one
+that matters; everything after it is marginal by construction, and the stopping message names the
+best idea that was not worth its columns.
+
+Three things this procedure gets right and one thing to watch. It re-evaluates every remaining
+block at every step, so a block that looks useless alone but shines once another is present can
+still be picked — sequential addition in a fixed order would have missed it. It stops on a *gain
+threshold* rather than exhausting the list, which is the difference between a feature set and a
+feature graveyard. And it reports columns added alongside the gain, so the trade is visible.
+
+The thing to watch is that the selection itself is a fitting step performed on the same folds it
+is scored on, exactly the pitfall from eval-tuning ch. 5. The gains printed here are optimistic by
+the usual selection bias, and the honest way to quote a number for a final report is to re-run the
+whole greedy procedure inside an outer loop, or to hold out a set the selector never touches.
+For steering your week the optimistic number is fine; for claiming a result it is not.
+</details>

@@ -1,0 +1,425 @@
+---
+course: eval-tuning
+chapter: 07-optuna
+title: "Optuna: Samplers, Pruners, and Multi-Objective Studies"
+order: 7
+---
+
+## A study is a loop that asks, evaluates, and tells
+
+Optuna inverts the search loop from ch. 6. You write an `objective(trial)` function that *asks*
+for values as it needs them; the sampler decides what to hand you based on every trial so far.
+
+```python
+import numpy as np
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)     # keep the page readable
+from sklearn.datasets import make_classification
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import cross_val_score
+
+X, y = make_classification(n_samples=3_000, n_features=25, n_informative=8,
+                           n_redundant=5, class_sep=0.8, random_state=0)
+
+def objective(trial):
+    params = dict(
+        max_depth=trial.suggest_int("max_depth", 2, 30),
+        min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 300, log=True),
+        max_features=trial.suggest_float("max_features", 0.1, 1.0),
+        ccp_alpha=trial.suggest_float("ccp_alpha", 1e-6, 1e-1, log=True),
+    )
+    m = DecisionTreeClassifier(random_state=0, **params)
+    return float(cross_val_score(m, X, y, cv=4, scoring="roc_auc").mean())
+
+study = optuna.create_study(direction="maximize",
+                            sampler=optuna.samplers.TPESampler(seed=0))
+study.optimize(objective, n_trials=40)
+print(f"best AUC {study.best_value:.4f} in trial {study.best_trial.number}")
+for k, v in study.best_params.items():
+    print(f"  {k:18} {v}")
+```
+
+```output
+best AUC 0.9183 in trial 36
+  max_depth          12
+  min_samples_leaf   21
+  max_features       0.8034616332856443
+  ccp_alpha          2.0901002061682083e-06
+```
+
+`log=True` is the log-uniform sampling from ch. 6, declared once instead of hand-rolled. The
+sampler is seeded, so this study is reproducible — always do that, or you cannot tell a real
+improvement from a lucky re-run.
+
+## Define-by-run: the space is ordinary Python
+
+Because the space is code, a branch can decide which knobs exist. There is no way to express this
+with a dict-of-lists grid.
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+def objective_conditional(trial):
+    kind = trial.suggest_categorical("model", ["tree", "forest", "logreg"])
+    if kind == "tree":
+        m = DecisionTreeClassifier(
+            max_depth=trial.suggest_int("tree_depth", 2, 20),
+            min_samples_leaf=trial.suggest_int("tree_leaf", 1, 200, log=True),
+            random_state=0)
+    elif kind == "forest":
+        m = RandomForestClassifier(
+            n_estimators=trial.suggest_int("rf_trees", 10, 60, log=True),
+            max_depth=trial.suggest_int("rf_depth", 2, 16), random_state=0)
+    else:
+        m = make_pipeline(StandardScaler(), LogisticRegression(
+            C=trial.suggest_float("lr_C", 1e-3, 1e3, log=True), max_iter=1_000))
+    return float(cross_val_score(m, X, y, cv=3, scoring="roc_auc").mean())
+
+st = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=1))
+st.optimize(objective_conditional, n_trials=24)
+by_model = {}
+for t in st.trials:
+    by_model.setdefault(t.params["model"], []).append(t.value)
+for kind, vals in sorted(by_model.items()):
+    print(f"{kind:8} {len(vals):>2} trials | best {max(vals):.4f} | median {np.median(vals):.4f}")
+print(f"\nwinner: {st.best_params}")
+```
+
+```output
+forest   15 trials | best 0.9669 | median 0.9650
+logreg    6 trials | best 0.9536 | median 0.9536
+tree      3 trials | best 0.9017 | median 0.8324
+
+winner: {'model': 'forest', 'rf_trees': 50, 'rf_depth': 9}
+```
+
+The sampler learns which branch pays and spends its later trials there — model selection and
+hyperparameter tuning become one search rather than two nested ones.
+
+## What TPE actually does
+
+Tree-structured Parzen Estimator does not model the objective. It splits the trials at a quantile
+$\gamma$ into "good" and "bad", fits a density to each, and prefers points where good is likely
+and bad is not:
+
+$$
+l(x) = p(x \mid f(x) \le y^\gamma), \qquad
+g(x) = p(x \mid f(x) > y^\gamma), \qquad
+x_{\text{next}} = \arg\max_x \frac{l(x)}{g(x)}
+$$
+
+Maximising $l/g$ is equivalent to maximising Expected Improvement (ch. 6) under this model, but it
+costs a kernel-density fit per parameter instead of a GP over the joint space — which is why it
+scales to dozens of knobs and handles categoricals natively.
+
+```python
+def hard(trial):                            # 6-D, one interaction term, cheap to evaluate
+    x = np.array([trial.suggest_float(f"x{i}", -5, 5) for i in range(6)])
+    target = np.array([1.3, -2.1, 0.4, 3.3, -1.0, 2.2])
+    return -float(((x - target) ** 2).sum() + 3 * np.sin(x[0] * x[1]))
+
+def curve(make_sampler, seed, n=60):
+    s = optuna.create_study(direction="maximize", sampler=make_sampler(seed))
+    s.optimize(hard, n_trials=n)
+    return np.maximum.accumulate([t.value for t in s.trials])
+
+for name, make in (("random", lambda s: optuna.samplers.RandomSampler(seed=s)),
+                   ("TPE", lambda s: optuna.samplers.TPESampler(seed=s))):
+    c = np.mean([curve(make, s) for s in range(5)], axis=0)
+    print(f"{name:8} best after 10/20/40/60 trials: "
+          f"{c[9]:8.3f} / {c[19]:8.3f} / {c[39]:8.3f} / {c[59]:8.3f}")
+```
+
+```output
+random   best after 10/20/40/60 trials:  -23.588 /  -20.594 /  -15.703 /  -12.655
+TPE      best after 10/20/40/60 trials:  -23.588 /  -12.786 /   -5.998 /   -2.004
+```
+
+The first ten trials are identical by construction — `n_startup_trials` defaults to 10, during
+which TPE samples randomly because it has nothing to model yet.
+
+### When TPE does not help
+
+```python
+def best_curve(sampler, n=30):
+    s = optuna.create_study(direction="maximize", sampler=sampler)
+    s.optimize(objective, n_trials=n)
+    return np.maximum.accumulate([t.value for t in s.trials])
+
+rand_c = best_curve(optuna.samplers.RandomSampler(seed=0))
+tpe_c = best_curve(optuna.samplers.TPESampler(seed=0))
+print(f"random best after 10/20/30 trials: {rand_c[9]:.4f} / {rand_c[19]:.4f} / {rand_c[29]:.4f}")
+print(f"TPE    best after 10/20/30 trials: {tpe_c[9]:.4f} / {tpe_c[19]:.4f} / {tpe_c[29]:.4f}")
+```
+
+```output
+random best after 10/20/30 trials: 0.9049 / 0.9189 / 0.9189
+TPE    best after 10/20/30 trials: 0.9049 / 0.9109 / 0.9153
+```
+
+On the decision-tree space random search actually finishes ahead, 0.9189 to 0.9153. Do not read
+that as "random beats TPE" — the gap is smaller than the CV noise of a single fold assignment
+(ch. 5), so the correct reading is *no measurable difference*. The reason is structural: the space
+is four-dimensional and forgiving, most trials land within a point or two of the best, and the
+noise in each measurement is about as large as the differences the sampler is trying to exploit. **A smarter sampler pays off when the space is large, structured, and the objective is
+measured precisely** — not on every problem you meet.
+
+## Pruning: kill hopeless trials early
+
+For any model trained in steps — epochs, boosting rounds, data slices — report the intermediate
+score and let the pruner stop trials that are already behind.
+
+```python
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+Xb, yb = make_classification(n_samples=8_000, n_features=30, n_informative=10,
+                             n_redundant=5, class_sep=0.7, random_state=0)
+Xtr, Xva, ytr, yva = train_test_split(Xb, yb, test_size=0.3, random_state=0)
+sc = StandardScaler().fit(Xtr)
+Xtr, Xva = sc.transform(Xtr), sc.transform(Xva)
+
+def objective_pruned(trial):
+    m = SGDClassifier(loss="log_loss", learning_rate="constant",
+                      eta0=trial.suggest_float("eta0", 1e-5, 1e-1, log=True),
+                      alpha=trial.suggest_float("alpha", 1e-7, 1e-1, log=True),
+                      random_state=0)
+    for epoch in range(30):
+        m.partial_fit(Xtr, ytr, classes=[0, 1])
+        auc = roc_auc_score(yva, m.decision_function(Xva))
+        trial.report(auc, epoch)                       # tell Optuna the running score
+        if trial.should_prune():                       # the pruner decides
+            raise optuna.TrialPruned()
+    return float(auc)
+
+for pruner, name in ((optuna.pruners.NopPruner(), "no pruner"),
+                     (optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+                      "median pruner")):
+    s = optuna.create_study(direction="maximize", pruner=pruner,
+                            sampler=optuna.samplers.TPESampler(seed=0))
+    s.optimize(objective_pruned, n_trials=30)
+    pruned = sum(t.state == optuna.trial.TrialState.PRUNED for t in s.trials)
+    epochs = sum((t.last_step or 0) + 1 for t in s.trials)
+    print(f"{name:14} best {s.best_value:.4f} | pruned {pruned:>2}/30 trials | "
+          f"{epochs:>4} epochs of training")
+```
+
+```output
+no pruner      best 0.7242 | pruned  0/30 trials |  900 epochs of training
+median pruner  best 0.7252 | pruned 16/30 trials |  484 epochs of training
+```
+
+Same answer — very slightly better, in fact — for 484 epochs instead of 900, a 46% cut in compute
+for an identical trial budget. `MedianPruner` stops a trial
+whose intermediate value is worse than the median of previous trials at the same step;
+`n_warmup_steps=3` protects slow starters for three epochs. The absolute AUC is modest because the
+model is a linear classifier trained for a few epochs; what matters here is the cost column.
+
+`SuccessiveHalvingPruner` and `HyperbandPruner` implement the rung schedule you hand-rolled in
+ch. 6. Use those when trials are expensive and the ranking at a small budget is trustworthy.
+
+## Reading a study
+
+```python
+imp = optuna.importance.get_param_importances(
+    study, evaluator=optuna.importance.MeanDecreaseImpurityImportanceEvaluator(seed=0))
+for k, v in imp.items():
+    print(f"{k:18} {v:.3f}  {'#' * int(round(v * 40))}")
+
+df = study.trials_dataframe(attrs=("number", "value", "params"))
+top = df.sort_values("value", ascending=False).head(3)
+print()
+print(top[["number", "value", "params_max_depth", "params_min_samples_leaf"]].to_string(index=False))
+```
+
+```output
+ccp_alpha          0.541  ######################
+max_features       0.242  ##########
+min_samples_leaf   0.144  ######
+max_depth          0.073  ###
+
+ number    value  params_max_depth  params_min_samples_leaf
+     36 0.918284                12                       21
+     32 0.915943                 9                       21
+     28 0.915348                13                       21
+```
+
+These importances describe **the study**, not the model: they say which knob moved the objective
+*within the ranges you searched*. Narrow a range and its importance collapses; that is a statement
+about your search space, not about the algorithm. Feature importance (ch. 8) is a different
+question entirely.
+
+## Multi-objective: there is no single best
+
+Accuracy against latency, AUC against model size, revenue against complaint rate — with two
+objectives "best" is a set, not a point. Optuna returns the **Pareto front**: trials no other
+trial beats on both objectives at once.
+
+```python
+X2, y2 = make_classification(n_samples=2_000, n_features=25, n_informative=8,
+                             n_redundant=5, class_sep=0.8, random_state=0)
+
+def objective_mo(trial):
+    n = trial.suggest_int("n_estimators", 5, 80, log=True)
+    d = trial.suggest_int("max_depth", 2, 16)
+    m = RandomForestClassifier(n_estimators=n, max_depth=d, random_state=0)
+    auc = float(cross_val_score(m, X2, y2, cv=3, scoring="roc_auc").mean())
+    nodes = int(sum(t.tree_.node_count for t in m.fit(X2, y2).estimators_))
+    return auc, nodes                                  # maximize AUC, minimize size
+
+mo = optuna.create_study(directions=["maximize", "minimize"],
+                         sampler=optuna.samplers.NSGAIISampler(seed=0))
+mo.optimize(objective_mo, n_trials=24)
+
+front = sorted(((t.values[0], int(t.values[1]), t.params) for t in mo.best_trials),
+               key=lambda z: z[1])
+print(f"{len(front)} Pareto-optimal trials out of {len(mo.trials)}")
+for auc, nodes, p in front:
+    print(f"AUC {auc:.4f} | {nodes:>6,} nodes | n_estimators={p['n_estimators']:>2} "
+          f"max_depth={p['max_depth']:>2}")
+```
+
+```output
+9 Pareto-optimal trials out of 24
+AUC 0.9083 |     90 nodes | n_estimators= 6 max_depth= 3
+AUC 0.9148 |    120 nodes | n_estimators= 8 max_depth= 3
+AUC 0.9168 |  1,409 nodes | n_estimators= 5 max_depth=11
+AUC 0.9279 |  1,710 nodes | n_estimators= 6 max_depth=11
+AUC 0.9424 |  2,269 nodes | n_estimators=13 max_depth= 8
+AUC 0.9471 |  3,574 nodes | n_estimators=20 max_depth= 8
+AUC 0.9488 |  7,372 nodes | n_estimators=26 max_depth=11
+AUC 0.9489 | 13,698 nodes | n_estimators=42 max_depth=15
+AUC 0.9501 | 20,920 nodes | n_estimators=68 max_depth=12
+```
+
+Read the front as a menu with prices. The last 3.5 points of AUC cost about 174x the model size;
+if you serve this at 10k requests per second, that trade is a business decision, not a modelling
+one. Note also that `study.best_value` does not exist for a multi-objective study — Optuna refuses
+to pick for you, which is correct.
+
+## Try it Yourself
+
+```python
+def run(sampler_name, n_startup, n_trials=30):
+    sampler = (optuna.samplers.RandomSampler(seed=7) if sampler_name == "random"
+               else optuna.samplers.TPESampler(seed=7, n_startup_trials=n_startup))
+    s = optuna.create_study(direction="maximize", sampler=sampler)
+    s.optimize(hard, n_trials=n_trials)
+    vals = np.maximum.accumulate([t.value for t in s.trials])
+    spread = np.std([t.params["x0"] for t in s.trials])
+    print(f"{sampler_name:8} startup={n_startup:>2} | best {vals[-1]:7.3f} | "
+          f"spread of x0 across trials {spread:.2f}")
+
+run("random", 0)
+for n_startup in (5, 10, 20):
+    run("TPE", n_startup)
+```
+
+```output
+random   startup= 0 | best  -3.418 | spread of x0 across trials 3.14
+TPE      startup= 5 | best  -6.139 | spread of x0 across trials 2.39
+TPE      startup=10 | best  -3.418 | spread of x0 across trials 2.50
+TPE      startup=20 | best  -3.418 | spread of x0 across trials 2.55
+```
+
+A short startup phase lets TPE commit early — good if the objective is smooth, risky if the first
+few trials landed in the wrong basin, which is what `startup=5` did here: it ends at -6.139 while
+every other setting reaches -3.418. Note also that at 30 trials none of the TPE settings *beats*
+plain random on this single seed; the five-seed benchmark above needed about 20 trials before the
+advantage showed. One run is never evidence about a sampler. The `x0` spread is the diagnostic
+for what changed: it drops from 3.14 to around 2.5, meaning the sampler concentrated its draws. Change `n_trials`, swap in `hard`'s target vector, or try
+`TPESampler(multivariate=True)` to model parameter interactions jointly.
+
+## Exercise
+
+Build one study that uses everything: a conditional space over two model families, a pruner, a
+warm start from a configuration you already trust (`study.enqueue_trial`), and a callback that
+stops the study early when it has not improved for N trials. Report the pruning savings and
+whether the warm start was ever beaten.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class StopWhenStale:
+    """Stop the study after `patience` trials without improvement."""
+    def __init__(self, patience=8):
+        self.patience, self.best, self.since = patience, -np.inf, 0
+
+    def __call__(self, study, trial):
+        if trial.value is not None and trial.value > self.best:
+            self.best, self.since = trial.value, 0
+        else:
+            self.since += 1
+        if self.since >= self.patience:
+            study.stop()
+
+def objective_full(trial):
+    kind = trial.suggest_categorical("model", ["sgd", "forest"])
+    if kind == "forest":                                # not iterative: no pruning possible
+        m = RandomForestClassifier(
+            n_estimators=trial.suggest_int("rf_trees", 10, 60, log=True),
+            max_depth=trial.suggest_int("rf_depth", 2, 16), random_state=0).fit(Xtr, ytr)
+        return float(roc_auc_score(yva, m.predict_proba(Xva)[:, 1]))
+    m = SGDClassifier(loss="log_loss", learning_rate="constant",
+                      eta0=trial.suggest_float("eta0", 1e-5, 1e-1, log=True),
+                      alpha=trial.suggest_float("alpha", 1e-7, 1e-1, log=True),
+                      random_state=0)
+    for epoch in range(30):
+        m.partial_fit(Xtr, ytr, classes=[0, 1])
+        auc = roc_auc_score(yva, m.decision_function(Xva))
+        trial.report(auc, epoch)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+    return float(auc)
+
+full = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=0),
+    pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3))
+full.enqueue_trial({"model": "sgd", "eta0": 1e-3, "alpha": 1e-4})   # the config you trust
+full.optimize(objective_full, n_trials=40, callbacks=[StopWhenStale(patience=8)])
+
+states = {}
+for t in full.trials:
+    states[t.state.name] = states.get(t.state.name, 0) + 1
+warm = full.trials[0]
+print(f"trials run: {len(full.trials)} of a 40 budget | states {states}")
+print(f"warm start (trial 0): {warm.state.name}, value "
+      f"{warm.value if warm.value is not None else float('nan'):.4f}")
+print(f"best: trial {full.best_trial.number} value {full.best_value:.4f} "
+      f"({full.best_params['model']})")
+
+epochs = sum((t.last_step or 0) + 1 for t in full.trials if t.params.get("model") == "sgd")
+sgd_trials = sum(1 for t in full.trials if t.params.get("model") == "sgd")
+print(f"SGD trials {sgd_trials}, epochs actually run {epochs} "
+      f"(unpruned cost would be {30 * sgd_trials})")
+```
+
+```output
+trials run: 36 of a 40 budget | states {'COMPLETE': 32, 'PRUNED': 4}
+warm start (trial 0): COMPLETE, value 0.7216
+best: trial 27 value 0.9516 (forest)
+SGD trials 7, epochs actually run 106 (unpruned cost would be 210)
+```
+
+Three mechanisms, three different kinds of saving. The **pruner** cuts within-trial cost; the
+**stale callback** cuts across-trial cost when the search has plateaued; the **warm start**
+guarantees you never ship worse than what you already had, because the trusted configuration is
+trial 0 and everything after is measured against it. Here it was beaten decisively — 0.7216
+against the forest's 0.9516 — which is itself information: the configuration the team trusted was
+the wrong model family, not a badly tuned one. Note the asymmetry in the objective: the
+forest branch cannot be pruned because it is not iterative, so mixing prunable and non-prunable
+families in one study means the pruner only helps on part of the space — worth knowing before you
+conclude a pruner "did nothing".
+
+The pieces you would add for a real project are storage and parallelism:
+`optuna.create_study(storage="sqlite:///study.db", study_name="...", load_if_exists=True)` lets
+several workers append trials to the same study and lets you resume after a crash. Everything else
+in this chapter works unchanged.
+</details>

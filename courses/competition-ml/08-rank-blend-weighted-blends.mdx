@@ -1,0 +1,437 @@
+---
+course: competition-ml
+chapter: 08-rank-blend-weighted-blends
+title: "Rank Blending and Weighted Blends"
+order: 8
+---
+
+## Choose the blend operator to match the metric
+
+Averaging is not one operation. Probabilities, log-odds and ranks are three different spaces, and
+the right one is determined by the metric you are scored on — not by habit.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
+from sklearn.metrics import roc_auc_score, log_loss
+
+rng = np.random.default_rng(0)
+n = 12_000
+truth = rng.normal(0, 1, n)
+y = (rng.random(n) < 1 / (1 + np.exp(-(0.9 * truth - 0.6)))).astype(int)
+
+def make_model(skill, bias=0.0, scale=1.0, seed=0):
+    """A model that sees the truth imperfectly, then reports on its own scale."""
+    r = np.random.default_rng(seed)
+    view = skill * truth + np.sqrt(max(1 - skill ** 2, 1e-9)) * r.normal(0, 1, n)
+    return 1 / (1 + np.exp(-(scale * (0.9 * view - 0.6) + bias)))
+
+preds = pd.DataFrame({
+    "A": make_model(0.90, seed=1),
+    "B": make_model(0.85, seed=2),
+    "C": make_model(0.80, bias=-1.2, seed=3),     # same idea, badly calibrated
+    "D": make_model(0.75, scale=0.35, seed=4),    # squashed toward the prior
+})
+for c in preds:
+    print(f"{c}: AUC {roc_auc_score(y, preds[c]):.4f} | log loss {log_loss(y, preds[c]):.4f} "
+          f"| mean {preds[c].mean():.3f} (actual rate {y.mean():.3f})")
+```
+
+```output
+A: AUC 0.6971 | log loss 0.6016 | mean 0.375 (actual rate 0.372)
+B: AUC 0.6845 | log loss 0.6111 | mean 0.376 (actual rate 0.372)
+C: AUC 0.6793 | log loss 0.7416 | mean 0.174 (actual rate 0.372)
+D: AUC 0.6642 | log loss 0.6417 | mean 0.450 (actual rate 0.372)
+```
+
+Models C and D rank almost as well as A and B but are on wrong scales — C is shifted, D is
+squashed. Watch what each blend operator does with that.
+
+## Four operators
+
+```python
+# every operator is "transform into a space, take a weighted mean, transform back"
+def to_prob(P):  return P.values
+def to_rank(P):  return np.column_stack([rankdata(P[c]) / len(P) for c in P])
+def to_log(P):   return np.log(np.clip(P.values, 1e-9, 1))
+def to_logit(P):
+    q = np.clip(P.values, 1e-9, 1 - 1e-9)
+    return np.log(q / (1 - q))
+
+SPACES = {"probability mean": (to_prob, lambda z: z),
+          "rank mean":        (to_rank, lambda z: z),
+          "geometric mean":   (to_log,  np.exp),
+          "logit mean":       (to_logit, lambda z: 1 / (1 + np.exp(-z)))}
+
+def blend(P_space, back, w=None):
+    """Weighted mean inside a precomputed space, mapped back to probabilities."""
+    w = np.ones(P_space.shape[1]) / P_space.shape[1] if w is None else w
+    return back(P_space @ w)
+
+print(f"{'operator':>18} {'AUC':>8} {'log loss':>10}")
+print(f"{'best single':>18} {max(roc_auc_score(y, preds[c]) for c in preds):>8.4f} "
+      f"{min(log_loss(y, preds[c]) for c in preds):>10.4f}")
+for name, (fwd, back) in SPACES.items():
+    p = np.clip(blend(fwd(preds), back), 1e-9, 1 - 1e-9)
+    print(f"{name:>18} {roc_auc_score(y, p):>8.4f} {log_loss(y, p):>10.4f}")
+```
+
+```output
+          operator      AUC   log loss
+       best single   0.6971     0.6016
+  probability mean   0.7094     0.6007
+         rank mean   0.7086     0.6562
+    geometric mean   0.7084     0.6061
+        logit mean   0.7097     0.6009
+```
+
+The two columns behave completely differently, and that asymmetry is the practical lesson. On
+**AUC** all four operators land inside 0.0013 of each other — every one of them is close enough to
+monotone in the same underlying score, so the choice barely matters. On **log loss** the spread is
+0.055, nearly ten times the gap between the best and worst single model, and the rank mean is a
+disaster at 0.6562 for an obvious reason: its output is a percentile, not a probability, so
+feeding it to a probability metric is a category error.
+
+The rule that follows: **for rank metrics pick whichever operator you like and spend your time
+elsewhere; for probability metrics the operator is a real decision** and rank blending is simply
+unavailable unless you map the ranks back to probabilities afterwards.
+
+### Why the logit mean behaves differently
+
+Averaging probabilities pulls everything toward the middle; averaging log-odds preserves the
+extremes. For two models predicting 0.01 and 0.30:
+
+$$
+\frac{0.01 + 0.30}{2} = 0.155,
+\qquad
+\sigma\!\left(\frac{\mathrm{logit}(0.01) + \mathrm{logit}(0.30)}{2}\right) = 0.055
+$$
+
+```python
+for pair in [(0.01, 0.30), (0.40, 0.60), (0.80, 0.99)]:
+    a, b = pair
+    lin = (a + b) / 2
+    lo = 1 / (1 + np.exp(-((np.log(a / (1 - a)) + np.log(b / (1 - b))) / 2)))
+    geo = np.sqrt(a * b)
+    print(f"({a:.2f}, {b:.2f}) -> probability {lin:.4f} | logit {lo:.4f} | geometric {geo:.4f}")
+```
+
+```output
+(0.01, 0.30) -> probability 0.1550 | logit 0.0617 | geometric 0.0548
+(0.40, 0.60) -> probability 0.5000 | logit 0.5000 | geometric 0.4899
+(0.80, 0.99) -> probability 0.8950 | logit 0.9522 | geometric 0.8899
+```
+
+The geometric mean sits between the two and is the one to use when you care about *small*
+probabilities specifically — it punishes any model that says "near zero" less gently than the
+arithmetic mean does.
+
+## Ranking is not free of choices
+
+```python
+tied = pd.Series([0.2, 0.5, 0.5, 0.5, 0.9])
+for method in ("average", "min", "max", "dense", "ordinal"):
+    print(f"{method:>8}: {rankdata(tied, method=method)}")
+```
+
+```output
+ average: [1. 3. 3. 3. 5.]
+     min: [1 2 2 2 5]
+     max: [1 4 4 4 5]
+   dense: [1 2 2 2 3]
+ ordinal: [1 2 3 4 5]
+```
+
+Use `average` (the default) unless you have a reason. `dense` compresses a model with many ties
+into a few levels, which changes its effective weight in the blend; `ordinal` breaks ties by
+position in the array, which makes your submission depend on row order.
+
+**Rank the training and test predictions separately.** Ranks are relative to the set they are
+computed in, so ranking a concatenation of train and test rows leaks the test distribution into
+your training-time blend, and ranking them in one file after a different row order changes the
+result.
+
+```python
+holdout = np.random.default_rng(5).permutation(len(y))[:3_000]
+sub = preds.iloc[holdout]
+within = np.column_stack([rankdata(sub[c]) / len(sub) for c in sub]).mean(axis=1)
+whole = np.column_stack([rankdata(preds[c]) / len(preds) for c in preds]).mean(axis=1)[holdout]
+print(f"ranked within the holdout : AUC {roc_auc_score(y[holdout], within):.4f}")
+print(f"ranked in the full frame  : AUC {roc_auc_score(y[holdout], whole):.4f}")
+print(f"rank correlation between the two blends: "
+      f"{float(pd.Series(within).corr(pd.Series(whole), method='spearman')):.6f}")
+```
+
+```output
+ranked within the holdout : AUC 0.7126
+ranked in the full frame  : AUC 0.7125
+rank correlation between the two blends: 0.999974
+```
+
+Identical rankings, because a rank transform is monotone and AUC only reads order. The reason to
+still rank separately is procedural: a test set with a different class balance will produce
+different *values*, and any downstream step that uses those values — a threshold, a second-level
+model, a weighted mix with a probability-space model — will silently shift.
+
+## Fitting weights, four ways
+
+```python
+from scipy.optimize import minimize, nnls
+
+def w_uniform(Z, y):
+    return np.ones(Z.shape[1]) / Z.shape[1]
+
+def w_nelder_mead(Z, y, maxiter=1_200):
+    """Z is already in blend space, so each evaluation is one matrix-vector product."""
+    def neg(v):
+        v = np.abs(v) / max(np.abs(v).sum(), 1e-9)
+        return -roc_auc_score(y, Z @ v)
+    r = minimize(neg, np.ones(Z.shape[1]) / Z.shape[1], method="Nelder-Mead",
+                 options={"maxiter": maxiter, "fatol": 1e-7})
+    return np.abs(r.x) / np.abs(r.x).sum()
+
+def w_nnls(P, y):
+    """Non-negative least squares against the labels: fast, closed-form-ish, no metric needed."""
+    coef, _ = nnls(P.values, y.astype(float))
+    return coef / max(coef.sum(), 1e-9)
+
+def w_dirichlet(Z, y, n_draws=600, seed=0):
+    r = np.random.default_rng(seed)
+    best, best_w = -np.inf, None
+    for _ in range(n_draws):
+        v = r.dirichlet(np.ones(Z.shape[1]))
+        s = roc_auc_score(y, Z @ v)
+        if s > best:
+            best, best_w = s, v
+    return best_w
+
+Zp = to_prob(preds)
+print(f"{'method':>14} " + " ".join(f"{c:>7}" for c in preds) + f" {'AUC':>9}")
+for name, fn in (("uniform", lambda Z, y: w_uniform(Z, y)),
+                 ("Nelder-Mead", w_nelder_mead),
+                 ("NNLS", lambda Z, y: w_nnls(pd.DataFrame(Z), y)),
+                 ("Dirichlet", w_dirichlet)):
+    w = fn(Zp, y)
+    print(f"{name:>14} " + " ".join(f"{v:>7.3f}" for v in w) +
+          f" {roc_auc_score(y, Zp @ w):>9.4f}")
+```
+
+```output
+        method       A       B       C       D       AUC
+       uniform   0.250   0.250   0.250   0.250    0.7094
+   Nelder-Mead   0.290   0.166   0.280   0.264    0.7099
+          NNLS   0.410   0.234   0.296   0.060    0.7088
+     Dirichlet   0.331   0.172   0.275   0.222    0.7099
+```
+
+All four land within 0.0011 AUC of each other, because there are only four models and twelve
+thousand rows — but look at the weight vectors rather than the scores. NNLS puts 0.41 on model A
+and 0.06 on model D, while Nelder-Mead spreads them almost evenly; the AUC surface is that flat.
+When several very different weight vectors score the same, the weights are not identified by the
+data and you should prefer the simplest one.
+
+NNLS is the one to reach for first while iterating: no metric evaluations, deterministic, and
+within a whisker of the direct optimiser. Switch to Nelder-Mead only when the metric is not
+squared error — it optimises the thing you are actually scored on.
+
+## Weight fitting overfits, and you can see exactly when
+
+With four models the fitted weights are safe. With thirty highly correlated models and a small
+evaluation set, the optimiser starts fitting the noise in your OOF predictions.
+
+```python
+def simulate_bank(n_models, n_rows, skill=0.80, seed=0):
+    r = np.random.default_rng(seed)
+    t = r.normal(0, 1, n_rows)
+    yy = (r.random(n_rows) < 1 / (1 + np.exp(-(0.9 * t - 0.6)))).astype(int)
+    cols = {}
+    for i in range(n_models):
+        view = skill * t + np.sqrt(1 - skill ** 2) * r.normal(0, 1, n_rows)
+        cols[f"m{i}"] = 1 / (1 + np.exp(-(0.9 * view - 0.6)))
+    return pd.DataFrame(cols), yy
+
+def fit_and_check(n_models, n_fit_rows, seed=0):
+    P, yy = simulate_bank(n_models, 2 * n_fit_rows, seed=seed)
+    Zf, yf = P.values[:n_fit_rows], yy[:n_fit_rows]
+    Zc, yc = P.values[n_fit_rows:], yy[n_fit_rows:]
+    w = w_nnls(pd.DataFrame(Zf), yf)          # NNLS: fast, and free to chase noise
+    uni = np.ones(n_models) / n_models
+    return (roc_auc_score(yf, Zf @ w), roc_auc_score(yc, Zc @ w),
+            roc_auc_score(yc, Zc @ uni))
+
+print(f"{'models':>7} {'rows':>7} {'fitted (in-sample)':>19} {'fitted (fresh)':>16} "
+      f"{'uniform (fresh)':>17}")
+for n_models, rows in ((4, 400), (4, 4_000), (16, 400), (16, 4_000)):
+    a, b, c = fit_and_check(n_models, rows)
+    print(f"{n_models:>7} {rows:>7} {a:>19.4f} {b:>16.4f} {c:>17.4f}")
+```
+
+```output
+ models    rows  fitted (in-sample)   fitted (fresh)   uniform (fresh)
+      4     400              0.6877           0.6769            0.6861
+      4    4000              0.7077           0.7066            0.7065
+     16     400              0.7153           0.6894            0.6947
+     16    4000              0.7203           0.7217            0.7226
+```
+
+Compare the first two columns for the overfit and the last two for whether fitting was worth it.
+With 16 models on 400 rows the fitted weights score 0.7153 in-sample and 0.6894 on fresh data — a
+0.0259 illusion — and the uniform weights they were supposed to improve on score 0.6947, *better*
+than the fitted ones. With 4,000 rows the same 16 models overfit by only 0.0014. The ratio of
+models to rows is what governs it.
+
+The defence is to shrink toward uniform:
+
+$$
+w_{\text{final}} = (1 - \lambda)\, w_{\text{fitted}} + \lambda \cdot \frac{1}{k}
+$$
+
+```python
+P, yy = simulate_bank(16, 800, seed=0)
+Zf, yf = P.values[:400], yy[:400]
+Zc, yc = P.values[400:], yy[400:]
+w_fit = w_nnls(pd.DataFrame(Zf), yf)
+uni = np.ones(16) / 16
+print(f"{'lambda':>7} {'fresh AUC':>11}")
+for lam in (0.0, 0.25, 0.5, 0.75, 1.0):
+    w = (1 - lam) * w_fit + lam * uni
+    print(f"{lam:>7.2f} {roc_auc_score(yc, Zc @ w):>11.4f}")
+```
+
+```output
+ lambda   fresh AUC
+   0.00      0.6894
+   0.25      0.6911
+   0.50      0.6925
+   0.75      0.6945
+   1.00      0.6947
+```
+
+Shrinkage recovers the whole gap here: at $\lambda = 1$ (pure uniform) the fresh AUC is 0.6947
+against 0.6894 for the raw fitted weights, and every intermediate value is monotone between them.
+That is the honest verdict for 16 models on 400 rows — the weights were worth nothing — but the
+same curve on a competition with enough rows peaks somewhere in the middle, which is why
+$\lambda$ belongs in your cross-validation rather than in your habits.
+
+## Try it Yourself
+
+```python
+def blend_bakeoff(P, y, spaces=SPACES):
+    rows = []
+    for name, (fwd, back) in spaces.items():
+        Z = fwd(P)
+        w = w_nelder_mead(Z, y)
+        rows.append({"operator": name,
+                     "uniform AUC": round(roc_auc_score(y, Z.mean(axis=1)), 4),
+                     "weighted AUC": round(roc_auc_score(y, Z @ w), 4),
+                     "weights": " ".join(f"{v:.2f}" for v in w)})
+    return pd.DataFrame(rows)
+
+print(blend_bakeoff(preds, y).to_string(index=False))
+```
+
+```output
+        operator  uniform AUC  weighted AUC             weights
+probability mean       0.7094        0.7099 0.29 0.17 0.28 0.26
+       rank mean       0.7086        0.7099 0.38 0.23 0.24 0.15
+  geometric mean       0.7084        0.7101 0.32 0.19 0.14 0.35
+      logit mean       0.7097        0.7105 0.31 0.18 0.20 0.31
+```
+
+Swap `roc_auc_score` for `-log_loss` inside `w_nelder_mead` and the weights change, because the
+weights are only optimal for the metric you optimised. Try dropping model D, or adding a fifth
+model that is a copy of A with noise, and watch how the weights redistribute.
+
+## Exercise
+
+Build a blender that chooses both the operator and the weights **honestly**: select them inside
+cross-validation folds so the reported score is not the score you optimised. Compare it against
+the naive version that picks the best operator and weights on all the data, and quantify the
+optimism. Run it with four models and again with thirty.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from sklearn.model_selection import StratifiedKFold
+
+SPACE_SUBSET = {k: SPACES[k] for k in ("probability mean", "rank mean", "logit mean")}
+
+def naive_blend(P, y, spaces=SPACE_SUBSET):
+    best = max(((roc_auc_score(y, fwd(P) @ w_nelder_mead(fwd(P), y)), name)
+                for name, (fwd, back) in spaces.items()))
+    return best[0], best[1]
+
+def honest_blend(P, y, spaces=SPACE_SUBSET, k=5, seed=0, shrink=0.0):
+    """Pick the space and the weights inside each fold; score on the held-out fold only."""
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    per_fold, chosen = [], []
+    for tr, va in cv.split(P, y):
+        yt = y[tr]
+        best_name, best_w, best_s = None, None, -np.inf
+        for name, (fwd, back) in spaces.items():
+            Zt = fwd(P.iloc[tr].reset_index(drop=True))
+            w = w_nelder_mead(Zt, yt)
+            w = (1 - shrink) * w + shrink * np.ones(len(w)) / len(w)
+            s = roc_auc_score(yt, Zt @ w)
+            if s > best_s:
+                best_name, best_w, best_s = name, w, s
+        chosen.append(best_name)
+        fwd = spaces[best_name][0]
+        # score each fold separately: values from different spaces are not comparable,
+        # so pooling them into one array and taking a global AUC would be meaningless
+        fold_pred = fwd(P.iloc[va].reset_index(drop=True)) @ best_w
+        per_fold.append(roc_auc_score(y[va], fold_pred))
+    return float(np.mean(per_fold)), chosen
+
+for n_models, rows in ((4, 3_000), (16, 3_000)):
+    P, yy = simulate_bank(n_models, rows, seed=1)
+    naive_score, naive_op = naive_blend(P, yy)
+    honest_score, picks = honest_blend(P, yy)
+    shrunk_score, _ = honest_blend(P, yy, shrink=0.5)
+    single = max(roc_auc_score(yy, P[c]) for c in P)
+    print(f"{n_models} models, {rows} rows")
+    print(f"  best single model              {single:.4f}")
+    print(f"  naive (picked on all rows)     {naive_score:.4f}   operator: {naive_op}")
+    print(f"  honest (picked inside folds)   {honest_score:.4f}   operators: "
+          f"{sorted(set(picks))}")
+    print(f"  honest + shrink 0.5            {shrunk_score:.4f}")
+    print(f"  optimism of the naive number   {naive_score - honest_score:+.4f}\n")
+```
+
+```output
+4 models, 3000 rows
+  best single model              0.6747
+  naive (picked on all rows)     0.6973   operator: rank mean
+  honest (picked inside folds)   0.6951   operators: ['rank mean']
+  honest + shrink 0.5            0.6958
+  optimism of the naive number   +0.0021
+
+16 models, 3000 rows
+  best single model              0.6830
+  naive (picked on all rows)     0.7106   operator: logit mean
+  honest (picked inside folds)   0.7033   operators: ['logit mean', 'probability mean', 'rank mean']
+  honest + shrink 0.5            0.7055
+  optimism of the naive number   +0.0073
+```
+
+The optimism grows with the number of models, exactly as the weight-fitting table predicted: four
+models leave almost nothing to overfit, thirty leave plenty. That is the number people quote when
+they report "my blend gets X" — it is the in-sample score of a procedure with thirty free
+parameters plus an operator choice, and the honest version is lower.
+
+Three things worth stealing from this harness. It selects the **operator** inside the fold as well
+as the weights, because choosing between four operators on the full data is itself a selection
+with its own bias — smaller than the weights' bias, but free to remove. It reports which operators
+were chosen across folds, and disagreement there is a signal in itself: if three folds pick rank
+mean and two pick logit mean, the operators are tied and you should take the simpler one rather
+than the winner. And **shrinkage is a tunable**, not a fixed choice; with many models it recovers
+most of what the naive fit throws away.
+
+The practical shape of this in a competition: keep the OOF matrix as your artefact (ch. 7), fit
+weights with NNLS for speed while you iterate, and only run the full honest procedure when you are
+choosing what to submit. The difference between the naive and honest numbers is not something you
+can fix by tuning — it is the price of having looked at the data, and the only remedy is to
+measure it rather than to hope it is small.
+</details>

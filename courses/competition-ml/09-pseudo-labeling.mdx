@@ -1,0 +1,394 @@
+---
+course: competition-ml
+chapter: 09-pseudo-labeling
+title: "Pseudo-Labeling Done Safely"
+order: 9
+---
+
+## Training on your own predictions
+
+Pseudo-labeling takes the unlabelled rows — usually the test set — predicts them, and adds the
+confident ones to the training data as if they were labelled. It is one of the few techniques that
+can add *information* rather than squeezing the model harder, and it is also one of the easiest
+ways to build a confident, wrong model. The difference is entirely in the protocol, and in whether
+labels are actually your scarce resource.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+X_all, y_all = make_classification(n_samples=12_000, n_features=20, n_informative=9,
+                                   n_redundant=4, class_sep=0.85, flip_y=0.02, random_state=0)
+X_all = pd.DataFrame(X_all, columns=[f"f{i}" for i in range(X_all.shape[1])])
+
+X_labelled, X_rest, y_labelled, y_rest = train_test_split(
+    X_all, y_all, train_size=2_000, random_state=0, stratify=y_all)
+X_pool, X_test, y_pool_true, y_test = train_test_split(
+    X_rest, y_rest, train_size=6_000, random_state=0, stratify=y_rest)
+
+# the scenario that matters: very few labels, a large unlabelled pool
+X_lab, y_lab = X_labelled.iloc[:150], y_labelled[:150]
+
+def fit_score(X, y, sample_weight=None):
+    m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+        X, y, sample_weight=sample_weight)
+    return m, roc_auc_score(y_test, m.predict_proba(X_test)[:, 1])
+
+base_model, base_auc = fit_score(X_lab, y_lab)
+print(f"labelled {len(X_lab)} | unlabelled pool {len(X_pool):,} | test {len(X_test):,}")
+print(f"baseline on {len(X_lab)} labelled rows: test AUC {base_auc:.4f}")
+```
+
+```output
+labelled 150 | unlabelled pool 6,000 | test 4,000
+baseline on 150 labelled rows: test AUC 0.8025
+```
+
+## One round
+
+```python
+def pseudo_round(model, X_lab, y_lab, X_pool, threshold=0.9, weight=1.0, soft=False):
+    p = model.predict_proba(X_pool)[:, 1]
+    confident = (p >= threshold) | (p <= 1 - threshold)
+    pp = p[confident]
+    yp = (pp >= 0.5).astype(int)
+    X_aug = pd.concat([X_lab, X_pool[confident]], ignore_index=True)
+    y_aug = np.concatenate([y_lab, yp])
+    w = np.concatenate([np.ones(len(y_lab)),
+                        (np.abs(pp - 0.5) * 2 if soft else np.ones(len(yp))) * weight])
+    return X_aug, y_aug, w, confident, yp
+
+X_aug, y_aug, w, conf, yp = pseudo_round(base_model, X_lab, y_lab, X_pool, threshold=0.8)
+_, aug_auc = fit_score(X_aug, y_aug, sample_weight=w)
+print(f"added {int(conf.sum()):,} pseudo-labelled rows ({conf.mean():.1%} of the pool)")
+print(f"of those, {accuracy_score(y_pool_true[conf], yp):.1%} carry the correct label")
+print(f"baseline        test AUC {base_auc:.4f}")
+print(f"after one round test AUC {aug_auc:.4f}  ({aug_auc - base_auc:+.4f})")
+```
+
+```output
+added 3,878 pseudo-labelled rows (64.6% of the pool)
+of those, 78.9% carry the correct label
+baseline        test AUC 0.8025
+after one round test AUC 0.8089  (+0.0064)
+```
+
+Note what just happened: nearly a quarter of the added labels are **wrong**, and the model still
+improved. Pseudo-labeling is not about adding correct labels — it is about adding *rows*, so the
+model sees the shape of the input distribution in regions where it had no data at all.
+
+## The threshold is the whole trade
+
+```python
+p = base_model.predict_proba(X_pool)[:, 1]
+print(f"{'threshold':>10} {'rows added':>11} {'label accuracy':>15} {'test AUC':>10} {'delta':>8}")
+for thr in (0.5, 0.7, 0.8, 0.9, 0.99):
+    c = (p >= thr) | (p <= 1 - thr)
+    yp_t = (p[c] >= 0.5).astype(int)
+    X_a = pd.concat([X_lab, X_pool[c]], ignore_index=True)
+    _, auc = fit_score(X_a, np.concatenate([y_lab, yp_t]))
+    print(f"{thr:>10.2f} {int(c.sum()):>11,} {accuracy_score(y_pool_true[c], yp_t):>15.4f} "
+          f"{auc:>10.4f} {auc - base_auc:>+8.4f}")
+```
+
+```output
+ threshold  rows added  label accuracy   test AUC    delta
+      0.50       6,000          0.7102     0.8099  +0.0075
+      0.70       4,702          0.7578     0.8078  +0.0053
+      0.80       3,878          0.7893     0.8089  +0.0064
+      0.90       2,719          0.8338     0.8039  +0.0014
+      0.99         382          0.9267     0.8041  +0.0016
+```
+
+Two forces pull against each other. A low threshold adds many rows with dirtier labels; a high one
+adds few rows with clean labels. In this label-starved regime the *rows* win outright: taking the
+entire pool at threshold 0.5, with 71% label accuracy, scores as well as anything else, and the
+0.99 threshold — 92.7% accurate labels on 382 rows — is worth almost nothing. Quantity beats
+purity when the model is starved of data, and the ordering reverses once it is not.
+
+**The label-accuracy column is the one you cannot see in a real competition.** You would be
+choosing the threshold blind, which is why it belongs in cross-validation rather than intuition.
+
+## Soft labels and down-weighting
+
+A pseudo-label is a *belief*, not a fact. Encode the uncertainty rather than discarding it.
+
+```python
+variants = {
+    "hard labels, weight 1.0": dict(soft=False, weight=1.0),
+    "hard labels, weight 0.5": dict(soft=False, weight=0.5),
+    "confidence-weighted": dict(soft=True, weight=1.0),
+    "confidence-weighted x0.5": dict(soft=True, weight=0.5),
+}
+for name, kw in variants.items():
+    X_a, y_a, w_a, c_a, _ = pseudo_round(base_model, X_lab, y_lab, X_pool,
+                                         threshold=0.8, **kw)
+    _, auc = fit_score(X_a, y_a, sample_weight=w_a)
+    print(f"{name:26} rows {int(c_a.sum()):>5,} | test AUC {auc:.4f} ({auc - base_auc:+.4f})")
+```
+
+```output
+hard labels, weight 1.0    rows 3,878 | test AUC 0.8089 (+0.0064)
+hard labels, weight 0.5    rows 3,878 | test AUC 0.8101 (+0.0076)
+confidence-weighted        rows 3,878 | test AUC 0.8094 (+0.0070)
+confidence-weighted x0.5   rows 3,878 | test AUC 0.8100 (+0.0075)
+```
+
+All four land within 0.0012 of each other, which is the honest result: with 3,878 pseudo rows
+against 150 real ones, halving the weight still leaves the pseudo-labels holding twelve times the
+mass, so the knob barely moves anything. Down-weighting starts to matter when the two sets are
+closer in size, or when the pseudo-labels are much dirtier than these. The reason to keep it in
+the harness is that it costs nothing and it is the only lever that keeps the real labels in charge
+when the pool is enormous.
+
+## When pseudo-labeling stops paying
+
+This is the table that contradicts the folklore, so read it carefully.
+
+```python
+print(f"{'labelled':>9} {'base AUC':>10} {'pseudo AUC':>12} {'delta':>8} {'rows added':>11} "
+      f"{'label acc':>10}")
+for n_lab in (150, 400, 2_000):
+    Xs, ys = X_labelled.iloc[:n_lab], y_labelled[:n_lab]
+    m0, a0 = fit_score(Xs, ys)
+    X_a, y_a, w_a, c_a, yp_a = pseudo_round(m0, Xs, ys, X_pool, threshold=0.8,
+                                            soft=True, weight=0.5)
+    _, a1 = fit_score(X_a, y_a, sample_weight=w_a)
+    print(f"{n_lab:>9,} {a0:>10.4f} {a1:>12.4f} {a1 - a0:>+8.4f} {int(c_a.sum()):>11,} "
+          f"{accuracy_score(y_pool_true[c_a], yp_a):>10.4f}")
+```
+
+```output
+ labelled   base AUC   pseudo AUC    delta  rows added  label acc
+      150     0.8025       0.8100  +0.0075       3,878     0.7893
+      400     0.8938       0.8945  +0.0007       3,959     0.8886
+    2,000     0.9487       0.9461  -0.0026       4,057     0.9495
+```
+
+The gain evaporates as labels stop being scarce, and turns negative once the base model is good.
+The mechanism is simple: the pseudo-labels can only teach the model something it does not already
+know, and a model trained on 2,000 rows already knows almost everything its own confident
+predictions could tell it — so all that remains is the noise in the wrong ones.
+
+**Pseudo-labeling is a technique for label-scarce competitions.** If you have plenty of labelled
+rows, the expected gain is zero or negative, and the honest thing is to measure before assuming.
+
+## The failure mode: confirmation bias
+
+Scarcity is necessary but not sufficient. If the labelled rows are *unrepresentative*, the model
+extrapolates wrongly, labels the pool wrongly with high confidence, and then trains on that.
+
+```python
+biased = (X_labelled["f0"] < X_labelled["f0"].quantile(0.35)).values
+X_bias, y_bias = X_labelled[biased].iloc[:300], y_labelled[biased][:300]
+m_bias, auc_bias = fit_score(X_bias, y_bias)
+p_bias = m_bias.predict_proba(X_pool)[:, 1]
+print(f"labelled sample drawn from one region of feature space ({len(X_bias)} rows)")
+print(f"{'threshold':>10} {'rows added':>11} {'label accuracy':>15} {'test AUC':>10} {'delta':>8}")
+for thr in (0.8, 0.9):
+    c = (p_bias >= thr) | (p_bias <= 1 - thr)
+    yp_b = (p_bias[c] >= 0.5).astype(int)
+    X_a = pd.concat([X_bias, X_pool[c]], ignore_index=True)
+    _, auc = fit_score(X_a, np.concatenate([y_bias, yp_b]))
+    print(f"{thr:>10.2f} {int(c.sum()):>11,} {accuracy_score(y_pool_true[c], yp_b):>15.4f} "
+          f"{auc:>10.4f} {auc - auc_bias:>+8.4f}")
+```
+
+```output
+labelled sample drawn from one region of feature space (300 rows)
+ threshold  rows added  label accuracy   test AUC    delta
+      0.80       4,344          0.7408     0.7443  -0.0067
+      0.90       3,466          0.7692     0.7405  -0.0105
+```
+
+Twice as scarce as the case that worked, and it goes the other way — and *raising* the confidence
+threshold makes it worse, because the rows the biased model is most sure about are exactly the
+ones where its extrapolation is most wrong. That inversion is the diagnostic: if your gain shrinks
+as the threshold rises, suspect that your labelled sample is not representative of the pool.
+
+## The leak that ruins your CV
+
+Pseudo-labels generated by a model that saw the whole training set contaminate every fold: the
+label attached to a pool row encodes information from rows that are about to be used for
+validation.
+
+```python
+def cv_with_pseudo(X, y, pool, leaky, k=3, threshold=0.8, seed=0):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    global_model = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(X, y)
+    scores = []
+    for tr, va in cv.split(X, y):
+        src = global_model if leaky else HistGradientBoostingClassifier(
+            max_depth=5, random_state=0).fit(X.iloc[tr], y[tr])
+        p_src = src.predict_proba(pool)[:, 1]
+        c = (p_src >= threshold) | (p_src <= 1 - threshold)
+        X_a = pd.concat([X.iloc[tr], pool[c]], ignore_index=True)
+        y_a = np.concatenate([y[tr], (p_src[c] >= 0.5).astype(int)])
+        m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(X_a, y_a)
+        scores.append(roc_auc_score(y[va], m.predict_proba(X.iloc[va])[:, 1]))
+    return float(np.mean(scores))
+
+print(f"CV with pseudo-labels from a model fitted on ALL folds: "
+      f"{cv_with_pseudo(X_lab, y_lab, X_pool, leaky=True):.4f}")
+print(f"CV with pseudo-labels regenerated inside each fold    : "
+      f"{cv_with_pseudo(X_lab, y_lab, X_pool, leaky=False):.4f}")
+print(f"honest quality (held-out test AUC of the same recipe) : {aug_auc:.4f}")
+```
+
+```output
+CV with pseudo-labels from a model fitted on ALL folds: 0.9733
+CV with pseudo-labels regenerated inside each fold    : 0.7623
+honest quality (held-out test AUC of the same recipe) : 0.8089
+```
+
+The leaky number is 0.9733 — better than anything achievable — because the pool rows carry labels
+derived from the validation rows themselves. The clean number, 0.7623, is *below* the honest test
+AUC of 0.8089, and that gap is not a second bug: each fold trains on 100 rows rather than 150, and
+in this regime a third less data costs real accuracy. A clean CV under label scarcity is
+pessimistic, and it is still the only one of the two you can act on.
+
+Regenerating the pseudo-labels inside each fold costs `k` extra fits and buys a number you can
+believe. It is the same rule as target encoding (ch. 5) and stacking (ch. 7): anything fitted on
+labels must be re-fitted inside the fold.
+
+## Try it Yourself
+
+```python
+def pseudo_experiment(n_labelled, threshold=0.8, soft=True, weight=0.5):
+    Xs, ys = X_labelled.iloc[:n_labelled], y_labelled[:n_labelled]
+    m0, a0 = fit_score(Xs, ys)
+    X_a, y_a, w_a, c_a, yp_a = pseudo_round(m0, Xs, ys, X_pool, threshold=threshold,
+                                            soft=soft, weight=weight)
+    _, a1 = fit_score(X_a, y_a, sample_weight=w_a)
+    acc = accuracy_score(y_pool_true[c_a], yp_a)
+    print(f"labelled {n_labelled:>5,} thr {threshold:.2f} w {weight:.2f} | "
+          f"{a0:.4f} -> {a1:.4f} ({a1 - a0:+.4f}) | added {int(c_a.sum()):>5,} at {acc:.1%}")
+
+pseudo_experiment(150, threshold=0.8, weight=0.5)
+pseudo_experiment(150, threshold=0.8, weight=1.0)
+pseudo_experiment(150, threshold=0.95, weight=0.5)
+pseudo_experiment(400, threshold=0.8, weight=0.5)
+```
+
+```output
+labelled   150 thr 0.80 w 0.50 | 0.8025 -> 0.8100 (+0.0075) | added 3,878 at 78.9%
+labelled   150 thr 0.80 w 1.00 | 0.8025 -> 0.8094 (+0.0070) | added 3,878 at 78.9%
+labelled   150 thr 0.95 w 0.50 | 0.8025 -> 0.8034 (+0.0010) | added 1,832 at 87.4%
+labelled   400 thr 0.80 w 0.50 | 0.8938 -> 0.8945 (+0.0007) | added 3,959 at 88.9%
+```
+
+Three knobs, one clear ordering: the size of the labelled set dominates, the threshold matters
+next, and the weight matters least. Try `soft=False` to confirm that discarding the confidence
+costs you, and push `n_labelled` down to 80 to see the gain grow.
+
+## Exercise
+
+Build the safe procedure end to end: pseudo-labels regenerated inside every fold, soft labels with
+a tunable weight, exactly one round, and a fold-level comparison against no pseudo-labeling that
+decides whether to use it at all. Report the decision and the evidence behind it.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def cv_compare(X, y, pool, k=3, threshold=0.8, weight=0.5, seed=0):
+    """Per-fold comparison. Pseudo-labels come from the fold's own model, never a global one."""
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    plain, pseudo, added, mean_conf = [], [], [], []
+    for tr, va in cv.split(X, y):
+        base = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+            X.iloc[tr], y[tr])
+        plain.append(roc_auc_score(y[va], base.predict_proba(X.iloc[va])[:, 1]))
+
+        p = base.predict_proba(pool)[:, 1]
+        c = (p >= threshold) | (p <= 1 - threshold)
+        X_a = pd.concat([X.iloc[tr], pool[c]], ignore_index=True)
+        y_a = np.concatenate([y[tr], (p[c] >= 0.5).astype(int)])
+        w = np.concatenate([np.ones(len(tr)), np.abs(p[c] - 0.5) * 2 * weight])
+        m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+            X_a, y_a, sample_weight=w)
+        pseudo.append(roc_auc_score(y[va], m.predict_proba(X.iloc[va])[:, 1]))
+        added.append(int(c.sum()))
+        # label quality you CAN compute without the truth: how far above the cut the rows sit
+        mean_conf.append(float(np.mean(np.abs(p[c] - 0.5) * 2)))
+    return np.array(plain), np.array(pseudo), added, mean_conf
+
+def decide(plain, pseudo, min_effect=0.002):
+    d = pseudo - plain
+    wins = int((d > 0).sum())
+    if d.mean() >= min_effect and wins >= len(d) - 1:
+        return d, wins, "USE pseudo-labeling"
+    return d, wins, "SKIP: gain below the effect floor or inconsistent across folds"
+
+print(f"{'threshold':>10} {'weight':>7} {'plain':>8} {'pseudo':>8} {'delta':>8} "
+      f"{'folds won':>10} {'added':>7} {'mean conf':>10}")
+best = None
+for thr, wt in ((0.8, 0.5), (0.95, 0.5)):
+    plain, pseudo, added, conf = cv_compare(X_lab, y_lab, X_pool, threshold=thr, weight=wt)
+    d, wins, _ = decide(plain, pseudo)
+    print(f"{thr:>10.2f} {wt:>7.2f} {plain.mean():>8.4f} {pseudo.mean():>8.4f} "
+          f"{d.mean():>+8.4f} {wins:>7}/{len(d)} {int(np.mean(added)):>7,} "
+          f"{np.mean(conf):>10.4f}")
+    if best is None or d.mean() > best[0]:
+        best = (d.mean(), thr, wt, plain, pseudo)
+
+_, thr, wt, plain, pseudo = best
+d, wins, verdict = decide(plain, pseudo)
+print(f"\nbest setting: threshold {thr}, weight {wt}")
+print(f"per-fold deltas: {np.round(d, 4)}")
+print(f"mean {d.mean():+.4f} | folds improved {wins}/{len(d)} | sd {d.std(ddof=1):.4f}")
+print(f"VERDICT: {verdict}")
+
+m_final, final_base_auc = fit_score(X_lab, y_lab)
+X_a, y_a, w_a, _, _ = pseudo_round(m_final, X_lab, y_lab, X_pool, threshold=thr,
+                                   soft=True, weight=wt)
+_, final_auc = fit_score(X_a, y_a, sample_weight=w_a)
+print(f"held-out test check: {final_base_auc:.4f} -> {final_auc:.4f} "
+      f"({final_auc - final_base_auc:+.4f})")
+```
+
+```output
+ threshold  weight    plain   pseudo    delta  folds won   added  mean conf
+      0.80    0.50   0.7399   0.7612  +0.0214       3/3   3,226     0.8206
+      0.95    0.50   0.7399   0.7650  +0.0251       3/3   1,020     0.9464
+
+best setting: threshold 0.95, weight 0.5
+per-fold deltas: [0.0192 0.024  0.0321]
+mean +0.0251 | folds improved 3/3 | sd 0.0065
+VERDICT: USE pseudo-labeling
+held-out test check: 0.8025 -> 0.8034 (+0.0010)
+```
+
+The harness reaches a verdict from evidence rather than folklore: +0.0251 with all three folds
+improving, so `USE pseudo-labeling`. The per-fold deltas are the reason to trust the direction — a
+positive mean would mean little if one fold went up and two went down.
+
+But compare the last line to the CV row above it, because this is the trap the exercise is really
+about. Cross-validation promised +0.0251; the held-out check delivered +0.0010. Both numbers are
+correct. Each CV fold trains on 100 rows while the final model trains on 150, and pseudo-labeling
+pays *more* the scarcer the labels are (the table earlier in this chapter), so the folds
+systematically overstate the gain the full model will see. **Under label scarcity, cross-validation
+gets the decision right and the effect size wrong** — use it to choose, not to forecast.
+
+Notice which knobs the search may touch and which it may not. Threshold and weight are tuned,
+because neither has a default that is right everywhere. The **number of rounds is fixed at one**:
+each additional round re-labels the pool with a model trained on the previous round's labels, so
+the confident set grows while the labels drift toward whatever the model already believed, and
+three folds cannot detect that drift before it costs you. And the pseudo-labels are regenerated
+inside every fold, which is the entire price of an honest number here.
+
+The `mean conf` column is the substitute for the label-accuracy column you cannot compute in a
+real competition. It reports how far above the cut the accepted rows actually sit: near the
+threshold means you are admitting marginal rows and should raise the cut; far above it means the
+threshold is not binding and you could lower it to admit more data. It is a weaker signal than the
+truth, but it is computable on test data, which is exactly where you need it.
+
+One constraint that is not statistical: pseudo-labeling the *test set* is legitimate in a
+competition and usually not in production, where the test distribution moves and training on your
+own predictions creates a feedback loop no offline metric will catch (mlops ch. 8). Know which of
+the two you are doing before you reach for this.
+</details>

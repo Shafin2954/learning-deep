@@ -1,0 +1,297 @@
+---
+course: system-design
+chapter: 03-clients-servers-proxies
+title: "Clients, Servers, Proxies, and Load Balancers"
+order: 3
+---
+
+## The request path is a chain of hops
+
+A browser typing `example.com` does not talk to your application. It talks to a chain, and
+every link is a place to cache, route, fail, or observe:
+
+```
+client → DNS → CDN edge → L4 load balancer → L7 reverse proxy → app server → cache → database
+```
+
+Each hop adds latency and a failure mode, and each hop can absorb work so the next one does
+less. Learning the chain by heart is most of what "knowing system design" means.
+
+```python
+hops = [
+    ("DNS lookup (cached)",       1),
+    ("TCP + TLS handshake",      70),
+    ("CDN edge (miss)",           5),
+    ("L4 LB",                     1),
+    ("L7 reverse proxy",          2),
+    ("app server",               25),
+    ("cache lookup",              1),
+    ("database query",           30),
+]
+total = 0
+for name, ms in hops:
+    total += ms
+    print(f"{name:24} +{ms:3} ms   cumulative {total:3} ms")
+```
+
+```output
+DNS lookup (cached)      +  1 ms   cumulative   1 ms
+TCP + TLS handshake      + 70 ms   cumulative  71 ms
+CDN edge (miss)          +  5 ms   cumulative  76 ms
+L4 LB                    +  1 ms   cumulative  77 ms
+L7 reverse proxy         +  2 ms   cumulative  79 ms
+app server               + 25 ms   cumulative 104 ms
+cache lookup             +  1 ms   cumulative 105 ms
+database query           + 30 ms   cumulative 135 ms
+```
+
+The handshake dominates a cold request. That single line is why connection reuse, HTTP/2
+multiplexing, and TLS session resumption exist — they delete 70 ms from every request after
+the first.
+
+## Forward proxy vs reverse proxy
+
+Same machinery, opposite direction, and the difference is *who it hides*.
+
+- A **forward proxy** sits in front of clients. It hides clients from the internet: corporate
+  egress filtering, caching for a campus, scraping through rotating IPs.
+- A **reverse proxy** sits in front of servers. It hides servers from clients: TLS
+  termination, routing, compression, rate limiting, request buffering.
+
+```python
+def forward_proxy(client, host):
+    return f"client {client} -> [proxy] -> {host}   (server sees the proxy's IP)"
+
+def reverse_proxy(host, backends, path):
+    for prefix, backend in backends:
+        if path.startswith(prefix):
+            return f"client -> {host}{path} -> [rproxy] -> {backend}  (client never learns {backend})"
+    return f"client -> {host}{path} -> [rproxy] -> 404"
+
+print(forward_proxy("10.0.0.7", "api.stripe.com"))
+routes = [("/api/", "app-svc:8080"), ("/static/", "nginx-static:80"), ("/ws", "realtime:9000")]
+for p in ("/api/v1/posts", "/static/logo.png", "/ws", "/admin"):
+    print(reverse_proxy("example.com", routes, p))
+```
+
+```output
+client 10.0.0.7 -> [proxy] -> api.stripe.com   (server sees the proxy's IP)
+client -> example.com/api/v1/posts -> [rproxy] -> app-svc:8080  (client never learns app-svc:8080)
+client -> example.com/static/logo.png -> [rproxy] -> nginx-static:80  (client never learns nginx-static:80)
+client -> example.com/ws -> [rproxy] -> realtime:9000  (client never learns realtime:9000)
+client -> example.com/admin -> [rproxy] -> 404
+```
+
+That routing table is the reverse proxy's whole job at layer 7: read the request, pick a
+backend pool by host and path, forward it, stream the response back.
+
+## L4 vs L7: what the balancer is allowed to read
+
+```python
+packet = {
+    "src_ip": "203.0.113.9", "dst_ip": "198.51.100.4", "dst_port": 443,
+    "tls": True,
+    "http": {"host": "api.example.com", "path": "/v1/feed", "cookie": "sid=abc123"},
+}
+
+print("L4 balancer sees:", {k: packet[k] for k in ("src_ip", "dst_ip", "dst_port")})
+print("L4 decision: pick a backend by 5-tuple hash. Cheap, protocol-agnostic, no TLS work.")
+print()
+print("L7 balancer sees:", packet["http"])
+print("L7 decision: route /v1/feed to the feed pool, sticky by cookie, retry idempotent GETs.")
+```
+
+```output
+L4 balancer sees: {'src_ip': '203.0.113.9', 'dst_ip': '198.51.100.4', 'dst_port': 443}
+L4 decision: pick a backend by 5-tuple hash. Cheap, protocol-agnostic, no TLS work.
+
+L7 balancer sees: {'host': 'api.example.com', 'path': '/v1/feed', 'cookie': 'sid=abc123'}
+L7 decision: route /v1/feed to the feed pool, sticky by cookie, retry idempotent GETs.
+```
+
+L4 forwards *connections* and can push millions of packets per second per core, but it cannot
+retry a failed request or route by URL. L7 terminates TLS and parses HTTP, so it can do
+everything smart and costs more CPU per request. Large systems use both: L4 in front for raw
+capacity and DDoS absorption, L7 behind it for routing.
+
+### Why L7 can retry and L4 cannot
+
+An L4 balancer has already forwarded bytes to a backend; if that backend dies mid-stream, the
+connection breaks and only the client can retry. An L7 balancer buffers the request, so it
+still holds a complete copy and can replay it to a healthy backend — but only if the request
+is idempotent (ch. 21). This is the mechanical reason `GET` and `PUT` are retried by
+infrastructure and `POST` usually is not.
+
+## Health checks decide who receives traffic
+
+A backend is not "up" or "down" — it is in a state machine driven by probe results, with
+hysteresis so one bad probe does not evict a healthy server.
+
+```python
+class HealthCheck:
+    def __init__(self, rise=2, fall=3):
+        self.rise, self.fall = rise, fall
+        self.ok_streak = self.bad_streak = 0
+        self.healthy = True
+
+    def probe(self, ok):
+        if ok:
+            self.ok_streak += 1; self.bad_streak = 0
+            if not self.healthy and self.ok_streak >= self.rise:
+                self.healthy = True
+        else:
+            self.bad_streak += 1; self.ok_streak = 0
+            if self.healthy and self.bad_streak >= self.fall:
+                self.healthy = False
+        return self.healthy
+
+hc = HealthCheck()
+probes = [True, True, False, True, False, False, False, False, True, True, True]
+for i, ok in enumerate(probes):
+    state = "UP  " if hc.probe(ok) else "DOWN"
+    print(f"t={i:2} probe={'ok ' if ok else 'FAIL'} -> {state} (bad_streak={hc.bad_streak})")
+```
+
+```output
+t= 0 probe=ok  -> UP   (bad_streak=0)
+t= 1 probe=ok  -> UP   (bad_streak=0)
+t= 2 probe=FAIL -> UP   (bad_streak=1)
+t= 3 probe=ok  -> UP   (bad_streak=0)
+t= 4 probe=FAIL -> UP   (bad_streak=1)
+t= 5 probe=FAIL -> UP   (bad_streak=2)
+t= 6 probe=FAIL -> DOWN (bad_streak=3)
+t= 7 probe=FAIL -> DOWN (bad_streak=4)
+t= 8 probe=ok  -> DOWN (bad_streak=0)
+t= 9 probe=ok  -> UP   (bad_streak=0)
+t=10 probe=ok  -> UP   (bad_streak=0)
+```
+
+Three consecutive failures to evict, two successes to return. Tune `fall` too low and a GC
+pause ejects a healthy node; tune it too high and users hit a dead backend for seconds.
+
+### Liveness is not readiness
+
+Two different questions, two different endpoints:
+
+- **Liveness** — "is the process wedged?" A failure means *restart me*.
+- **Readiness** — "can I serve traffic right now?" A failure means *stop sending requests*,
+  but do not restart: the process may just be warming a cache or waiting on a migration.
+
+Wiring a readiness check to a restart action is a classic outage: a slow dependency makes
+every replica report not-ready, the orchestrator restarts them all, and cold caches turn a
+brownout into a full outage.
+
+## Sticky sessions, and why you should not need them
+
+An L7 balancer can pin a client to one backend by hashing a cookie. It is occasionally useful
+(in-memory WebSocket state), and it is a trap for HTTP APIs: the pinned backend becomes a
+single point of failure for that user, deploys drop sessions, and load skews.
+
+```python
+import hashlib
+
+backends = ["app-1", "app-2", "app-3"]
+
+def sticky(session_id):
+    h = hashlib.md5(session_id.encode()).hexdigest()
+    return backends[int(h, 16) % len(backends)]
+
+for sid in ("sid=abc123", "sid=def456", "sid=zzz999"):
+    print(f"{sid} -> {sticky(sid)}")
+
+backends.append("app-4")             # deploy adds a node
+print("\nafter adding app-4:")
+for sid in ("sid=abc123", "sid=def456", "sid=zzz999"):
+    print(f"{sid} -> {sticky(sid)}")
+```
+
+```output
+sid=abc123 -> app-3
+sid=def456 -> app-2
+sid=zzz999 -> app-1
+
+after adding app-4:
+sid=abc123 -> app-1
+sid=def456 -> app-2
+sid=zzz999 -> app-4
+```
+
+Adding one backend moved two of three sessions. That is the modulo problem — ch. 4 fixes it
+with consistent hashing. The better fix for application state is to not have it: keep session
+data in a shared store and let any backend serve any request (ch. 19).
+
+## Try it Yourself
+
+```python
+import random
+random.seed(7)
+
+class Backend:
+    def __init__(self, name, fail_rate): self.name, self.fail_rate = name, fail_rate
+    def handle(self): return random.random() > self.fail_rate
+
+pool = [Backend("app-1", 0.0), Backend("app-2", 0.0), Backend("app-3", 0.6)]  # app-3 is sick
+health = {b.name: HealthCheck() for b in pool}
+served, errors = 0, 0
+
+for t in range(300):
+    live = [b for b in pool if health[b.name].healthy]
+    b = live[t % len(live)]                      # round robin over healthy backends
+    ok = b.handle()
+    health[b.name].probe(ok)
+    served += ok
+    errors += (not ok)
+
+print(f"requests 300 | ok {served} | errors {errors} ({errors/300:.1%})")
+print("final health:", {n: hc.healthy for n, hc in health.items()})
+```
+
+```output
+requests 300 | ok 297 | errors 3 (1.0%)
+final health: {'app-1': True, 'app-2': True, 'app-3': False}
+```
+
+Set `fall=1` on the health check and the sick backend is ejected far sooner — at the cost of
+ejecting healthy nodes on a single blip. Try `fail_rate=0.2` and watch the balancer flap.
+
+## Exercise
+
+Your reverse proxy fronts three pools: `/api/` (10 servers), `/static/` (2 servers), and
+`/ws` (4 servers, WebSocket, long-lived connections). Traffic is 3,000 rps to `/api/`,
+9,000 rps to `/static/`, and 200 new WebSocket connections per second with an average
+connection lifetime of 20 minutes.
+
+Write code that computes per-server load for each pool (requests per second for HTTP,
+*concurrent connections* for WebSocket), and decide which pool is the one to worry about.
+
+<details>
+<summary>Solution</summary>
+
+```python
+pools = {
+    "/api/":   {"servers": 10, "rps": 3_000},
+    "/static/":{"servers": 2,  "rps": 9_000},
+}
+for path, p in pools.items():
+    print(f"{path:9} {p['rps']/p['servers']:8,.0f} rps/server")
+
+ws_servers, new_conn_per_s, lifetime_s = 4, 200, 20 * 60
+concurrent = new_conn_per_s * lifetime_s          # Little's law: L = lambda * W
+print(f"/ws       {concurrent:,} concurrent conns -> {concurrent/ws_servers:,.0f} per server")
+print(f"          file descriptors + memory, not CPU: at ~40 KB/conn that is "
+      f"{concurrent/ws_servers*40/1e6:.1f} GB per server")
+```
+
+```output
+/api/          300 rps/server
+/static/     4,500 rps/server
+/ws       240,000 concurrent conns -> 60,000 per server
+          file descriptors + memory, not CPU: at ~40 KB/conn that is 2.4 GB per server
+```
+
+The insight: HTTP pools are sized by **rate**, WebSocket pools by **Little's law** —
+concurrency equals arrival rate times holding time. 240,000 concurrent connections across 4
+servers is the pool to worry about, and it is a memory and file-descriptor problem, not a CPU
+one. It also cannot use naive round robin on connection count alone: a server that restarts
+comes back empty and gets flooded with every new connection until it catches up.
+</details>

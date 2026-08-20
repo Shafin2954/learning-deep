@@ -1,0 +1,400 @@
+---
+course: mlops
+chapter: 03-containerizing
+title: "Containerizing: Reproducible Builds and Resource Limits"
+order: 3
+---
+
+## The container is the environment contract
+
+Chapter 1 recorded which library versions produced the model. A container is how you *enforce*
+that record: the image is a frozen filesystem, so the code that runs in production is bit-for-bit
+the code you tested. Everything in this chapter exists to keep that promise while the image stays
+small and starts fast.
+
+```dockerfile
+# Naive first attempt — it works, and it is wrong in five ways.
+FROM python:3.11
+COPY . /app
+WORKDIR /app
+RUN pip install -r requirements.txt
+CMD ["uvicorn", "serve:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+```python
+issues = [
+    ("FROM python:3.11",       "a floating tag: rebuilds pull a different patch release"),
+    ("COPY . /app",            "invalidates the pip layer on every source edit"),
+    ("pip install -r ...",     "unpinned versions: today's build != last week's"),
+    ("no USER",                "runs as root inside the container"),
+    ("no healthcheck/limits",  "the orchestrator cannot tell healthy from wedged"),
+]
+for line, why in issues:
+    print(f"{line:24} -> {why}")
+```
+
+```output
+FROM python:3.11         -> a floating tag: rebuilds pull a different patch release
+COPY . /app              -> invalidates the pip layer on every source edit
+pip install -r ...       -> unpinned versions: today's build != last week's
+no USER                  -> runs as root inside the container
+no healthcheck/limits    -> the orchestrator cannot tell healthy from wedged
+```
+
+Each is a reproducibility or safety hole, and each has a one-line fix. The rewrite below is the
+whole chapter in compressed form; the rest explains why every line is there.
+
+## The build, done properly
+
+```dockerfile
+# ---- stage 1: build wheels in a fat image -------------------------------
+FROM python:3.11.9-slim@sha256:0e2b8bdd... AS build
+WORKDIR /w
+COPY requirements.lock .
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.lock
+
+# ---- stage 2: the runtime image, as small as it can be ------------------
+FROM python:3.11.9-slim@sha256:0e2b8bdd...
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+
+COPY --from=build /wheels /wheels
+COPY requirements.lock .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.lock \
+ && rm -rf /wheels
+
+COPY --chown=appuser:appuser models/ ./models/      # rarely changes: cache it early
+COPY --chown=appuser:appuser serve.py ./            # changes constantly: copy it last
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
+  CMD python -c "import httpx,sys; sys.exit(0 if httpx.get('http://localhost:8000/healthz').status_code==200 else 1)"
+CMD ["uvicorn", "serve:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+Six decisions worth naming: a **digest-pinned base image** (a tag can be re-pointed; a digest
+cannot), a **lock file** rather than a range, a **multi-stage build** so compilers never reach the
+runtime image, **layer ordering by change frequency**, a **non-root user**, and a **healthcheck**
+that hits the same endpoint your load balancer uses (ch. 2).
+
+## Layer caching is the build-time lever
+
+Docker caches layers; a changed layer invalidates every layer after it. Order your `COPY`
+instructions from least to most frequently changed and your rebuild goes from minutes to
+seconds.
+
+```python
+LAYERS = [("base image", 45, 0.0), ("system packages", 30, 0.01),
+          ("pip install", 95, 0.05), ("model artifact", 12, 0.15),
+          ("application code", 2, 0.90)]
+
+def rebuild_cost(layers, changed_index):
+    """Everything from the changed layer onward is rebuilt."""
+    return sum(sec for _, sec, _ in layers[changed_index:])
+
+print(f"{'what changed':20}{'rebuild seconds':>17}{'how often':>12}")
+expected = 0.0
+for i, (name, _, freq) in enumerate(LAYERS):
+    cost = rebuild_cost(LAYERS, i)
+    expected += cost * freq
+    print(f"{name:20}{cost:>17.0f}{freq:>12.0%}")
+print(f"\nexpected rebuild: {expected:.0f} s with this order")
+
+bad = [LAYERS[0], LAYERS[4], LAYERS[1], LAYERS[2], LAYERS[3]]     # code copied early
+expected_bad = sum(rebuild_cost(bad, i) * f for i, (_, _, f) in enumerate(bad))
+print(f"expected rebuild: {expected_bad:.0f} s if application code is copied before pip install")
+```
+
+```output
+what changed          rebuild seconds   how often
+base image                        184          0%
+system packages                   139          1%
+pip install                       109          5%
+model artifact                     14         15%
+application code                    2         90%
+
+expected rebuild: 11 s with this order
+expected rebuild: 134 s if application code is copied before pip install
+```
+
+A code-only change should rebuild one two-second layer. Copy the source before `pip install` and
+the same edit rebuilds the dependency layer every time — the difference between a 15-second CI
+loop and a two-minute one, paid on every commit.
+
+## Image size: what you actually pay for
+
+```python
+images = [
+    ("python:3.11",            1_010, "full Debian + build toolchain"),
+    ("python:3.11-slim",         130, "Debian minimal, no compilers"),
+    ("python:3.11-alpine",        55, "musl libc: wheels often rebuild from source"),
+    ("distroless/python3",        55, "no shell, no package manager"),
+]
+deps = [("scikit-learn + numpy + scipy", 220), ("fastapi + uvicorn + pydantic", 25),
+        ("torch (CPU)", 780), ("the model artifact", 3)]
+
+print(f"{'base image':26}{'MB':>7}  note")
+for name, mb, note in images:
+    print(f"{name:26}{mb:>7}  {note}")
+print(f"\n{'layer':30}{'MB':>7}")
+for name, mb in deps:
+    print(f"{name:30}{mb:>7}")
+
+sklearn_total = 130 + 220 + 25 + 3
+torch_total = 130 + 780 + 25 + 3
+print(f"\nslim + sklearn stack : {sklearn_total:>5} MB")
+print(f"slim + torch stack   : {torch_total:>5} MB")
+for gbps in (1, 10):
+    print(f"pull time at {gbps:2} Gbit/s: sklearn {sklearn_total*8/1000/gbps:5.1f} s | "
+          f"torch {torch_total*8/1000/gbps:5.1f} s")
+```
+
+```output
+base image                     MB  note
+python:3.11                  1010  full Debian + build toolchain
+python:3.11-slim              130  Debian minimal, no compilers
+python:3.11-alpine             55  musl libc: wheels often rebuild from source
+distroless/python3             55  no shell, no package manager
+
+layer                              MB
+scikit-learn + numpy + scipy      220
+fastapi + uvicorn + pydantic       25
+torch (CPU)                       780
+the model artifact                  3
+
+slim + sklearn stack :   378 MB
+slim + torch stack   :   938 MB
+pull time at  1 Gbit/s: sklearn   3.0 s | torch   7.5 s
+pull time at 10 Gbit/s: sklearn   0.3 s | torch   0.8 s
+```
+
+Image size is not vanity: it is **cold-start latency**, multiplied by every node that pulls it
+during a scale-out or a rollout. A torch image is not automatically wrong, but if the model is a
+logistic regression (ch. 1), shipping 800 MB of CUDA-capable tensor library to compute a dot
+product is a choice you should have to defend.
+
+## Resource limits, and how the JVM-style surprise happens in Python too
+
+```python
+def container_sizing(model_mb, workers, overhead_mb=180, page_cache_mb=100):
+    rss = overhead_mb + workers * model_mb
+    request = rss + page_cache_mb
+    limit = int(request * 1.5)
+    print(f"model {model_mb:>5} MB x {workers} workers -> RSS ~{rss:>5} MB | "
+          f"request {request:>5} MB | limit {limit:>5} MB")
+    if workers > 1 and model_mb > 500:
+        print(f"{'':4}consider 1 worker per container and more replicas: "
+              f"{workers} copies of a {model_mb} MB model is {workers*model_mb} MB of duplication")
+
+container_sizing(40, 4)
+container_sizing(1_200, 4)
+container_sizing(1_200, 1)
+```
+
+```output
+model    40 MB x 4 workers -> RSS ~  340 MB | request   440 MB | limit   660 MB
+model  1200 MB x 4 workers -> RSS ~ 4980 MB | request  5080 MB | limit  7620 MB
+    consider 1 worker per container and more replicas: 4 copies of a 1200 MB model is 4800 MB of duplication
+model  1200 MB x 1 workers -> RSS ~ 1380 MB | request  1480 MB | limit  2220 MB
+```
+
+Three rules that prevent most container incidents. **Set a memory limit**, because an unbounded
+process gets OOM-killed by the kernel at the worst possible moment and the orchestrator reports
+only exit code 137. **Set requests below limits** but not by much — the gap is what gets you
+evicted under node pressure. And know that **CPU limits throttle rather than kill**: a container
+limited to 1 CPU running 4 worker processes does not get 4 CPUs of throughput, it gets one, split
+four ways, with latency to match.
+
+```python
+def cpu_throttling(cpu_limit, workers, model_ms=5.0):
+    effective = min(workers, cpu_limit)
+    throughput = effective * 1000 / model_ms
+    latency = model_ms * max(1.0, workers / cpu_limit)
+    print(f"limit {cpu_limit:>4} CPU, {workers} workers -> {throughput:>7,.0f} rps, "
+          f"p50 ~{latency:5.1f} ms {'(throttled)' if workers > cpu_limit else ''}")
+
+for limit, workers in [(1, 1), (1, 4), (4, 4), (4, 8)]:
+    cpu_throttling(limit, workers)
+```
+
+```output
+limit    1 CPU, 1 workers ->     200 rps, p50 ~  5.0 ms 
+limit    1 CPU, 4 workers ->     200 rps, p50 ~ 20.0 ms (throttled)
+limit    4 CPU, 4 workers ->     800 rps, p50 ~  5.0 ms 
+limit    4 CPU, 8 workers ->     800 rps, p50 ~ 10.0 ms (throttled)
+```
+
+## Configuration and secrets
+
+```python
+import os
+
+def load_config(env):
+    required = ["MODEL_URI", "MODEL_VERSION"]
+    optional = {"MAX_BATCH": "32", "MAX_WAIT_MS": "5", "LOG_LEVEL": "info"}
+    missing = [k for k in required if k not in env]
+    if missing:
+        return f"REFUSING TO START: missing {missing}"
+    cfg = {k: env[k] for k in required}
+    cfg.update({k: env.get(k, v) for k, v in optional.items()})
+    return cfg
+
+print(load_config({"MODEL_VERSION": "1.4.0"}))
+print(load_config({"MODEL_URI": "s3://models/claims/1.4.0", "MODEL_VERSION": "1.4.0",
+                   "MAX_BATCH": "64"}))
+print("\nsecrets never go in the image, in an ENV line, or in the repo:")
+for how, verdict in [("ENV API_KEY=... in the Dockerfile", "baked into a layer, visible forever"),
+                     ("--build-arg", "recorded in the image history"),
+                     ("runtime env var from a secret store", "acceptable"),
+                     ("mounted file from a secret manager", "best: rotatable without a rebuild")]:
+    print(f"  {how:38} {verdict}")
+```
+
+```output
+REFUSING TO START: missing ['MODEL_URI']
+{'MODEL_URI': 's3://models/claims/1.4.0', 'MODEL_VERSION': '1.4.0', 'MAX_BATCH': '64', 'MAX_WAIT_MS': '5', 'LOG_LEVEL': 'info'}
+
+secrets never go in the image, in an ENV line, or in the repo:
+  ENV API_KEY=... in the Dockerfile      baked into a layer, visible forever
+  --build-arg                            recorded in the image history
+  runtime env var from a secret store    acceptable
+  mounted file from a secret manager     best: rotatable without a rebuild
+```
+
+**Fail fast on missing configuration.** A server that starts with `MODEL_URI` unset and discovers
+it on the first request has converted a deploy-time error into a user-facing one.
+
+## Try it Yourself
+
+```python
+def build_report(base_mb, deps_mb, model_mb, code_mb, layers_changed, replicas, gbps=5):
+    total = base_mb + deps_mb + model_mb + code_mb
+    pull_s = total * 8 / 1000 / gbps
+    print(f"image {total:>5} MB | pull {pull_s:5.1f} s | "
+          f"rollout of {replicas:>3} replicas, 25% at a time: "
+          f"{pull_s * (replicas / max(1, replicas // 4)):6.1f} s of pulling")
+    rebuilt = sum(mb for name, mb in
+                  [("deps", deps_mb), ("model", model_mb), ("code", code_mb)]
+                  if name in layers_changed)
+    print(f"   changed {layers_changed} -> {rebuilt:>4} MB of layers repushed and repulled")
+
+build_report(130, 245, 3, 1, ["code"], replicas=40)
+build_report(130, 245, 3, 1, ["deps", "model", "code"], replicas=40)
+build_report(130, 805, 1_200, 1, ["code"], replicas=40)
+```
+
+```output
+image   379 MB | pull   0.6 s | rollout of  40 replicas, 25% at a time:    2.4 s of pulling
+   changed ['code'] ->    1 MB of layers repushed and repulled
+image   379 MB | pull   0.6 s | rollout of  40 replicas, 25% at a time:    2.4 s of pulling
+   changed ['deps', 'model', 'code'] ->  249 MB of layers repushed and repulled
+image  2136 MB | pull   3.4 s | rollout of  40 replicas, 25% at a time:   13.7 s of pulling
+   changed ['code'] ->    1 MB of layers repushed and repulled
+```
+
+Two different costs live in that output. Ordered layers keep a code-only redeploy cheap — one
+megabyte moves, whatever the image weighs. But **image size still sets your cold-start cost**: a
+new node, an autoscale event, or a cache-cold region pulls the whole 2.1 GB, and that is the
+number that decides how fast you can add capacity under load. If the model is large, the usual
+answer is to **load it from object storage at startup** rather than baking it in — a smaller
+image and a rollback that does not re-pull gigabytes, paid for with a slower cold start and a
+runtime dependency on the store. Both are defensible; pick deliberately.
+
+## Exercise
+
+Write a `docker_lint` function that takes a Dockerfile as a list of lines and reports violations
+of the rules in this chapter: unpinned base image, no `USER`, secrets in `ENV`, `COPY .` before
+dependency installation, `pip install` without a lock file, missing `HEALTHCHECK`, and use of
+`latest`. Run it against a bad Dockerfile and a good one, and make it exit non-zero on any
+finding so it can run in CI (ch. 4).
+
+<details>
+<summary>Solution</summary>
+
+```python
+import re
+
+RULES = [
+    ("unpinned base image", lambda ls: any(
+        l.startswith("FROM") and "@sha256:" not in l for l in ls)),
+    ("runs as root", lambda ls: not any(l.startswith("USER") for l in ls)),
+    ("secret baked into a layer", lambda ls: any(
+        re.match(r"(ENV|ARG)\s+\w*(KEY|TOKEN|SECRET|PASSWORD)", l) for l in ls)),
+    ("copies source before installing deps", lambda ls: _copy_before_install(ls)),
+    ("install without a lock file", lambda ls: any(
+        "pip install" in l and "lock" not in l and "--no-index" not in l for l in ls)),
+    ("no HEALTHCHECK", lambda ls: not any(l.startswith("HEALTHCHECK") for l in ls)),
+]
+
+def _copy_before_install(lines):
+    copy_all = next((i for i, l in enumerate(lines) if re.match(r"COPY\s+\.\s", l)), None)
+    install = next((i for i, l in enumerate(lines) if "pip install" in l), None)
+    return copy_all is not None and install is not None and copy_all < install
+
+def docker_lint(dockerfile, name):
+    lines = [l.strip() for l in dockerfile.strip().splitlines() if l.strip()
+             and not l.strip().startswith("#")]
+    findings = [rule for rule, check in RULES if check(lines)]
+    print(f"{name}:")
+    for f in findings:
+        print(f"   FAIL {f}")
+    print(f"   -> {len(findings)} finding(s); CI exit code {1 if findings else 0}")
+    return len(findings)
+
+bad = """
+FROM python:3.11
+ENV API_KEY=sk-live-1234
+COPY . /app
+WORKDIR /app
+RUN pip install -r requirements.txt
+CMD ["uvicorn", "serve:app"]
+"""
+
+good = """
+FROM python:3.11.9-slim@sha256:0e2b8bdd AS build
+WORKDIR /w
+COPY requirements.lock .
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.lock
+
+FROM python:3.11.9-slim@sha256:0e2b8bdd
+RUN useradd --uid 10001 appuser
+WORKDIR /app
+COPY --from=build /wheels /wheels
+COPY requirements.lock .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.lock
+COPY --chown=appuser:appuser serve.py ./
+USER appuser
+HEALTHCHECK CMD python -c "import httpx; httpx.get('http://localhost:8000/healthz')"
+CMD ["uvicorn", "serve:app", "--host", "0.0.0.0"]
+"""
+
+failures = docker_lint(bad, "bad Dockerfile") + docker_lint(good, "good Dockerfile")
+print(f"\npipeline result: {'BLOCKED' if failures else 'clean'}")
+```
+
+```output
+bad Dockerfile:
+   FAIL unpinned base image
+   FAIL runs as root
+   FAIL secret baked into a layer
+   FAIL copies source before installing deps
+   FAIL install without a lock file
+   FAIL no HEALTHCHECK
+   -> 6 finding(s); CI exit code 1
+good Dockerfile:
+   -> 0 finding(s); CI exit code 0
+
+pipeline result: BLOCKED
+```
+
+The insight: every rule here is a *reproducibility* or *blast-radius* rule, and both matter more
+than the aesthetics of a Dockerfile. A floating base tag means the image you roll back to is not
+the image you rolled out — the single most disorienting failure in an incident, because your
+"known good" version now behaves differently. A secret in a layer is permanent: deleting it in a
+later layer leaves it in the image history and in every registry copy. And running as root turns
+a request-parsing bug into host access. Notice also that this lint is worth ten pages of
+convention documents, because it runs in CI on every pull request and cannot be forgotten
+(ch. 4) — which is the theme of the next chapter: the checks you automate are the only checks you
+actually have.
+</details>

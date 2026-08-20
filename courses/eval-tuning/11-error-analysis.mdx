@@ -1,0 +1,422 @@
+---
+course: eval-tuning
+chapter: 11-error-analysis
+title: "Error Analysis as a Discipline"
+order: 11
+---
+
+## One number cannot tell you what to do next
+
+A test AUC is a grade, not a work list. Error analysis converts the same predictions into a
+ranked set of actions: *this segment is broken, that one is mislabelled, this third one is fine
+and you should stop looking at it.* The discipline is mechanical — slice, measure, rank by
+impact, act — and it beats another round of tuning almost every time.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, accuracy_score, log_loss
+
+rng = np.random.default_rng(0)
+n = 12_000
+channel = rng.choice(["web", "app", "phone", "partner"], n, p=[0.45, 0.35, 0.15, 0.05])
+country = rng.choice(["US", "DE", "BR", "IN"], n, p=[0.5, 0.25, 0.15, 0.10])
+amount = np.round(10 ** rng.uniform(0.5, 3.2, n), 2)
+age_days = rng.integers(0, 900, n)
+device_age = rng.integers(0, 60, n)
+
+logit = (-2.2 + 0.9 * np.log10(amount) - 0.0015 * age_days
+         + 0.6 * (channel == "phone") + 0.3 * (country == "BR"))
+# the partner channel behaves differently and its main driver is not in the features
+hidden = rng.normal(0, 1.6, n)
+logit = np.where(channel == "partner", -1.0 + 1.8 * hidden, logit)
+y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+# phone orders are labelled by a noisy manual process
+flip = (channel == "phone") & (rng.random(n) < 0.18)
+y = np.where(flip, 1 - y, y)
+
+df = pd.DataFrame({"channel": channel, "country": country, "amount": amount,
+                   "age_days": age_days, "device_age": device_age})
+X = pd.get_dummies(df, columns=["channel", "country"])
+Xtr, Xte, ytr, yte, dtr, dte = train_test_split(X, y, df, test_size=0.3, random_state=0)
+model = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(Xtr, ytr)
+p = model.predict_proba(Xte)[:, 1]
+print(f"overall: AUC {roc_auc_score(yte, p):.4f} | accuracy {accuracy_score(yte, p > 0.5):.4f} "
+      f"| log loss {log_loss(yte, p):.4f} | fraud rate {yte.mean():.3f}")
+```
+
+```output
+overall: AUC 0.6769 | accuracy 0.6906 | log loss 0.5820 | fraud rate 0.311
+```
+
+That looks like a decent model. Three separate problems are hiding inside it.
+
+## Slice, measure, rank by impact
+
+The unit of error analysis is a **slice**: a subgroup defined by feature values. For each one you
+need three numbers — the metric inside the slice, the slice's size, and the *impact* if you fixed
+it. Impact is what ranks the work; a terrible slice covering 0.3% of traffic is not your problem.
+
+```python
+def slices_from(frame, max_bins=4):
+    """Every categorical level, plus quantile bins of every numeric column."""
+    out = {}
+    for col in frame.columns:
+        if not pd.api.types.is_numeric_dtype(frame[col]):
+            for level in sorted(frame[col].unique()):
+                out[f"{col}={level}"] = (frame[col] == level).values
+        else:
+            edges = np.quantile(frame[col], np.linspace(0, 1, max_bins + 1))
+            for k in range(max_bins):
+                lo, hi = edges[k], edges[k + 1]
+                mask = (frame[col] >= lo) & (frame[col] <= hi if k == max_bins - 1
+                                             else frame[col] < hi)
+                out[f"{col} in [{lo:.0f}, {hi:.0f})"] = mask.values
+    return out
+
+def slice_report(frame, y_true, y_prob, threshold=0.5, min_support=100):
+    overall_err = float((y_true != (y_prob > threshold)).mean())
+    rows = []
+    for name, mask in slices_from(frame).items():
+        if mask.sum() < min_support:
+            continue
+        err = float((y_true[mask] != (y_prob[mask] > threshold)).mean())
+        share = float(mask.mean())
+        rows.append({"slice": name, "n": int(mask.sum()), "share": share,
+                     "base_rate": float(y_true[mask].mean()),
+                     "error": err, "lift": err / overall_err,
+                     # errors removed overall if this slice reached the global rate
+                     "headroom": share * max(0.0, err - overall_err)})
+    return (pd.DataFrame(rows).sort_values("headroom", ascending=False)
+            .reset_index(drop=True), overall_err)
+
+report, overall_err = slice_report(dte, yte, p)
+print(f"overall error rate {overall_err:.4f}\n")
+print(report.head(8).round(4).to_string(index=False))
+```
+
+```output
+overall error rate 0.3094
+
+                 slice   n  share  base_rate  error   lift  headroom
+ amount in [358, 1577) 900 0.2500     0.4667 0.4444 1.4363    0.0337
+         channel=phone 547 0.1519     0.4296 0.4260 1.3765    0.0177
+  age_days in [0, 234) 898 0.2494     0.3964 0.3641 1.1768    0.0136
+   amount in [74, 358) 900 0.2500     0.3589 0.3600 1.1634    0.0126
+age_days in [234, 444) 900 0.2500     0.3267 0.3444 1.1131    0.0087
+       channel=partner 192 0.0533     0.3802 0.4115 1.3297    0.0054
+device_age in [44, 59) 933 0.2592     0.3280 0.3194 1.0322    0.0026
+            country=BR 508 0.1411     0.3346 0.3248 1.0496    0.0022
+```
+
+The `headroom` column is the whole point. It converts "this slice is bad" into "fixing this slice
+moves the overall number by *this much*", which is the only form a stakeholder can prioritise.
+`channel=partner` has a lift of 1.33 and sits sixth, below slices with smaller lifts, because it
+is 5% of traffic.
+
+Now read `base_rate` next to `error`, because the top row is a trap. Mid-range amounts have a base
+rate of 0.467 — a coin flip — so a high error rate there is mostly *intrinsic difficulty*, not a
+defect. Any slice whose base rate approaches 0.5 will float to the top of an error-rate ranking
+whether or not anything is wrong with it, which is the first thing to check before assigning work.
+
+## Three findings, three different fixes
+
+A high-error slice is a symptom. The diagnosis comes from asking *why* the model is wrong there,
+and each answer implies a different action.
+
+```python
+for seg in ["web", "app", "phone", "partner"]:
+    m = (dte["channel"] == seg).values
+    print(f"{seg:8} n={m.sum():>4} | base rate {yte[m].mean():.3f} | "
+          f"mean p {p[m].mean():.3f} | AUC {roc_auc_score(yte[m], p[m]):.4f} | "
+          f"error {float((yte[m] != (p[m] > 0.5)).mean()):.4f}")
+```
+
+```output
+web      n=1597 | base rate 0.275 | mean p 0.271 | AUC 0.6866 | error 0.2705
+app      n=1264 | base rate 0.294 | mean p 0.263 | AUC 0.6902 | error 0.2927
+phone    n= 547 | base rate 0.430 | mean p 0.414 | AUC 0.5871 | error 0.4260
+partner  n= 192 | base rate 0.380 | mean p 0.391 | AUC 0.4721 | error 0.4115
+```
+
+Two of those channels are broken in completely different ways, and the AUC column separates them.
+`partner` has a poor AUC: **the model cannot rank inside that segment**, because its true driver
+(`hidden`) is not a column. That is a *feature* problem — no amount of tuning fixes a missing
+variable. `phone` also scores badly, but read the next section before deciding why.
+
+### Is it the model or the labels?
+
+```python
+row_loss = -(yte * np.log(np.clip(p, 1e-9, 1)) + (1 - yte) * np.log(np.clip(1 - p, 1e-9, 1)))
+worst = np.argsort(-row_loss)[:200]
+print(f"{'channel':9} {'mean loss':>10} {'share of data':>14} {'share of worst 200':>19} "
+      f"{'|mean p - base|':>16}")
+for seg in ["web", "app", "phone", "partner"]:
+    m = (dte["channel"] == seg).values
+    print(f"{seg:9} {row_loss[m].mean():>10.4f} {m.mean():>14.3f} "
+          f"{float((dte.iloc[worst]['channel'] == seg).mean()):>19.3f} "
+          f"{abs(p[m].mean() - yte[m].mean()):>16.4f}")
+```
+
+```output
+channel    mean loss  share of data  share of worst 200  |mean p - base|
+web           0.5461          0.444               0.485           0.0044
+app           0.5632          0.351               0.465           0.0303
+phone         0.6898          0.152               0.045           0.0154
+partner       0.6980          0.053               0.005           0.0105
+```
+
+Read the last three columns together, because they contradict each other in a useful way. `phone`
+and `partner` carry the highest *mean* loss, but they are almost absent from the 200 worst
+individual rows — 4.5% and 0.5% against data shares of 15% and 5%. `web` and `app` are
+over-represented there instead.
+
+That is not a paradox, it is the signature of the two failure modes. Where the labels are noisy or
+the driving feature is missing, the model has learned it cannot tell — so it predicts mid-range
+probabilities and pays a steady, moderate loss on every row. Confident, catastrophic single errors
+come from the segments the model thinks it understands. **Chasing the worst individual losses
+finds you confident mistakes; averaging loss per slice finds you broken segments.** You need both
+views, and the mean-loss column is the one that points at label noise.
+
+The `|mean p - base|` column rules out the third possibility: every channel's average prediction
+sits within three points of its actual rate, so nothing here is a calibration failure (ch. 4)
+that a per-segment adjustment would fix.
+
+```python
+clean = (dte["channel"] != "phone").values
+print(f"AUC on all test rows        : {roc_auc_score(yte, p):.4f}")
+print(f"AUC excluding the noisy set : {roc_auc_score(yte[clean], p[clean]):.4f}")
+print(f"AUC on the noisy set alone  : {roc_auc_score(yte[~clean], p[~clean]):.4f}")
+```
+
+```output
+AUC on all test rows        : 0.6769
+AUC excluding the noisy set : 0.6802
+AUC on the noisy set alone  : 0.5871
+```
+
+The ceiling on a segment with flipped labels is not 1.0, and no model will reach past it. Knowing
+that stops you from burning a week on a segment that is already at its noise limit.
+
+## Cluster the errors when you do not know the slices
+
+Predefined slices only find problems in dimensions you thought of. Clustering the misclassified
+rows lets the errors group themselves.
+
+```python
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+wrong = (yte != (p > 0.5))
+num_cols = ["amount", "age_days", "device_age"]
+Z = StandardScaler().fit_transform(np.column_stack([
+    np.log10(dte[num_cols[0]]), dte[num_cols[1]], dte[num_cols[2]]]))
+km = KMeans(n_clusters=4, n_init=10, random_state=0).fit(Z[wrong])
+lab = km.labels_
+prof = pd.DataFrame({
+    "n": pd.Series(lab).value_counts().sort_index(),
+    "mean_amount": pd.Series(dte["amount"].values[wrong]).groupby(lab).mean().round(1),
+    "mean_age_days": pd.Series(dte["age_days"].values[wrong]).groupby(lab).mean().round(0),
+    "top_channel": pd.Series(dte["channel"].values[wrong]).groupby(lab).agg(
+        lambda s: s.value_counts().idxmax()),
+    "false_positive_rate": pd.Series((p[wrong] > 0.5).astype(float)).groupby(lab).mean().round(3),
+})
+print(prof.to_string())
+```
+
+```output
+     n  mean_amount  mean_age_days top_channel  false_positive_rate
+0  278        472.3          253.0         web                0.309
+1  277        372.5          722.0         app                0.087
+2  259         23.3          256.0         web                0.073
+3  300        541.4          399.0         web                0.333
+```
+
+Each cluster is a candidate slice you did not write down. Read the `false_positive_rate` column
+alongside the profile: a cluster of high-amount, long-lived accounts that the model flags as fraud
+is a different bug from a cluster of new accounts it misses.
+
+## Regression errors: look at the residual structure
+
+For a regressor the same discipline applies to residuals — the question is whether the error is
+*uniform* or *structured*.
+
+```python
+from sklearn.ensemble import HistGradientBoostingRegressor
+
+target = (np.log10(dte["amount"]) * 2 + dte["age_days"] / 300
+          + rng.normal(0, 0.4, len(dte))).values
+half = len(Xte) // 2
+reg = HistGradientBoostingRegressor(max_depth=4, random_state=0).fit(
+    Xte.iloc[:half], target[:half])
+pred = reg.predict(Xte.iloc[half:])
+resid = target[half:] - pred
+bins = pd.qcut(pred, 4, labels=["Q1 low", "Q2", "Q3", "Q4 high"])
+tab = pd.DataFrame({"bin": bins, "resid": resid})
+print(tab.groupby("bin", observed=True)["resid"].agg(
+    bias="mean", spread="std", n="count").round(3).to_string())
+```
+
+```output
+          bias  spread    n
+bin                        
+Q1 low   0.006   0.429  450
+Q2       0.014   0.433  450
+Q3      -0.015   0.419  450
+Q4 high  0.020   0.417  450
+```
+
+Bias near zero in every bin means the model is not systematically over- or under-predicting
+anywhere. A rising `spread` column would say the model is *less certain* at the high end even when
+unbiased — which is a prediction-interval problem (quantile regression, ch. 2), not an accuracy
+problem.
+
+## Try it Yourself
+
+```python
+def top_slices(frame, y_true, y_prob, metric="error", threshold=0.5, k=5, min_support=150):
+    overall = {"error": float((y_true != (y_prob > threshold)).mean()),
+               "logloss": float(log_loss(y_true, y_prob))}[metric]
+    rows = []
+    for name, mask in slices_from(frame).items():
+        if mask.sum() < min_support:
+            continue
+        if metric == "error":
+            val = float((y_true[mask] != (y_prob[mask] > threshold)).mean())
+        else:
+            val = float(log_loss(y_true[mask], y_prob[mask], labels=[0, 1]))
+        rows.append((name, int(mask.sum()), round(val, 4),
+                     round(float(mask.mean()) * max(0.0, val - overall), 5)))
+    rows.sort(key=lambda r: -r[3])
+    print(f"metric={metric}  overall={overall:.4f}")
+    for name, cnt, val, head in rows[:k]:
+        print(f"  {name:28} n={cnt:>5} {metric}={val:<8.4f} headroom={head:.5f}")
+
+top_slices(dte, yte, p, metric="error")
+print()
+top_slices(dte, yte, p, metric="logloss")
+```
+
+```output
+metric=error  overall=0.3094
+  amount in [358, 1577)        n=  900 error=0.4444   headroom=0.03375
+  channel=phone                n=  547 error=0.4260   headroom=0.01770
+  age_days in [0, 234)         n=  898 error=0.3641   headroom=0.01364
+  amount in [74, 358)          n=  900 error=0.3600   headroom=0.01264
+  age_days in [234, 444)       n=  900 error=0.3444   headroom=0.00875
+
+metric=logloss  overall=0.5820
+  amount in [358, 1577)        n=  900 logloss=0.6964   headroom=0.02859
+  age_days in [0, 234)         n=  898 logloss=0.6495   headroom=0.01683
+  amount in [74, 358)          n=  900 logloss=0.6487   headroom=0.01668
+  channel=phone                n=  547 logloss=0.6898   headroom=0.01637
+  channel=partner              n=  192 logloss=0.6980   headroom=0.00619
+```
+
+The two metrics rank the work differently, and neither ranking is wrong — error rate asks "how
+many decisions are wrong", log loss asks "how badly calibrated are the scores" (ch. 4). Change
+`threshold` to see the error-rate list reshuffle while the log-loss list stays put, which is the
+clearest demonstration that a threshold is a business choice layered on top of a model.
+
+## Exercise
+
+Produce the artefact this chapter is really about: a prioritised remediation plan. For each of the
+worst slices, estimate the overall-metric gain from fixing it to parity, classify the likely cause
+using evidence you can compute (ranking failure versus label noise versus simple scarcity), and
+attach the action each cause implies. Then sanity-check the total claimed headroom against what is
+actually achievable.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def diagnose_slice(name, mask, y_true, y_prob, overall_err):
+    n_slice = int(mask.sum())
+    auc = roc_auc_score(y_true[mask], y_prob[mask]) if 0 < y_true[mask].mean() < 1 else np.nan
+    err = float((y_true[mask] != (y_prob[mask] > 0.5)).mean())
+    mean_p, base = float(y_prob[mask].mean()), float(y_true[mask].mean())
+    # a bin of a numeric feature restricts that feature's range, which depresses AUC mechanically
+    range_restricted = " in [" in name
+    if abs(mean_p - base) > 0.05:
+        cause, action = "miscalibrated in slice", "per-segment calibration or threshold (ch. 3-4)"
+    elif range_restricted and abs(base - 0.5) < 0.15:
+        cause, action = ("near the decision boundary",
+                         "expect little free win; check the Bayes rate before investing")
+    elif not range_restricted and not np.isnan(auc) and auc < 0.6:
+        cause, action = "cannot rank inside slice", "add a feature that explains this segment"
+    elif n_slice < 0.05 * len(y_true):
+        cause, action = "scarce data", "collect or oversample; check variance before acting"
+    else:
+        cause, action = "irreducible / label quality", "audit labels on a sample before modelling"
+    return {"n": n_slice, "auc": round(float(auc), 4), "error": round(err, 4),
+            "mean_p": round(mean_p, 3), "base_rate": round(base, 3),
+            "headroom": round(float(mask.mean()) * max(0.0, err - overall_err), 5),
+            "likely_cause": cause, "action": action}
+
+plan = []
+for name in report.head(6)["slice"]:
+    row = {"slice": name}
+    row.update(diagnose_slice(name, slices_from(dte)[name], yte, p, overall_err))
+    plan.append(row)
+plan = pd.DataFrame(plan).sort_values("headroom", ascending=False)
+print(plan[["slice", "n", "auc", "base_rate", "error", "headroom",
+            "likely_cause"]].to_string(index=False))
+
+print("\nremediation plan:")
+for _, r in plan.iterrows():
+    if r["headroom"] <= 0:
+        continue
+    print(f"  [{r['headroom']:.4f}] {r['slice']}: {r['likely_cause']} -> {r['action']}")
+
+claimed = plan["headroom"].sum()
+print(f"\nsum of claimed headroom: {claimed:.4f} of an overall error rate of {overall_err:.4f}")
+disjoint = plan.head(2)["slice"].tolist()
+masks = [slices_from(dte)[s] for s in disjoint]
+overlap = float((masks[0] & masks[1]).mean())
+print(f"overlap between the top two slices: {overlap:.4f} of all rows "
+      f"(headroom double-counts any overlap)")
+```
+
+```output
+                 slice   n    auc  base_rate  error  headroom                likely_cause
+ amount in [358, 1577) 900 0.5791      0.467 0.4444   0.03375  near the decision boundary
+         channel=phone 547 0.5871      0.430 0.4260   0.01770    cannot rank inside slice
+  age_days in [0, 234) 898 0.6431      0.396 0.3641   0.01364  near the decision boundary
+   amount in [74, 358) 900 0.5991      0.359 0.3600   0.01264  near the decision boundary
+age_days in [234, 444) 900 0.6571      0.327 0.3444   0.00875 irreducible / label quality
+       channel=partner 192 0.4721      0.380 0.4115   0.00544    cannot rank inside slice
+
+remediation plan:
+  [0.0338] amount in [358, 1577): near the decision boundary -> expect little free win; check the Bayes rate before investing
+  [0.0177] channel=phone: cannot rank inside slice -> add a feature that explains this segment
+  [0.0136] age_days in [0, 234): near the decision boundary -> expect little free win; check the Bayes rate before investing
+  [0.0126] amount in [74, 358): near the decision boundary -> expect little free win; check the Bayes rate before investing
+  [0.0088] age_days in [234, 444): irreducible / label quality -> audit labels on a sample before modelling
+  [0.0054] channel=partner: cannot rank inside slice -> add a feature that explains this segment
+
+sum of claimed headroom: 0.0919 of an overall error rate of 0.3094
+overlap between the top two slices: 0.0353 of all rows (headroom double-counts any overlap)
+```
+
+Three things this plan gets right, and one it cannot.
+
+It ranks by **headroom**, not by how bad a slice looks, so `channel=partner` — the worst-ranked
+segment in the model, AUC 0.4721, no better than chance — correctly sits last, because it is 5% of
+traffic. It attaches a **cause** derived from computable evidence rather than intuition, and the
+order of those tests matters. Calibration is checked first (a gap between mean predicted
+probability and the slice's base rate is cheap to fix, ch. 4). Then range restriction: a bin of a
+numeric feature holds that feature nearly constant, so AUC inside it drops *mechanically* — the
+top slice's 0.5791 is not evidence of a ranking failure, and a naive `auc < 0.6` rule would have
+sent an engineer hunting for a feature that does not exist. Only categorical slices get the
+"cannot rank" verdict, which is why `phone` and `partner` are the two flagged for feature work.
+Each cause carries an **action**, so the output is a work list rather than a dashboard.
+
+What it cannot do is add up. Slices overlap — the printed overlap between the top two is real
+traffic counted twice — so the summed headroom is an upper bound, not a forecast. Fixing the top
+slice usually moves the others as well, and a slice at its label-noise ceiling has no headroom at
+all no matter what the arithmetic says. Treat the numbers as an ordering, verify the top item by
+actually fixing it, then re-run the whole report; error analysis is a loop, and the second pass is
+where the real second-order problems surface.
+</details>

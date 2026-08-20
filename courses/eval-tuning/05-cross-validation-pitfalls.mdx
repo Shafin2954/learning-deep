@@ -1,0 +1,462 @@
+---
+course: eval-tuning
+chapter: 05-cross-validation-pitfalls
+title: "Cross-Validation Pitfalls in Practice"
+order: 5
+---
+
+## The only question CV answers
+
+Cross-validation estimates *how well this procedure generalizes to data drawn the way your test
+data will be drawn*. Every pitfall in this chapter is the same mistake: the folds do not
+resemble the deployment split, so the number is optimistic and nobody finds out until launch.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+def make_data(n=3_000, d=30, seed=0, signal=0.6):
+    r = np.random.default_rng(seed)
+    X = r.normal(0, 1, (n, d))
+    w = np.zeros(d); w[:5] = signal
+    y = (X @ w + r.normal(0, 1, n) > 0).astype(int)
+    return X, y
+
+X, y = make_data()
+print(f"X {X.shape} | positive rate {y.mean():.3f}")
+```
+
+```output
+X (3000, 30) | positive rate 0.496
+```
+
+## Pitfall 1: preprocessing outside the folds
+
+Any step that *learns* from the data — scaling, imputation, target encoding, feature selection —
+must be fitted inside each fold. Fit it once on everything and the validation rows have already
+influenced the transform.
+
+```python
+def kfold_indices(n, k, seed=0):
+    idx = np.random.default_rng(seed).permutation(n)
+    return [(np.concatenate([idx[:i * n // k], idx[(i + 1) * n // k:]]),
+             idx[i * n // k:(i + 1) * n // k]) for i in range(k)]
+
+def cv_score(X, y, k=5, leak_selection=False, n_keep=5):
+    folds = kfold_indices(len(y), k)
+    if leak_selection:                                   # selection done ONCE on all data
+        corr = np.abs([np.corrcoef(X[:, j], y)[0, 1] for j in range(X.shape[1])])
+        keep_global = np.argsort(-corr)[:n_keep]
+    scores = []
+    for tr, va in folds:
+        if leak_selection:
+            keep = keep_global
+        else:                                            # selection re-done per fold
+            corr = np.abs([np.corrcoef(X[tr, j], y[tr])[0, 1] for j in range(X.shape[1])])
+            keep = np.argsort(-corr)[:n_keep]
+        model = Pipeline([("s", StandardScaler()),
+                          ("m", LogisticRegression(max_iter=500))]).fit(X[tr][:, keep], y[tr])
+        scores.append(float((model.predict(X[va][:, keep]) == y[va]).mean()))
+    return float(np.mean(scores)), float(np.std(scores))
+
+X_noise, y_noise = make_data(n=300, d=2_000, signal=0.0)   # NO signal at all
+leaky = cv_score(X_noise, y_noise, leak_selection=True)
+honest = cv_score(X_noise, y_noise, leak_selection=False)
+print(f"pure noise, 2,000 features, 300 rows:")
+print(f"  selection outside the folds: accuracy {leaky[0]:.3f} +- {leaky[1]:.3f}   <- fiction")
+print(f"  selection inside each fold  : accuracy {honest[0]:.3f} +- {honest[1]:.3f}   "
+      f"(chance = {max(y_noise.mean(), 1-y_noise.mean()):.3f})")
+```
+
+```output
+pure noise, 2,000 features, 300 rows:
+  selection outside the folds: accuracy 0.660 +- 0.060   <- fiction
+  selection inside each fold  : accuracy 0.497 +- 0.041   (chance = 0.510)
+```
+
+There is no signal in that data whatsoever, and selecting features on the full set manufactures
+a model that looks better than chance. This is the single most common way a Kaggle notebook or a
+research result turns out to be nothing.
+
+## Pitfall 2: ignoring groups
+
+When rows are not independent — several visits per patient, several sessions per user, several
+photos of the same object — random folds put the *same entity* on both sides of the split. The
+model then wins by recognising the entity, not by learning anything transferable.
+
+```python
+from sklearn.neighbors import KNeighborsClassifier
+
+def grouped_data(n_groups=300, per_group=10, seed=1, d_sig=6):
+    r = np.random.default_rng(seed)
+    g = np.repeat(np.arange(n_groups), per_group)
+    sig = r.normal(0, 1, (n_groups, d_sig))[g]           # per-entity fingerprint in the features
+    ge = r.normal(0, 1.5, n_groups)[g]                   # per-entity shift in the label, hidden
+    x = r.normal(0, 1, len(g))                           # the one transferable signal
+    y = ((0.9 * x + ge + r.normal(0, 0.4, len(g))) > 0).astype(int)
+    return np.column_stack([x, sig + r.normal(0, 0.05, sig.shape)]), y, g
+
+Xg, yg, groups = grouped_data()
+
+def group_kfold(groups, k=5, seed=0):
+    uniq = np.unique(groups)
+    order = np.random.default_rng(seed).permutation(uniq)
+    chunks = np.array_split(order, k)
+    return [(np.flatnonzero(~np.isin(groups, c)), np.flatnonzero(np.isin(groups, c)))
+            for c in chunks]
+
+def evaluate(splits):
+    accs = []
+    for tr, va in splits:
+        m = Pipeline([("s", StandardScaler()),
+                      ("m", KNeighborsClassifier(5))]).fit(Xg[tr], yg[tr])
+        accs.append(float((m.predict(Xg[va]) == yg[va]).mean()))
+    return float(np.mean(accs)), float(np.std(accs))
+
+random_cv = evaluate(kfold_indices(len(yg), 5))
+grouped_cv = evaluate(group_kfold(groups, 5))
+print(f"random 5-fold : accuracy {random_cv[0]:.4f} +- {random_cv[1]:.4f}")
+print(f"grouped 5-fold: accuracy {grouped_cv[0]:.4f} +- {grouped_cv[1]:.4f}")
+print(f"optimism from ignoring groups: {random_cv[0] - grouped_cv[0]:+.4f}")
+```
+
+```output
+random 5-fold : accuracy 0.8413 +- 0.0159
+grouped 5-fold: accuracy 0.5980 +- 0.0307
+optimism from ignoring groups: +0.2433
+```
+
+Both numbers are honest measurements of *different questions*. Random folds answer "another
+session from a user I have already seen" — the nearest neighbour is usually the same person, so
+the model just copies their previous label. Grouped folds answer "a user I have never seen",
+which is the question production asks, and the score drops by 24 points. Ask this of every
+dataset: **what is the unit the model will meet fresh in production?** If it is a new user, the
+fold must hold out whole users.
+
+Note that the leak survives dropping the obvious ID column. The fingerprint here is six ordinary
+feature columns; nothing is labelled `user_id`. Any set of features that identifies the entity
+will do it.
+
+## Pitfall 3: shuffling time
+
+```python
+def time_series_data(n=2_000, seed=2):
+    r = np.random.default_rng(seed)
+    t = np.arange(n)
+    level = np.cumsum(r.normal(0, 0.25, n))              # a random walk: the level drifts
+    y = level + r.normal(0, 0.5, n)
+    return np.column_stack([t, np.sin(t / 50.0)]), y, t  # trend + seasonal features
+
+Xt, yt, t = time_series_data()
+
+def rolling_origin(n, k=5, min_train=400):
+    step = (n - min_train) // k
+    return [(np.arange(0, min_train + i * step),
+             np.arange(min_train + i * step, min_train + (i + 1) * step)) for i in range(k)]
+
+def rmse_cv(splits):
+    out = []
+    for tr, va in splits:
+        m = Ridge(alpha=1.0).fit(Xt[tr], yt[tr])
+        out.append(float(np.sqrt(np.mean((m.predict(Xt[va]) - yt[va]) ** 2))))
+    return float(np.mean(out)), [round(o, 2) for o in out]
+
+rand_rmse, _ = rmse_cv(kfold_indices(len(yt), 5))
+roll_rmse, per_fold = rmse_cv(rolling_origin(len(yt)))
+print(f"random k-fold on a time series : RMSE {rand_rmse:.4f}")
+print(f"rolling-origin (past -> future): RMSE {roll_rmse:.4f}   per fold {per_fold}")
+```
+
+```output
+random k-fold on a time series : RMSE 2.3006
+rolling-origin (past -> future): RMSE 3.4404   per fold [1.84, 4.81, 3.42, 4.47, 2.66]
+```
+
+Random folds let the model fit a trend line through the whole span and then *interpolate* between
+neighbouring timestamps; production only ever asks it to extrapolate past the end of the training
+data, which is 50% worse here. The per-fold numbers matter as much as the mean: they range from
+1.84 to 4.81 because the walk drifts more in some periods than others. A single averaged
+time-series score hides exactly the regime risk you are trying to measure.
+
+## Pitfall 4: tuning on the same folds you report
+
+Selecting a hyperparameter by CV score and then reporting that same score is **selection bias**:
+you have chosen the maximum of a noisy quantity, so it is biased upward. The clean way to see it
+is to re-score the winner on a *different fold assignment* of the same data. Both numbers estimate
+the same thing; only the first one was maximised over.
+
+```python
+def cv_for(X, y, c, fold_seed):
+    scores = []
+    for tr, va in kfold_indices(len(y), 5, seed=fold_seed):
+        m = Pipeline([("s", StandardScaler()),
+                      ("m", LogisticRegression(C=c, max_iter=500))]).fit(X[tr], y[tr])
+        scores.append(float((m.predict(X[va]) == y[va]).mean()))
+    return float(np.mean(scores))
+
+gaps = []
+for ds in range(5):
+    Xd, yd = make_data(n=400, d=40, signal=0.25, seed=ds)
+    r = np.random.default_rng(0)
+    cands = [float(10 ** r.uniform(-4, 2)) for _ in range(25)]
+    tuned = np.array([cv_for(Xd, yd, c, fold_seed=1) for c in cands])   # tune on fold set A
+    win = int(tuned.argmax())
+    rescored = cv_for(Xd, yd, cands[win], fold_seed=2)                  # same winner, fold set B
+    gaps.append(tuned[win] - rescored)
+    print(f"dataset {ds}: reported max {tuned[win]:.4f} | median candidate {np.median(tuned):.4f} "
+          f"| winner re-scored {rescored:.4f} | gap {gaps[-1]:+.4f}")
+print(f"mean gap over 5 datasets: {np.mean(gaps):+.4f}")
+```
+
+```output
+dataset 0: reported max 0.6525 | median candidate 0.6475 | winner re-scored 0.6175 | gap +0.0350
+dataset 1: reported max 0.6400 | median candidate 0.6375 | winner re-scored 0.6300 | gap +0.0100
+dataset 2: reported max 0.6375 | median candidate 0.6250 | winner re-scored 0.6300 | gap +0.0075
+dataset 3: reported max 0.6575 | median candidate 0.6475 | winner re-scored 0.6450 | gap +0.0125
+dataset 4: reported max 0.6400 | median candidate 0.6150 | winner re-scored 0.5825 | gap +0.0575
+mean gap over 5 datasets: +0.0245
+```
+
+Every one of the five gaps is positive, averaging about two and a half points. Look at the median
+candidate column: on this data `C` barely changes anything, so the search is almost entirely
+ranking noise — and picking the top of 25 noisy draws still buys you a couple of points of pure
+fiction. The bias grows with the number of candidates you try and with how noisy each estimate is,
+which is why a thousand-trial Optuna study on 400 rows (ch. 7) produces a CV score you should not
+believe.
+
+### Nested CV: the correct procedure
+
+Nested CV puts the entire tuning procedure inside each outer fold, so no outer validation row
+ever influenced the choice of hyperparameter that is scored on it.
+
+```python
+def nested_cv(X, y, outer_k=5, n_candidates=25, seed=0):
+    outer_scores = []
+    for tr, te in kfold_indices(len(y), outer_k, seed=seed):
+        inner = kfold_indices(len(tr), 3, seed=seed + 1)
+        r = np.random.default_rng(seed)
+        best_s, best_c = -1.0, 1.0
+        for _ in range(n_candidates):
+            c = float(10 ** r.uniform(-4, 2))
+            sc = []
+            for itr, iva in inner:
+                m = Pipeline([("s", StandardScaler()),
+                              ("m", LogisticRegression(C=c, max_iter=500))]
+                             ).fit(X[tr][itr], y[tr][itr])
+                sc.append(float((m.predict(X[tr][iva]) == y[tr][iva]).mean()))
+            if np.mean(sc) > best_s:                     # tuning happens INSIDE the outer fold
+                best_s, best_c = float(np.mean(sc)), c
+        final = Pipeline([("s", StandardScaler()),
+                          ("m", LogisticRegression(C=best_c, max_iter=500))]).fit(X[tr], y[tr])
+        outer_scores.append(float((final.predict(X[te]) == y[te]).mean()))
+    return float(np.mean(outer_scores)), float(np.std(outer_scores))
+
+Xs, ys = make_data(n=400, d=40, signal=0.25, seed=0)
+r = np.random.default_rng(0)
+cands = [float(10 ** r.uniform(-4, 2)) for _ in range(25)]
+naive = max(cv_for(Xs, ys, c, fold_seed=1) for c in cands)
+nested = nested_cv(Xs, ys)
+print(f"naive tuned score : {naive:.4f}   <- the number people report")
+print(f"nested CV estimate: {nested[0]:.4f} +- {nested[1]:.4f}")
+```
+
+```output
+naive tuned score : 0.6525   <- the number people report
+nested CV estimate: 0.6500 +- 0.0500
+```
+
+Two things to read here honestly. The nested estimate sits below the naive one, as expected — but
+by less than its own fold-to-fold spread, because with 400 rows the outer folds are 80 rows each
+and everything is noisy. Nested CV removes the *bias*; it does nothing about the **variance**, and
+on small data variance is usually the bigger problem.
+
+Nested CV costs `outer x inner x candidates` fits and buys an *unbiased estimate of the whole
+procedure*, tuning included. Use it when the estimate matters (a paper, a go/no-go decision); use
+a single held-out test set when compute is tight — it is cheaper and just as honest, as long as
+you touch it once.
+
+## How noisy is a CV estimate?
+
+```python
+def repeated_cv(X, y, k=5, repeats=8):
+    means = []
+    for rep in range(repeats):
+        folds = kfold_indices(len(y), k, seed=100 + rep)
+        scores = []
+        for tr, va in folds:
+            m = Pipeline([("s", StandardScaler()),
+                          ("m", LogisticRegression(max_iter=500))]).fit(X[tr], y[tr])
+            scores.append(float((m.predict(X[va]) == y[va]).mean()))
+        means.append(float(np.mean(scores)))
+    return np.array(means)
+
+for n_rows in (300, 1_000, 3_000):
+    Xr, yr = make_data(n=n_rows, d=20, signal=0.5, seed=9)
+    m = repeated_cv(Xr, yr)
+    print(f"n={n_rows:>5}: CV mean {m.mean():.4f} | spread across shuffles "
+          f"[{m.min():.4f}, {m.max():.4f}] (range {m.max()-m.min():.4f})")
+```
+
+```output
+n=  300: CV mean 0.6967 | spread across shuffles [0.6800, 0.7133] (range 0.0333)
+n= 1000: CV mean 0.7746 | spread across shuffles [0.7690, 0.7820] (range 0.0130)
+n= 3000: CV mean 0.7677 | spread across shuffles [0.7643, 0.7707] (range 0.0063)
+```
+
+The fold assignment alone moves the score by a visible amount on small data. **If two models
+differ by less than the spread across shuffles, you have not measured a difference** — repeat the
+CV with several seeds and compare distributions, not single numbers (ch. 12).
+
+## Try it Yourself
+
+```python
+def diagnose(X, y, groups=None, times=None):
+    checks = []
+    n, d = X.shape
+    checks.append(("rows per feature", f"{n/d:.1f}",
+                   "under 10 -> selection and tuning will overfit; prefer nested CV"))
+    if groups is not None:
+        sizes = np.bincount(groups)
+        checks.append(("grouping", f"{len(sizes)} groups, {sizes.mean():.1f} rows each",
+                       "use GroupKFold: random folds leak entity identity"))
+    if times is not None:
+        checks.append(("time ordering", "present",
+                       "use rolling-origin: random folds let the model see the future"))
+    pos = y.mean()
+    if min(pos, 1 - pos) * n / 5 < 30:
+        checks.append(("class balance", f"{pos:.3f}",
+                       "fewer than 30 positives per fold -> stratify and consider fewer folds"))
+    else:
+        checks.append(("class balance", f"{pos:.3f}", "stratify anyway; it costs nothing"))
+    for name, value, advice in checks:
+        print(f"{name:18}{value:28}{advice}")
+
+print("dataset A: wide and short")
+diagnose(*make_data(n=300, d=2_000))
+print("\ndataset B: grouped panel")
+diagnose(Xg, yg, groups=groups)
+print("\ndataset C: rare positives")
+Xrare, _ = make_data(n=5_000, d=20)
+yrare = (np.random.default_rng(1).random(5_000) < 0.004).astype(int)
+diagnose(Xrare, yrare)
+```
+
+```output
+dataset A: wide and short
+rows per feature  0.1                         under 10 -> selection and tuning will overfit; prefer nested CV
+class balance     0.473                       fewer than 30 positives per fold -> stratify and consider fewer folds
+
+dataset B: grouped panel
+rows per feature  428.6                       under 10 -> selection and tuning will overfit; prefer nested CV
+grouping          300 groups, 10.0 rows each  use GroupKFold: random folds leak entity identity
+class balance     0.512                       stratify anyway; it costs nothing
+
+dataset C: rare positives
+rows per feature  250.0                       under 10 -> selection and tuning will overfit; prefer nested CV
+class balance     0.003                       fewer than 30 positives per fold -> stratify and consider fewer folds
+```
+
+Run this before choosing a splitter, not after the results disappoint. Add your own checks — a
+duplicate-row detector, a date-range printer per fold — and you have a validation design review
+that takes thirty seconds.
+
+## Exercise
+
+Build a validation harness that picks the correct splitter automatically from a dataset
+description (grouped, temporal, rare-positive, or plain), runs the CV with per-fold preprocessing,
+and reports the estimate with its fold-to-fold spread. Then demonstrate on one dataset that has
+**both** groups and time ordering — the case where most codebases quietly get it wrong — and show
+the three different numbers you get from random, grouped, and grouped-temporal splits.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from sklearn.metrics import roc_auc_score
+
+def combined_data(n_users=200, per_user=25, seed=4, d_sig=4, trend=0.10):
+    r = np.random.default_rng(seed)
+    user = np.repeat(np.arange(n_users), per_user)
+    t = np.tile(np.arange(per_user), n_users).astype(float)
+    sig = r.normal(0, 1, (n_users, d_sig))[user]            # identifies the user
+    ue = r.normal(0, 1.2, n_users)[user]                    # per-user propensity, hidden
+    x = r.normal(0, 1, len(user))
+    y = ((0.7 * x + ue + trend * t - trend * t.mean()
+          + r.normal(0, 0.5, len(user))) > 0.6).astype(int)  # behaviour drifts over time
+    X = np.column_stack([x, sig + r.normal(0, 0.05, sig.shape), t])
+    return X, y, user, t
+
+Xc, yc, user, tt = combined_data()
+
+def grouped_temporal(groups, times, k=4, holdout_frac=0.25):
+    """Hold out LATER time slices of UNSEEN groups: both constraints at once."""
+    uniq = np.unique(groups)
+    order = np.random.default_rng(0).permutation(uniq)
+    chunks = np.array_split(order, k)
+    cutoff = np.quantile(times, 1 - holdout_frac)
+    splits = []
+    for c in chunks:
+        va = np.flatnonzero(np.isin(groups, c) & (times >= cutoff))
+        tr = np.flatnonzero(~np.isin(groups, c) & (times < cutoff))
+        splits.append((tr, va))
+    return splits
+
+def run(splits, label):
+    aucs = []
+    for tr, va in splits:                                  # preprocessing fitted per fold
+        m = Pipeline([("s", StandardScaler()),
+                      ("m", KNeighborsClassifier(15))]).fit(Xc[tr], yc[tr])
+        aucs.append(float(roc_auc_score(yc[va], m.predict_proba(Xc[va])[:, 1])))
+    print(f"{label:26} AUC {np.mean(aucs):.4f} +- {np.std(aucs):.4f} "
+          f"| folds {len(aucs)} | mean val rows {np.mean([len(v) for _, v in splits]):.0f}")
+    return float(np.mean(aucs))
+
+a = run(kfold_indices(len(yc), 4), "random 4-fold")
+b = run(group_kfold(user, 4), "grouped by user")
+c = run(grouped_temporal(user, tt), "grouped + temporal")
+print(f"\noptimism of random vs grouped+temporal: {a - c:+.4f}")
+print(f"optimism of grouped-only vs grouped+temporal: {b - c:+.4f}")
+
+def choose_splitter(has_groups, has_time, n, pos_rate):
+    if has_groups and has_time:  return "grouped + rolling-origin (hold out later data of unseen entities)"
+    if has_groups:               return "GroupKFold"
+    if has_time:                 return "rolling-origin / TimeSeriesSplit"
+    if pos_rate * n < 500:       return "repeated stratified k-fold (rare positives need repeats)"
+    return "stratified k-fold"
+
+for hg, ht, nn, pr in [(True, True, 5_000, 0.2), (True, False, 5_000, 0.2),
+                       (False, True, 5_000, 0.2), (False, False, 5_000, 0.02)]:
+    print(f"groups={hg!s:5} time={ht!s:5} n={nn:,} pos={pr:.2f} -> {choose_splitter(hg, ht, nn, pr)}")
+```
+
+```output
+random 4-fold              AUC 0.8608 +- 0.0033 | folds 4 | mean val rows 1250
+grouped by user            AUC 0.7100 +- 0.0340 | folds 4 | mean val rows 1250
+grouped + temporal         AUC 0.6650 +- 0.0412 | folds 4 | mean val rows 350
+
+optimism of random vs grouped+temporal: +0.1958
+optimism of grouped-only vs grouped+temporal: +0.0450
+groups=True  time=True  n=5,000 pos=0.20 -> grouped + rolling-origin (hold out later data of unseen entities)
+groups=True  time=False n=5,000 pos=0.20 -> GroupKFold
+groups=False time=True  n=5,000 pos=0.20 -> rolling-origin / TimeSeriesSplit
+groups=False time=False n=5,000 pos=0.02 -> repeated stratified k-fold (rare positives need repeats)
+```
+
+The insight: each constraint you add removes a source of optimism, and they are **not
+interchangeable**. Random folds leak entity identity; grouping fixes that but still lets the model
+train on the future; only the combined splitter answers the question production actually asks —
+*a user we have never seen, behaving next month*. The numbers fall monotonically as the split
+gets more honest, and the total gap between random and grouped-temporal is the error you would
+have shipped. The metric is AUC on purpose: the positive rate drifts upward with time, so the late
+validation slice has a different base rate from the training data, and accuracy would move for
+that reason alone (ch. 1). Two practical notes. The combined splitter **throws data away** (training rows after
+the cutoff are unused), which is the price of the estimate; some teams use the honest split to
+*decide* and then refit on everything to *ship*, which is legitimate as long as the reported
+number comes from the honest split. And the splitter choice belongs in code next to the data
+loading, not in a notebook cell someone forgets to copy — it is the single assumption that most
+often separates a promising validation score from a disappointing launch (ch. 11 turns the
+resulting errors into a work list).
+</details>

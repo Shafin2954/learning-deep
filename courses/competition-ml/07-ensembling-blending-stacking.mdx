@@ -1,0 +1,451 @@
+---
+course: competition-ml
+chapter: 07-ensembling-blending-stacking
+title: "Ensembling: Blending versus Stacking"
+order: 7
+---
+
+## Why averaging works, in one formula
+
+Average $k$ predictors whose errors have variance $\sigma^2$ and average pairwise correlation
+$\rho$, and the variance of the average is
+
+$$
+\mathrm{Var}\!\left(\frac{1}{k}\sum_i f_i\right)
+= \sigma^2\left(\frac{1}{k} + \frac{k-1}{k}\rho\right)
+\;\xrightarrow[k \to \infty]{}\; \rho\,\sigma^2
+$$
+
+Two consequences run this entire chapter. Adding models has **diminishing returns**, and the floor
+is set by $\rho$ — the correlation between your models' mistakes. **Diversity beats individual
+quality**, which is why a mediocre model with different errors can improve an ensemble that a
+better but correlated model cannot.
+
+```python
+import numpy as np
+import pandas as pd
+
+print(f"{'k':>3} " + " ".join(f"rho={r:<5}" for r in (0.0, 0.5, 0.9, 0.99)))
+for k in (1, 2, 5, 20, 100):
+    row = [f"{np.sqrt(1 / k + (k - 1) / k * r):<9.4f}" for r in (0.0, 0.5, 0.9, 0.99)]
+    print(f"{k:>3} " + " ".join(row))
+print("\n(values are the sd of the averaged error, relative to a single model)")
+```
+
+```output
+  k rho=0.0   rho=0.5   rho=0.9   rho=0.99 
+  1 1.0000    1.0000    1.0000    1.0000   
+  2 0.7071    0.8660    0.9747    0.9975   
+  5 0.4472    0.7746    0.9592    0.9960   
+ 20 0.2236    0.7246    0.9513    0.9952   
+100 0.1000    0.7106    0.9492    0.9950   
+
+(values are the sd of the averaged error, relative to a single model)
+```
+
+At $\rho = 0.99$ — two versions of the same gradient booster with different seeds — a hundred
+models buy you a 0.5% reduction. At $\rho = 0.5$, five models buy 22%.
+
+## Four models, and how correlated they actually are
+
+```python
+from sklearn.datasets import make_classification
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = make_classification(n_samples=9_000, n_features=25, n_informative=10, n_redundant=5,
+                           class_sep=0.7, flip_y=0.03, random_state=0)
+X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+
+MODELS = {
+    "logreg": lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=1_000)),
+    "knn": lambda: make_pipeline(StandardScaler(), KNeighborsClassifier(45)),
+    "forest": lambda: RandomForestClassifier(n_estimators=250, min_samples_leaf=5,
+                                             random_state=0, n_jobs=-1),
+    "hgb": lambda: HistGradientBoostingClassifier(max_depth=5, random_state=0),
+}
+
+def oof_predictions(models, X, y, k=5, seed=0):
+    """Out-of-fold predictions for every model, on the same folds. The ensembling substrate."""
+    cv = list(StratifiedKFold(n_splits=k, shuffle=True, random_state=seed).split(X, y))
+    oof = {name: np.zeros(len(y)) for name in models}
+    for name, make in models.items():
+        for tr, va in cv:
+            m = make().fit(X.iloc[tr], y[tr])
+            oof[name][va] = m.predict_proba(X.iloc[va])[:, 1]
+    return pd.DataFrame(oof), cv
+
+oof, folds = oof_predictions(MODELS, X, y)
+for name in MODELS:
+    print(f"{name:8} OOF AUC {roc_auc_score(y, oof[name]):.4f}")
+print("\ncorrelation of the ERRORS (what actually matters):")
+errors = oof.sub(y, axis=0)
+print(errors.corr().round(3).to_string())
+```
+
+```output
+logreg   OOF AUC 0.7685
+knn      OOF AUC 0.9470
+forest   OOF AUC 0.9643
+hgb      OOF AUC 0.9613
+
+correlation of the ERRORS (what actually matters):
+        logreg    knn  forest    hgb
+logreg   1.000  0.885   0.868  0.747
+knn      0.885  1.000   0.945  0.862
+forest   0.868  0.945   1.000  0.923
+hgb      0.747  0.862   0.923  1.000
+```
+
+Read the error-correlation matrix, not the prediction-correlation matrix. Predictions correlate
+because they all track the target; only the *errors* tell you whether two models are making the
+same mistakes.
+
+## Rung 1: the simple average
+
+```python
+def report(name, pred):
+    print(f"{name:34} AUC {roc_auc_score(y, pred):.4f}")
+    return pred                                # return the predictions, not the score
+
+best_single = max(roc_auc_score(y, oof[c]) for c in oof)
+print(f"{'best single model':34} AUC {best_single:.4f}")
+simple = report("simple average of 4", oof.mean(axis=1).values)
+top2 = oof[["hgb", "forest"]].mean(axis=1).values
+report("average of the two best", top2)
+```
+
+```output
+best single model                  AUC 0.9643
+simple average of 4                AUC 0.9574
+average of the two best            AUC 0.9650
+```
+
+The four-model average is *worse* than the best single model. That is the formula doing its job:
+`logreg` sits at 0.7685 while the others are above 0.94, and an unweighted average gives the weak
+model a full quarter of the vote. Averaging only helps when the members are comparable in quality
+— or when the weights account for the difference, which is rung 3.
+
+## Rung 2: rank averaging
+
+When the metric is rank-based, average the *ranks* rather than the probabilities. It makes the
+blend immune to models being on different scales — a badly calibrated model no longer drags the
+average around (ch. 1, ch. 8).
+
+```python
+from scipy.stats import rankdata
+
+ranks = oof.apply(lambda c: rankdata(c) / len(c))
+report("rank average of 4", ranks.mean(axis=1).values)
+
+skewed = oof.copy()
+skewed["knn"] = skewed["knn"] ** 3                        # same ranking, very different scale
+report("probability average, one model rescaled", skewed.mean(axis=1).values)
+report("rank average, one model rescaled",
+       skewed.apply(lambda c: rankdata(c) / len(c)).mean(axis=1).values)
+```
+
+```output
+rank average of 4                  AUC 0.9491
+probability average, one model rescaled AUC 0.9566
+rank average, one model rescaled   AUC 0.9491
+```
+
+Cubing a model's probabilities changes nothing about its ranking, yet it moves the probability
+average (0.9574 to 0.9566) and leaves the rank average at exactly 0.9491. That invariance is why
+rank averaging is the default for AUC competitions.
+
+It is not a fix for a weak member, though: the rank average of all four (0.9491) is *below* the
+probability average, because converting to ranks throws away the information that `logreg` is
+usually confident and wrong while the others are confident and right. Rank averaging protects you
+from scale mismatches; only weights protect you from quality mismatches.
+
+## Rung 3: weighted blending
+
+Fit the weights instead of assuming they are equal. Constrain them to be non-negative and sum to
+one, and fit them on out-of-fold predictions only.
+
+```python
+from scipy.optimize import minimize
+
+def fit_weights(oof_frame, y, metric=roc_auc_score):
+    cols = list(oof_frame)
+    def neg(w):
+        w = np.abs(w) / max(np.abs(w).sum(), 1e-9)
+        return -metric(y, oof_frame.values @ w)
+    res = minimize(neg, x0=np.ones(len(cols)) / len(cols), method="Nelder-Mead",
+                   options={"maxiter": 2_000, "xatol": 1e-4, "fatol": 1e-6})
+    w = np.abs(res.x) / np.abs(res.x).sum()
+    return pd.Series(w, index=cols)
+
+w = fit_weights(oof, y)
+print("fitted weights:")
+print(w.round(4).to_string())
+weighted = report("\nweighted blend", (oof.values @ w.values))
+```
+
+```output
+fitted weights:
+logreg    0.0000
+knn       0.3592
+forest    0.3563
+hgb       0.2845
+
+weighted blend                    AUC 0.9655
+```
+
+The optimiser is allowed to zero out a model, which is how weight fitting doubles as model
+selection. Watch for weights that look extreme — they are fitted on a finite sample and inherit
+the selection bias of any optimisation (eval-tuning ch. 5).
+
+## Rung 4: stacking
+
+A blend is a linear function of the base predictions with weights you fit. **Stacking** replaces
+that with a model, so the combination can be non-linear and conditional: *trust the forest when
+`f3` is large, trust the linear model otherwise.*
+
+```python
+def stack(oof_frame, y, folds, meta=None, extra_features=None):
+    """Train the meta-learner on OOF predictions only, evaluated out-of-fold itself."""
+    meta = meta or (lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=1_000)))
+    Z = oof_frame.copy()
+    if extra_features is not None:
+        Z = pd.concat([Z.reset_index(drop=True),
+                       extra_features.reset_index(drop=True)], axis=1)
+    meta_oof = np.zeros(len(y))
+    for tr, va in folds:
+        m = meta().fit(Z.iloc[tr], y[tr])
+        meta_oof[va] = m.predict_proba(Z.iloc[va])[:, 1]
+    return meta_oof
+
+stacked = report("stacked (logistic meta)", stack(oof, y, folds))
+stacked_gbm = report("stacked (gbm meta)", stack(
+    oof, y, folds, meta=lambda: HistGradientBoostingClassifier(max_depth=3, random_state=0)))
+restacked = report("restacked (meta sees 5 raw features)", stack(
+    oof, y, folds, extra_features=X[["f0", "f1", "f2", "f3", "f4"]]))
+```
+
+```output
+stacked (logistic meta)            AUC 0.9670
+stacked (gbm meta)                 AUC 0.9669
+restacked (meta sees 5 raw features) AUC 0.9670
+```
+
+Three notes on the discipline that makes stacking safe:
+
+- The meta-learner is trained on **out-of-fold** base predictions. Train it on in-fold predictions
+  and it learns to trust whichever base model overfits hardest.
+- The meta-learner is itself evaluated **out-of-fold**, using the same folds, or its score is the
+  optimism of ch. 5 in a new costume.
+- At test time, base predictions come either from models refitted on all the training data or from
+  averaging the fold models. Pick one and be consistent.
+
+## What happens if you break the discipline
+
+```python
+in_fold = {}
+for name, make in MODELS.items():
+    m = make().fit(X, y)                                  # fitted on everything
+    in_fold[name] = m.predict_proba(X)[:, 1]
+in_fold = pd.DataFrame(in_fold)
+print("base models scored on their own training data:")
+for name in in_fold:
+    print(f"  {name:8} in-fold AUC {roc_auc_score(y, in_fold[name]):.4f} "
+          f"(OOF was {roc_auc_score(y, oof[name]):.4f})")
+leaky = stack(in_fold, y, folds)
+print(f"\nstack on in-fold predictions : AUC {roc_auc_score(y, leaky):.4f}  <- fiction")
+print(f"stack on out-of-fold preds   : AUC {roc_auc_score(y, stacked):.4f}")
+```
+
+```output
+base models scored on their own training data:
+  logreg   in-fold AUC 0.7713 (OOF was 0.7685)
+  knn      in-fold AUC 0.9569 (OOF was 0.9470)
+  forest   in-fold AUC 0.9980 (OOF was 0.9643)
+  hgb      in-fold AUC 0.9884 (OOF was 0.9613)
+
+stack on in-fold predictions : AUC 0.9997  <- fiction
+stack on out-of-fold preds   : AUC 0.9670
+```
+
+The leaky stack looks better and is worthless: it learned to lean on the random forest, whose
+in-fold predictions are nearly perfect memorisation. On the leaderboard that weight goes to a
+model that is no better than the others.
+
+## Blending versus stacking
+
+| | Blending (holdout) | Stacking (out-of-fold) |
+|---|---|---|
+| Combination data | one held-out split, typically 10–20% | every training row, via OOF |
+| Cost | one extra fit per model | k fits per model |
+| Risk | overfits a small holdout; wastes rows | folds must be identical across models |
+| Non-linear combination | awkward | natural |
+| Use it when | models are expensive, data is plentiful | data is limited, folds are cheap |
+
+```python
+from sklearn.model_selection import train_test_split
+
+idx_tr, idx_ho = train_test_split(np.arange(len(y)), test_size=0.15, random_state=0, stratify=y)
+blend_preds = {}
+for name, make in MODELS.items():
+    m = make().fit(X.iloc[idx_tr], y[idx_tr])
+    blend_preds[name] = m.predict_proba(X.iloc[idx_ho])[:, 1]
+blend_preds = pd.DataFrame(blend_preds)
+w_blend = fit_weights(blend_preds, y[idx_ho])
+print("blend weights fitted on a 15% holdout:")
+print(w_blend.round(4).to_string())
+print(f"\nweights fitted on OOF (all rows):")
+print(w.round(4).to_string())
+print(f"\nL1 distance between the two weight vectors: {float(np.abs(w - w_blend).sum()):.4f}")
+```
+
+```output
+blend weights fitted on a 15% holdout:
+logreg    0.0004
+knn       0.2185
+forest    0.4938
+hgb       0.2873
+
+weights fitted on OOF (all rows):
+logreg    0.0000
+knn       0.3592
+forest    0.3563
+hgb       0.2845
+
+L1 distance between the two weight vectors: 0.2814
+```
+
+The two weight vectors disagree, and the holdout version is the less trustworthy of the two: it
+was fitted on 1,350 rows instead of 9,000. Blending is a compute-saving compromise, not a
+different theory.
+
+## Try it Yourself
+
+```python
+def ensemble_ladder(frame, y, subset):
+    sub = frame[list(subset)]
+    err_corr = sub.sub(y, axis=0).corr().values
+    rho = float((err_corr.sum() - len(subset)) / (len(subset) * (len(subset) - 1))) \
+        if len(subset) > 1 else 1.0
+    best = max(roc_auc_score(y, sub[c]) for c in sub)
+    avg = roc_auc_score(y, sub.mean(axis=1))
+    print(f"{'+'.join(subset):28} rho {rho:5.3f} | best single {best:.4f} | "
+          f"average {avg:.4f} | gain {avg - best:+.4f}")
+
+ensemble_ladder(oof, y, ("hgb",))
+ensemble_ladder(oof, y, ("hgb", "forest"))
+ensemble_ladder(oof, y, ("hgb", "logreg"))
+ensemble_ladder(oof, y, ("hgb", "forest", "logreg"))
+ensemble_ladder(oof, y, ("hgb", "forest", "logreg", "knn"))
+```
+
+```output
+hgb                          rho 1.000 | best single 0.9613 | average 0.9613 | gain +0.0000
+hgb+forest                   rho 0.923 | best single 0.9643 | average 0.9650 | gain +0.0007
+hgb+logreg                   rho 0.747 | best single 0.9613 | average 0.9392 | gain -0.0221
+hgb+forest+logreg            rho 0.846 | best single 0.9643 | average 0.9541 | gain -0.0101
+hgb+forest+logreg+knn        rho 0.872 | best single 0.9643 | average 0.9574 | gain -0.0069
+```
+
+This table is the chapter's caveat in five lines. `hgb+logreg` has the lowest error correlation of
+any pair (0.747) and the *worst* result (-0.0221): diversity is necessary but not sufficient, and
+a member two hundred basis points behind the rest destroys an unweighted average no matter how
+uncorrelated its mistakes are. `hgb+forest`, at rho 0.923, is the only unweighted combination that
+beats its best member — barely, by 0.0007.
+
+The rule to take away: for **unweighted** averaging, require both low correlation and comparable
+quality. When quality differs, move up a rung and fit weights, which is exactly what the weighted
+blend does when it assigns `logreg` a weight of zero. Add a fifth model of your own — an
+extra-trees, a differently-seeded booster — and watch where it lands on both axes.
+
+## Exercise
+
+Build the ensembling harness you will reuse: it takes a dictionary of models, produces out-of-fold
+predictions on shared folds, and reports every combination rule — best single, simple average,
+rank average, weighted, and stacked — with an honest estimate of each. Then demonstrate the two
+failure modes on the same data: weights fitted and evaluated on the same rows, and a meta-learner
+trained on in-fold predictions.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def ensemble_report(models, X, y, k=5, seed=0):
+    oof_frame, folds = oof_predictions(models, X, y, k=k, seed=seed)
+    results = {}
+    results["best single"] = max(roc_auc_score(y, oof_frame[c]) for c in oof_frame)
+    results["simple average"] = roc_auc_score(y, oof_frame.mean(axis=1))
+    results["rank average"] = roc_auc_score(
+        y, oof_frame.apply(lambda c: rankdata(c) / len(c)).mean(axis=1))
+
+    # honest weighted blend: weights fitted INSIDE each fold, scored on the held-out fold
+    honest = np.zeros(len(y))
+    for tr, va in folds:
+        w_in = fit_weights(oof_frame.iloc[tr], y[tr])
+        honest[va] = oof_frame.iloc[va].values @ w_in.values
+    results["weighted (fitted per fold)"] = roc_auc_score(y, honest)
+    # the version everyone reports: weights fitted on all the rows they are scored on
+    w_all = fit_weights(oof_frame, y)
+    results["weighted (fitted on all rows)"] = roc_auc_score(y, oof_frame.values @ w_all.values)
+
+    results["stacked (OOF meta)"] = roc_auc_score(y, stack(oof_frame, y, folds))
+    in_fold_frame = pd.DataFrame({name: make().fit(X, y).predict_proba(X)[:, 1]
+                                  for name, make in models.items()})
+    results["stacked (in-fold meta)"] = roc_auc_score(y, stack(in_fold_frame, y, folds))
+    return oof_frame, results
+
+oof_frame, res = ensemble_report(MODELS, X, y)
+honest_keys = ["best single", "simple average", "rank average",
+               "weighted (fitted per fold)", "stacked (OOF meta)"]
+print("HONEST estimates")
+for key in honest_keys:
+    print(f"  {key:32} {res[key]:.4f}  ({res[key] - res['best single']:+.4f} vs best single)")
+print("\nOPTIMISTIC estimates (same numbers people quote)")
+for key in ["weighted (fitted on all rows)", "stacked (in-fold meta)"]:
+    print(f"  {key:32} {res[key]:.4f}  "
+          f"(inflated by {res[key] - res['weighted (fitted per fold)']:+.4f})")
+```
+
+```output
+HONEST estimates
+  best single                      0.9643  (+0.0000 vs best single)
+  simple average                   0.9574  (-0.0069 vs best single)
+  rank average                     0.9491  (-0.0151 vs best single)
+  weighted (fitted per fold)       0.9657  (+0.0014 vs best single)
+  stacked (OOF meta)               0.9670  (+0.0027 vs best single)
+
+OPTIMISTIC estimates (same numbers people quote)
+  weighted (fitted on all rows)    0.9655  (inflated by -0.0002)
+  stacked (in-fold meta)           0.9997  (inflated by +0.0340)
+```
+
+The two failure modes turn out to be wildly different sizes, and that asymmetry is the useful
+result. Fitting blend weights on the same rows you score them on costs essentially nothing here —
+0.9655 against the honest 0.9657, a difference of the wrong sign and far inside the noise. Four
+base models means four fitted parameters against 9,000 rows, so there is almost nothing to
+overfit. This is why sloppy weighted blending survives in practice.
+
+Training the meta-learner on in-fold predictions is a different order of error entirely: 0.9997
+against an honest 0.9670. Look at why in the table above it — the random forest's in-fold AUC is
+0.9980 because it has memorised its training rows, so the meta-learner learns "always trust the
+forest", and at test time that forest will be an ordinary 0.9643 model. The stack has optimised
+for a base model that does not exist.
+
+The honest table is the one to act on. Note what it says about effort: the gap between the best
+single model and the best ensemble is real but small, and simple averaging captures most of it.
+Stacking earns its extra complexity when the base models are genuinely complementary — different
+algorithm families, different feature sets, different target transformations — and returns almost
+nothing when they are four variations of the same tree.
+
+Two extensions to make this production-grade for a competition. First, save the OOF matrix to
+disk: it is the single most reusable artefact you produce, since every future blend and stack is
+just another function of that matrix, and re-running base models to try a new combination rule is
+pure waste. Second, keep the fold assignment fixed across the whole competition — one seed, one
+splitter, written down (ch. 12) — because OOF predictions from different fold structures cannot be
+stacked together without leaking across the boundaries.
+</details>

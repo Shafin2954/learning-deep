@@ -95,6 +95,26 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 12,
     badge: 'Ch 1 – 12',
   },
+  'eval-tuning': {
+    tagline: '12 chapters: metrics that answer your question, cost-optimal thresholds, calibration, CV pitfalls, Optuna, permutation importance and SHAP, PDP/ICE/ALE, error analysis, and honest model comparison.',
+    chapters: 13,
+    badge: 'Ch 1 – 13',
+  },
+  'competition-ml': {
+    tagline: '13 chapters: metric and leak audits, CV that matches the leaderboard, feature blocks, target encoding, anonymized-column archaeology, blending, stacking, hill climbing, pseudo-labeling, adversarial validation, and submission hygiene.',
+    chapters: 14,
+    badge: 'Ch 1 – 14',
+  },
+  'system-design': {
+    tagline: '30 chapters: consistent hashing, caching, Bloom filters, storage engines, replication, sharding, transactions, CAP, Raft, rate limiting, resilience, ML systems, and six case studies.',
+    chapters: 31,
+    badge: 'Ch 1 – 31',
+  },
+  'mlops': {
+    tagline: '9 chapters: packaging, FastAPI serving with batching, containers, CI gates on data and models, orchestration, tracking and registries, drift monitoring, retraining triggers, and inference cost.',
+    chapters: 10,
+    badge: 'Ch 1 – 10',
+  },
 };
 
 export default function Home() {

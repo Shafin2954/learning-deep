@@ -1,0 +1,396 @@
+---
+course: system-design
+chapter: 11-btree-vs-lsm
+title: "Storage Engines: B-Tree vs LSM-Tree"
+order: 11
+---
+
+## Two answers to one problem: disks hate random writes
+
+Every storage engine solves the same problem — keep data sorted on a device where sequential
+access is orders of magnitude faster than random access (ch. 2). There are exactly two families
+of answer:
+
+- **B-tree** — keep a sorted tree of fixed-size pages and **update in place**. Reads are
+  predictable; writes cost a random page write each.
+- **LSM-tree** — never update in place. **Buffer in memory, append sorted runs, merge later.**
+  Writes are sequential; reads may have to look in several places.
+
+Postgres, MySQL/InnoDB, and SQLite are B-trees. RocksDB, LevelDB, Cassandra, ScyllaDB, and
+HBase are LSM-trees. Everything else about them follows from this one decision.
+
+## The B-tree: a page-oriented sorted structure
+
+A B-tree node is one page (typically 4–16 KB) holding many keys and pointers to children. The
+branching factor is high, so the tree is shallow: with 4 KB pages and 100 entries per page,
+three levels index a million keys and four index a hundred million.
+
+```python
+def btree_depth(n_keys, entries_per_page=100):
+    depth, capacity = 1, entries_per_page
+    while capacity < n_keys:
+        capacity *= entries_per_page
+        depth += 1
+    return depth, capacity
+
+for n in (10_000, 1_000_000, 100_000_000, 10_000_000_000):
+    d, cap = btree_depth(n)
+    print(f"{n:>15,} keys -> depth {d} (capacity {cap:,}) = {d} page reads for a point lookup, "
+          f"{d-1} of them usually cached")
+```
+
+```output
+         10,000 keys -> depth 2 (capacity 10,000) = 2 page reads for a point lookup, 1 of them usually cached
+      1,000,000 keys -> depth 3 (capacity 1,000,000) = 3 page reads for a point lookup, 2 of them usually cached
+    100,000,000 keys -> depth 4 (capacity 100,000,000) = 4 page reads for a point lookup, 3 of them usually cached
+ 10,000,000,000 keys -> depth 5 (capacity 10,000,000,000) = 5 page reads for a point lookup, 4 of them usually cached
+```
+
+Three or four page reads for any key in a hundred-million-row table, with the upper levels
+almost always resident in memory — that is why a B-tree point lookup is one disk read in
+practice, and why B-trees have survived fifty years.
+
+### The cost: a random write dirties a whole page
+
+```python
+PAGE = 4096
+ROW  = 80
+
+def btree_write_amplification(n_rows, sequential):
+    rows_per_page = PAGE // ROW
+    if sequential:
+        pages_written = -(-n_rows // rows_per_page)   # a page fills, then is written once
+    else:
+        pages_written = n_rows                        # each insert dirties a different page
+    bytes_written = pages_written * PAGE
+    wal = n_rows * ROW                                # write-ahead log, written once
+    return (bytes_written + wal) / (n_rows * ROW)
+
+for n in (100_000, 1_000_000):
+    print(f"{n:>9,} rows | sequential keys (auto-increment) WA = "
+          f"{btree_write_amplification(n, True):5.2f}x")
+    print(f"{n:>9,} rows | random keys (UUIDv4)             WA = "
+          f"{btree_write_amplification(n, False):5.2f}x")
+```
+
+```output
+  100,000 rows | sequential keys (auto-increment) WA =  2.00x
+  100,000 rows | random keys (UUIDv4)             WA = 52.20x
+1,000,000 rows | sequential keys (auto-increment) WA =  2.00x
+1,000,000 rows | random keys (UUIDv4)             WA = 52.20x
+```
+
+Fifty-two times more bytes written than the data you inserted. This is the mechanical reason
+**random primary keys are a performance bug**: UUIDv4 scatters inserts across the whole tree,
+so every insert touches a cold page, dirties it, and forces the WAL and the page write. Using a
+time-sortable key (auto-increment, ULID, UUIDv7) restores locality and drops write
+amplification by an order of magnitude.
+
+## The LSM-tree: buffer, flush, merge
+
+Writes go to an in-memory table (plus a WAL for durability). When it fills, it is flushed as
+an immutable sorted run (an **SSTable**). Background **compaction** merges runs, discarding
+overwritten and deleted keys.
+
+```python
+import bisect, random
+
+class MiniLSM:
+    def __init__(self, memtable_limit=1000, fanout=10):
+        self.mem, self.limit, self.fanout = {}, memtable_limit, fanout
+        self.levels = []                 # each level: one merged sorted run
+        self.records_written = 0         # everything that ever hit "disk"
+        self.compactions = 0
+
+    def put(self, k, v):
+        self.mem[k] = v                  # overwrite in memory: no disk work at all
+        if len(self.mem) >= self.limit:
+            self.flush()
+
+    def flush(self):
+        run, self.mem = sorted(self.mem.items()), {}
+        self.records_written += len(run)               # sequential write of a new SSTable
+        self._merge_into(0, run)
+
+    def _merge_into(self, level, run):
+        while len(self.levels) <= level:
+            self.levels.append([])
+        merged = dict(self.levels[level]); merged.update(dict(run))
+        merged = sorted(merged.items())
+        self.records_written += len(merged)            # compaction rewrites the level
+        self.compactions += 1
+        if len(merged) > self.limit * self.fanout ** (level + 1):
+            self.levels[level] = []
+            self._merge_into(level + 1, merged)        # cascade to the next level
+        else:
+            self.levels[level] = merged
+
+    def get(self, k):
+        places = 1                                     # the memtable
+        if k in self.mem:
+            return self.mem[k], places
+        for lvl in self.levels:
+            places += 1
+            i = bisect.bisect_left(lvl, (k,))
+            if i < len(lvl) and lvl[i][0] == k:
+                return lvl[i][1], places
+        return None, places
+
+random.seed(0)
+lsm = MiniLSM(memtable_limit=1000)
+N = 100_000
+for i in range(N):
+    lsm.put(f"key{random.randrange(50_000):06}", i)
+
+print(f"user writes          {N:>10,}")
+print(f"records to disk      {lsm.records_written:>10,}  ({lsm.compactions} compactions)")
+print(f"write amplification  {lsm.records_written / N:>10.2f}x")
+print(f"level sizes          {[len(l) for l in lsm.levels]}")
+```
+
+```output
+user writes             100,000
+records to disk         908,923  (106 compactions)
+write amplification        9.09x
+level sizes          [3885, 42572]
+```
+
+Nine times amplification — but every one of those bytes is written **sequentially**, in large
+batches, which an SSD handles at full bandwidth. Compare the B-tree's 52x of *random* 4 KB
+writes. This is why LSM engines dominate write-heavy workloads.
+
+### Reads pay for the same trick
+
+```python
+present_deep = lsm.levels[-1][0][0]      # a key that settled in the bottom level
+present_new  = next(iter(sorted(lsm.mem)))  # a key still in the memtable
+for key in (present_new, present_deep, "key999999"):
+    v, places = lsm.get(key)
+    found = "found" if v is not None else "absent"
+    print(f"get({key}) -> {found:6} after checking {places} places")
+```
+
+```output
+get(key000092) -> found  after checking 1 places
+get(key000000) -> found  after checking 3 places
+get(key999999) -> absent after checking 3 places
+```
+
+A point lookup may touch the memtable and every level. Real engines cut this down with a Bloom
+filter per SSTable (ch. 7) — "no" is free, so an absent key usually costs zero disk reads
+instead of one per file. Range scans have no such escape: they must merge across all levels,
+which is why LSM range scans are slower than a B-tree's single ordered walk.
+
+## The three amplifications
+
+Every storage-engine trade-off is one of these:
+
+$$
+\text{WA} = \frac{\text{bytes written to disk}}{\text{bytes of data}}, \quad
+\text{RA} = \frac{\text{reads per lookup}}{1}, \quad
+\text{SA} = \frac{\text{bytes on disk}}{\text{bytes of live data}}
+$$
+
+```python
+live_keys = len({k for lvl in lsm.levels for k, _ in lvl} | set(lsm.mem))
+on_disk = sum(len(l) for l in lsm.levels) + len(lsm.mem)
+print(f"live keys {live_keys:,} | records stored {on_disk:,} | "
+      f"space amplification {on_disk/live_keys:.2f}x")
+
+print(f"leveled compaction keeps one run per level -> low space amplification")
+```
+
+```output
+live keys 43,280 | records stored 47,421 | space amplification 1.10x
+leveled compaction keeps one run per level -> low space amplification
+```
+
+| Engine | Write amp | Read amp | Space amp | Best at |
+|---|---|---|---|---|
+| B-tree | high, and *random* | 1–2 pages | ~1.3x | reads, range scans, transactions |
+| LSM, leveled | ~10x, sequential | 1 + levels | ~1.1x | write-heavy, compressible data |
+| LSM, size-tiered | ~4x, sequential | 1 + runs | ~2x | ingest-heavy workloads where space is cheap |
+
+You cannot minimize all three — this is the **RUM conjecture** (read, update, memory: pick
+two). Leveled compaction trades write amplification for low space amplification; size-tiered
+compaction does the reverse. Configuring RocksDB is almost entirely a matter of choosing where
+on that curve you want to sit.
+
+## Deletes are writes, and that has consequences
+
+An LSM cannot remove a key from an immutable file, so a delete writes a **tombstone** — a
+marker that shadows older versions until compaction finally drops both.
+
+```python
+class LSMWithDeletes(MiniLSM):
+    TOMBSTONE = object()
+    def delete(self, k): self.put(k, self.TOMBSTONE)
+    def get(self, k):
+        v, places = super().get(k)
+        return (None, places) if v is self.TOMBSTONE else (v, places)
+
+db = LSMWithDeletes(memtable_limit=4)
+for i in range(6): db.put(f"k{i}", i)
+db.delete("k1")
+for i in range(6, 12): db.put(f"k{i}", i)
+
+print("get k1 ->", db.get("k1")[0], "(deleted)")
+print("get k5 ->", db.get("k5")[0])
+stored = sum(len(l) for l in db.levels) + len(db.mem)
+print(f"logically live keys: 11, records still stored: {stored} <- tombstone included")
+```
+
+```output
+get k1 -> None (deleted)
+get k5 -> 5
+logically live keys: 11, records still stored: 12 <- tombstone included
+```
+
+Two operational consequences. A workload that deletes a lot can make range scans slower over
+time (you scan tombstones), and **a delete makes the database bigger until compaction runs**.
+Cassandra's `gc_grace_seconds` exists precisely because a tombstone must outlive any node that
+might still be holding the deleted value (ch. 13).
+
+## Choosing between them
+
+```python
+workloads = [
+    ("OLTP: 80% reads, indexed lookups, transactions", "B-tree"),
+    ("time-series ingest at 200k writes/s",            "LSM"),
+    ("event log / message store, mostly appends",      "LSM"),
+    ("financial ledger, strict isolation, joins",      "B-tree"),
+    ("key-value cache tier, huge write churn",         "LSM"),
+    ("analytics over wide rows, scan-heavy",           "columnar (neither)"),
+]
+for w, engine in workloads:
+    print(f"{w:48} -> {engine}")
+```
+
+```output
+OLTP: 80% reads, indexed lookups, transactions   -> B-tree
+time-series ingest at 200k writes/s              -> LSM
+event log / message store, mostly appends        -> LSM
+financial ledger, strict isolation, joins        -> B-tree
+key-value cache tier, huge write churn           -> LSM
+analytics over wide rows, scan-heavy             -> columnar (neither)
+```
+
+The honest summary: **B-tree unless writes are the bottleneck.** Relational databases with
+B-trees handle far more write throughput than people assume, and they hand you transactions,
+joins, and mature tooling for free. Reach for an LSM store when the write rate, not the query
+shape, is what breaks.
+
+## Try it Yourself
+
+```python
+def sweep(memtable_limit, fanout, n=100_000, distinct=50_000, seed=0):
+    random.seed(seed)
+    lsm = MiniLSM(memtable_limit=memtable_limit, fanout=fanout)
+    for i in range(n):
+        lsm.put(f"key{random.randrange(distinct):06}", i)
+    stored = sum(len(l) for l in lsm.levels) + len(lsm.mem)
+    live = len({k for lvl in lsm.levels for k, _ in lvl} | set(lsm.mem))
+    print(f"memtable {memtable_limit:6,} fanout {fanout:3} -> WA {lsm.records_written/n:6.2f}x  "
+          f"levels {len(lsm.levels)}  SA {stored/live:5.2f}x  compactions {lsm.compactions}")
+
+for limit in (250, 1_000, 10_000):
+    sweep(limit, 10)
+print()
+for fanout in (4, 10, 50):
+    sweep(1_000, fanout)
+```
+
+```output
+memtable    250 fanout  10 -> WA  12.72x  levels 3  SA  1.39x  compactions 436
+memtable  1,000 fanout  10 -> WA   9.09x  levels 2  SA  1.10x  compactions 106
+memtable 10,000 fanout  10 -> WA   3.13x  levels 1  SA  1.19x  compactions 8
+
+memtable  1,000 fanout   4 -> WA   7.03x  levels 3  SA  1.32x  compactions 121
+memtable  1,000 fanout  10 -> WA   9.09x  levels 2  SA  1.10x  compactions 106
+memtable  1,000 fanout  50 -> WA  28.87x  levels 1  SA  1.02x  compactions 98
+```
+
+A bigger memtable means fewer flushes and less merging — RAM buys write amplification back. A
+bigger fanout means fewer levels (faster reads) but more rewriting per level. These two knobs
+are the first thing to touch when an LSM store is unhappy.
+
+## Exercise
+
+Add **per-SSTable Bloom filters** (ch. 7) to `MiniLSM` and measure the read amplification for
+keys that do not exist. Use 10 bits per key, and report: the number of levels consulted per
+absent-key lookup with and without filters, and the extra memory the filters cost.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import hashlib, math
+
+class Bloom:
+    def __init__(self, n, bits_per_key=10):
+        self.m = max(64, n * bits_per_key)
+        self.k = max(1, round(bits_per_key * math.log(2)))
+        self.bits = bytearray((self.m + 7) // 8)
+    def _idx(self, key):
+        d = hashlib.blake2b(str(key).encode(), digest_size=16).digest()
+        h1, h2 = int.from_bytes(d[:8], "big"), int.from_bytes(d[8:], "big") | 1
+        return [(h1 + i * h2) % self.m for i in range(self.k)]
+    def add(self, key):
+        for i in self._idx(key): self.bits[i >> 3] |= 1 << (i & 7)
+    def __contains__(self, key):
+        return all(self.bits[i >> 3] >> (i & 7) & 1 for i in self._idx(key))
+
+class FilteredLSM(MiniLSM):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.filters = []
+    def _merge_into(self, level, run):
+        super()._merge_into(level, run)
+        while len(self.filters) < len(self.levels):
+            self.filters.append(None)
+        for i, lvl in enumerate(self.levels):        # rebuild filters for rewritten levels
+            if lvl and (self.filters[i] is None or self.filters[i].n != len(lvl)):
+                bf = Bloom(len(lvl)); bf.n = len(lvl)
+                for k, _ in lvl: bf.add(k)
+                self.filters[i] = bf
+    def get(self, k, use_filters=True):
+        places = 1
+        if k in self.mem: return self.mem[k], places
+        for i, lvl in enumerate(self.levels):
+            if use_filters and self.filters[i] is not None and k not in self.filters[i]:
+                continue                              # filter says "definitely not here"
+            places += 1
+            j = bisect.bisect_left(lvl, (k,))
+            if j < len(lvl) and lvl[j][0] == k:
+                return lvl[j][1], places
+        return None, places
+
+random.seed(0)
+f = FilteredLSM(memtable_limit=1000)
+for i in range(100_000):
+    f.put(f"key{random.randrange(50_000):06}", i)
+
+absent = [f"missing{i:06}" for i in range(2_000)]
+with_f = sum(f.get(k)[1] for k in absent) / len(absent)
+without = sum(f.get(k, use_filters=False)[1] for k in absent) / len(absent)
+mem = sum(bf.m for bf in f.filters if bf) / 8 / 1024
+print(f"absent-key lookups: {without:.2f} places checked without filters, "
+      f"{with_f:.2f} with filters")
+print(f"filter memory: {mem:.1f} KB for {sum(len(l) for l in f.levels):,} keys")
+probe = f.levels[-1][0][0]
+print(f"present key {probe} still found: {f.get(probe)[0] is not None}")
+```
+
+```output
+absent-key lookups: 3.00 places checked without filters, 1.02 with filters
+filter memory: 56.7 KB for 46,457 keys
+present key key000000 still found: True
+```
+
+The insight: a Bloom filter converts "check every level" into "check the one level that
+probably has it", so absent-key reads — which are extremely common (existence checks, cache
+misses, first-write-wins logic) — cost close to zero disk I/O. The memory price is about 1.25
+bytes per key, and it is the single highest-leverage tuning knob in any LSM engine. Note also
+what filters cannot help: **range scans** must still merge every level, because a filter answers
+only point-membership questions.
+</details>

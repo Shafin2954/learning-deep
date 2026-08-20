@@ -1,0 +1,397 @@
+---
+course: system-design
+chapter: 07-bloom-filters
+title: "Bloom Filters: Membership Without Storing the Set"
+order: 7
+---
+
+## The question a Bloom filter answers
+
+"Have I seen this key?" — answered in constant time, in a few bits per key, with **no false
+negatives** and a tunable rate of false positives. That asymmetry is the whole design:
+
+- "no" is always the truth,
+- "maybe" means *go check the real store*.
+
+That is exactly the shape of a cache-penetration guard (ch. 6), an LSM-tree's per-SSTable
+filter (ch. 11), a crawler's URL-seen set, or a "has this user seen this post" filter.
+
+```python
+import hashlib
+
+class Bloom:
+    def __init__(self, m_bits, k):
+        self.m, self.k = m_bits, k
+        self.bits = bytearray((m_bits + 7) // 8)
+        self.n = 0
+
+    def _idx(self, key):
+        """k independent positions from one 128-bit digest (Kirsch-Mitzenmacher)."""
+        d = hashlib.blake2b(str(key).encode(), digest_size=16).digest()
+        h1 = int.from_bytes(d[:8], "big")
+        h2 = int.from_bytes(d[8:], "big") | 1        # odd, so it generates the full range
+        return [(h1 + i * h2) % self.m for i in range(self.k)]
+
+    def add(self, key):
+        for i in self._idx(key):
+            self.bits[i >> 3] |= 1 << (i & 7)
+        self.n += 1
+
+    def __contains__(self, key):
+        return all(self.bits[i >> 3] >> (i & 7) & 1 for i in self._idx(key))
+
+    def fill_ratio(self):
+        return sum(bin(b).count("1") for b in self.bits) / self.m
+
+bf = Bloom(m_bits=1024, k=7)
+for w in ("alice", "bob", "carol"):
+    bf.add(w)
+print("alice in bf   ->", "alice" in bf)
+print("dave in bf    ->", "dave" in bf)
+print("bits set      ->", f"{bf.fill_ratio():.2%} of 1024")
+```
+
+```output
+alice in bf   -> True
+dave in bf    -> False
+bits set      -> 1.95% of 1024
+```
+
+Three keys, twenty bits set, and the structure never stored a single character of "alice". You
+cannot enumerate it, you cannot delete from it, and you cannot ask it how many items it holds
+— you can only ask "maybe?".
+
+### Why two hashes are enough for k
+
+Computing $k$ independent hashes is wasteful. Kirsch and Mitzenmacher showed that
+$g_i(x) = h_1(x) + i \cdot h_2(x) \bmod m$ has the same asymptotic false-positive rate as $k$
+independent hash functions. One digest, split in half, gives you all $k$ positions.
+
+## The false-positive rate, derived
+
+Insert $n$ keys into $m$ bits with $k$ hashes. Each insertion sets $k$ bits, so the chance a
+given bit is still zero is
+
+$$
+P(\text{bit} = 0) = \left(1 - \frac{1}{m}\right)^{kn} \approx e^{-kn/m}
+$$
+
+A false positive needs all $k$ probed bits to be set:
+
+$$
+\boxed{\; \varepsilon \approx \left(1 - e^{-kn/m}\right)^{k} \;}
+$$
+
+```python
+import math
+
+def fp_rate(m, n, k):
+    return (1 - math.exp(-k * n / m)) ** k
+
+n = 10_000
+for bits_per_key in (4, 8, 10, 16, 24):
+    m = bits_per_key * n
+    k = max(1, round(m / n * math.log(2)))
+    print(f"{bits_per_key:2} bits/key, k={k:2} -> false positive rate {fp_rate(m, n, k):8.4%}"
+          f"   ({m/8/1e3:6.1f} KB for {n:,} keys)")
+```
+
+```output
+ 4 bits/key, k= 3 -> false positive rate 14.6892%   (   5.0 KB for 10,000 keys)
+ 8 bits/key, k= 6 -> false positive rate  2.1577%   (  10.0 KB for 10,000 keys)
+10 bits/key, k= 7 -> false positive rate  0.8194%   (  12.5 KB for 10,000 keys)
+16 bits/key, k=11 -> false positive rate  0.0459%   (  20.0 KB for 10,000 keys)
+24 bits/key, k=17 -> false positive rate  0.0010%   (  30.0 KB for 10,000 keys)
+```
+
+Ten bits per key gives roughly 1% false positives. Storing 10,000 32-byte keys in a set costs
+320 KB; the filter costs 12.5 KB and answers the same question 99% as usefully.
+
+### The optimal number of hashes
+
+Differentiating $\varepsilon$ with respect to $k$ gives
+
+$$
+k^{*} = \frac{m}{n}\ln 2 \approx 0.693 \frac{m}{n}, \qquad
+\varepsilon^{*} = 2^{-k^{*}} \approx 0.6185^{\,m/n}
+$$
+
+At the optimum exactly half the bits are set — a filter more than half full is past its
+design point.
+
+```python
+m, n = 100_000, 10_000
+best = min(range(1, 21), key=lambda k: fp_rate(m, n, k))
+print(f"m/n = {m//n} bits/key   optimal k (search) = {best}   formula = {m/n*math.log(2):.2f}")
+for k in (2, 4, best, 10, 16):
+    print(f"  k={k:2} -> {fp_rate(m, n, k):7.3%}")
+```
+
+```output
+m/n = 10 bits/key   optimal k (search) = 7   formula = 6.93
+  k= 2 ->  3.286%
+  k= 4 ->  1.181%
+  k= 7 ->  0.819%
+  k=10 ->  1.019%
+  k=16 ->  2.710%
+```
+
+Too few hashes and each key marks too little of the space; too many and the filter saturates.
+The curve is flat near the optimum, which is why "seven hashes, ten bits per key" is such a
+common default.
+
+## Theory versus a real filter
+
+```python
+import random
+random.seed(0)
+
+n, bits_per_key = 20_000, 10
+m = n * bits_per_key
+k = round(bits_per_key * math.log(2))
+bf = Bloom(m, k)
+
+inserted = [f"key-{i}" for i in range(n)]
+for key in inserted:
+    bf.add(key)
+
+probes = [f"absent-{i}" for i in range(100_000)]
+fps = sum(p in bf for p in probes)
+
+print(f"m={m:,} bits ({m/8/1024:.1f} KB), n={n:,}, k={k}")
+print(f"fill ratio        {bf.fill_ratio():.4f}   (theory {1 - math.exp(-k*n/m):.4f})")
+print(f"false positives   {fps/len(probes):.4%}   (theory {fp_rate(m, n, k):.4%})")
+print(f"false negatives   {sum(key not in bf for key in inserted)}   <- always zero, by construction")
+```
+
+```output
+m=200,000 bits (24.4 KB), n=20,000, k=7
+fill ratio        0.5030   (theory 0.5034)
+false positives   0.8200%   (theory 0.8194%)
+false negatives   0   <- always zero, by construction
+```
+
+Measured matches theory to the third decimal, and the fill ratio lands on 0.5 as predicted.
+The zero false negatives is not luck: a bit that was set is never unset, so a key that was
+added can never fail the test.
+
+## Sizing a filter for a target error rate
+
+Invert the formula: given $n$ and a target $\varepsilon$,
+
+$$
+m = -\frac{n \ln \varepsilon}{(\ln 2)^{2}}, \qquad k = \frac{m}{n} \ln 2
+$$
+
+```python
+def size_for(n, eps):
+    m = math.ceil(-n * math.log(eps) / (math.log(2) ** 2))
+    k = max(1, round(m / n * math.log(2)))
+    return m, k
+
+for eps in (0.1, 0.01, 0.001, 1e-6):
+    m, k = size_for(1_000_000, eps)
+    print(f"eps={eps:<8} -> {m/8/1e6:6.2f} MB, k={k:2}, {m/1e6:5.2f} bits/key")
+```
+
+```output
+eps=0.1      ->   0.60 MB, k= 3,  4.79 bits/key
+eps=0.01     ->   1.20 MB, k= 7,  9.59 bits/key
+eps=0.001    ->   1.80 MB, k=10, 14.38 bits/key
+eps=1e-06    ->   3.59 MB, k=20, 28.76 bits/key
+```
+
+Each additional order of magnitude of accuracy costs a fixed ~4.8 bits per key, forever. That
+linear-in-log-error cost is what makes Bloom filters so hard to beat: an exact set would cost
+you the key size, whatever that is.
+
+## What it costs you: no deletes, no counts, no iteration
+
+A counting Bloom filter replaces bits with small counters so deletion becomes possible — at
+4x the space for 4-bit counters, and with the risk of counter overflow.
+
+```python
+class CountingBloom(Bloom):
+    def __init__(self, m, k):
+        super().__init__(m, k)
+        self.counts = [0] * m
+
+    def add(self, key):
+        for i in self._idx(key):
+            self.counts[i] = min(15, self.counts[i] + 1)     # 4-bit saturating counter
+        self.n += 1
+
+    def remove(self, key):
+        if key not in self: return False
+        for i in self._idx(key):
+            if self.counts[i] < 15:                          # never decrement a saturated one
+                self.counts[i] -= 1
+        self.n -= 1
+        return True
+
+    def __contains__(self, key):
+        return all(self.counts[i] > 0 for i in self._idx(key))
+
+cb = CountingBloom(4096, 7)
+for w in ("alice", "bob", "carol"): cb.add(w)
+print("bob in cb          ->", "bob" in cb)
+cb.remove("bob")
+print("after remove(bob)  ->", "bob" in cb, "| alice still there:", "alice" in cb)
+print("counters in use    ->", sum(c > 0 for c in cb.counts))
+```
+
+```output
+bob in cb          -> True
+after remove(bob)  -> False | alice still there: True
+counters in use    -> 14
+```
+
+Deletion only works if the key really was inserted; removing a key you never added corrupts
+the filter for other keys. The modern alternative is a **cuckoo filter**, which stores short
+fingerprints in a cuckoo hash table, supports true deletes, and beats Bloom on space below
+about a 3% error rate.
+
+## Where they actually appear
+
+- **LSM-tree reads** (ch. 11): one filter per SSTable; a `GET` skips every file whose filter
+  says "no", turning a 10-file lookup into one disk read.
+- **Cache penetration** (ch. 6): a filter over all existing ids in front of Redis; unknown ids
+  never reach the database.
+- **Crawler / dedup**: "have I fetched this URL?" over billions of URLs in gigabytes, not
+  terabytes.
+- **CDN**: "is this object popular enough to cache?" — the one-hit-wonder filter.
+- **Databases**: Cassandra, HBase, RocksDB, and Postgres (`bloom` index extension) all ship
+  Bloom filters.
+
+```python
+sstables = [Bloom(80_000, 7) for _ in range(10)]
+for t, table in enumerate(sstables):
+    for i in range(t * 1000, (t + 1) * 1000):        # each SSTable holds a disjoint key range
+        table.add(f"row-{i}")
+
+def lookup(key):
+    checked = [t for t, table in enumerate(sstables) if key in table]
+    return checked
+
+print("row-4200 lives in table 4; filters say check:", lookup("row-4200"))
+print("row-99999 does not exist;   filters say check:", lookup("row-99999"))
+random.seed(1)
+missing = [f"row-{random.randrange(50_000, 60_000)}" for _ in range(2_000)]
+reads = sum(len(lookup(kk)) for kk in missing)
+print(f"disk reads for 2,000 absent keys: {reads} (without filters: {2_000 * 10:,})")
+```
+
+```output
+row-4200 lives in table 4; filters say check: [4]
+row-99999 does not exist;   filters say check: []
+disk reads for 2,000 absent keys: 0 (without filters: 20,000)
+```
+
+That is the difference between an LSM-tree that serves point lookups and one that does not.
+
+## Try it Yourself
+
+```python
+def penetration_guard(existing_ids, attack_ids, bits_per_key=10):
+    """A membership filter in front of the cache stops random-id attacks (ch. 6)."""
+    n = len(existing_ids)
+    m = n * bits_per_key
+    k = round(bits_per_key * math.log(2))
+    guard = Bloom(m, k)
+    for i in existing_ids:
+        guard.add(i)
+    db_hits = sum(1 for i in attack_ids if i in guard)     # only "maybe" reaches the db
+    print(f"{bits_per_key:2} bits/key ({m/8/1024:6.1f} KB): "
+          f"{db_hits:5} of {len(attack_ids):,} attack requests reached the database "
+          f"({db_hits/len(attack_ids):.2%})")
+
+random.seed(2)
+existing = [f"user:{i}" for i in range(100_000)]
+attack = [f"user:{random.randrange(10**6, 10**7)}" for _ in range(20_000)]
+for bpk in (4, 8, 12, 20):
+    penetration_guard(existing, attack, bpk)
+```
+
+```output
+ 4 bits/key (  48.8 KB):  2919 of 20,000 attack requests reached the database (14.59%)
+ 8 bits/key (  97.7 KB):   442 of 20,000 attack requests reached the database (2.21%)
+12 bits/key ( 146.5 KB):    61 of 20,000 attack requests reached the database (0.30%)
+20 bits/key ( 244.1 KB):     4 of 20,000 attack requests reached the database (0.02%)
+```
+
+Twenty bits per key costs 244 KB and blocks essentially the whole attack. Change `existing` to
+10 million ids and recompute the memory — that scaling question (bits per key stays constant,
+total memory grows linearly) is the one to have an answer for before you propose this in a
+design review.
+
+## Exercise
+
+A Bloom filter cannot be resized, but you can *chain* filters: when the current filter reaches
+its design capacity, freeze it and start a new one with tighter parameters. This is a
+**scalable Bloom filter**. Implement one where filter $i$ has error target
+$\varepsilon_i = \varepsilon_0 r^{i}$ with ratio $r = 0.5$, and capacity growing by 2x each
+time. A lookup checks every filter. Show that the compound error rate stays below
+$\varepsilon_0 / (1 - r)$ no matter how many keys you insert.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class ScalableBloom:
+    def __init__(self, initial_cap=1000, eps0=0.01, r=0.5, growth=2):
+        self.cap, self.eps0, self.r, self.growth = initial_cap, eps0, r, growth
+        self.filters, self.counts = [], []
+        self._grow()
+
+    def _grow(self):
+        i = len(self.filters)
+        cap = self.cap * (self.growth ** i)
+        eps = self.eps0 * (self.r ** i)
+        m = math.ceil(-cap * math.log(eps) / (math.log(2) ** 2))
+        k = max(1, round(m / cap * math.log(2)))
+        self.filters.append(Bloom(m, k))
+        self.counts.append(cap)
+
+    def add(self, key):
+        if key in self: return
+        cur = self.filters[-1]
+        if cur.n >= self.counts[-1]:
+            self._grow()
+            cur = self.filters[-1]
+        cur.add(key)
+
+    def __contains__(self, key):
+        return any(key in f for f in self.filters)
+
+    def bits(self):
+        return sum(f.m for f in self.filters)
+
+sb = ScalableBloom(initial_cap=1000, eps0=0.01)
+random.seed(0)
+for i in range(20_000):
+    sb.add(f"k-{i}")
+
+probes = [f"absent-{i}" for i in range(100_000)]
+fp = sum(p in sb for p in probes)
+bound = 0.01 / (1 - 0.5)
+print(f"filters grown: {len(sb.filters)}  capacities: {sb.counts}")
+print(f"total memory:  {sb.bits()/8/1024:.1f} KB for 20,000 keys "
+      f"({sb.bits()/20_000:.1f} bits/key)")
+print(f"false positives: {fp/len(probes):.4%}   bound eps0/(1-r) = {bound:.2%}")
+print(f"false negatives: {sum(f'k-{i}' not in sb for i in range(0, 20_000, 97))}")
+```
+
+```output
+filters grown: 5  capacities: [1000, 2000, 4000, 8000, 16000]
+total memory:  53.5 KB for 20,000 keys (21.9 bits/key)
+false positives: 1.9930%   bound eps0/(1-r) = 2.00%
+false negatives: 0
+```
+
+The insight: the union of filters has error rate $1 - \prod_i (1 - \varepsilon_i)$, and since
+$\sum_i \varepsilon_0 r^i = \varepsilon_0/(1-r)$ is a convergent geometric series, the compound
+error is bounded **no matter how many times you grow**. The cost is that every lookup touches
+every filter ($O(\log n)$ of them) and later filters spend more bits per key to buy the tighter
+error budget. This is the standard answer to "we do not know the cardinality in advance" — the
+same trick RocksDB uses when it re-partitions filters across levels.
+</details>

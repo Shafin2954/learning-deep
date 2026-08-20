@@ -1,0 +1,360 @@
+---
+course: system-design
+chapter: 10-sql-vs-nosql
+title: "SQL vs NoSQL: Picking a Store by Access Pattern"
+order: 10
+---
+
+## The question is never "which database is best"
+
+It is: *what are the access patterns, and which data model makes them cheap?* Every store is
+fast at the shape it was built for and slow at everything else. Write the queries first, then
+pick.
+
+```python
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE users  (id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INT, total REAL, status TEXT);
+INSERT INTO users VALUES (1,'alice','Dhaka'), (2,'bob','Riyadh'), (3,'carol','Dhaka');
+INSERT INTO orders VALUES (10,1,49.5,'paid'), (11,1,12.0,'paid'),
+                          (12,2,99.0,'paid'),  (13,3,7.25,'refunded');
+""")
+
+rows = db.execute("""
+    SELECT u.city, COUNT(*) AS n, ROUND(SUM(o.total), 2) AS revenue
+    FROM orders o JOIN users u ON u.id = o.user_id
+    WHERE o.status = 'paid'
+    GROUP BY u.city ORDER BY revenue DESC
+""").fetchall()
+for city, n, revenue in rows:
+    print(f"{city:8} {n} paid orders, {revenue:8.2f} revenue")
+```
+
+```output
+Riyadh   1 paid orders,    99.00 revenue
+Dhaka    2 paid orders,    61.50 revenue
+```
+
+That query was not planned for in advance. **That** is what a relational database buys you: the
+data is stored once, in normalized form, and arbitrary new questions cost a query rather than
+a migration.
+
+## The relational model: normalize, then join
+
+Normalization means every fact lives in exactly one place. The consequences are worth naming:
+
+- **No update anomalies.** Change a city once and every report is correct.
+- **Storage is minimal.** No repeated copies.
+- **Reads cost joins**, and a join across two large tables is the expensive operation.
+
+```python
+db.execute("UPDATE users SET city='Chattogram' WHERE id=1")     # one write
+print(db.execute("""SELECT u.name, u.city, COUNT(o.id) FROM users u
+                    LEFT JOIN orders o ON o.user_id=u.id GROUP BY u.id""").fetchall())
+```
+
+```output
+[('alice', 'Chattogram', 2), ('bob', 'Riyadh', 1), ('carol', 'Dhaka', 1)]
+```
+
+One `UPDATE` fixed every derived view. In a denormalized store you would have to find and
+rewrite every copy of "Dhaka" attached to Alice's orders — and any copy you miss is a bug that
+surfaces months later.
+
+### When joins stop being free
+
+A join is a nested loop, a hash build, or a merge (ch. 12). All three are cheap when one side
+is small or indexed and expensive when both sides are huge and distributed — a join across
+shards means a network shuffle. That is the actual reason large-scale systems denormalize: not
+"SQL is slow", but *distributed joins are slow*.
+
+## Denormalization: pay at write time to make reads a single lookup
+
+```python
+import json
+
+# Document shape: everything one screen needs, in one key.
+order_doc = {
+    "id": 10, "total": 49.5, "status": "paid",
+    "user": {"id": 1, "name": "alice", "city": "Chattogram"},   # embedded copy
+    "items": [{"sku": "A1", "qty": 2, "price": 19.75},
+              {"sku": "B7", "qty": 1, "price": 10.0}],
+}
+print("one read serves the whole page:", json.dumps(order_doc)[:96], "...")
+print("cost: user.city is now stored in every order document")
+
+orders_touched = 250_000       # alice is a heavy user
+print(f"a city change for one user rewrites {orders_touched:,} documents")
+print(f"or you accept staleness and store the *historical* city, which is often correct")
+```
+
+```output
+one read serves the whole page: {"id": 10, "total": 49.5, "status": "paid", "user": {"id": 1, "name": "alice", "city": "Chattogr ...
+cost: user.city is now stored in every order document
+a city change for one user rewrites 250,000 documents
+or you accept staleness and store the *historical* city, which is often correct
+```
+
+That last line is the important one. Embedded copies are not always duplication — for an
+order, the shipping city *at the time of purchase* is a fact about the order, not about the
+user. Denormalization is wrong when it copies mutable state and right when it captures a
+snapshot.
+
+## The five families, and what each is good at
+
+| Family | Data model | Great at | Bad at |
+|---|---|---|---|
+| Relational (Postgres, MySQL) | tables, rows, joins | ad-hoc queries, transactions, integrity | horizontal writes, deeply nested docs |
+| Key-value (Redis, DynamoDB) | key to blob | single-key reads/writes at any scale | queries you did not key for |
+| Document (MongoDB, Couch) | JSON trees | one-document-per-screen reads | cross-document transactions, joins |
+| Wide-column (Cassandra, HBase) | partition key + clustering key | huge write volume, time-ordered ranges | ad-hoc filters, aggregates |
+| Graph (Neo4j) | nodes and edges | variable-depth traversal | scans, aggregates over everything |
+
+Time-series stores (Timescale, Influx) and search engines (Elasticsearch) are specialized
+variants of the last two rows: append-only, time-partitioned, inverted-indexed.
+
+```python
+patterns = [
+    ("get user by id",                       "key-value / any"),
+    ("list a user's last 20 orders",         "wide-column or indexed SQL"),
+    ("revenue by city this quarter",         "relational / columnar"),
+    ("friends of friends within 3 hops",     "graph"),
+    ("full-text search across descriptions", "search engine"),
+    ("counter incremented 50k times/second", "key-value with atomic incr"),
+    ("last 30 days of sensor readings",      "time-series"),
+]
+for q, store in patterns:
+    print(f"{q:40} -> {store}")
+```
+
+```output
+get user by id                           -> key-value / any
+list a user's last 20 orders             -> wide-column or indexed SQL
+revenue by city this quarter             -> relational / columnar
+friends of friends within 3 hops         -> graph
+full-text search across descriptions     -> search engine
+counter incremented 50k times/second     -> key-value with atomic incr
+last 30 days of sensor readings          -> time-series
+```
+
+Notice that a system with all seven patterns needs more than one store — and that is normal.
+The mistake is not polyglot persistence; it is choosing the second store before the first one
+hurts.
+
+## Designing for a key-value store: the key is the query
+
+In DynamoDB or Cassandra you cannot ask a question you have not keyed for. Design goes
+backwards: list the access patterns, then construct partition and sort keys that answer them
+with one range scan.
+
+```python
+from collections import defaultdict
+
+table = defaultdict(list)     # (partition_key) -> list of (sort_key, item)
+
+def put(pk, sk, item): table[pk].append((sk, item)); table[pk].sort()
+def query(pk, prefix=""):     # one partition, one contiguous range: the only cheap read
+    return [(sk, it) for sk, it in table[pk] if sk.startswith(prefix)]
+
+put("USER#1", "PROFILE",              {"name": "alice"})
+put("USER#1", "ORDER#2026-01-14#10",  {"total": 49.5})
+put("USER#1", "ORDER#2026-02-02#11",  {"total": 12.0})
+put("USER#1", "ADDRESS#home",         {"city": "Dhaka"})
+put("USER#2", "PROFILE",              {"name": "bob"})
+
+print("whole user profile page (1 query):")
+for sk, item in query("USER#1"):
+    print("   ", sk, item)
+print("\njust the orders, newest last (1 query, 1 partition):")
+for sk, item in query("USER#1", "ORDER#"):
+    print("   ", sk, item)
+```
+
+```output
+whole user profile page (1 query):
+    ADDRESS#home {'city': 'Dhaka'}
+    ORDER#2026-01-14#10 {'total': 49.5}
+    ORDER#2026-02-02#11 {'total': 12.0}
+    PROFILE {'name': 'alice'}
+
+just the orders, newest last (1 query, 1 partition):
+    ORDER#2026-01-14#10 {'total': 49.5}
+    ORDER#2026-02-02#11 {'total': 12.0}
+```
+
+This is **single-table design**: heterogeneous item types sharing one partition so that a
+screen is one request. It is fast and it is rigid — "revenue by city" is not answerable here
+without a full scan or a second index, and that is the trade you sign up for.
+
+### Hot partitions are the failure mode
+
+```python
+import random
+random.seed(0)
+
+def skew(keys, n=200_000):
+    counts = defaultdict(int)
+    for _ in range(n):
+        counts[random.choice(keys)] += 1
+    hi = max(counts.values())
+    return hi / (n / len(keys))
+
+celebrity = ["USER#1"] * 90 + [f"USER#{i}" for i in range(2, 12)]     # one hot user
+uniform = [f"USER#{i}" for i in range(100)]
+print(f"uniform keys   : hottest partition is {skew(uniform):5.2f}x the average")
+print(f"celebrity key  : hottest partition is {skew(celebrity):5.2f}x the average")
+print("a partition has a fixed throughput ceiling -> the hot one throttles first")
+```
+
+```output
+uniform keys   : hottest partition is  1.06x the average
+celebrity key  : hottest partition is 89.96x the average
+a partition has a fixed throughput ceiling -> the hot one throttles first
+```
+
+The fix is **key salting**: append a small random suffix (`USER#1#3`) to spread writes across
+partitions, and read all salts in parallel. You trade read fan-out for write throughput —
+another instance of the same trade this whole chapter is about.
+
+## ACID and its NoSQL counterpart
+
+- **Atomicity** — all or nothing.
+- **Consistency** — constraints hold before and after (this is the *C* in ACID, and it is
+  unrelated to the *C* in CAP, ch. 16).
+- **Isolation** — concurrent transactions do not corrupt each other (ch. 15).
+- **Durability** — a committed write survives a crash.
+
+"BASE" (basically available, soft state, eventually consistent) is not a competing theory so
+much as a description of what you get when you drop cross-node isolation for availability.
+Modern stores blur the line: DynamoDB has transactions, MongoDB has multi-document ACID,
+Postgres has JSONB with GIN indexes and logical replication. Choose on **access patterns and
+scale**, not on the label.
+
+```python
+db.isolation_level = None          # let us drive transactions explicitly
+db.execute("BEGIN")
+try:
+    db.execute("UPDATE orders SET status='refunded' WHERE id=10")
+    db.execute("INSERT INTO orders VALUES (14, 1, -49.5, 'refund')")
+    raise RuntimeError("payment gateway timed out")     # something fails mid-way
+except RuntimeError as e:
+    db.execute("ROLLBACK")
+    print("rolled back:", e)
+print("order 10 status:", db.execute("SELECT status FROM orders WHERE id=10").fetchone()[0])
+print("row count:", db.execute("SELECT COUNT(*) FROM orders").fetchone()[0], "<- no partial write")
+```
+
+```output
+rolled back: payment gateway timed out
+order 10 status: paid
+row count: 4 <- no partial write
+```
+
+Getting that guarantee yourself, across two stores, means implementing sagas and compensating
+actions — which is a real design (ch. 15) and a large amount of code you do not write when one
+transaction will do.
+
+## Try it Yourself
+
+```python
+def recommend(patterns):
+    """Score stores against a workload. Crude, but it is the right conversation."""
+    fit = {
+        "relational": {"adhoc": 3, "join": 3, "txn": 3, "scale_writes": 1, "kv": 2, "graph": 1},
+        "key-value":  {"adhoc": 0, "join": 0, "txn": 1, "scale_writes": 3, "kv": 3, "graph": 0},
+        "document":   {"adhoc": 1, "join": 1, "txn": 2, "scale_writes": 2, "kv": 3, "graph": 0},
+        "wide-column":{"adhoc": 0, "join": 0, "txn": 1, "scale_writes": 3, "kv": 3, "graph": 0},
+        "graph":      {"adhoc": 2, "join": 3, "txn": 2, "scale_writes": 1, "kv": 1, "graph": 3},
+    }
+    scores = {s: sum(w * f[p] for p, w in patterns.items()) for s, f in fit.items()}
+    for store, sc in sorted(scores.items(), key=lambda kv: -kv[1]):
+        print(f"  {store:12} {sc:4}")
+
+print("workload A: analytics dashboard, many ad-hoc queries, 200 writes/s")
+recommend({"adhoc": 5, "join": 4, "txn": 2, "scale_writes": 1, "kv": 1, "graph": 0})
+print("\nworkload B: IoT ingest, 200k writes/s, always read by device and time range")
+recommend({"adhoc": 1, "join": 0, "txn": 1, "scale_writes": 5, "kv": 4, "graph": 0})
+```
+
+```output
+workload A: analytics dashboard, many ad-hoc queries, 200 writes/s
+  relational     36
+  graph          28
+  document       18
+  key-value       8
+  wide-column     8
+
+workload B: IoT ingest, 200k writes/s, always read by device and time range
+  key-value      28
+  wide-column    28
+  document       25
+  relational     19
+  graph          13
+```
+
+Change the weights to your own system and see whether the winner survives. Then ask the
+question the score cannot answer: *what happens in a year when someone needs a query you did
+not key for?*
+
+## Exercise
+
+You are storing chat messages: 50,000 writes per second, each message belongs to a room, and
+the only read pattern is "the last 50 messages in room R, then page backwards". Retention is
+forever, and one room can hold a billion messages.
+
+Design the key (partition key and sort key), explain why a relational table with
+`WHERE room_id = ? ORDER BY created_at DESC LIMIT 50` becomes a problem at this scale, and
+write code that demonstrates paging backwards through a room with a cursor.
+
+<details>
+<summary>Solution</summary>
+
+```python
+import bisect
+from collections import defaultdict
+
+# PK = room bucket (room + month), SK = (timestamp, message_id) so the sort is total.
+store = defaultdict(list)
+
+def pk(room, ts):  return f"ROOM#{room}#{ts[:7]}"      # bucket by month: bounded partitions
+def put_msg(room, ts, mid, body):
+    bisect.insort(store[pk(room, ts)], (ts, mid, body))
+
+def page(room, month, before=None, limit=3):
+    items = store[f"ROOM#{room}#{month}"]
+    idx = bisect.bisect_left(items, before) if before else len(items)
+    page_items = items[max(0, idx - limit):idx]
+    cursor = page_items[0][:2] + ("",) if page_items else None
+    return list(reversed(page_items)), cursor
+
+for i, (ts, body) in enumerate([
+    ("2026-03-01T10:00:00", "hi"), ("2026-03-01T10:00:05", "hello"),
+    ("2026-03-01T10:01:00", "how are you"), ("2026-03-01T10:02:00", "fine"),
+    ("2026-03-01T10:03:00", "bye"), ("2026-03-01T10:04:00", "later")]):
+    put_msg("42", ts, f"m{i}", body)
+
+items, cur = page("42", "2026-03")
+print("newest page:", [(t[11:19], b) for t, _, b in items])
+items, cur = page("42", "2026-03", before=cur)
+print("older page :", [(t[11:19], b) for t, _, b in items])
+print("cursor is (timestamp, message_id): a position, not an offset")
+```
+
+```output
+newest page: [('10:04:00', 'later'), ('10:03:00', 'bye'), ('10:02:00', 'fine')]
+older page : [('10:01:00', 'how are you'), ('10:00:05', 'hello'), ('10:00:00', 'hi')]
+cursor is (timestamp, message_id): a position, not an offset
+```
+
+The insight: the sort key is `(timestamp, message_id)` so paging is a **range scan from a
+cursor**, never `OFFSET n` — an offset makes the database skip rows it has already read, so
+page 20,000 of a billion-row room costs 20,000 times page 1. The partition key includes a time
+bucket because an unbounded partition eventually exceeds a node's storage and throughput limits
+(most wide-column stores cap a partition in the low gigabytes); bucketing by month bounds it,
+at the cost of a client that must walk backwards across buckets. A single relational table can
+serve this exact query well with an index on `(room_id, created_at DESC)` — what breaks is not
+the query but the *write* rate: 50,000 inserts per second against one B-tree, on one primary
+node, with every insert dirtying the rightmost pages (ch. 11, 14).
+</details>

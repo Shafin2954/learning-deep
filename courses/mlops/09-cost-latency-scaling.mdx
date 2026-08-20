@@ -1,0 +1,341 @@
+---
+course: mlops
+chapter: 09-cost-latency-scaling
+title: "Cost, Latency, and Scaling Inference"
+order: 9
+---
+
+## The three numbers that decide an inference architecture
+
+Every serving decision reduces to a trade among **latency** (how long one request takes),
+**throughput** (how many per second per machine), and **cost** (dollars per million predictions).
+Improve one and you usually pay in another; the job is to know which one your product actually
+needs.
+
+```python
+def unit_economics(model_ms, instance_usd_hour=0.20, cores=4, util=0.6, rps=None):
+    capacity = cores * 1000 / model_ms * util
+    per_million = instance_usd_hour / (capacity * 3600) * 1e6
+    line = (f"{model_ms:>6.1f} ms/pred -> {capacity:>8,.0f} rps/instance | "
+            f"${per_million:>7.2f} per million predictions")
+    if rps:
+        instances = max(1, int(-(-rps // capacity)))
+        line += f" | {rps:,} rps needs {instances:>3} instances (${instances*instance_usd_hour*720:>8,.0f}/mo)"
+    print(line)
+
+for ms in (0.5, 5, 50, 500):
+    unit_economics(ms, rps=2_000)
+```
+
+```output
+   0.5 ms/pred ->    4,800 rps/instance | $   0.01 per million predictions | 2,000 rps needs   1 instances ($     144/mo)
+   5.0 ms/pred ->      480 rps/instance | $   0.12 per million predictions | 2,000 rps needs   5 instances ($     720/mo)
+  50.0 ms/pred ->       48 rps/instance | $   1.16 per million predictions | 2,000 rps needs  42 instances ($   6,048/mo)
+ 500.0 ms/pred ->        5 rps/instance | $  11.57 per million predictions | 2,000 rps needs 417 instances ($  60,048/mo)
+```
+
+Three orders of magnitude of model latency produce three orders of magnitude of cost, for the
+same traffic. That is why "how fast is the model?" is a budget question long before it is an
+engineering one — and why the cheapest performance work is usually done on the model, not on the
+infrastructure.
+
+## Where the milliseconds actually go
+
+```python
+def budget(stages):
+    total = sum(ms for _, ms in stages)
+    for name, ms in sorted(stages, key=lambda x: -x[1]):
+        bar = "#" * int(ms / total * 40)
+        print(f"{name:26}{ms:>7.1f} ms {ms/total:>6.0%} {bar}")
+    print(f"{'TOTAL':26}{total:>7.1f} ms")
+    return total
+
+budget([("TLS + gateway", 4.0), ("auth", 2.0), ("feature fetch", 14.0),
+        ("preprocess", 2.0), ("model forward", 6.0), ("post-process", 1.0),
+        ("prediction log write", 0.8), ("serialize + network out", 3.0)])
+```
+
+```output
+feature fetch                14.0 ms    43% #################
+model forward                 6.0 ms    18% #######
+TLS + gateway                 4.0 ms    12% ####
+serialize + network out       3.0 ms     9% ###
+auth                          2.0 ms     6% ##
+preprocess                    2.0 ms     6% ##
+post-process                  1.0 ms     3% #
+prediction log write          0.8 ms     2% 
+TOTAL                        32.8 ms
+```
+
+The model is a fifth of the request. Optimizing it from 6 ms to 3 ms buys 9% of the total; making
+the feature fetch a batched multi-get or a local cache buys three times more. **Profile before
+optimizing** is not a platitude here — it is the difference between a week of quantization work
+and an afternoon of caching.
+
+## Four levers on model latency, in order of effort
+
+```python
+levers = [
+    ("batching (ch. 2)",        "10-50x throughput", "adds queue wait", "hours"),
+    ("caching predictions",     "eliminates repeats", "only if inputs recur", "hours"),
+    ("smaller model / distill", "2-10x", "quality drop must be measured", "days"),
+    ("quantization (int8)",     "2-4x, less memory", "accuracy check required", "days"),
+    ("compilation (ONNX etc.)", "1.5-3x", "conversion must be verified", "days"),
+    ("GPU + a serving runtime", "10-100x at high batch", "idle cost, ops burden", "weeks"),
+]
+print(f"{'lever':26}{'typical gain':22}{'cost':32}effort")
+for name, gain, cost, effort in levers:
+    print(f"{name:26}{gain:22}{cost:32}{effort}")
+```
+
+```output
+lever                     typical gain          cost                            effort
+batching (ch. 2)          10-50x throughput     adds queue wait                 hours
+caching predictions       eliminates repeats    only if inputs recur            hours
+smaller model / distill   2-10x                 quality drop must be measured   days
+quantization (int8)       2-4x, less memory     accuracy check required         days
+compilation (ONNX etc.)   1.5-3x                conversion must be verified     days
+GPU + a serving runtime   10-100x at high batch idle cost, ops burden           weeks
+```
+
+```python
+def with_batching(per_row_ms, batch, overhead_ms, rps, max_wait_ms=5):
+    single_capacity = 1000 / (overhead_ms + per_row_ms)      # batch of 1, for reference
+    batch_ms = overhead_ms + batch * per_row_ms
+    batch_capacity = batch / batch_ms * 1000
+    fill_ms = min(max_wait_ms, batch / rps * 1000)
+    print(f"batch {batch:>4}: {batch_capacity:>9,.0f} rps/core "
+          f"({batch_capacity/single_capacity:>5.1f}x) | added latency {fill_ms + batch_ms:>6.2f} ms")
+
+for b in (1, 8, 32, 128):
+    with_batching(per_row_ms=0.15, batch=b, overhead_ms=5.85, rps=2_000)   # 6.0 ms at batch 1
+```
+
+```output
+batch    1:       167 rps/core (  1.0x) | added latency   6.50 ms
+batch    8:     1,135 rps/core (  6.8x) | added latency  11.05 ms
+batch   32:     3,005 rps/core ( 18.0x) | added latency  15.65 ms
+batch  128:     5,110 rps/core ( 30.7x) | added latency  30.05 ms
+```
+
+Batching is the highest-return lever because it costs an afternoon and a few milliseconds. Note
+the shape from ch. 2: the throughput gain saturates while the latency cost keeps growing, so
+there is an optimum, and it is usually a batch of 16–64 for CPU inference.
+
+## CPU or GPU: the crossover is about batch size
+
+```python
+def device_economics(name, per_row_ms_at_batch, usd_hour, batch, min_batch_for_efficiency):
+    effective = per_row_ms_at_batch if batch >= min_batch_for_efficiency \
+        else per_row_ms_at_batch * (min_batch_for_efficiency / batch)
+    rps = 1000 / effective
+    per_million = usd_hour / (rps * 3600) * 1e6
+    print(f"{name:14} batch {batch:>4} -> {rps:>9,.0f} rps | ${per_million:>7.2f} per million")
+
+print("small model (a few MB of weights):")
+for b in (1, 8, 64):
+    device_economics("4-core CPU", 1.5, 0.20, b, min_batch_for_efficiency=8)
+    device_economics("T4 GPU", 0.08, 0.53, b, min_batch_for_efficiency=64)
+    print()
+```
+
+```output
+small model (a few MB of weights):
+4-core CPU     batch    1 ->        83 rps | $   0.67 per million
+T4 GPU         batch    1 ->       195 rps | $   0.75 per million
+
+4-core CPU     batch    8 ->       667 rps | $   0.08 per million
+T4 GPU         batch    8 ->     1,562 rps | $   0.09 per million
+
+4-core CPU     batch   64 ->       667 rps | $   0.08 per million
+T4 GPU         batch   64 ->    12,500 rps | $   0.01 per million
+```
+
+At batch 1 the GPU is *more expensive per prediction* than the CPU: the accelerator is idle
+between tiny kernels while you pay for it by the hour. GPUs win when you can keep them fed —
+large batches, large models, or a serving runtime that does continuous batching. **The question
+is never "CPU or GPU", it is "what batch size will this workload actually see?"**
+
+## Autoscaling and the cost of idle
+
+```python
+def monthly_cost(profile, instance_usd_hour=0.20, capacity_rps=480, min_instances=2,
+                 scale=True):
+    total, hours = 0.0, 0
+    for rps, n_hours in profile:
+        needed = max(min_instances, int(-(-rps // capacity_rps))) if scale \
+            else max(int(-(-max(p[0] for p in profile) // capacity_rps)), min_instances)
+        total += needed * instance_usd_hour * n_hours
+        hours += n_hours
+    label = "autoscaled" if scale else "fixed at peak"
+    print(f"{label:14} ${total:>8,.0f}/month over {hours} h")
+    return total
+
+# a typical day: quiet nights, a busy afternoon, a spike at 20:00
+profile = [(80, 8 * 30), (600, 10 * 30), (2_400, 4 * 30), (300, 2 * 30)]
+fixed = monthly_cost(profile, scale=False)
+auto = monthly_cost(profile, scale=True)
+print(f"saving        ${fixed - auto:>8,.0f}/month ({1 - auto/fixed:.0%})")
+print("the price: cold starts during the 20:00 ramp (ch. 3) — measure the pull + load time")
+```
+
+```output
+fixed at peak  $     720/month over 720 h
+autoscaled     $     360/month over 720 h
+saving        $     360/month (50%)
+the price: cold starts during the 20:00 ramp (ch. 3) — measure the pull + load time
+```
+
+Autoscaling saves real money on spiky traffic and buys nothing on flat traffic. Two caveats worth
+holding onto: **the floor matters more than the ceiling** (a `min_instances` of 2 is the
+difference between a cheap bill and a cold start on every quiet-hour request), and scale-up is
+never instant — the model load and image pull are the latency you must cover with headroom.
+
+## Batch scoring is often the whole answer
+
+```python
+def batch_vs_online(users, model_ms, freshness_hours, online_rps, instance_usd_hour=0.20):
+    batch_core_hours = users * model_ms / 1000 / 3600
+    batch_cost = batch_core_hours * instance_usd_hour * (24 / max(freshness_hours, 1)) * 30
+    online_instances = max(1, int(-(-online_rps // (4 * 1000 / model_ms * 0.6))))
+    online_cost = online_instances * instance_usd_hour * 720
+    print(f"{users:>12,} users, {freshness_hours:>3}h freshness | "
+          f"batch ${batch_cost:>8,.0f}/mo | online ${online_cost:>8,.0f}/mo | "
+          f"{'BATCH' if batch_cost < online_cost else 'ONLINE'} is cheaper")
+
+batch_vs_online(10_000_000, model_ms=5, freshness_hours=24, online_rps=2_000)
+batch_vs_online(10_000_000, model_ms=5, freshness_hours=1, online_rps=2_000)
+batch_vs_online(500_000_000, model_ms=5, freshness_hours=24, online_rps=2_000)
+```
+
+```output
+  10,000,000 users,  24h freshness | batch $      83/mo | online $     720/mo | BATCH is cheaper
+  10,000,000 users,   1h freshness | batch $   2,000/mo | online $     720/mo | ONLINE is cheaper
+ 500,000,000 users,  24h freshness | batch $   4,167/mo | online $     720/mo | ONLINE is cheaper
+```
+
+If the input space is enumerable and the freshness requirement is hours rather than seconds,
+precomputing every prediction nightly and serving a key-value lookup is both cheaper and faster
+than any online architecture. The mistake this chapter is trying to prevent is building a
+serving fleet for a question that a nightly job and a Redis key could answer.
+
+## Try it Yourself
+
+```python
+def optimization_plan(current_ms, current_rps, target_rps, instance_usd_hour=0.20,
+                      cores=4, util=0.6):
+    options = [("do nothing", current_ms, 1.0, 0),
+               ("batch 32 (ch. 2)", current_ms / 6.5, 1.0, 4),
+               ("cache 40% of requests", current_ms, 0.6, 6),
+               ("distil to a smaller model", current_ms / 3, 1.0, 40),
+               ("batch + cache", current_ms / 6.5, 0.6, 10)]
+    print(f"{'option':28}{'eff ms':>8}{'instances':>11}{'$/month':>10}{'eng hours':>11}")
+    for name, ms, traffic_factor, hours in options:
+        capacity = cores * 1000 / ms * util
+        instances = max(1, int(-(-target_rps * traffic_factor // capacity)))
+        cost = instances * instance_usd_hour * 720
+        print(f"{name:28}{ms:>8.2f}{instances:>11}{cost:>10,.0f}{hours:>11}")
+
+optimization_plan(current_ms=50, current_rps=800, target_rps=5_000)
+```
+
+```output
+option                        eff ms  instances   $/month  eng hours
+do nothing                     50.00        105    15,120          0
+batch 32 (ch. 2)                7.69         17     2,448          4
+cache 40% of requests          50.00         63     9,072          6
+distil to a smaller model      16.67         35     5,040         40
+batch + cache                   7.69         10     1,440         10
+```
+
+Compare the two columns on the right: forty engineering hours of distillation and ten hours of
+batching-plus-caching land in the same place. Always price the cheap infrastructure lever before
+the expensive modelling one — and re-run this table with `current_ms=2`, where the model is no
+longer the bottleneck and none of the options matter.
+
+## Exercise
+
+Produce a capacity and cost plan for a fraud model: 3,000 rps at peak, 400 rps at night, a 120 ms
+p99 budget, 8 ms per prediction alone and 0.4 ms per row in batches of 32, feature lookups at
+20 ms p99, and a hard requirement that a single availability-zone failure not cause an outage.
+Report the instance count, the monthly cost, and the p99 under both a batched and an unbatched
+design — then state which lever you would pull first and why.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def capacity_plan(peak_rps, night_rps, budget_ms, single_ms, batch_row_ms, batch_size,
+                  feature_ms, cores=4, util=0.6, usd_hour=0.20, azs=3, max_wait_ms=5):
+    for label, per_row_ms, batched in [("unbatched", single_ms, False),
+                                       ("batched(32)", batch_row_ms, True)]:
+        capacity = cores * 1000 / per_row_ms * util
+        needed = -(-peak_rps // capacity)
+        # survive losing one AZ: provision so that (azs-1)/azs of the fleet covers peak
+        with_az = -(-int(needed * azs / (azs - 1)) // azs) * azs
+        night = max(azs, -(-int(night_rps / capacity * azs / (azs - 1)) // azs) * azs)
+
+        fill_ms = min(max_wait_ms, batch_size / peak_rps * 1000) if batched else 0
+        compute_ms = (1.2 + batch_size * batch_row_ms) if batched else single_ms
+        p99 = feature_ms + fill_ms + compute_ms
+        fixed_cost = with_az * usd_hour * 720
+        auto_cost = (with_az * usd_hour * 8 * 30) + (night * usd_hour * 16 * 30)
+
+        print(f"{label:12} capacity {capacity:>7,.0f} rps/instance | peak {with_az:>3} "
+              f"instances ({with_az // azs}/AZ), night {night:>3}")
+        print(f"{'':12} p99 = {feature_ms} (features) + {fill_ms:.1f} (batch wait) + "
+              f"{compute_ms:.1f} (compute) = {p99:.1f} ms "
+              f"{'FITS' if p99 <= budget_ms else 'OVER'} the {budget_ms} ms budget")
+        print(f"{'':12} fixed ${fixed_cost:>7,.0f}/mo | autoscaled ${auto_cost:>7,.0f}/mo "
+              f"({1 - auto_cost / fixed_cost:.0%} saved)")
+        print()
+
+capacity_plan(peak_rps=3_000, night_rps=400, budget_ms=120, single_ms=8.0,
+              batch_row_ms=0.4, batch_size=32, feature_ms=20.0)
+
+print("what breaks the budget first:")
+for feature_p99 in (20, 60, 120):
+    p99 = feature_p99 + 5 + (1.2 + 32 * 0.4)
+    print(f"  feature store p99 {feature_p99:>3} ms -> request p99 {p99:>5.1f} ms "
+          f"{'ok' if p99 <= 120 else 'BUDGET BLOWN — and no model work fixes it'}")
+```
+
+```output
+unbatched    capacity     300 rps/instance | peak  15 instances (5/AZ), night   3
+             p99 = 20.0 (features) + 0.0 (batch wait) + 8.0 (compute) = 28.0 ms FITS the 120 ms budget
+             fixed $  2,160/mo | autoscaled $  1,008/mo (53% saved)
+
+batched(32)  capacity   6,000 rps/instance | peak   3 instances (1/AZ), night   3
+             p99 = 20.0 (features) + 5.0 (batch wait) + 14.0 (compute) = 39.0 ms FITS the 120 ms budget
+             fixed $    432/mo | autoscaled $    432/mo (-0% saved)
+
+what breaks the budget first:
+  feature store p99  20 ms -> request p99  39.0 ms ok
+  feature store p99  60 ms -> request p99  79.0 ms ok
+  feature store p99 120 ms -> request p99 139.0 ms BUDGET BLOWN — and no model work fixes it
+```
+
+The insight: batching turns a 15-instance fleet into a 3-instance fleet and costs eleven
+milliseconds, which makes it the first lever every time. But look at the second block — the model
+and the batching are not what put you over budget; the **feature store is**. At a 100 ms feature
+p99 the request is over budget with a model that takes 14 ms, and no amount of quantization,
+distillation, or GPU spend changes that. This is the general shape of inference cost work: the
+model is the part everyone optimizes and rarely the part that dominates, so the order of
+operations is **measure the budget (ch. 2), batch, cache, then and only then touch the model**. The
+availability-zone requirement is the other quiet multiplier — surviving one AZ failure costs 50%
+more instances at three AZs, which is a real bill that belongs in the plan rather than in a
+surprise at the end of the quarter.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You won't need them daily, but
+you'll stop being surprised when you meet them.
+
+- **Feature stores (Feast)** — one definition serving both training and inference, with an offline store for point-in-time joins and an online store for millisecond lookups (ch. 1, 7).
+- **Model and data versioning (DVC) & lineage** — content-addressed data and model files in git-like history, so any past result can be rebuilt exactly (ch. 6).
+- **Canary, shadow, and A/B rollout** — serve a candidate to a slice or to nobody, compare on live traffic, and roll back on a metric gate rather than on a hunch (ch. 4, 8).
+- **Edge and on-device deployment (ONNX Runtime, TFLite, Core ML)** — export once, run without a server; quantization and operator coverage become the deployment risk (ch. 1).
+- **GPU serving and continuous batching (Triton, vLLM)** — server-side batching that keeps the accelerator fed; paged attention and KV-cache reuse for LLM serving.
+- **Infrastructure as code and GitOps (Terraform, Argo CD)** — the cluster's desired state lives in a repository, so environments are reproducible and drift is a diff (ch. 3).
+- **Data and ML observability platforms** — end-to-end quality tracking across pipelines, features, and predictions, with lineage-aware alerting (ch. 5, 7).

@@ -1,0 +1,388 @@
+---
+course: recommender-systems
+chapter: 01-the-recommendation-problem
+title: "The Recommendation Problem: Explicit versus Implicit"
+order: 1
+---
+
+## What you are actually predicting
+
+A recommender does not predict ratings. It produces an **ordered short list** of items for a user,
+under a budget — ten slots on a home page, three in a carousel, one in a notification. Everything
+that follows in this course is a way of filling those slots, and most of the mistakes come from
+optimising something else and hoping it transfers.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n_users, n_items = 3_000, 1_200
+
+# latent taste: users and items each live in a small space
+user_taste = rng.normal(0, 1, (n_users, 4))
+item_style = rng.normal(0, 1, (n_items, 4))
+activity = rng.lognormal(-0.5, 1.1, n_users)                  # some users do far more than others
+exposure = rng.lognormal(-1.0, 1.8, n_items)                  # popularity is heavy-tailed
+launch_day = rng.integers(0, 365, n_items) * (rng.random(n_items) < 0.25)   # 25% launch later
+
+months = []
+for month in range(12):                                       # a year, one month at a time
+    day0 = month * 30
+    user_taste = user_taste + rng.normal(0, 0.25, (n_users, 4))   # taste drifts
+    live = launch_day <= day0
+    logit = (user_taste @ item_style.T / 2 - 4.2
+             + np.log(activity)[:, None] + np.log(exposure)[None, :])
+    prob = np.where(live[None, :], 1 / (1 + np.exp(-logit)), 0.0) / 12
+    r, c = np.nonzero(rng.random((n_users, n_items)) < prob)
+    months.append(pd.DataFrame({"user": r, "item": c,
+                                "ts": day0 + rng.integers(0, 30, len(r))}))
+
+events = pd.concat(months).sort_values("ts").reset_index(drop=True)
+print(f"{n_users:,} users x {n_items:,} items = {n_users * n_items:,} cells")
+print(f"observed interactions: {len(events):,} "
+      f"({len(events.drop_duplicates(['user', 'item'])):,} distinct user-item pairs)")
+print(f"density: {len(events) / (n_users * n_items):.4%}")
+```
+
+```output
+3,000 users x 1,200 items = 3,600,000 cells
+observed interactions: 84,392 (75,955 distinct user-item pairs)
+density: 2.3442%
+```
+
+That density is the defining fact of the field. **Over 97% of the matrix is missing** — and real
+catalogues are two orders of magnitude sparser still. The missing entries are not missing at
+random — a user has not seen most items, and the ones they have
+seen were shown to them by a previous recommender.
+
+## Explicit and implicit feedback are different problems
+
+| | Explicit (ratings) | Implicit (clicks, plays, purchases) |
+|---|---|---|
+| Signal | graded preference, 1–5 stars | binary presence, unbounded counts |
+| Negatives | a low rating is a real negative | **absence is not a negative** |
+| Volume | rare; users rate a fraction of what they consume | abundant; every interaction is logged |
+| Bias | who chooses to rate, and when | what was shown, and how it was ranked |
+| Objective | reconstruct the observed entries | rank all items, including unobserved ones |
+
+```python
+ratings = pd.DataFrame({
+    "user": events["user"].values[:20_000],
+    "item": events["item"].values[:20_000],
+})
+noise = rng.normal(0, 0.8, len(ratings))
+latent = (user_taste[ratings["user"]] * item_style[ratings["item"]]).sum(axis=1) / 2
+ratings["stars"] = np.clip(np.round(3.4 + latent + noise), 1, 5)
+print(ratings["stars"].value_counts().sort_index().to_string())
+print(f"\nmean rating {ratings['stars'].mean():.3f}")
+print(f"share of the matrix with a rating: {len(ratings) / (n_users * n_items):.4%}")
+```
+
+```output
+stars
+1.0     651
+2.0    1827
+3.0    3996
+4.0    5255
+5.0    8271
+
+mean rating 3.933
+share of the matrix with a rating: 0.5556%
+```
+
+Ratings skew high because people mostly rate things they chose to consume. A model that predicts
+ratings well is answering "how much would this user like this item *if they watched it*" — which
+is not the question the product asks.
+
+## The interaction matrix, stored properly
+
+```python
+def to_csr(df, n_users, n_items, value=1.0):
+    return sparse.csr_matrix((np.full(len(df), value), (df["user"], df["item"])),
+                             shape=(n_users, n_items))
+
+M = to_csr(events, n_users, n_items)
+M.data[:] = 1.0
+print(f"CSR matrix {M.shape}, {M.nnz:,} stored values")
+print(f"dense would need {n_users * n_items * 8 / 1e6:.1f} MB; "
+      f"CSR needs {(M.data.nbytes + M.indices.nbytes + M.indptr.nbytes) / 1e6:.1f} MB")
+per_user = np.diff(M.indptr)
+per_item = np.asarray(M.sum(axis=0)).ravel()
+print(f"\ninteractions per user: median {np.median(per_user):.0f} | "
+      f"p10 {np.percentile(per_user, 10):.0f} | p99 {np.percentile(per_user, 99):.0f}")
+print(f"interactions per item: median {np.median(per_item):.0f} | "
+      f"max {per_item.max():.0f} | items with < 5: {(per_item < 5).sum()}")
+```
+
+```output
+CSR matrix (3000, 1200), 75,955 stored values
+dense would need 28.8 MB; CSR needs 0.9 MB
+
+interactions per user: median 19 | p10 5 | p99 110
+interactions per item: median 24 | max 975 | items with < 5: 226
+```
+
+Never materialise the dense matrix. At a realistic scale — ten million users, a million items —
+the dense form is 80 terabytes and the sparse form is a few gigabytes.
+
+## The long tail decides your architecture
+
+```python
+order = np.argsort(-per_item)
+cum = np.cumsum(per_item[order]) / per_item.sum()
+for frac in (0.01, 0.05, 0.10, 0.25, 0.50):
+    k = int(frac * n_items)
+    print(f"top {frac:>5.0%} of items ({k:>4}) carry {cum[k - 1]:>6.1%} of all interactions")
+print(f"\nitems never interacted with: {(per_item == 0).sum()}")
+print(f"users with fewer than 5 interactions: {(per_user < 5).sum()} "
+      f"({(per_user < 5).mean():.1%})")
+```
+
+```output
+top    1% of items (  12) carry  12.4% of all interactions
+top    5% of items (  60) carry  34.6% of all interactions
+top   10% of items ( 120) carry  51.0% of all interactions
+top   25% of items ( 300) carry  76.6% of all interactions
+top   50% of items ( 600) carry  93.3% of all interactions
+
+items never interacted with: 72
+users with fewer than 5 interactions: 257 (8.6%)
+```
+
+Two consequences you will meet in every later chapter. **Head items dominate the training signal**,
+so a model that only learns popularity scores surprisingly well; and **tail items and new users
+have almost no data**, which is the cold-start problem (ch. 9) rather than a modelling failure.
+
+## The baseline that beats most first attempts
+
+```python
+def temporal_split(events, holdout_days=60):
+    cut = events["ts"].max() - holdout_days
+    return events[events["ts"] <= cut], events[events["ts"] > cut]
+
+train, test = temporal_split(events)
+print(f"train {len(train):,} interactions (days <= {train['ts'].max()}) | "
+      f"test {len(test):,} (days > {train['ts'].max()})")
+
+train_pop = np.zeros(n_items)
+np.add.at(train_pop, train["item"].values, 1.0)
+top_items = np.argsort(-train_pop)
+
+seen = {u: set(g) for u, g in train.groupby("user")["item"]}
+truth = {u: set(g) for u, g in test.groupby("user")["item"]}
+
+def recall_at_k(recommend, k=10, users=None):
+    users = users if users is not None else list(truth)
+    hits, total = 0, 0
+    for u in users:
+        if not truth[u]:
+            continue
+        rec = recommend(u, k)
+        hits += len(set(rec) & truth[u])
+        total += min(k, len(truth[u]))
+    return hits / max(total, 1)
+
+def popular_rec(u, k):
+    out, i = [], 0
+    while len(out) < k and i < len(top_items):
+        if top_items[i] not in seen.get(u, ()):        # do not recommend what they already have
+            out.append(top_items[i])
+        i += 1
+    return out
+
+def random_rec(u, k, r=np.random.default_rng(0)):
+    return r.choice(n_items, size=k, replace=False)
+
+print(f"\nrecall@10, random     : {recall_at_k(random_rec):.4f}")
+print(f"recall@10, popularity : {recall_at_k(popular_rec):.4f}")
+```
+
+```output
+train 67,285 interactions (days <= 299) | test 17,107 (days > 299)
+
+recall@10, random     : 0.0100
+recall@10, popularity : 0.1055
+```
+
+Popularity is not a strawman. In many production systems it is within a few points of the deployed
+model, and any personalised model that cannot beat it is not earning its serving cost. It is also
+the baseline that makes evaluation honest: a metric that cannot separate your model from
+popularity is not measuring personalisation.
+
+## Try it Yourself
+
+```python
+def dataset_report(events, n_users, n_items):
+    M = to_csr(events, n_users, n_items)
+    per_user, per_item = np.diff(M.indptr), np.asarray(M.sum(axis=0)).ravel()
+    gini_x = np.sort(per_item)
+    gini = float((2 * np.arange(1, n_items + 1) - n_items - 1).dot(gini_x)
+                 / (n_items * gini_x.sum()))
+    print(f"users {n_users:,} | items {n_items:,} | interactions {M.nnz:,}")
+    print(f"density {M.nnz / (n_users * n_items):.4%} | "
+          f"item Gini {gini:.3f} (0 = uniform, 1 = one item takes everything)")
+    print(f"cold users (<5): {(per_user < 5).mean():.1%} | "
+          f"cold items (<5): {(per_item < 5).mean():.1%}")
+    print(f"a random user's list would need {n_items / max(np.median(per_item), 1):.0f}x "
+          f"the median item's data to be personalised at the tail")
+
+dataset_report(events, n_users, n_items)
+print()
+head_only = events[events["item"].isin(np.argsort(-per_item)[:120])]
+dataset_report(head_only, n_users, n_items)
+```
+
+```output
+users 3,000 | items 1,200 | interactions 75,955
+density 2.1099% | item Gini 0.693 (0 = uniform, 1 = one item takes everything)
+cold users (<5): 8.6% | cold items (<5): 18.8%
+a random user's list would need 50x the median item's data to be personalised at the tail
+
+users 3,000 | items 1,200 | interactions 38,745
+density 1.0762% | item Gini 0.930 (0 = uniform, 1 = one item takes everything)
+cold users (<5): 17.3% | cold items (<5): 90.0%
+a random user's list would need 1200x the median item's data to be personalised at the tail
+```
+
+The second call keeps the same 1,200-item catalogue but throws away every interaction outside the
+120 most popular items — the log a "head-only" product produces. Watch the numbers move the wrong
+way: the Gini rises from 0.693 to 0.930 and the cold-item share goes from 19% to 90%, because the
+1,080 remaining items now have no data at all. That is the feedback loop such a product creates:
+it cannot learn about the tail because it never shows the tail, and the logs then prove the tail is
+unpopular. Run this on your own logs and the gap between catalogue size and covered items tells you
+how much of that loop you are in.
+
+## Exercise
+
+Build the data layer the rest of this course will use: a loader that produces a CSR interaction
+matrix from an event log, a temporal split that respects the fact that you will predict the
+future, and a popularity baseline evaluated with recall@k and coverage. Then show what a *random*
+split would have told you instead, and explain the difference.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class InteractionData:
+    def __init__(self, events, n_users, n_items, holdout_days=60):
+        cut = events["ts"].max() - holdout_days
+        self.train = events[events["ts"] <= cut]
+        self.test = events[events["ts"] > cut]
+        self.n_users, self.n_items = n_users, n_items
+        self.M = to_csr(self.train, n_users, n_items)
+        self.M.data[:] = 1.0
+        self.seen = {u: set(g) for u, g in self.train.groupby("user")["item"]}
+        self.truth = {u: set(g) for u, g in self.test.groupby("user")["item"]}
+        self.pop = np.asarray(self.M.sum(axis=0)).ravel()
+
+    def eval_recommender(self, recommend, k=10):
+        hits = total = 0
+        recommended = set()
+        users = [u for u in self.truth if self.truth[u]]
+        for u in users:
+            rec = list(recommend(u, k))
+            recommended.update(rec)
+            hits += len(set(rec) & self.truth[u])
+            total += min(k, len(self.truth[u]))
+        return {"recall@k": hits / max(total, 1),
+                "coverage": len(recommended) / self.n_items,
+                "users_scored": len(users)}
+
+data = InteractionData(events, n_users, n_items)
+order = np.argsort(-data.pop)
+
+def pop_rec(u, k):
+    out = []
+    for i in order:
+        if i not in data.seen.get(u, ()):
+            out.append(i)
+            if len(out) == k:
+                break
+    return out
+
+def rand_rec(u, k, r=np.random.default_rng(1)):
+    return r.choice(data.n_items, size=k, replace=False)
+
+print("TEMPORAL split (train on the past, predict the future)")
+for name, fn in (("random", rand_rec), ("popularity", pop_rec)):
+    print(f"  {name:11} {data.eval_recommender(fn)}")
+
+# the same evaluation with a random split, for comparison
+shuffled = events.sample(frac=1.0, random_state=0).reset_index(drop=True)
+n_hold = len(data.test)
+rand_split = shuffled.copy()
+rand_split["ts"] = 0
+rand_split.loc[rand_split.index[:n_hold], "ts"] = 999
+data_rand = InteractionData(rand_split, n_users, n_items, holdout_days=1)
+order_r = np.argsort(-data_rand.pop)
+
+def pop_rec_r(u, k):
+    out = []
+    for i in order_r:
+        if i not in data_rand.seen.get(u, ()):
+            out.append(i)
+            if len(out) == k:
+                break
+    return out
+
+print("\nRANDOM split (leaks the future into the past)")
+print(f"  popularity  {data_rand.eval_recommender(pop_rec_r)}")
+print(f"\ntest interactions: temporal {len(data.test):,} | random {len(data_rand.test):,}")
+
+def leak_surface(d):
+    """Share of held-out (user, item) pairs whose ITEM the user also touched in train."""
+    hit = tot = 0
+    for u, items in d.truth.items():
+        tot += len(items)
+        hit += len(items & d.seen.get(u, set()))
+    return hit / max(tot, 1)
+
+print(f"\nheld-out pairs the model has already seen for that user:")
+print(f"  temporal split {leak_surface(data):.4f} | random split {leak_surface(data_rand):.4f}")
+```
+
+```output
+TEMPORAL split (train on the past, predict the future)
+  random      {'recall@k': 0.01096553688407861, 'coverage': 1.0, 'users_scored': 2716}
+  popularity  {'recall@k': 0.10666476787240102, 'coverage': 0.0225, 'users_scored': 2716}
+
+RANDOM split (leaks the future into the past)
+  popularity  {'recall@k': 0.12671012105150062, 'coverage': 0.0225, 'users_scored': 2710}
+
+test interactions: temporal 17,107 | random 17,107
+
+held-out pairs the model has already seen for that user:
+  temporal split 0.1561 | random split 0.1515
+```
+
+Both splits are scored on the same 17,107 held-out interactions, and the random split reports
+0.1267 against the temporal split's 0.1067 — **19% higher, from a recommender with no
+personalisation at all.**
+
+The mechanism is worth spelling out, because it is not the one people usually name. A random split
+puts rows from the *test period* into the training data, so the popularity vector it computes
+already reflects which items are popular then — including the items that launched in month 9. The
+temporal split has to extrapolate popularity forward across a catalogue that changed, and gets
+punished for the items it cannot know about. No user-level memorisation is involved.
+
+The last line adds the mechanism that *does* involve users: about 15% of held-out pairs are items
+the user already touched in training, under either split. Popularity cannot exploit that, but the
+neighbourhood and matrix-factorisation models from chapter 3 onward absolutely can. Use the
+temporal split from the beginning — the future is what you are ranking for — rather than switching
+once the models are good enough to cheat.
+
+Two design decisions in `InteractionData` are worth keeping. It stores `seen` per user and every
+recommender filters against it, because recommending an item the user has already interacted with
+is free recall in an offline metric and a bug in a product. And `eval_recommender` returns
+**coverage** alongside recall, because a recommender that shows the same ten items to everyone can
+score respectably on recall while being useless — that is the accuracy-diversity tension chapter 2
+puts numbers on.
+
+One caveat this data layer cannot fix: the held-out interactions are the items the *previous*
+system showed the user, so an offline metric rewards you for reproducing that system's choices.
+An item the user would have loved but never saw counts as a miss. That is exposure bias, it is the
+reason offline gains often fail to reproduce online, and the only real answers are randomised
+exposure data or the bandit machinery in chapter 11.
+</details>

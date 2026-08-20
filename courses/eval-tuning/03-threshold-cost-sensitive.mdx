@@ -1,0 +1,386 @@
+---
+course: eval-tuning
+chapter: 03-threshold-cost-sensitive
+title: "Threshold Selection and Cost-Sensitive Decisions"
+order: 3
+---
+
+## The model outputs a score; the business needs a decision
+
+A classifier's threshold is not a modelling parameter — it is where you convert a probability
+into an action, and the right value comes from **the cost of each mistake**, not from 0.5.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+n = 50_000
+# Calibrated by construction: draw a true probability per case, then draw the outcome.
+p = rng.beta(0.8, 60, n)
+y = (rng.random(n) < p).astype(int)
+print(f"prevalence {y.mean():.4f} | mean predicted probability {p.mean():.4f}")
+
+COSTS = {"tp": -40.0,     # a caught fraud: we save 40 (negative cost = benefit)
+         "fp": 6.0,       # a false alarm: 6 of review time and customer friction
+         "fn": 250.0,     # a missed fraud: the full loss
+         "tn": 0.0}
+
+def expected_cost(y, score, threshold, costs=COSTS):
+    pred = score >= threshold
+    tp = int((pred & (y == 1)).sum()); fp = int((pred & (y == 0)).sum())
+    fn = int((~pred & (y == 1)).sum()); tn = int((~pred & (y == 0)).sum())
+    total = tp * costs["tp"] + fp * costs["fp"] + fn * costs["fn"] + tn * costs["tn"]
+    return total, tp, fp, fn, tn
+
+for t in (0.005, 0.02, 0.05, 0.10, 0.50):
+    total, tp, fp, fn, _ = expected_cost(y, p, t)
+    print(f"threshold {t:.3f}: TP {tp:>4} FP {fp:>6,} FN {fn:>4} -> "
+          f"total cost {total:>10,.0f}")
+```
+
+```output
+prevalence 0.0130 | mean predicted probability 0.0132
+threshold 0.005: TP  615 FP 31,648 FN   36 -> total cost    174,288
+threshold 0.020: TP  404 FP 10,644 FN  247 -> total cost    109,454
+threshold 0.050: TP   88 FP  1,414 FN  563 -> total cost    145,714
+threshold 0.100: TP    4 FP     41 FN  647 -> total cost    161,836
+threshold 0.500: TP    0 FP      0 FN  651 -> total cost    162,750
+```
+
+On a problem where positives are rare and misses are expensive, the sensible cutoff is nowhere
+near 0.5 — it is two percent, and using the default costs you a third of the achievable value. **The threshold is where most of the realizable
+value of a classifier lives**, and it costs one line of code to move.
+
+## The optimal threshold, derived
+
+Act when the expected cost of acting is lower than the expected cost of not acting. With a
+calibrated probability $p$:
+
+$$
+p\,C_{TP} + (1-p)\,C_{FP} \;<\; p\,C_{FN} + (1-p)\,C_{TN}
+$$
+
+Rearranging gives the classic threshold:
+
+$$
+\boxed{\;p^{*} = \frac{C_{FP} - C_{TN}}{(C_{FN} - C_{TP}) + (C_{FP} - C_{TN})}\;}
+$$
+
+```python
+def optimal_threshold(costs=COSTS):
+    num = costs["fp"] - costs["tn"]
+    den = (costs["fn"] - costs["tp"]) + (costs["fp"] - costs["tn"])
+    return num / den
+
+t_star = optimal_threshold()
+print(f"analytic optimum p* = {t_star:.4f}")
+
+grid = np.linspace(0.001, 0.5, 500)
+costs = [expected_cost(y, p, t)[0] for t in grid]
+best = grid[int(np.argmin(costs))]
+print(f"empirical optimum   = {best:.4f} (cost {min(costs):,.0f})")
+print(f"cost at 0.5         = {expected_cost(y, p, 0.5)[0]:,.0f}")
+print(f"value of moving the threshold: {expected_cost(y, p, 0.5)[0] - min(costs):,.0f}")
+```
+
+```output
+analytic optimum p* = 0.0203
+empirical optimum   = 0.0200 (cost 109,454)
+cost at 0.5         = 162,750
+value of moving the threshold: 53,296
+```
+
+The formula and the grid search agree, which is the check worth running: **if they disagree, your
+probabilities are not calibrated** (ch. 4), because the derivation assumes $p$ is a real
+probability rather than a score that merely ranks well.
+
+### Cost ratios, not absolute costs
+
+```python
+for fn_cost in (50, 250, 1_000, 5_000):
+    c = dict(COSTS, fn=float(fn_cost))
+    t = optimal_threshold(c)
+    total, tp, fp, fn_count, _ = expected_cost(y, p, t, c)
+    print(f"miss costs {fn_cost:>5}: p* {t:.4f} -> flag {tp+fp:>6,} cases, "
+          f"catch {tp:>4}/{int(y.sum())}, miss {fn_count:>4}")
+```
+
+```output
+miss costs    50: p* 0.0625 -> flag    649 cases, catch   46/651, miss  605
+miss costs   250: p* 0.0203 -> flag 10,865 cases, catch  399/651, miss  252
+miss costs  1000: p* 0.0057 -> flag 30,523 cases, catch  610/651, miss   41
+miss costs  5000: p* 0.0012 -> flag 43,770 cases, catch  649/651, miss    2
+```
+
+Only the *ratio* between costs matters, which is liberating: nobody can tell you what a missed
+fraud costs to the nearest dollar, but everyone can answer "is a miss worth ten false alarms, or
+a hundred?" — and that is enough to fix the threshold.
+
+## When you cannot price the errors: constrained optimization
+
+```python
+def threshold_for_constraint(y, score, kind, target):
+    grid = np.unique(np.round(score, 4))
+    best = None
+    for t in grid:
+        pred = score >= t
+        tp = int((pred & (y == 1)).sum()); fp = int((pred & (y == 0)).sum())
+        fn = int((~pred & (y == 1)).sum())
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        flagged = int(pred.sum())
+        if kind == "min_precision" and precision >= target:
+            if best is None or recall > best[1]:
+                best = (t, recall, precision, flagged)
+        elif kind == "min_recall" and recall >= target:
+            if best is None or precision > best[2]:
+                best = (t, recall, precision, flagged)
+        elif kind == "max_flagged" and flagged <= target:
+            if best is None or recall > best[1]:
+                best = (t, recall, precision, flagged)
+    return best
+
+for kind, target, label in [("min_precision", 0.5, "precision >= 50%"),
+                            ("min_recall", 0.8, "recall >= 80%"),
+                            ("max_flagged", 500, "at most 500 flagged")]:
+    t, rec, prec, flagged = threshold_for_constraint(y, p, kind, target)
+    print(f"{label:22} -> threshold {t:.3f} | precision {prec:.3f} recall {rec:.3f} "
+          f"flagged {flagged:,}")
+```
+
+```output
+precision >= 50%       -> threshold 0.125 | precision 0.500 recall 0.005 flagged 6
+recall >= 80%          -> threshold 0.013 | precision 0.029 recall 0.800 flagged 17,991
+at most 500 flagged    -> threshold 0.066 | precision 0.066 recall 0.051 flagged 497
+```
+
+Three legitimate ways to pick a threshold without a cost model: a **precision floor** (a
+compliance or trust requirement), a **recall floor** (a regulator or a safety case), and a
+**capacity constraint** (the review team's throughput — usually the real one). Read the first row
+carefully: on a 1.3% base rate this model can only reach 50% precision by flagging six cases, so
+the constraint is effectively infeasible. That is a finding, not a bug — it says the signal is
+too weak for an automated block, and the honest response is triage rather than a threshold.
+
+## Multiple actions, not one
+
+Real systems rarely have a single binary decision. Two thresholds give you three actions, and
+the middle band is where a human or a cheaper check goes.
+
+```python
+def three_way(y, score, low, high, cost_review=6.0, cost_miss=250.0, cost_block=40.0,
+              review_catch_rate=0.9):
+    auto_accept = score < low
+    review = (score >= low) & (score < high)
+    auto_block = score >= high
+    cost = 0.0
+    cost += float((auto_accept & (y == 1)).sum()) * cost_miss                # missed entirely
+    cost += float(review.sum()) * cost_review                                 # review effort
+    cost += float((review & (y == 1)).sum()) * cost_miss * (1 - review_catch_rate)
+    cost -= float((auto_block & (y == 1)).sum()) * cost_block                 # prevented loss
+    cost += float((auto_block & (y == 0)).sum()) * 25.0                       # blocked a good customer
+    return cost, int(auto_accept.sum()), int(review.sum()), int(auto_block.sum())
+
+print(f"{'low':>6}{'high':>7}{'auto-accept':>13}{'review':>9}{'block':>8}{'cost':>12}")
+for low, high in [(0.02, 0.02), (0.01, 0.05), (0.005, 0.10), (0.01, 0.20)]:
+    cost, a, r, b = three_way(y, p, low, high)
+    print(f"{low:>6.2f}{high:>7.2f}{a:>13,}{r:>9,}{b:>8,}{cost:>12,.0f}")
+```
+
+```output
+   low   high  auto-accept   review   block        cost
+  0.02   0.02       38,952        0  11,048     311,690
+  0.01   0.05       27,775   20,723   1,502     190,043
+  0.01   0.10       17,737   32,218      45     218,448
+  0.01   0.20       27,775   22,224       1     169,444
+```
+
+The two-threshold policy beats every single cutoff because it **spends human attention only where
+the model is uncertain**. This is also the design that makes a model shippable when precision is
+too low for automation: the model does not decide, it *triages*.
+
+## Thresholds per segment: only when calibration or costs differ
+
+With **calibrated** probabilities the optimal threshold does not depend on the base rate — the
+formula contains only costs. A segment with four times the risk simply has more cases above the
+same cutoff. Segment-specific thresholds are needed for two other reasons: the model is
+miscalibrated *differently* per segment, or the costs differ per segment.
+
+```python
+segment = rng.integers(0, 3, n)                          # e.g. channel: web, app, partner
+scale = np.array([0.4, 1.0, 4.0])[segment]               # partner traffic is riskier
+p_true = np.clip(rng.beta(0.8, 60, n) * scale, 0, 1)
+y_seg = (rng.random(n) < p_true).astype(int)
+
+p_hat = p_true.copy()
+p_hat[segment == 2] *= 0.45                              # the model under-scores segment 2
+
+grid = np.linspace(0.002, 0.30, 150)
+print(f"{'segment':9}{'prevalence':>12}{'calibration':>14}{'own optimum':>13}"
+      f"{'cost at 0.02':>14}{'saving':>10}")
+for s_ in range(3):
+    m = segment == s_
+    ratio = p_hat[m].mean() / max(p_true[m].mean(), 1e-9)
+    at_global = expected_cost(y_seg[m], p_hat[m], 0.0203)[0]
+    costs_s = [expected_cost(y_seg[m], p_hat[m], t)[0] for t in grid]
+    best_t = grid[int(np.argmin(costs_s))]
+    print(f"{s_:<9}{y_seg[m].mean():>12.4f}{ratio:>14.2f}{best_t:>13.3f}"
+          f"{at_global:>14,.0f}{at_global - min(costs_s):>10,.0f}")
+```
+
+```output
+segment    prevalence   calibration  own optimum  cost at 0.02    saving
+0              0.0052          1.00        0.018        21,216     2,124
+1              0.0126          1.00        0.018        40,450     1,432
+2              0.0524          0.45        0.010        47,902     8,798
+```
+
+Segments 0 and 1 are calibrated and land on the shared optimum; segment 2, whose scores are
+scaled down by 55%, needs a proportionally lower threshold to make the same decision. **The fix
+is usually to calibrate per segment (ch. 4), not to maintain three thresholds** — and when the
+segment is a protected attribute, differing thresholds are a policy with legal weight that must
+be decided deliberately, documented, and audited per group (ch. 12).
+
+## Try it Yourself
+
+```python
+def threshold_report(y, score, costs, capacity=None):
+    grid = np.linspace(0.001, 0.5, 500)
+    rows = []
+    for t in grid:
+        total, tp, fp, fn, tn = expected_cost(y, score, t, costs)
+        flagged = tp + fp
+        if capacity is not None and flagged > capacity:
+            continue
+        rows.append((t, total, tp, fp, fn, flagged))
+    best = min(rows, key=lambda r: r[1])
+    t, total, tp, fp, fn, flagged = best
+    print(f"cost ratio miss:alarm = {costs['fn']/costs['fp']:.0f}:1"
+          + (f", capacity {capacity:,}" if capacity else "")
+          + f" -> threshold {t:.3f}")
+    print(f"   flag {flagged:,} | catch {tp}/{int(y.sum())} ({tp/max(int(y.sum()),1):.1%}) "
+          f"| miss {fn} | cost {total:,.0f}")
+
+threshold_report(y, p, COSTS)
+threshold_report(y, p, dict(COSTS, fn=1_000.0))
+threshold_report(y, p, dict(COSTS, fn=1_000.0), capacity=3_000)
+threshold_report(y, p, dict(COSTS, fp=30.0))
+```
+
+```output
+cost ratio miss:alarm = 42:1 -> threshold 0.020
+   flag 11,048 | catch 404/651 (62.1%) | miss 247 | cost 109,454
+cost ratio miss:alarm = 167:1 -> threshold 0.008
+   flag 25,749 | catch 586/651 (90.0%) | miss 65 | cost 192,538
+cost ratio miss:alarm = 167:1, capacity 3,000 -> threshold 0.040
+   flag 2,879 | catch 149/651 (22.9%) | miss 502 | cost 512,420
+cost ratio miss:alarm = 8:1 -> threshold 0.124
+   flag 7 | catch 3/651 (0.5%) | miss 648 | cost 162,000
+```
+
+The third line is the one to sit with: a capacity constraint overrides the cost model entirely.
+When the optimum says "flag 4,000 cases" and the team can review 800, the threshold is set by the
+team, and the remaining value has to come from somewhere else — a better model, a cheaper
+triage tier, or more reviewers.
+
+## Exercise
+
+Build a threshold-setting harness that a stakeholder can actually use: it takes a validation set,
+a cost structure expressed as *ratios* rather than currency, an optional capacity limit, and a
+required minimum recall; it returns the chosen threshold, the expected monthly cost, the
+confusion matrix, and a sensitivity analysis showing how the choice moves if the cost ratio is
+off by 2x in either direction. Then show what happens to the recommended threshold when the
+prevalence in production is half what it was in validation.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def choose_threshold(y, score, miss_to_alarm, capacity=None, min_recall=None,
+                     monthly_volume=1_000_000):
+    costs = {"tp": 0.0, "fp": 1.0, "fn": float(miss_to_alarm), "tn": 0.0}   # in "alarm units"
+    grid = np.linspace(0.005, 0.995, 199)
+    feasible = []
+    for t in grid:
+        pred = score >= t
+        tp = int((pred & (y == 1)).sum()); fp = int((pred & (y == 0)).sum())
+        fn = int((~pred & (y == 1)).sum())
+        recall = tp / max(tp + fn, 1)
+        flagged = tp + fp
+        if capacity is not None and flagged * (monthly_volume / len(y)) > capacity:
+            continue
+        if min_recall is not None and recall < min_recall:
+            continue
+        cost = fp * costs["fp"] + fn * costs["fn"]
+        feasible.append((t, cost, tp, fp, fn, recall, flagged))
+    if not feasible:
+        return None
+    return min(feasible, key=lambda r: r[1])
+
+def report(y, score, miss_to_alarm, **kw):
+    best = choose_threshold(y, score, miss_to_alarm, **kw)
+    if best is None:
+        print(f"ratio {miss_to_alarm:>4}:1 -> NO FEASIBLE THRESHOLD under these constraints")
+        return
+    t, cost, tp, fp, fn, recall, flagged = best
+    scale = kw.get("monthly_volume", 1_000_000) / len(y)
+    print(f"ratio {miss_to_alarm:>4}:1 -> t {t:.3f} | recall {recall:.1%} | "
+          f"flag {flagged*scale:>8,.0f}/mo | miss {fn*scale:>6,.0f}/mo | "
+          f"cost {cost*scale:>10,.0f} alarm-units/mo")
+    return t
+
+print("baseline, no constraints:")
+base_t = report(y, p, 40)
+
+print("\nsensitivity: the cost ratio is a guess, so check 2x either way")
+for ratio in (20, 40, 80):
+    report(y, p, ratio)
+
+print("\nwith a capacity limit of 12,000 reviews/month:")
+report(y, p, 40, capacity=12_000)
+
+print("\nwith a regulator-mandated 90% recall floor:")
+report(y, p, 40, min_recall=0.90)
+report(y, p, 40, min_recall=0.90, capacity=12_000)
+
+print("\nproduction prevalence is HALF of validation:")
+half = y.copy()
+flip = np.flatnonzero(y == 1)[: int(y.sum() // 2)]
+half[flip] = 0                                    # same scores, fewer true positives
+report(half, p, 40)
+print(f"   validation prevalence {y.mean():.4f} vs production {half.mean():.4f}")
+```
+
+```output
+baseline, no constraints:
+ratio   40:1 -> t 0.020 | recall 62.1% | flag  220,960/mo | miss  4,940/mo | cost    410,480 alarm-units/mo
+
+sensitivity: the cost ratio is a guess, so check 2x either way
+ratio   20:1 -> t 0.055 | recall 10.4% | flag   21,420/mo | miss 11,660/mo | cost    253,260 alarm-units/mo
+ratio   40:1 -> t 0.020 | recall 62.1% | flag  220,960/mo | miss  4,940/mo | cost    410,480 alarm-units/mo
+ratio   80:1 -> t 0.010 | recall 86.5% | flag  444,500/mo | miss  1,760/mo | cost    574,040 alarm-units/mo
+
+with a capacity limit of 12,000 reviews/month:
+ratio   40:1 -> t 0.065 | recall 6.0% | flag   11,080/mo | miss 12,240/mo | cost    499,900 alarm-units/mo
+
+with a regulator-mandated 90% recall floor:
+ratio   40:1 -> t 0.005 | recall 94.5% | flag  645,260/mo | miss    720/mo | cost    661,760 alarm-units/mo
+ratio   40:1 -> NO FEASIBLE THRESHOLD under these constraints
+
+production prevalence is HALF of validation:
+ratio   40:1 -> t 0.055 | recall 11.0% | flag   21,420/mo | miss  5,800/mo | cost    252,700 alarm-units/mo
+   validation prevalence 0.0130 vs production 0.0065
+```
+
+The insight: three separate things move the threshold, and only one of them is about the model.
+The **cost ratio** is a business input, and the sensitivity block exists because that input is
+always a guess — if the recommendation is stable from 20:1 to 80:1, you can stop arguing about
+the exact number; if it swings wildly, the argument matters and someone senior has to own it.
+The **capacity limit** overrides everything, and the row where a 90% recall floor and a 12,000
+review budget cannot both be satisfied is the most useful output in the whole harness: it is a
+formal proof that the constraints are contradictory, which converts an engineering problem into
+a resourcing conversation. And **prevalence** shifts the optimum even with the model untouched,
+because the same threshold flags a different mix when positives get rarer — which is why the
+threshold is not a constant to be set once, but a parameter to be re-derived whenever the base
+rate moves (ch. 5 for how validation prevalence goes wrong, and the MLOps course for detecting it
+in production).
+</details>

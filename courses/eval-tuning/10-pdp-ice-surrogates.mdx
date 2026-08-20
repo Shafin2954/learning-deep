@@ -1,0 +1,480 @@
+---
+course: eval-tuning
+chapter: 10-pdp-ice-surrogates
+title: "Partial Dependence, ICE, and Surrogate Models"
+order: 10
+---
+
+## What shape did the model learn?
+
+SHAP (ch. 9) tells you how much a feature contributed to one prediction. Partial dependence asks
+a different question: **as this feature sweeps across its range, how does the model's output move
+on average?** It is the closest thing to reading a coefficient out of a black box.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 4_000
+tenure = rng.uniform(0, 60, n).round(1)                    # months as a customer
+discount = rng.uniform(0, 40, n).round(1)                  # percent off
+support = rng.poisson(1.2, n)                              # support tickets last quarter
+
+# a discount retains new customers and annoys long-tenured ones (they feel over-charged before)
+effect_of_discount = np.where(tenure < 24, +0.9, -0.7) * (discount / 40)
+spend = (50 + 0.6 * tenure + 20 * effect_of_discount - 3 * support
+         + rng.normal(0, 4, n)).round(2)
+
+df = pd.DataFrame({"tenure": tenure, "discount": discount, "support_tickets": support})
+Xtr, Xte, ytr, yte = train_test_split(df, spend, test_size=0.3, random_state=0)
+model = RandomForestRegressor(n_estimators=150, min_samples_leaf=10,
+                              random_state=0).fit(Xtr, ytr)
+print(f"train R2 {model.score(Xtr, ytr):.4f} | test R2 {model.score(Xte, yte):.4f}")
+print(f"mean spend {ytr.mean():.2f}")
+```
+
+```output
+train R2 0.8265 | test R2 0.7650
+mean spend 63.70
+```
+
+There is a real interaction buried in that data. Watch partial dependence walk straight past it.
+
+## Partial dependence, from the definition
+
+$$
+\mathrm{PD}_j(z) = \mathbb{E}_{X_{-j}}\bigl[f(z, X_{-j})\bigr]
+\;\approx\; \frac{1}{n}\sum_{i=1}^{n} f\bigl(z,\; x^{(i)}_{-j}\bigr)
+$$
+
+Set feature $j$ to $z$ for **every** row, predict, average. Repeat across a grid of $z$. That is
+the whole algorithm — the same interventional replacement SHAP uses, restricted to one feature.
+
+```python
+def partial_dependence(model, X, feature, grid):
+    out = []
+    for z in grid:
+        Xz = X.copy()
+        Xz[feature] = z
+        out.append(float(model.predict(Xz).mean()))
+    return np.array(out)
+
+sample = Xte.sample(400, random_state=0)
+grid = np.linspace(0, 40, 5)
+pd_discount = partial_dependence(model, sample, "discount", grid)
+for z, v in zip(grid, pd_discount):
+    print(f"discount {z:5.1f}%  ->  mean predicted spend {v:7.3f}")
+print(f"\ntotal swing across the range: {pd_discount.max() - pd_discount.min():.3f}")
+```
+
+```output
+discount   0.0%  ->  mean predicted spend  64.604
+discount  10.0%  ->  mean predicted spend  64.762
+discount  20.0%  ->  mean predicted spend  63.596
+discount  30.0%  ->  mean predicted spend  63.460
+discount  40.0%  ->  mean predicted spend  62.940
+
+total swing across the range: 1.822
+```
+
+Read that as "discount barely matters". It is wrong, and it is wrong in the specific way partial
+dependence is always wrong: **averaging destroys anything that cancels**.
+
+```python
+from sklearn.inspection import partial_dependence as sk_pd
+
+sk = sk_pd(model, sample, features=["discount"], grid_resolution=9,
+           kind="average", method="brute")               # "recursion" is a different estimator
+sk_grid = np.asarray(sk["grid_values"][0])          # sklearn picks its own grid (percentiles)
+print("sklearn grid:", np.round(sk_grid, 2))
+print("sklearn PD  :", np.round(sk["average"][0], 3))
+print("ours, same  :", np.round(partial_dependence(model, sample, "discount", sk_grid), 3))
+```
+
+```output
+sklearn grid: [ 1.7   6.17 10.64 15.11 19.58 24.05 28.52 32.99 37.46]
+sklearn PD  : [64.613 65.059 64.694 64.326 63.558 63.709 63.49  63.498 63.028]
+ours, same  : [64.613 65.059 64.694 64.326 63.558 63.709 63.49  63.498 63.028]
+```
+
+Identical, once you match two things sklearn chooses for you. It picks its grid by *percentile* of
+the observed feature rather than by `linspace`, so it never asks about values the data does not
+contain. And `method` defaults to `"recursion"` for tree ensembles, which walks the trees instead
+of replacing values — faster, but a different estimator that ignores the rows entirely. Pass
+`method="brute"` when you want the definition above, which is the one that matches SHAP's
+interventional value function.
+
+## ICE: one curve per row, no averaging
+
+Individual Conditional Expectation plots the same sweep **per row** instead of averaging. If the
+curves fan out, the average was hiding something.
+
+```python
+def ice(model, X, feature, grid):
+    curves = []
+    for z in grid:
+        Xz = X.copy()
+        Xz[feature] = z
+        curves.append(model.predict(Xz))
+    return np.array(curves).T                              # (rows, grid)
+
+sub = Xte.sample(200, random_state=1)
+curves = ice(model, sub, "discount", grid)
+slopes = (curves[:, -1] - curves[:, 0]) / (grid[-1] - grid[0])
+print(f"per-row slope of spend vs discount:")
+print(f"  mean {slopes.mean():+.4f}  (this is the PDP slope)")
+print(f"  rows with a POSITIVE slope: {(slopes > 0).mean():.0%}")
+print(f"  rows with a NEGATIVE slope: {(slopes < 0).mean():.0%}")
+print(f"  10th / 90th percentile slope: {np.percentile(slopes, 10):+.4f} / "
+      f"{np.percentile(slopes, 90):+.4f}")
+```
+
+```output
+per-row slope of spend vs discount:
+  mean -0.0009  (this is the PDP slope)
+  rows with a POSITIVE slope: 44%
+  rows with a NEGATIVE slope: 56%
+  10th / 90th percentile slope: -0.3230 / +0.4020
+```
+
+Half the customers respond positively to a discount and half negatively, so the average is flat.
+A PDP alone would have told the business "discounts do nothing"; the ICE spread says "discounts do
+a lot, in opposite directions, to different people".
+
+### Splitting the ICE curves reveals the driver
+
+```python
+new_cust = sub["tenure"].values < 24
+for label, mask in (("tenure < 24 months", new_cust), ("tenure >= 24 months", ~new_cust)):
+    mean_curve = curves[mask].mean(axis=0)
+    print(f"{label:22} n={mask.sum():>3} | "
+          f"spend at 0% {mean_curve[0]:7.2f} -> at 40% {mean_curve[-1]:7.2f} "
+          f"({mean_curve[-1] - mean_curve[0]:+.2f})")
+```
+
+```output
+tenure < 24 months     n= 87 | spend at 0%   54.37 -> at 40%   69.44 (+15.07)
+tenure >= 24 months    n=113 | spend at 0%   70.29 -> at 40%   58.63 (-11.66)
+```
+
+That is the interaction the data generator put in, recovered from the model. The workflow: PDP
+looks flat, so check the ICE spread, then group the curves by a candidate moderator. Colouring ICE
+curves by a second feature is the standard visual version of these three lines.
+
+### Centred ICE
+
+Raw ICE curves are stacked at different heights because rows differ in their other features.
+Subtract each curve's value at the left edge and only the *shape* remains:
+
+```python
+centred = curves - curves[:, [0]]
+print(f"{'discount':>9} {'mean':>8} {'new custs':>11} {'old custs':>11}")
+for j, z in enumerate(grid):
+    print(f"{z:>9.1f} {centred[:, j].mean():>+8.2f} "
+          f"{centred[new_cust, j].mean():>+11.2f} {centred[~new_cust, j].mean():>+11.2f}")
+```
+
+```output
+ discount     mean   new custs   old custs
+      0.0    +0.00       +0.00       +0.00
+     10.0    +0.51       +4.01       -2.19
+     20.0    -0.30       +6.70       -5.69
+     30.0    +0.09      +11.81       -8.94
+     40.0    -0.04      +15.07      -11.66
+```
+
+The centred view is what you show a stakeholder: from a common starting point, a 40% discount is
+worth +15.07 to a new customer and -11.66 to a long-tenured one, and the `mean` column — never
+more than 0.51 away from zero at any point on the grid — is the flat line that told you nothing.
+
+## PDP extrapolates into data that does not exist
+
+The replacement step evaluates $f(z, x_{-j})$ for every row, including combinations that never
+occur. With correlated features that means asking the model about impossible customers.
+
+```python
+df_corr = df.copy()
+df_corr["credit_limit"] = (200 + 8 * df_corr["tenure"] + rng.normal(0, 15, n)).round(0)
+Xc_tr, Xc_te, yc_tr, yc_te = train_test_split(df_corr, spend, test_size=0.3, random_state=0)
+mc = RandomForestRegressor(n_estimators=150, min_samples_leaf=10,
+                           random_state=0).fit(Xc_tr, yc_tr)
+corr = np.corrcoef(df_corr["tenure"], df_corr["credit_limit"])[0, 1]
+
+sample_c = Xc_te.sample(400, random_state=0)
+grid_limit = np.linspace(df_corr["credit_limit"].quantile(0.05),
+                         df_corr["credit_limit"].quantile(0.95), 7)
+pd_limit = partial_dependence(mc, sample_c, "credit_limit", grid_limit)
+print(f"corr(tenure, credit_limit) = {corr:.3f}")
+for z, v in zip(grid_limit, pd_limit):
+    share = float(((sample_c["credit_limit"] - z).abs() < 40).mean())
+    print(f"limit {z:6.0f} -> PDP {v:7.3f}   (rows actually near this value: {share:.0%})")
+```
+
+```output
+corr(tenure, credit_limit) = 0.994
+limit    222 -> PDP  62.069   (rows actually near this value: 12%)
+limit    294 -> PDP  62.926   (rows actually near this value: 15%)
+limit    367 -> PDP  63.459   (rows actually near this value: 16%)
+limit    439 -> PDP  63.612   (rows actually near this value: 14%)
+limit    511 -> PDP  64.216   (rows actually near this value: 20%)
+limit    584 -> PDP  65.176   (rows actually near this value: 18%)
+limit    656 -> PDP  65.997   (rows actually near this value: 12%)
+```
+
+Every PDP point averages over 400 rows, but only 12–20% of them plausibly *could* have that credit
+limit given their tenure. The rest are fabricated customers, and the model's answer about them is
+an extrapolation you have no way to check.
+
+### ALE: only ask about differences that are local
+
+Accumulated Local Effects fixes this by bingeing on locality: inside each bin of the feature,
+compute the prediction *difference* between the bin edges **for the rows that are actually in that
+bin**, then accumulate.
+
+$$
+\mathrm{ALE}_j(z) = \sum_{k:\,z_k \le z}\;
+\frac{1}{|S_k|}\sum_{i \in S_k}\bigl[f(z_k, x^{(i)}_{-j}) - f(z_{k-1}, x^{(i)}_{-j})\bigr]
+$$
+
+```python
+def ale(model, X, feature, n_bins=8):
+    edges = np.quantile(X[feature], np.linspace(0, 1, n_bins + 1))
+    edges = np.unique(edges)
+    idx = np.clip(np.searchsorted(edges, X[feature], side="left") - 1, 0, len(edges) - 2)
+    deltas = np.zeros(len(edges) - 1)
+    for k in range(len(edges) - 1):
+        rows = X[idx == k]
+        if len(rows) == 0:
+            continue
+        lo, hi = rows.copy(), rows.copy()
+        lo[feature], hi[feature] = edges[k], edges[k + 1]
+        deltas[k] = float((model.predict(hi) - model.predict(lo)).mean())
+    acc = np.concatenate([[0.0], np.cumsum(deltas)])
+    return edges, acc - acc.mean()                          # centred
+
+edges, ale_vals = ale(mc, sample_c, "credit_limit")
+pd_at_edges = partial_dependence(mc, sample_c, "credit_limit", edges)
+pd_centred = pd_at_edges - pd_at_edges.mean()
+print(f"{'credit_limit':>13} {'PDP (centred)':>15} {'ALE':>9}")
+for e, p, a in zip(edges, pd_centred, ale_vals):
+    print(f"{e:>13.0f} {p:>15.3f} {a:>9.3f}")
+```
+
+```output
+ credit_limit   PDP (centred)       ALE
+          186          -2.066    -5.035
+          264          -1.329    -3.489
+          326          -0.710    -1.925
+          391          -0.462    -1.093
+          460          -0.152     0.204
+          518           0.328     1.552
+          569           0.817     2.187
+          615           1.501     3.035
+          694           2.074     4.564
+```
+
+The two curves disagree, and ALE is the *steeper* one: it spans about 9.6 units of spend against
+the PDP's 4.1. That is the opposite of what people expect, and it is the right result. Inside a
+narrow band of `credit_limit`, every row has a similar tenure, so nudging the limit to the band's
+edges moves the model a lot — the forest is using `credit_limit` as a stand-in for tenure. The PDP
+dilutes exactly that signal: forcing a limit of 222 onto a five-year customer lands the row in a
+region where the model's tenure splits dominate and pin the prediction back where it was.
+
+Neither curve tells you that `credit_limit` has no causal effect on spend, which is the truth of
+the generator. Both describe the *model*, and the model genuinely leans on the proxy. Use ALE when
+features are correlated and you want an effect estimate that never fabricates a row; use PDP when
+you specifically want the "what if we forced this value on everyone" answer, and say so.
+
+## Global surrogates: approximate the model with something readable
+
+Fit an interpretable model to the black box's **predictions** (not to `y`), then read the simple
+model — but only if it is faithful.
+
+```python
+from sklearn.tree import DecisionTreeRegressor, export_text
+
+black_box_preds = model.predict(Xtr)
+print(f"{'depth':>6} {'fidelity R2 vs model':>22} {'accuracy R2 vs truth':>22}")
+for depth in (1, 2, 3, 5, 8):
+    surrogate = DecisionTreeRegressor(max_depth=depth, random_state=0).fit(Xtr, black_box_preds)
+    fidelity = surrogate.score(Xte, model.predict(Xte))     # does it mimic the model?
+    truth = surrogate.score(Xte, yte)                       # is it any good on its own?
+    print(f"{depth:>6} {fidelity:>22.4f} {truth:>22.4f}")
+```
+
+```output
+ depth   fidelity R2 vs model   accuracy R2 vs truth
+     1                 0.2556                 0.1902
+     2                 0.3940                 0.2938
+     3                 0.4725                 0.3595
+     5                 0.7752                 0.5882
+     8                 0.9658                 0.7334
+```
+
+Fidelity is the number that licenses the explanation, and on this model it is brutal: a depth-3
+tree reproduces only 47% of the forest's variance. That tree is not an explanation of the forest;
+it is a different, worse model. You need depth 8 — 256 leaves, unreadable — before fidelity
+reaches 0.97. Report fidelity whenever you show a surrogate, and never let the surrogate's *own*
+accuracy against the truth (the right-hand column) stand in for it: those numbers are lower still
+and answer a question nobody asked.
+
+```python
+surrogate = DecisionTreeRegressor(max_depth=3, random_state=0).fit(Xtr, black_box_preds)
+print(f"fidelity R2 = {surrogate.score(Xte, model.predict(Xte)):.4f}\n")
+print(export_text(surrogate, feature_names=list(Xtr.columns), decimals=1))
+```
+
+```output
+fidelity R2 = 0.4725
+
+|--- tenure <= 43.8
+|   |--- support_tickets <= 1.5
+|   |   |--- tenure <= 6.4
+|   |   |   |--- value: [58.9]
+|   |   |--- tenure >  6.4
+|   |   |   |--- value: [64.1]
+|   |--- support_tickets >  1.5
+|   |   |--- tenure <= 4.0
+|   |   |   |--- value: [51.8]
+|   |   |--- tenure >  4.0
+|   |   |   |--- value: [58.4]
+|--- tenure >  43.8
+|   |--- discount <= 17.1
+|   |   |--- support_tickets <= 1.5
+|   |   |   |--- value: [76.4]
+|   |   |--- support_tickets >  1.5
+|   |   |   |--- value: [70.9]
+|   |--- discount >  17.1
+|   |   |--- tenure <= 53.4
+|   |   |   |--- value: [64.7]
+|   |   |--- tenure >  53.4
+|   |   |   |--- value: [70.2]
+```
+
+The rules are readable and directionally sensible — tenure dominates, support tickets subtract —
+which is exactly what makes them dangerous at a fidelity of 0.47. Notice also what the tree does
+with `discount`: it splits on it only inside the long-tenure branch, and there *higher* discount
+maps to lower predicted spend. That fragment of the interaction is real, but a reader would take
+the whole rule list as a description of the model, and less than half of the model is in it. A
+surrogate is a summary you must earn with a fidelity number, not a translation.
+
+## Try it Yourself
+
+```python
+def inspect_feature(feature, n_grid=7, n_rows=200):
+    lo, hi = df[feature].quantile(0.05), df[feature].quantile(0.95)
+    g = np.linspace(lo, hi, n_grid)
+    rows = Xte.sample(n_rows, random_state=1)
+    c = ice(model, rows, feature, g)
+    slopes = (c[:, -1] - c[:, 0]) / (g[-1] - g[0])
+    print(f"{feature:16} PDP swing {c.mean(axis=0).max() - c.mean(axis=0).min():7.3f} | "
+          f"mean slope {slopes.mean():+.4f} | "
+          f"share positive {(slopes > 0).mean():.0%} | "
+          f"slope spread (p90-p10) {np.percentile(slopes, 90) - np.percentile(slopes, 10):.4f}")
+
+for f in df.columns:
+    inspect_feature(f)
+```
+
+```output
+tenure           PDP swing  17.215 | mean slope +0.3188 | share positive 100% | slope spread (p90-p10) 0.4437
+discount         PDP swing   0.852 | mean slope +0.0002 | share positive 44% | slope spread (p90-p10) 0.7923
+support_tickets  PDP swing   7.573 | mean slope -2.5243 | share positive 0% | slope spread (p90-p10) 1.2296
+```
+
+The last two columns are the diagnostic: a feature where every row's slope has the same sign is
+safe to summarise with a PDP, and a feature where the share is near 50% with a wide spread must
+never be summarised that way. Change `n_grid`, or run `inspect_feature` on the correlated dataset
+(`mc`, `Xc_te`) to see what a spurious feature looks like.
+
+## Exercise
+
+Turn this into a shippable check. Build a model-behaviour report that, for each feature, states
+the expected direction of effect (from domain knowledge), measures the actual direction from ICE
+slopes, flags disagreements and heterogeneity, and reports the fidelity of a depth-3 surrogate.
+The output should be something you could paste into a model card and a reviewer could act on.
+
+<details>
+<summary>Solution</summary>
+
+```python
+EXPECTED = {"tenure": "up", "discount": "up", "support_tickets": "down"}
+
+def behaviour_report(model, X, features, expected, n_rows=300, n_grid=7, seed=1):
+    rows = X.sample(n_rows, random_state=seed)
+    findings = []
+    for f in features:
+        g = np.linspace(X[f].quantile(0.05), X[f].quantile(0.95), n_grid)
+        c = ice(model, rows, f, g)
+        slopes = (c[:, -1] - c[:, 0]) / (g[-1] - g[0])
+        share_pos = float((slopes > 0).mean())
+        direction = "up" if slopes.mean() > 0 else "down"
+        heterogeneous = 0.2 < share_pos < 0.8
+        flags = []
+        if direction != expected[f]:
+            flags.append("DIRECTION DISAGREES WITH DOMAIN")
+        if heterogeneous:
+            flags.append("HETEROGENEOUS (PDP is misleading)")
+        findings.append({
+            "feature": f, "expected": expected[f], "observed": direction,
+            "mean_slope": round(float(slopes.mean()), 4),
+            "share_positive": f"{share_pos:.0%}",
+            "flags": "; ".join(flags) or "ok",
+        })
+    return pd.DataFrame(findings)
+
+report = behaviour_report(model, Xte, list(df.columns), EXPECTED)
+print(report.to_string(index=False))
+
+surrogate = DecisionTreeRegressor(max_depth=3, random_state=0).fit(Xtr, model.predict(Xtr))
+fid = surrogate.score(Xte, model.predict(Xte))
+print(f"\nsurrogate (depth 3) fidelity R2 vs the model: {fid:.4f}")
+print(f"model test R2 vs truth: {model.score(Xte, yte):.4f}")
+print("verdict:", "surrogate is a fair summary" if fid > 0.9 else
+      "surrogate is NOT faithful enough to quote as an explanation")
+
+flagged = report[report["flags"] != "ok"]
+print(f"\n{len(flagged)} feature(s) need a human look:")
+for _, r in flagged.iterrows():
+    print(f"  - {r['feature']}: {r['flags']}")
+```
+
+```output
+        feature expected observed  mean_slope share_positive                                                              flags
+         tenure       up       up      0.3138           100%                                                                 ok
+       discount       up     down     -0.0180            41% DIRECTION DISAGREES WITH DOMAIN; HETEROGENEOUS (PDP is misleading)
+support_tickets     down     down     -2.5319             0%                                                                 ok
+
+surrogate (depth 3) fidelity R2 vs the model: 0.4725
+model test R2 vs truth: 0.7650
+verdict: surrogate is NOT faithful enough to quote as an explanation
+
+1 feature(s) need a human look:
+  - discount: DIRECTION DISAGREES WITH DOMAIN; HETEROGENEOUS (PDP is misleading)
+```
+
+The report catches the thing a PDP chart would have hidden. `discount` trips both flags at once: a
+mean slope of -0.018 nominally disagrees with the expected direction, and 41% of rows still slope
+upward, so the direction flag is *not* the real finding — the heterogeneity flag is. That ordering
+matters when you read one of these: on a heterogeneous feature the mean direction is an artefact
+of the mix, and the reviewer should be sent looking for the moderator (tenure), not asked to
+explain a sign. `tenure` (100% positive) and `support_tickets` (0% positive) are unanimous, so a
+one-line summary of each is defensible.
+
+The surrogate line is the other half of the discipline, and here it fails: depth 3 reproduces
+0.4725 of the forest, so the check prints its refusal rather than a rule list. That verdict is the
+feature, not a bug in the exercise — a fidelity below roughly 0.9 means the readable rules
+describe a model you are not shipping. The honest options at that point are to deepen the
+surrogate (and lose readability), to fit surrogates per segment (which would work well here, since
+the population splits cleanly at 24 months), or to drop the rule list and fall back to
+per-prediction attribution (ch. 9).
+
+Two extensions worth building once you need them. First, make `EXPECTED` part of the repository
+and run `behaviour_report` in CI: a monotonicity violation that appears after a retrain is exactly
+the kind of silent regression that reaches production otherwise. Second, when a feature is flagged
+heterogeneous, automate the moderator search — fit a shallow tree with the ICE slope as the target
+and the other features as inputs; its first split is the moderator, found without a chart.
+</details>

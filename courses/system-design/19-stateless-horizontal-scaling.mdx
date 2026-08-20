@@ -1,0 +1,368 @@
+---
+course: system-design
+chapter: 19-stateless-horizontal-scaling
+title: "Stateless Services and Horizontal Scaling"
+order: 19
+---
+
+## "Stateless" means the request carries everything
+
+A stateless service keeps no per-client state in its own memory between requests. It may read
+and write state — in a database, a cache, or object storage — but any instance can serve any
+request, which is what makes the fleet replaceable, autoscalable, and survivable.
+
+```python
+sessions_in_memory = {}          # the thing that makes a service stateful
+
+def stateful_login(server, token, user):
+    sessions_in_memory.setdefault(server, {})[token] = user
+    return f"{server} remembers {token}"
+
+def handle(server, token):
+    user = sessions_in_memory.get(server, {}).get(token)
+    return f"{server}: {'serving ' + user if user else 'HTTP 401 — I have never seen this token'}"
+
+print(stateful_login("app-1", "tok-abc", "alice"))
+print(handle("app-1", "tok-abc"))
+print(handle("app-2", "tok-abc"), "<- the load balancer sent the next request elsewhere")
+```
+
+```output
+app-1 remembers tok-abc
+app-1: serving alice
+app-2: HTTP 401 — I have never seen this token <- the load balancer sent the next request elsewhere
+```
+
+That failure has three bad fixes and one good one. Sticky sessions (ch. 3) pin the user to
+`app-1` and make it a single point of failure. Session replication broadcasts state to every
+node and does not scale. Both are worse than simply moving the state somewhere shared.
+
+```python
+shared_store = {}                # Redis, Postgres — anything all instances can reach
+
+def stateless_login(token, user):
+    shared_store[token] = {"user": user, "exp": 1_700_000_600}
+    return f"session stored centrally under {token}"
+
+def handle_stateless(server, token, now=1_700_000_000):
+    s = shared_store.get(token)
+    if not s or s["exp"] < now:
+        return f"{server}: HTTP 401"
+    return f"{server}: serving {s['user']}"
+
+print(stateless_login("tok-abc", "alice"))
+for server in ("app-1", "app-2", "app-7"):
+    print(handle_stateless(server, "tok-abc"))
+```
+
+```output
+session stored centrally under tok-abc
+app-1: serving alice
+app-2: serving alice
+app-7: serving alice
+```
+
+Now any instance answers, instances can be killed at will, and a deploy does not log anyone out.
+The cost is one network hop per request — which is why the session store is a cache (ch. 5), and
+why its availability is now part of your availability budget (ch. 2).
+
+### Where each kind of state should live
+
+| State | Put it in | Why |
+|---|---|---|
+| Session / auth | signed token or a shared cache | needed on every request, tiny, expires |
+| User data | the database | durable, queryable, transactional |
+| Uploads and media | object storage (ch. 9) | large, immutable, cheap |
+| Derived aggregates | cache or materialized view | rebuildable from the source |
+| In-flight work | a queue (ch. 8) | survives instance death, retryable |
+| WebSocket connection | the instance itself | genuinely unavoidable — plan for it |
+
+The last row is the honest exception: a live connection *is* server state. The pattern is to keep
+the connection on the instance and everything about it (subscriptions, presence, undelivered
+messages) in a shared store, so a dropped connection costs a reconnect, not data.
+
+### Signed tokens versus server-side sessions
+
+```python
+import hmac, hashlib, base64, json
+
+SECRET = b"signing-key"
+
+def issue(payload):
+    body = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True).encode()).decode()
+    sig = hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{body}.{sig}"
+
+def verify(token, now):
+    body, _, sig = token.partition(".")
+    if hmac.new(SECRET, body.encode(), hashlib.sha256).hexdigest()[:16] != sig:
+        return "invalid signature"
+    claims = json.loads(base64.urlsafe_b64decode(body))
+    return "expired" if claims["exp"] < now else f"ok: {claims['sub']} ({claims['role']})"
+
+tok = issue({"sub": "alice", "role": "admin", "exp": 1_700_000_600})
+print("token:", tok[:44], "...")
+print("verify at t=1700000000:", verify(tok, 1_700_000_000), "<- zero network calls")
+print("verify at t=1700000900:", verify(tok, 1_700_000_900))
+print("revoke alice right now :  impossible without a revocation list — the trade-off")
+```
+
+```output
+token: eyJleHAiOiAxNzAwMDAwNjAwLCAicm9sZSI6ICJhZG1p ...
+verify at t=1700000000: ok: alice (admin) <- zero network calls
+verify at t=1700000900: expired
+revoke alice right now :  impossible without a revocation list — the trade-off
+```
+
+A signed token needs no lookup, which makes it the fastest option and the hardest to revoke.
+The standard compromise: short-lived access tokens (minutes) plus a refresh token checked
+against a store, so revocation takes effect within one token lifetime.
+
+## Horizontal scaling has a ceiling: the Universal Scalability Law
+
+Doubling instances does not double throughput. Two effects fight you: **contention** (a serialized
+fraction, Amdahl) and **coherency** (nodes coordinating with each other, which gets *worse* with
+scale).
+
+$$
+C(N) = \frac{N}{1 + \sigma (N - 1) + \kappa N (N - 1)}
+$$
+
+with $\sigma$ the contention factor and $\kappa$ the coherency (crosstalk) factor.
+
+```python
+def usl(n, sigma, kappa):
+    return n / (1 + sigma * (n - 1) + kappa * n * (n - 1))
+
+print(f"{'nodes':>6} {'ideal':>8} {'sigma=.05':>11} {'+kappa=.001':>13}")
+for n in (1, 2, 4, 8, 16, 32, 64, 128):
+    print(f"{n:>6} {n:>8} {usl(n, 0.05, 0):>11.1f} {usl(n, 0.05, 0.001):>13.1f}")
+
+best = max(range(1, 200), key=lambda n: usl(n, 0.05, 0.001))
+print(f"\npeak throughput at N={best}; beyond that, adding nodes makes it SLOWER")
+```
+
+```output
+ nodes    ideal   sigma=.05   +kappa=.001
+     1        1         1.0           1.0
+     2        2         1.9           1.9
+     4        4         3.5           3.4
+     8        8         5.9           5.7
+    16       16         9.1           8.0
+    32       32        12.5           9.0
+    64       64        15.4           7.8
+   128      128        17.4           5.4
+
+peak throughput at N=31; beyond that, adding nodes makes it SLOWER
+```
+
+That last line is the one people do not expect: with any coherency cost at all, the curve has a
+maximum and then declines. Shared locks, a chatty cache-invalidation bus, and a single database
+all show up as $\kappa$ — which is why "just add servers" stops working, and why the fixes are
+architectural (shard, ch. 14; cache, ch. 5; queue, ch. 8) rather than numerical.
+
+## Autoscaling: the lag is the design problem
+
+```python
+def autoscale(load, instances, capacity_per_instance, boot_time_s, step_s=30,
+              target_util=0.7, cooldown_s=120):
+    pending, cooldown, log = [], 0, []
+    for t, demand in enumerate(load):
+        arrived = [b for b in pending if b <= t * step_s]      # instances that finished booting
+        instances += len(arrived)
+        pending = [b for b in pending if b > t * step_s]
+        served = min(demand, instances * capacity_per_instance)
+        util = demand / (instances * capacity_per_instance)
+        if util > target_util and cooldown <= 0:
+            add = max(1, int(demand / (capacity_per_instance * target_util)) - instances)
+            pending += [t * step_s + boot_time_s] * add
+            cooldown = cooldown_s
+        cooldown -= step_s
+        log.append((t * step_s, demand, instances, served, util))
+    return log
+
+spike = [1000] * 3 + [6000] * 6 + [1000] * 3        # traffic jumps 6x for 3 minutes
+for t, demand, inst, served, util in autoscale(spike, instances=2, capacity_per_instance=1000,
+                                               boot_time_s=90):
+    dropped = demand - served
+    print(f"t={t:4}s demand {demand:5} | instances {inst:2} | served {served:5} | "
+          f"util {util:5.0%} | dropped {dropped:5}")
+```
+
+```output
+t=   0s demand  1000 | instances  2 | served  1000 | util   50% | dropped     0
+t=  30s demand  1000 | instances  2 | served  1000 | util   50% | dropped     0
+t=  60s demand  1000 | instances  2 | served  1000 | util   50% | dropped     0
+t=  90s demand  6000 | instances  2 | served  2000 | util  300% | dropped  4000
+t= 120s demand  6000 | instances  2 | served  2000 | util  300% | dropped  4000
+t= 150s demand  6000 | instances  2 | served  2000 | util  300% | dropped  4000
+t= 180s demand  6000 | instances  8 | served  6000 | util   75% | dropped     0
+t= 210s demand  6000 | instances  8 | served  6000 | util   75% | dropped     0
+t= 240s demand  6000 | instances  8 | served  6000 | util   75% | dropped     0
+t= 270s demand  1000 | instances  8 | served  1000 | util   12% | dropped     0
+t= 300s demand  1000 | instances  9 | served  1000 | util   11% | dropped     0
+t= 330s demand  1000 | instances  9 | served  1000 | util   11% | dropped     0
+```
+
+Ninety seconds of boot time means the first ninety seconds of a spike are served by the capacity
+you already had — and everything above it is dropped or queued. Autoscaling is a **cost
+optimization, not an availability mechanism**. If you need to survive an instant 6x spike, you
+need headroom, a queue that absorbs it (ch. 8), or a rate limiter that sheds it (ch. 20).
+
+### Scale on the right signal
+
+```python
+signals = [
+    ("CPU utilization",   "cheap, lags for I/O-bound work, and is meaningless for async services"),
+    ("request rate",      "leading indicator; needs a known per-instance capacity"),
+    ("p99 latency",       "closest to the user, but it rises *after* you are already in trouble"),
+    ("queue depth / lag", "the best signal for worker pools: directly proportional to work owed"),
+    ("concurrent conns",  "the right signal for WebSocket and streaming tiers (ch. 3)"),
+]
+for name, note in signals:
+    print(f"{name:20} {note}")
+```
+
+```output
+CPU utilization      cheap, lags for I/O-bound work, and is meaningless for async services
+request rate         leading indicator; needs a known per-instance capacity
+p99 latency          closest to the user, but it rises *after* you are already in trouble
+queue depth / lag    the best signal for worker pools: directly proportional to work owed
+concurrent conns     the right signal for WebSocket and streaming tiers (ch. 3)
+```
+
+## Deploys and drains: the other half of statelessness
+
+An instance that can be created can be destroyed, and destroying one mid-request is how you
+turn a deploy into an incident.
+
+```python
+def rolling_deploy(total, batch, boot_s, drain_s, requests_per_s):
+    batches = -(-total // batch)
+    per_batch = boot_s + drain_s
+    capacity_lost = batch / total
+    print(f"{total} instances, batch {batch} -> {batches} batches x {per_batch}s "
+          f"= {batches * per_batch}s total")
+    print(f"   capacity during a batch: {1 - capacity_lost:.0%} "
+          f"-> can serve {requests_per_s * (1 - capacity_lost):,.0f} of {requests_per_s:,} rps")
+    print(f"   in-flight requests protected by the {drain_s}s connection drain")
+
+rolling_deploy(20, batch=2, boot_s=60, drain_s=30, requests_per_s=10_000)
+rolling_deploy(20, batch=10, boot_s=60, drain_s=30, requests_per_s=10_000)
+```
+
+```output
+20 instances, batch 2 -> 10 batches x 90s = 900s total
+   capacity during a batch: 90% -> can serve 9,000 of 10,000 rps
+   in-flight requests protected by the 30s connection drain
+20 instances, batch 10 -> 2 batches x 90s = 180s total
+   capacity during a batch: 50% -> can serve 5,000 of 10,000 rps
+   in-flight requests protected by the 30s connection drain
+```
+
+The graceful shutdown sequence is worth memorizing, because every framework implements the same
+four steps: **stop reporting ready** (so the load balancer stops sending new requests), **finish
+in-flight requests** (the drain window), **close connections**, **exit**. Skip the first step and
+the balancer keeps routing to a dying process for one health-check interval (ch. 3).
+
+## Try it Yourself
+
+```python
+def fleet_size(peak_rps, per_instance_rps, target_util=0.6, az_count=3, failure_domain=1):
+    """Size a fleet for peak load, target utilization, and the loss of one availability zone."""
+    needed = peak_rps / (per_instance_rps * target_util)
+    with_az_loss = needed * az_count / (az_count - failure_domain)
+    instances = -(-int(with_az_loss) // az_count) * az_count      # round up to a multiple of AZs
+    print(f"peak {peak_rps:>7,} rps | {needed:5.1f} bare minimum | "
+          f"{instances:3} instances ({instances//az_count} per AZ) survives losing 1 of {az_count} AZs")
+
+for rps in (5_000, 50_000, 500_000):
+    fleet_size(rps, per_instance_rps=800)
+print()
+for util in (0.4, 0.6, 0.85):
+    fleet_size(50_000, per_instance_rps=800, target_util=util)
+```
+
+```output
+peak   5,000 rps |  10.4 bare minimum |  15 instances (5 per AZ) survives losing 1 of 3 AZs
+peak  50,000 rps | 104.2 bare minimum | 156 instances (52 per AZ) survives losing 1 of 3 AZs
+peak 500,000 rps | 1041.7 bare minimum | 1563 instances (521 per AZ) survives losing 1 of 3 AZs
+
+peak  50,000 rps | 156.2 bare minimum | 234 instances (78 per AZ) survives losing 1 of 3 AZs
+peak  50,000 rps | 104.2 bare minimum | 156 instances (52 per AZ) survives losing 1 of 3 AZs
+peak  50,000 rps |  73.5 bare minimum | 111 instances (37 per AZ) survives losing 1 of 3 AZs
+```
+
+Raising target utilization from 60% to 85% cuts the fleet by a third and removes the headroom
+that absorbs a spike while new instances boot. That number — how full you run your servers — is
+the single biggest lever on both your cloud bill and your incident rate.
+
+## Exercise
+
+Model **queue-based autoscaling** for a worker pool: workers are scaled on queue depth rather
+than CPU, each takes 45 seconds to start, and each processes 20 messages per second. Given a
+burst of 500,000 messages arriving over 5 minutes with a steady baseline of 2,000 messages per
+second, compute how many workers the scaler adds, the peak backlog, and how long until the queue
+drains. Then compare against a fixed pool sized for peak.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def simulate(minutes=25, base_rate=2_000, burst_total=500_000, burst_minutes=5,
+             per_worker=20, boot_s=45, workers=120, scale=True, target_backlog_s=30):
+    backlog, pending, log, peak = 0, [], [], 0
+    for t in range(minutes * 60):
+        arrivals = base_rate + (burst_total / (burst_minutes * 60) if t < burst_minutes * 60 else 0)
+        ready = [w for w in pending if w <= t]
+        workers += len(ready)
+        pending = [w for w in pending if w > t]
+        capacity = workers * per_worker
+        backlog = max(0, backlog + arrivals - capacity)
+        peak = max(peak, backlog)
+        if scale and t % 30 == 0:                       # scaler runs every 30 s
+            wanted = (arrivals + backlog / target_backlog_s) / per_worker
+            if wanted > workers + len(pending):
+                add = int(wanted - workers - len(pending))
+                pending += [t + boot_s] * add
+        log.append((t, backlog, workers))
+    return log, peak, workers
+
+log, peak, final = simulate()
+drained = next((t for t, b, _ in log if t > 300 and b == 0), None)
+print(f"autoscaled: peak backlog {peak:>9,.0f} msgs | workers {120} -> {final} | "
+      f"queue empty at t={drained}s")
+
+log_f, peak_f, _ = simulate(scale=False, workers=120)
+print(f"fixed 120 : peak backlog {peak_f:>9,.0f} msgs | never scales | "
+      f"queue empty at t="
+      f"{next((t for t, b, _ in log_f if t > 300 and b == 0), 'never')}")
+
+log_p, peak_p, _ = simulate(scale=False, workers=200)
+print(f"fixed 200 : peak backlog {peak_p:>9,.0f} msgs | sized for peak, idle the rest of the day")
+print(f"\nthe scaler overshot to {final} workers because it sized to drain the backlog in 30 s;")
+print("raising target_backlog_s to 120 trades a slower drain for a smaller peak fleet")
+```
+
+```output
+autoscaled: peak backlog    57,000 msgs | workers 120 -> 277 | queue empty at t=301s
+fixed 120 : peak backlog   380,000 msgs | never scales | queue empty at t=1250
+fixed 200 : peak backlog         0 msgs | sized for peak, idle the rest of the day
+
+the scaler overshot to 277 workers because it sized to drain the backlog in 30 s;
+raising target_backlog_s to 120 trades a slower drain for a smaller peak fleet
+```
+
+The insight: queue depth is the *only* signal that directly measures work owed, so it produces
+scaling decisions the other signals cannot. CPU on a worker pool is near 100% whether the queue
+holds ten messages or ten million; latency tells you about work already finished. The backlog,
+divided by your target drain time, gives you the worker count in one line — and it degrades
+gracefully, because a queue that grows means delay, not errors (ch. 8). The remaining constraint
+is boot time: for the first 45 seconds of any burst you have exactly the capacity you already
+had, which is why the fixed-200 pool still wins on latency and loses badly on cost. The
+production answer is usually a floor sized for the baseline plus fast scaling on backlog, with
+the queue absorbing whatever the boot window cannot. Note the overshoot, too: a scaler that
+targets a 30-second drain briefly provisions *more* workers than the peak-sized fixed pool,
+because it is solving for backlog rather than arrival rate. The drain target is the knob — and
+it is the one place where "how stale may this data be?" becomes a number in a config file.
+</details>
