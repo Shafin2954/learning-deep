@@ -1,0 +1,402 @@
+---
+course: competition-ml
+chapter: 10-adversarial-validation
+title: "Adversarial Validation: Train and Test Drift"
+order: 10
+---
+
+## Ask a model whether train and test are the same
+
+Every validation scheme assumes the test set looks like the training set. Adversarial validation
+checks that assumption directly: label training rows 0, test rows 1, and try to tell them apart.
+If a classifier can, the two sets differ — and its feature importances name exactly how.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+rng = np.random.default_rng(0)
+n = 12_000
+day = np.sort(rng.integers(0, 400, n))                  # rows arrive over time
+f_stable = rng.normal(0, 1, n)
+f_drift = rng.normal(0, 1, n) + day / 250               # this feature shifts over time
+f_noise = rng.normal(0, 1, n)
+account_age = rng.integers(0, 900, n)
+
+logit = -0.4 + 0.9 * f_stable + 0.5 * f_drift - 0.001 * account_age
+y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+
+df = pd.DataFrame({"f_stable": f_stable, "f_drift": f_drift, "f_noise": f_noise,
+                   "account_age": account_age, "day": day})
+# the organiser splits by time: the last 30% of days are the test set
+cut = int(0.7 * n)
+train, test = df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
+y_train, y_test = y[:cut], y[cut:]
+print(f"train {len(train):,} rows (days {train['day'].min()}-{train['day'].max()}) | "
+      f"test {len(test):,} rows (days {test['day'].min()}-{test['day'].max()})")
+print(f"positive rate: train {y_train.mean():.3f} | test {y_test.mean():.3f}")
+```
+
+```output
+train 8,400 rows (days 0-279) | test 3,600 rows (days 279-399)
+positive rate: train 0.390 | test 0.475
+```
+
+## The adversarial classifier
+
+```python
+def adversarial_auc(train, test, features=None, k=4, seed=0, return_model=False):
+    features = list(features or train.columns)
+    X = pd.concat([train[features], test[features]], ignore_index=True)
+    is_test = np.concatenate([np.zeros(len(train)), np.ones(len(test))]).astype(int)
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    oof = np.zeros(len(X))
+    model = None
+    for tr, va in cv.split(X, is_test):
+        model = HistGradientBoostingClassifier(max_depth=4, random_state=0).fit(
+            X.iloc[tr], is_test[tr])
+        oof[va] = model.predict_proba(X.iloc[va])[:, 1]
+    auc = roc_auc_score(is_test, oof)
+    return (auc, oof, model, features) if return_model else auc
+
+auc_all = adversarial_auc(train, test)
+print(f"adversarial AUC using every column: {auc_all:.4f}")
+print(f"adversarial AUC without 'day'     : "
+      f"{adversarial_auc(train, test, [c for c in df.columns if c != 'day']):.4f}")
+print(f"adversarial AUC on stable columns : "
+      f"{adversarial_auc(train, test, ['f_stable', 'f_noise', 'account_age']):.4f}")
+```
+
+```output
+adversarial AUC using every column: 1.0000
+adversarial AUC without 'day'     : 0.7046
+adversarial AUC on stable columns : 0.5043
+```
+
+Read the scale, not just the number:
+
+- **0.50–0.55** — train and test are interchangeable. Random k-fold is fine.
+- **0.55–0.75** — a real shift. Find the features carrying it and decide what to do.
+- **> 0.90** — something separates the sets almost perfectly: usually a date, an ID, or a column
+  the organiser generated differently. Treat it as a bug in your feature set, not as drift.
+
+## Which features carry the drift?
+
+```python
+def drift_by_feature(train, test, k=4):
+    rows = []
+    for col in train.columns:
+        rows.append({"feature": col,
+                     "solo adversarial AUC": round(adversarial_auc(train, test, [col], k=k), 4),
+                     "train mean": round(float(train[col].mean()), 3),
+                     "test mean": round(float(test[col].mean()), 3)})
+    return pd.DataFrame(rows).sort_values("solo adversarial AUC", ascending=False)
+
+print(drift_by_feature(train, test).to_string(index=False))
+```
+
+```output
+    feature  solo adversarial AUC  train mean  test mean
+        day                1.0000     139.419    339.964
+    f_drift                0.7080       0.560      1.364
+account_age                0.5120     443.676    447.351
+   f_stable                0.5070       0.013      0.003
+    f_noise                0.4939       0.003     -0.019
+```
+
+A per-feature adversarial AUC is more useful than a distribution plot because it is a single
+comparable number for every column, whatever its type. Anything above about 0.55 on its own is a
+column whose distribution moved.
+
+## What to do about it
+
+There are four responses, and the right one depends on whether the drifting feature is *useful*.
+
+```python
+def model_score(features, sample_weight=None):
+    m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+        train[features], y_train, sample_weight=sample_weight)
+    return roc_auc_score(y_test, m.predict_proba(test[features])[:, 1])
+
+all_feats = list(df.columns)
+no_day = [c for c in all_feats if c != "day"]
+no_drift = [c for c in all_feats if c not in ("day", "f_drift")]
+print(f"{'feature set':>34} {'test AUC':>10} {'adversarial AUC':>17}")
+for name, feats in (("everything (incl. day)", all_feats),
+                    ("drop day", no_day),
+                    ("drop day and f_drift", no_drift)):
+    print(f"{name:>34} {model_score(feats):>10.4f} "
+          f"{adversarial_auc(train, test, feats):>17.4f}")
+```
+
+```output
+                       feature set   test AUC   adversarial AUC
+            everything (incl. day)     0.7379            1.0000
+                          drop day     0.7455            0.7046
+              drop day and f_drift     0.7127            0.5043
+```
+
+Dropping a drifting feature is only correct when it is not carrying signal. `day` is pure
+leakage — it identifies the split and cannot generalise forward — so it goes. `f_drift` genuinely
+predicts the target, so dropping it costs you.
+
+### Importance weighting: train on the rows that look like test
+
+Instead of dropping a feature, re-weight the *rows*. If $p(x)$ is the adversarial model's
+probability that a row is from the test set, the density-ratio weight is
+
+$$
+w(x) = \frac{p_{\text{test}}(x)}{p_{\text{train}}(x)} \approx \frac{p(x)}{1 - p(x)}
+$$
+
+```python
+auc_adv, oof, _, feats_used = adversarial_auc(train, test, no_day, return_model=True)
+p_train = np.clip(oof[:len(train)], 0.01, 0.99)
+w = p_train / (1 - p_train)
+w = w / w.mean()
+print(f"adversarial AUC (no day): {auc_adv:.4f}")
+print(f"weights: min {w.min():.3f} | median {np.median(w):.3f} | max {w.max():.3f}")
+print(f"rows with weight > 2: {(w > 2).mean():.1%}")
+print(f"\nunweighted test AUC : {model_score(no_day):.4f}")
+print(f"weighted test AUC   : {model_score(no_day, sample_weight=w):.4f}")
+print(f"clipped weights (<=5): {model_score(no_day, sample_weight=np.clip(w, 0, 5)):.4f}")
+```
+
+```output
+adversarial AUC (no day): 0.7046
+weights: min 0.023 | median 0.680 | max 14.896
+rows with weight > 2: 11.2%
+
+unweighted test AUC : 0.7455
+weighted test AUC   : 0.7450
+clipped weights (<=5): 0.7409
+```
+
+Weighting keeps every row but tilts the fit toward the ones that resemble the test set — and here
+it costs 0.0005 unclipped and 0.0046 clipped. Both are the wrong side of zero, which is the
+expected outcome for mild drift on a large training set: the bias you remove is smaller than the
+variance you add by concentrating the fit on 11% of the rows. The weight range explains why, with
+a maximum of 14.9 against a median of 0.68 — a handful of rows would carry the influence of
+twenty.
+
+Reach for importance weighting when the adversarial AUC is high *and* the training set is large
+enough to absorb the variance, and always measure it rather than assuming. Clip in any case: an
+unclipped density ratio can hand one row hundreds of times the influence of its neighbours.
+
+### Build a validation set that looks like the test set
+
+The most valuable use of adversarial validation is not fixing the model, it is fixing the
+*validation*. Rank the training rows by how test-like they are and validate on the top slice.
+
+```python
+order = np.argsort(-p_train)
+adv_val = order[:2_000]
+adv_tr = order[2_000:]
+random_val = np.random.default_rng(0).permutation(len(train))[:2_000]
+random_tr = np.setdiff1d(np.arange(len(train)), random_val)
+
+def local_fit(tr_idx, va_idx, feats=no_day):
+    m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+        train.iloc[tr_idx][feats], y_train[tr_idx])
+    return (roc_auc_score(y_train[va_idx], m.predict_proba(train.iloc[va_idx][feats])[:, 1]),
+            roc_auc_score(y_test, m.predict_proba(test[feats])[:, 1]))
+
+rand_val_auc, rand_test_auc = local_fit(random_tr, random_val)
+adv_val_auc, adv_test_auc = local_fit(adv_tr, adv_val)
+print(f"{'validation scheme':>26} {'local AUC':>11} {'true test AUC':>15} {'gap':>8}")
+print(f"{'random 2,000 rows':>26} {rand_val_auc:>11.4f} {rand_test_auc:>15.4f} "
+      f"{rand_val_auc - rand_test_auc:>+8.4f}")
+print(f"{'2,000 most test-like rows':>26} {adv_val_auc:>11.4f} {adv_test_auc:>15.4f} "
+      f"{adv_val_auc - adv_test_auc:>+8.4f}")
+```
+
+```output
+         validation scheme   local AUC   true test AUC      gap
+         random 2,000 rows      0.7389          0.7405  -0.0017
+ 2,000 most test-like rows      0.7154          0.7310  -0.0157
+```
+
+The number you want small is the **gap**, not the local AUC — and on this data the technique does
+not earn its keep: the random split's gap is -0.0017 against the test-like split's -0.0157. Two
+things are happening. Once `day` is gone the remaining drift is mild (adversarial AUC 0.70), so a
+random validation set was already representative enough; and pulling the 2,000 most test-like rows
+out of training removes exactly the rows most useful for predicting the test period, which drags
+the true test AUC down from 0.7405 to 0.7310.
+
+That trade-off is the rule, not an accident of this dataset. A test-like validation set is worth
+building when the adversarial AUC is high enough that a random split is genuinely misleading —
+above roughly 0.75 — and is a self-inflicted wound below that. Measure the gap both ways before
+committing, because every decision you make all week is a comparison against this set (ch. 2).
+
+## Adversarial validation finds leaks, too
+
+A column that separates train from test perfectly is usually not drift — it is an artefact.
+
+```python
+train_leak = train.copy()
+test_leak = test.copy()
+train_leak["submitted_at"] = np.arange(len(train))            # a row counter that survived
+test_leak["submitted_at"] = np.arange(len(train), len(train) + len(test))
+leak_auc = adversarial_auc(train_leak, test_leak, ["submitted_at"])
+print(f"adversarial AUC on 'submitted_at' alone: {leak_auc:.4f}")
+print("perfect separation => this column encodes the split itself, not the phenomenon")
+```
+
+```output
+adversarial AUC on 'submitted_at' alone: 1.0000
+perfect separation => this column encodes the split itself, not the phenomenon
+```
+
+This is the same check as ch. 1's leak audit, arrived at from the other direction: there you asked
+whether a column predicts the *target* suspiciously well, here whether it predicts the *split*.
+Run both.
+
+## Try it Yourself
+
+```python
+def adversarial_report(train, test, target_features=None, threshold=0.55):
+    feats = list(target_features or train.columns)
+    overall = adversarial_auc(train, test, feats)
+    verdict = ("distributions match; random k-fold is safe" if overall < 0.55 else
+               "real shift; weight rows or build a test-like validation set" if overall < 0.90
+               else "near-perfect separation; look for a split artefact before anything else")
+    print(f"overall adversarial AUC {overall:.4f} -> {verdict}\n")
+    per = drift_by_feature(train[feats], test[feats])
+    drifters = per[per["solo adversarial AUC"] > threshold]
+    print(f"{len(drifters)} feature(s) above {threshold}:")
+    print((drifters if len(drifters) else per.head(3)).to_string(index=False))
+
+adversarial_report(train, test)
+print()
+adversarial_report(train[["f_stable", "f_noise"]], test[["f_stable", "f_noise"]])
+```
+
+```output
+overall adversarial AUC 1.0000 -> near-perfect separation; look for a split artefact before anything else
+
+2 feature(s) above 0.55:
+feature  solo adversarial AUC  train mean  test mean
+    day                 1.000     139.419    339.964
+f_drift                 0.708       0.560      1.364
+
+overall adversarial AUC 0.5079 -> distributions match; random k-fold is safe
+
+0 feature(s) above 0.55:
+ feature  solo adversarial AUC  train mean  test mean
+f_stable                0.5070       0.013      0.003
+ f_noise                0.4939       0.003     -0.019
+```
+
+The second call is the control: two stable columns, adversarial AUC at chance, no action needed.
+Run this on every competition before you choose a CV scheme — it takes one minute and it decides
+which chapter of this course you need next.
+
+## Exercise
+
+Turn the diagnosis into a decision procedure. Given train and test, produce a plan that names the
+drifting features, decides for each whether to drop it or keep it (based on whether it pays on a
+test-like validation set), computes clipped importance weights, and reports the expected effect of
+each decision. Verify the plan against the true test score at the end.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def drift_plan(train, test, y_train, y_test, drift_threshold=0.55, weight_clip=5.0):
+    feats = list(train.columns)
+    overall = adversarial_auc(train, test, feats)
+    per = drift_by_feature(train, test)
+    drifters = per.loc[per["solo adversarial AUC"] > drift_threshold, "feature"].tolist()
+
+    # the honest test-like validation set: fitted on the adversarial model, no test labels used
+    _, oof, _, _ = adversarial_auc(train, test, feats, return_model=True)
+    p_tr = np.clip(oof[:len(train)], 0.01, 0.99)
+    order = np.argsort(-p_tr)
+    va_idx, tr_idx = order[:2_000], order[2_000:]
+
+    def val_score(cols, weights=None):
+        w = None if weights is None else weights[tr_idx]
+        m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+            train.iloc[tr_idx][cols], y_train[tr_idx], sample_weight=w)
+        return roc_auc_score(y_train[va_idx],
+                             m.predict_proba(train.iloc[va_idx][cols])[:, 1])
+
+    keep = list(feats)
+    decisions = []
+    base = val_score(keep)
+    for col in drifters:                       # drop only if the validation set says it pays
+        trial = [c for c in keep if c != col]
+        if not trial:
+            continue
+        s = val_score(trial)
+        verdict = "DROP" if s >= base else "KEEP"
+        decisions.append((col, round(per.set_index("feature").loc[col,
+                          "solo adversarial AUC"], 4), round(base, 4), round(s, 4), verdict))
+        if verdict == "DROP":
+            keep, base = trial, s
+
+    w = p_tr / (1 - p_tr)
+    w = np.clip(w / w.mean(), 0, weight_clip)
+    weighted = val_score(keep, weights=w)
+
+    print(f"overall adversarial AUC {overall:.4f} | drifting features {drifters}")
+    print(f"\n{'feature':>14} {'adv AUC':>9} {'val before':>11} {'val after':>10} {'action':>8}")
+    for col, a, b, c, v in decisions:
+        print(f"{col:>14} {a:>9.4f} {b:>11.4f} {c:>10.4f} {v:>8}")
+    print(f"\nfinal feature set: {keep}")
+    print(f"validation AUC unweighted {base:.4f} | weighted {weighted:.4f} -> "
+          f"{'USE weights' if weighted > base else 'skip weights'}")
+    return keep, w, weighted > base
+
+keep, weights, use_w = drift_plan(train, test, y_train, y_test)
+
+final_w = weights if use_w else None
+m = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+    train[keep], y_train, sample_weight=final_w)
+final_auc = roc_auc_score(y_test, m.predict_proba(test[keep])[:, 1])
+naive = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(
+    train, y_train)
+naive_auc = roc_auc_score(y_test, naive.predict_proba(test)[:, 1])
+print(f"\nTRUE test AUC, naive (everything, unweighted): {naive_auc:.4f}")
+print(f"TRUE test AUC, after the plan               : {final_auc:.4f} "
+      f"({final_auc - naive_auc:+.4f})")
+```
+
+```output
+overall adversarial AUC 1.0000 | drifting features ['day', 'f_drift']
+
+       feature   adv AUC  val before  val after   action
+           day    1.0000      0.7149     0.7337     DROP
+       f_drift    0.7080      0.7337     0.7037     KEEP
+
+final feature set: ['f_stable', 'f_drift', 'f_noise', 'account_age']
+validation AUC unweighted 0.7337 | weighted 0.7317 -> skip weights
+
+TRUE test AUC, naive (everything, unweighted): 0.7379
+TRUE test AUC, after the plan               : 0.7455 (+0.0076)
+```
+
+The plan works because it never asks "is this feature drifting?" on its own — it asks "does
+dropping this drifting feature improve a validation set that resembles the test data?", which is a
+question with an answer you can act on. `day` gets dropped because it is a split artefact with no
+transferable signal; a drifting feature that still predicts is kept, because moving distributions
+and useless features are different problems that happen to trip the same detector.
+
+Three properties worth preserving if you rebuild this. The validation set is chosen by the
+**adversarial model only** — no test labels are touched, so the whole procedure is legal in a
+competition where you have test features but no test targets. Decisions are made **sequentially
+against an updating baseline**, so two correlated drifting columns cannot both be dropped on the
+strength of the same evidence. And the weighting decision is made last and *tested*, rather than
+assumed: importance weights trade bias for variance, and on a large training set with mild drift
+that trade is often not worth taking.
+
+The limitation to keep in view: everything here assumes **covariate shift** — that $p(x)$ moved
+while $p(y \mid x)$ stayed put. Adversarial validation cannot see a change in the relationship
+itself, because it never looks at the labels. If the test period has a different label mechanism,
+the adversarial AUC can sit at a comfortable 0.52 while your model quietly falls apart, and the
+only defences are a time-ordered validation scheme (ch. 2) and the monitoring machinery from
+mlops ch. 7.
+</details>
