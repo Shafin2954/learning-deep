@@ -100,6 +100,11 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 13,
     badge: 'Ch 1 – 13',
   },
+  'competition-ml': {
+    tagline: '13 chapters: metric and leak audits, CV that matches the leaderboard, feature blocks, target encoding, anonymized-column archaeology, blending, stacking, hill climbing, pseudo-labeling, adversarial validation, and submission hygiene.',
+    chapters: 14,
+    badge: 'Ch 1 – 14',
+  },
   'system-design': {
     tagline: '30 chapters: consistent hashing, caching, Bloom filters, storage engines, replication, sharding, transactions, CAP, Raft, rate limiting, resilience, ML systems, and six case studies.',
     chapters: 31,
