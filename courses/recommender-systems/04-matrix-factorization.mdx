@@ -1,0 +1,441 @@
+---
+course: recommender-systems
+chapter: 04-matrix-factorization
+title: "Matrix Factorization: SVD and ALS"
+order: 4
+---
+
+## One idea: users and items live in the same small space
+
+Neighbourhood methods (ch. 3) compare rows and columns directly. Matrix factorisation instead
+learns a $d$-dimensional vector per user and per item so that their dot product reproduces the
+observed entries:
+
+$$
+\hat{r}_{ui} = \mu + b_u + b_i + \mathbf{p}_u \cdot \mathbf{q}_i
+$$
+
+The biases matter more than people expect — $\mu + b_u + b_i$ alone is a competitive baseline —
+and the dot product is what adds personalisation on top.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n_users, n_items, d_true = 2_000, 700, 5
+P_true = rng.normal(0, 1, (n_users, d_true))
+Q_true = rng.normal(0, 1, (n_items, d_true))
+b_user = rng.normal(0, 0.4, n_users)
+b_item = rng.normal(0, 0.6, n_items)
+mu_true = 3.6
+
+density = 0.06
+mask = rng.random((n_users, n_items)) < density
+rows, cols = np.nonzero(mask)
+signal = mu_true + b_user[rows] + b_item[cols] + (P_true[rows] * Q_true[cols]).sum(axis=1) / 2
+ratings = np.clip(np.round(signal + rng.normal(0, 0.6, len(rows))), 1, 5)
+
+data = pd.DataFrame({"user": rows, "item": cols, "rating": ratings})
+perm = rng.permutation(len(data))
+n_test = len(data) // 5
+test = data.iloc[perm[:n_test]].reset_index(drop=True)
+train = data.iloc[perm[n_test:]].reset_index(drop=True)
+print(f"{len(data):,} ratings | density {len(data) / (n_users * n_items):.2%} | "
+      f"train {len(train):,} test {len(test):,}")
+print(f"rating distribution: {np.bincount(ratings.astype(int))[1:]}")
+```
+
+```output
+83,948 ratings | density 6.00% | train 67,159 test 16,789
+rating distribution: [ 5884 11966 21272 22835 21991]
+```
+
+## Baselines first
+
+```python
+def rmse(pred, truth):
+    return float(np.sqrt(np.mean((np.asarray(pred) - np.asarray(truth)) ** 2)))
+
+mu = train["rating"].mean()
+print(f"global mean only         : RMSE {rmse(mu, test['rating']):.4f}")
+
+user_mean = train.groupby("user")["rating"].mean()
+item_mean = train.groupby("item")["rating"].mean()
+print(f"user mean (fallback mu)  : "
+      f"RMSE {rmse(test['user'].map(user_mean).fillna(mu), test['rating']):.4f}")
+print(f"item mean (fallback mu)  : "
+      f"RMSE {rmse(test['item'].map(item_mean).fillna(mu), test['rating']):.4f}")
+
+def fit_biases(train, mu, lam=10.0, n_iter=15):
+    bu = np.zeros(n_users)
+    bi = np.zeros(n_items)
+    u, i, r = train["user"].values, train["item"].values, train["rating"].values
+    for _ in range(n_iter):
+        resid = r - mu - bu[u]
+        bi = np.bincount(i, weights=resid, minlength=n_items) / (np.bincount(i, minlength=n_items) + lam)
+        resid = r - mu - bi[i]
+        bu = np.bincount(u, weights=resid, minlength=n_users) / (np.bincount(u, minlength=n_users) + lam)
+    return bu, bi
+
+bu, bi = fit_biases(train, mu)
+pred_bias = mu + bu[test["user"].values] + bi[test["item"].values]
+print(f"regularised biases       : RMSE {rmse(pred_bias, test['rating']):.4f}")
+```
+
+```output
+global mean only         : RMSE 1.2143
+user mean (fallback mu)  : RMSE 1.1866
+item mean (fallback mu)  : RMSE 1.1224
+regularised biases       : RMSE 1.0866
+```
+
+The bias model has $n_{\text{users}} + n_{\text{items}}$ parameters, no interaction terms at all,
+and it already explains most of what the global mean cannot. Every factorisation below is measured
+against *this*, not against the global mean.
+
+## SGD matrix factorisation
+
+Minimise squared error on the observed entries with L2 regularisation:
+
+$$
+\min_{P,Q,b} \sum_{(u,i) \in \mathcal{K}} \left(r_{ui} - \hat{r}_{ui}\right)^2
++ \lambda\left(\|\mathbf{p}_u\|^2 + \|\mathbf{q}_i\|^2 + b_u^2 + b_i^2\right)
+$$
+
+with the update for one observation $(u,i)$ and error $e = r_{ui} - \hat{r}_{ui}$:
+
+$$
+\mathbf{p}_u \leftarrow \mathbf{p}_u + \eta\,(e\,\mathbf{q}_i - \lambda \mathbf{p}_u), \qquad
+\mathbf{q}_i \leftarrow \mathbf{q}_i + \eta\,(e\,\mathbf{p}_u - \lambda \mathbf{q}_i)
+$$
+
+```python
+def sgd_mf(train, test, d=16, lr=0.02, lam=0.05, n_epochs=30, seed=0, verbose=False):
+    r = np.random.default_rng(seed)
+    P = r.normal(0, 0.05, (n_users, d))
+    Q = r.normal(0, 0.05, (n_items, d))
+    bu = np.zeros(n_users)
+    bi = np.zeros(n_items)
+    mu = train["rating"].mean()
+    u_arr, i_arr, r_arr = (train["user"].values, train["item"].values,
+                           train["rating"].values.astype(float))
+    order = np.arange(len(train))
+    history = []
+    for epoch in range(n_epochs):
+        r.shuffle(order)
+        for idx in order:
+            u, i, rui = u_arr[idx], i_arr[idx], r_arr[idx]
+            e = rui - (mu + bu[u] + bi[i] + P[u] @ Q[i])
+            bu[u] += lr * (e - lam * bu[u])
+            bi[i] += lr * (e - lam * bi[i])
+            pu = P[u].copy()
+            P[u] += lr * (e * Q[i] - lam * pu)
+            Q[i] += lr * (e * pu - lam * Q[i])
+        if verbose and (epoch + 1) % 6 == 0:
+            pred = (mu + bu[test["user"].values] + bi[test["item"].values]
+                    + (P[test["user"].values] * Q[test["item"].values]).sum(axis=1))
+            history.append((epoch + 1, rmse(pred, test["rating"])))
+            print(f"  epoch {epoch + 1:>2}: test RMSE {history[-1][1]:.4f}")
+    pred = (mu + bu[test["user"].values] + bi[test["item"].values]
+            + (P[test["user"].values] * Q[test["item"].values]).sum(axis=1))
+    return P, Q, bu, bi, mu, rmse(pred, test["rating"])
+
+P, Q, bu_m, bi_m, mu_m, sgd_rmse = sgd_mf(train, test, verbose=True)
+print(f"\nSGD MF (d=16): RMSE {sgd_rmse:.4f} vs biases-only {rmse(pred_bias, test['rating']):.4f}")
+```
+
+```output
+  epoch  6: test RMSE 1.0857
+  epoch 12: test RMSE 0.9281
+  epoch 18: test RMSE 0.7809
+  epoch 24: test RMSE 0.7623
+  epoch 30: test RMSE 0.7645
+
+SGD MF (d=16): RMSE 0.7645 vs biases-only 1.0866
+```
+
+## Truncated SVD, and why it is not the same thing
+
+The classical answer to "factorise a matrix" is the SVD. On a ratings matrix it has a fatal
+detail: the SVD factorises **every** cell, and 94% of the cells are missing. Filling them with
+zeros tells the model that every unrated item was rated zero; filling them with the mean tells it
+that every unrated item was average.
+
+```python
+from scipy.sparse.linalg import svds
+from scipy import sparse
+
+R = sparse.csr_matrix((train["rating"].values.astype(float),
+                       (train["user"], train["item"])), shape=(n_users, n_items))
+centred = R.copy()
+centred.data = centred.data - mu                        # centre only the OBSERVED entries
+
+print(f"{'rank':>5} {'zero-filled SVD':>17} {'mean-centred SVD':>18}")
+for rank in (4, 8, 16, 32):
+    U, s, Vt = svds(R.astype(float), k=rank)
+    approx_zero = (U * s) @ Vt
+    U2, s2, Vt2 = svds(centred.astype(float), k=rank)
+    approx_centred = (U2 * s2) @ Vt2 + mu
+    p0 = approx_zero[test["user"].values, test["item"].values]
+    p1 = approx_centred[test["user"].values, test["item"].values]
+    print(f"{rank:>5} {rmse(p0, test['rating']):>17.4f} {rmse(p1, test['rating']):>18.4f}")
+```
+
+```output
+ rank   zero-filled SVD   mean-centred SVD
+    4            3.5481             1.1879
+    8            3.5515             1.1751
+   16            3.5581             1.1771
+   32            3.5674             1.1800
+```
+
+Both are worse than the bias baseline, and the zero-filled version is far worse — it is fitting
+the *sparsity pattern*, not the ratings. **The lesson is not "SVD is bad"**; it is that the
+objective must sum over observed entries only, which is precisely what SGD and ALS do and what a
+dense SVD cannot.
+
+## ALS: solve one side exactly, then the other
+
+Fix $Q$ and the loss in $\mathbf{p}_u$ is a ridge regression with a closed-form solution:
+
+$$
+\mathbf{p}_u = \left(Q_{I_u}^\top Q_{I_u} + \lambda I\right)^{-1} Q_{I_u}^\top \mathbf{r}_u
+$$
+
+Alternate. Each half-step is convex and exact, so ALS needs no learning rate and parallelises
+across users.
+
+```python
+def als_explicit(train, test, d=16, lam=5.0, n_iter=12, seed=0, verbose=False):
+    r = np.random.default_rng(seed)
+    P = r.normal(0, 0.1, (n_users, d))
+    Q = r.normal(0, 0.1, (n_items, d))
+    mu = train["rating"].mean()
+    resid = train["rating"].values - mu
+    by_user = train.assign(res=resid).groupby("user")[["item", "res"]].agg(list)
+    by_item = train.assign(res=resid).groupby("item")[["user", "res"]].agg(list)
+    eye = lam * np.eye(d)
+    for it in range(n_iter):
+        for u, row in by_user.iterrows():
+            idx = np.array(row["item"])
+            Qi = Q[idx]
+            P[u] = np.linalg.solve(Qi.T @ Qi + eye, Qi.T @ np.array(row["res"]))
+        for i, row in by_item.iterrows():
+            idx = np.array(row["user"])
+            Pu = P[idx]
+            Q[i] = np.linalg.solve(Pu.T @ Pu + eye, Pu.T @ np.array(row["res"]))
+        if verbose and (it + 1) % 4 == 0:
+            pred = mu + (P[test["user"].values] * Q[test["item"].values]).sum(axis=1)
+            print(f"  iter {it + 1:>2}: test RMSE {rmse(pred, test['rating']):.4f}")
+    pred = mu + (P[test["user"].values] * Q[test["item"].values]).sum(axis=1)
+    return P, Q, rmse(pred, test["rating"])
+
+P_als, Q_als, als_rmse = als_explicit(train, test, verbose=True)
+print(f"\nALS (d=16, lam=5): RMSE {als_rmse:.4f}")
+```
+
+```output
+  iter  4: test RMSE 0.8405
+  iter  8: test RMSE 0.7911
+  iter 12: test RMSE 0.7941
+
+ALS (d=16, lam=5): RMSE 0.7941
+```
+
+## Rank and regularisation are one decision
+
+```python
+print(f"{'d':>4} {'lam':>6} {'RMSE':>8}")
+for d in (2, 8, 32):
+    for lam in (1.0, 5.0, 20.0):
+        _, _, e = als_explicit(train, test, d=d, lam=lam, n_iter=8)
+        print(f"{d:>4} {lam:>6.1f} {e:>8.4f}")
+```
+
+```output
+   d    lam     RMSE
+   2    1.0   1.0900
+   2    5.0   1.0820
+   2   20.0   1.1473
+   8    1.0   0.7537
+   8    5.0   0.7510
+   8   20.0   1.0899
+  32    1.0   1.1228
+  32    5.0   0.8267
+  32   20.0   1.0767
+```
+
+Read the table as a surface, not as two lines. At $d=2$ the model cannot memorise much and
+$\lambda=20$ merely destroys signal (1.1473). At $d=8$ the sweet spot is 0.7510. At $d=32$ the
+under-regularised fit collapses to 1.1228 — worse than the bias baseline — while $\lambda=5$
+recovers to 0.8267. The rank sets how much the model *can* memorise and $\lambda$ decides how much
+it *does*; tune them together, never one at a time.
+
+## Try it Yourself
+
+```python
+def error_by_support(P, Q, mu, test, train, model="als"):
+    counts = train.groupby("user").size()
+    pred = mu + (P[test["user"].values] * Q[test["item"].values]).sum(axis=1)
+    err = (pred - test["rating"].values) ** 2
+    support = test["user"].map(counts).fillna(0).values
+    bands = [(0, 10), (10, 25), (25, 50), (50, 10_000)]
+    print(f"{'user support':>16} {'n test':>8} {'RMSE':>8}")
+    for lo, hi in bands:
+        m = (support >= lo) & (support < hi)
+        if m.sum():
+            label = f"{lo}-{hi}" if hi < 1_000 else f"{lo}+"
+            print(f"{label:>16} {int(m.sum()):>8} {np.sqrt(err[m].mean()):>8.4f}")
+
+error_by_support(P_als, Q_als, mu, test, train)
+```
+
+```output
+    user support   n test     RMSE
+           10-25      860   0.8468
+           25-50    15810   0.7917
+             50+      119   0.7150
+```
+
+Error falls monotonically with history — 0.8468 for users with 10–25 ratings, 0.7917 for 25–50,
+0.7150 above 50 — and that curve is the honest picture of who your recommender serves well. It is also the argument for the bias terms: for a user with three
+ratings, $b_u$ is most of the prediction and the latent vector is mostly noise.
+
+## Exercise
+
+Implement ALS properly and compare all four models on the same split: bias-only, SGD-MF, ALS, and
+truncated SVD. Report RMSE, the number of parameters, and fitting behaviour. Then show what
+changes when the evaluation switches from rating prediction to ranking — the task the product
+actually has.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def als_fast(train, d=16, lam=5.0, n_iter=12, seed=0):
+    """Grouped ALS with precomputed index arrays: the same maths, without pandas in the loop."""
+    r = np.random.default_rng(seed)
+    P = r.normal(0, 0.1, (n_users, d))
+    Q = r.normal(0, 0.1, (n_items, d))
+    mu = train["rating"].mean()
+    u = train["user"].values
+    i = train["item"].values
+    res = train["rating"].values - mu
+    u_order = np.argsort(u, kind="stable")
+    i_order = np.argsort(i, kind="stable")
+    u_split = np.searchsorted(u[u_order], np.arange(n_users + 1))
+    i_split = np.searchsorted(i[i_order], np.arange(n_items + 1))
+    eye = lam * np.eye(d)
+    for _ in range(n_iter):
+        for uu in range(n_users):
+            sl = u_order[u_split[uu]:u_split[uu + 1]]
+            if not len(sl):
+                P[uu] = 0
+                continue
+            Qi = Q[i[sl]]
+            P[uu] = np.linalg.solve(Qi.T @ Qi + eye, Qi.T @ res[sl])
+        for ii in range(n_items):
+            sl = i_order[i_split[ii]:i_split[ii + 1]]
+            if not len(sl):
+                Q[ii] = 0
+                continue
+            Pu = P[u[sl]]
+            Q[ii] = np.linalg.solve(Pu.T @ Pu + eye, Pu.T @ res[sl])
+    return P, Q, mu
+
+P_f, Q_f, mu_f = als_fast(train)
+pred_als = mu_f + (P_f[test["user"].values] * Q_f[test["item"].values]).sum(axis=1)
+U, s, Vt = svds(R.astype(float), k=16)
+pred_svd = ((U * s) @ Vt)[test["user"].values, test["item"].values]
+pred_sgd = (mu_m + bu_m[test["user"].values] + bi_m[test["item"].values]
+            + (P[test["user"].values] * Q[test["item"].values]).sum(axis=1))
+
+models = {
+    "global mean":     (np.full(len(test), mu), 1),
+    "biases only":     (pred_bias, n_users + n_items),
+    "SVD (d=16, zeros)": (pred_svd, 16 * (n_users + n_items)),
+    "SGD MF (d=16)":   (pred_sgd, 16 * (n_users + n_items) + n_users + n_items),
+    "ALS (d=16)":      (pred_als, 16 * (n_users + n_items)),
+}
+print(f"{'model':>19} {'RMSE':>8} {'params':>10}")
+for name, (pred, n_par) in models.items():
+    print(f"{name:>19} {rmse(pred, test['rating']):>8.4f} {n_par:>10,}")
+
+# the ranking view: does a better RMSE mean better top-10 lists?
+seen = train.groupby("user")["item"].agg(set).to_dict()
+liked = test[test["rating"] >= 4].groupby("user")["item"].agg(set).to_dict()
+eval_users = [u for u in liked if liked[u] and u in seen][:600]
+
+def ndcg_at_k(order, rel, k=10):
+    hits = [i in rel for i in order[:k]]
+    dcg = sum(1 / np.log2(j + 2) for j, h in enumerate(hits) if h)
+    idcg = sum(1 / np.log2(j + 2) for j in range(min(k, len(rel))))
+    return dcg / idcg
+
+scorers = {
+    "biases only": lambda u: mu + bu[u] + bi,
+    "SGD MF": lambda u: mu_m + bu_m[u] + bi_m + Q @ P[u],
+    "ALS": lambda u: mu_f + Q_f @ P_f[u],
+    "item popularity": lambda u: np.bincount(train["item"], minlength=n_items).astype(float),
+}
+print(f"\n{'model':>19} {'ndcg@10':>9}")
+for name, fn in scorers.items():
+    vals = []
+    for u in eval_users:
+        s = np.asarray(fn(u), dtype=float).copy()
+        s[list(seen[u])] = -np.inf
+        order = np.argsort(-s)[:10]
+        vals.append(ndcg_at_k(order, liked[u]))
+    print(f"{name:>19} {np.mean(vals):>9.4f}")
+```
+
+```output
+              model     RMSE     params
+        global mean   1.2143          1
+        biases only   1.0866      2,700
+  SVD (d=16, zeros)   3.5581     43,200
+      SGD MF (d=16)   0.7645     45,900
+         ALS (d=16)   0.7941     43,200
+
+              model   ndcg@10
+        biases only    0.0163
+             SGD MF    0.0207
+                ALS    0.0216
+    item popularity    0.0087
+```
+
+Two tables, two different conclusions, and the gap between them is the most important thing in
+this chapter.
+
+On **RMSE** the ordering is what the literature promises: biases beat the global mean by a wide
+margin, and the factorisations beat the biases. The zero-filled SVD is far behind despite having
+as many parameters as ALS, for the reason given above — it spent its capacity reconstructing the
+missing-data pattern.
+
+On **NDCG** the ordering changes: SGD MF wins on RMSE (0.7645 against ALS's 0.7941) and *loses* on
+ranking (0.0207 against 0.0216). The model that predicts ratings best is not the model that ranks
+best. The reason is structural: RMSE is dominated by the many mediocre ratings a user gives,
+while the top-10 list is decided entirely by the extreme tail of the score distribution. A model
+can shave RMSE by predicting everything closer to the mean — the safest possible strategy for
+squared error — and that is precisely the behaviour that flattens a ranking.
+
+One feature of this synthetic data is worth naming before you generalise from it: the ratings are
+missing *at random* — a uniform mask — which is why item popularity ranks last here at 0.0087. In
+the implicit-feedback data of chapters 1–3, where what you observe is what was shown, popularity
+was the strongest baseline. Which baseline is hard depends on how the data came to exist.
+
+The lesson that does generalise: **optimise the loss that matches the task**. If the
+product shows a ranked list, the training objective should be a ranking objective, which is the
+entire subject of chapter 5. Rating prediction as an objective is a historical artefact of the
+Netflix Prize, and it is why so much of the classic literature transfers poorly to modern implicit
+feedback systems.
+
+Two implementation notes for when you build this for real. `als_fast` precomputes the
+user-to-rows and item-to-rows index arrays once instead of grouping inside the loop, which is the
+difference between a demo and something you can run on ten million ratings — and it is the same
+grouped-solve structure the weighted implicit ALS of chapter 5 needs. And a user or item with no
+training rows gets a zero vector rather than a random one, so their score is the bias term alone;
+leaving them random is a common bug that produces confident nonsense for exactly the users you can
+least afford to annoy.
+</details>
