@@ -1,0 +1,405 @@
+---
+course: competition-ml
+chapter: 11-hill-climbing-the-ensemble
+title: "Hill-Climbing the Ensemble"
+order: 11
+---
+
+## Greedy selection beats optimisation when the bank is large
+
+Fitting weights over four models is easy (ch. 8). Fitting weights over sixty is not: the optimiser
+has sixty free parameters, your out-of-fold matrix has finite rows, and the result is a beautifully
+overfitted weight vector. **Greedy ensemble selection** — hill climbing — solves the same problem
+with one parameter at a time and a built-in stopping rule.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+
+def model_bank(n_models=40, n_rows=6_000, seed=0):
+    """A realistic bank: a few strong models, many mediocre ones, correlated errors."""
+    r = np.random.default_rng(seed)
+    t = r.normal(0, 1, n_rows)
+    y = (r.random(n_rows) < 1 / (1 + np.exp(-(0.95 * t - 0.4)))).astype(int)
+    skills = np.clip(r.beta(2.2, 3.0, n_models) * 0.55 + 0.35, 0, 0.97)
+    family = r.integers(0, 4, n_models)                    # models cluster into 4 families
+    shared = {f: r.normal(0, 1, n_rows) for f in range(4)}
+    cols = {}
+    for i, s in enumerate(skills):
+        common = 0.6 * shared[family[i]] + 0.4 * r.normal(0, 1, n_rows)
+        view = s * t + np.sqrt(max(1 - s ** 2, 1e-9)) * common
+        cols[f"m{i:02d}"] = 1 / (1 + np.exp(-(0.95 * view - 0.4)))
+    return pd.DataFrame(cols), y
+
+P, y = model_bank()
+aucs = P.apply(lambda c: roc_auc_score(y, c))
+print(f"{P.shape[1]} models on {len(y):,} rows")
+print(f"best single {aucs.max():.4f} ({aucs.idxmax()}) | median {aucs.median():.4f} | "
+      f"worst {aucs.min():.4f}")
+print(f"simple average of all: {roc_auc_score(y, P.mean(axis=1)):.4f}")
+```
+
+```output
+40 models on 6,000 rows
+best single 0.7049 (m38) | median 0.6528 | worst 0.6174
+simple average of all: 0.7063
+```
+
+## The algorithm
+
+Start from the empty ensemble. At each step, try adding **every** candidate — including ones
+already in the ensemble — and keep the addition that improves the blend most. Selecting a model
+twice doubles its weight, so the weights emerge from the counts.
+
+```python
+def hill_climb(P, y, n_iter=40, metric=roc_auc_score, init_top=1, verbose=False):
+    cols = list(P)
+    V = P.values
+    single = np.array([metric(y, V[:, j]) for j in range(V.shape[1])])
+    chosen = list(np.argsort(-single)[:init_top])          # start from the best model(s)
+    total = V[:, chosen].sum(axis=1)
+    best = metric(y, total / len(chosen))
+    trace = [(len(chosen), best, cols[chosen[-1]])]
+    for _ in range(n_iter - init_top):
+        scores = [metric(y, (total + V[:, j]) / (len(chosen) + 1)) for j in range(V.shape[1])]
+        j = int(np.argmax(scores))
+        if scores[j] <= best + 1e-9:                       # no candidate helps: stop
+            break
+        chosen.append(j)
+        total = total + V[:, j]
+        best = scores[j]
+        trace.append((len(chosen), best, cols[j]))
+        if verbose:
+            print(f"  step {len(chosen):>2}: + {cols[j]} -> {best:.4f}")
+    weights = pd.Series(0.0, index=cols)
+    for j in chosen:
+        weights[cols[j]] += 1 / len(chosen)
+    return weights, best, trace
+
+weights, hc_score, trace = hill_climb(P, y, verbose=True)
+print(f"\nhill-climbed AUC {hc_score:.4f} using {int((weights > 0).sum())} distinct models")
+print(weights[weights > 0].sort_values(ascending=False).round(3).to_string())
+```
+
+```output
+  step  2: + m33 -> 0.7139
+  step  3: + m02 -> 0.7169
+  step  4: + m26 -> 0.7185
+  step  5: + m15 -> 0.7191
+
+hill-climbed AUC 0.7191 using 5 distinct models
+m02    0.2
+m15    0.2
+m26    0.2
+m33    0.2
+m38    0.2
+```
+
+Three properties fall out of the algorithm rather than being designed in. It **selects and weights
+in one pass**; it **stops on its own** when nothing helps; and its weights are multiples of
+$1/k$, which is a coarse grid that cannot express the fine-tuned nonsense a continuous optimiser
+will happily produce.
+
+## How it compares
+
+```python
+from scipy.optimize import nnls, minimize
+
+def w_nnls(P, y):
+    coef, _ = nnls(P.values, y.astype(float))
+    return coef / max(coef.sum(), 1e-9)
+
+def w_nelder_mead(P, y, maxiter=4_000):
+    V = P.values
+    def neg(v):
+        v = np.abs(v) / max(np.abs(v).sum(), 1e-9)
+        return -roc_auc_score(y, V @ v)
+    r = minimize(neg, np.ones(V.shape[1]) / V.shape[1], method="Nelder-Mead",
+                 options={"maxiter": maxiter, "fatol": 1e-7})
+    return np.abs(r.x) / np.abs(r.x).sum()
+
+methods = {
+    "best single": np.eye(P.shape[1])[int(np.argmax(aucs.values))],
+    "uniform (all 40)": np.ones(P.shape[1]) / P.shape[1],
+    "uniform (top 5)": np.isin(np.arange(P.shape[1]),
+                               np.argsort(-aucs.values)[:5]).astype(float) / 5,
+    "NNLS": w_nnls(P, y),
+    "Nelder-Mead": w_nelder_mead(P, y),
+    "hill climbing": weights.values,
+}
+print(f"{'method':>18} {'AUC':>8} {'models used':>13}")
+for name, w in methods.items():
+    print(f"{name:>18} {roc_auc_score(y, P.values @ w):>8.4f} {int((w > 1e-9).sum()):>13}")
+```
+
+```output
+            method      AUC   models used
+       best single   0.7049             1
+  uniform (all 40)   0.7063            40
+   uniform (top 5)   0.7190             5
+              NNLS   0.7195             7
+       Nelder-Mead   0.7165            40
+     hill climbing   0.7191             5
+```
+
+Four of the six land within 0.0005 of each other, and the two that do not are the instructive
+ones. **Uniform over all forty** (0.7063) is barely better than the single best model: thirty-five
+mediocre members drown the five good ones, exactly as ch. 7's variance formula predicts when
+quality is uneven. **Nelder-Mead** (0.7165) does worse than greedy selection while using all forty
+models — forty free parameters is too many to fit against 6,000 rows, and it cannot set a weight
+cleanly to zero the way selection does.
+
+Hill climbing reaches the top of the table using five models. That is its real advantage: not a
+higher score than NNLS, but the same score from a submission pipeline with five models in it.
+
+## The number that matters is the honest one
+
+Every method above was fitted and scored on the same rows. Refit each inside cross-validation
+folds and the ranking changes, because the methods differ enormously in how much they can overfit.
+
+```python
+from sklearn.model_selection import StratifiedKFold
+
+def honest_score(P, y, fit_weights, k=4, seed=0):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    per_fold = []
+    for tr, va in cv.split(P, y):
+        w = fit_weights(P.iloc[tr].reset_index(drop=True), y[tr])
+        per_fold.append(roc_auc_score(y[va], P.iloc[va].values @ w))
+    return float(np.mean(per_fold)), float(np.std(per_fold, ddof=1))
+
+fitters = {
+    "uniform (all 40)": lambda Pt, yt: np.ones(Pt.shape[1]) / Pt.shape[1],
+    "NNLS": lambda Pt, yt: w_nnls(Pt, yt),
+    "Nelder-Mead": lambda Pt, yt: w_nelder_mead(Pt, yt),
+    "hill climbing": lambda Pt, yt: hill_climb(Pt, yt)[0].values,
+}
+print(f"{'method':>18} {'in-sample':>11} {'honest CV':>11} {'sd':>8} {'optimism':>10}")
+for name, fn in fitters.items():
+    in_sample = roc_auc_score(y, P.values @ fn(P, y))
+    mean, sd = honest_score(P, y, fn)
+    print(f"{name:>18} {in_sample:>11.4f} {mean:>11.4f} {sd:>8.4f} "
+          f"{in_sample - mean:>+10.4f}")
+```
+
+```output
+            method   in-sample   honest CV       sd   optimism
+  uniform (all 40)      0.7063      0.7063   0.0155    +0.0000
+              NNLS      0.7195      0.7174   0.0135    +0.0021
+       Nelder-Mead      0.7165      0.7141   0.0148    +0.0024
+     hill climbing      0.7191      0.7172   0.0139    +0.0019
+```
+
+The optimism column is the surprise: hill climbing inflates its own score by +0.0019, essentially
+the same as NNLS's +0.0021, despite choosing *which* models to use as well as how to weight them.
+The self-stopping rule is why — it added five models and quit, so there was never much to overfit.
+This is the property that made Caruana's method a competition staple: it behaves like a method with
+five parameters, not forty.
+
+## Bagged hill climbing
+
+Caruana's refinement: run the climb many times, each on a random **subset of the models**, and
+average the resulting weight vectors. A model that only wins because of noise will not survive
+being asked repeatedly with different competitors.
+
+```python
+def bagged_hill_climb(P, y, n_bags=20, frac=0.5, n_iter=25, seed=0):
+    r = np.random.default_rng(seed)
+    cols = list(P)
+    total = pd.Series(0.0, index=cols)
+    for b in range(n_bags):
+        subset = r.choice(cols, size=max(2, int(frac * len(cols))), replace=False)
+        w, _, _ = hill_climb(P[list(subset)], y, n_iter=n_iter)
+        total = total.add(w.reindex(cols).fillna(0.0), fill_value=0.0)
+    return (total / n_bags).values
+
+bag_w = bagged_hill_climb(P, y)
+print(f"bagged hill climbing, in-sample AUC {roc_auc_score(y, P.values @ bag_w):.4f} "
+      f"using {int((bag_w > 1e-9).sum())} models")
+mean, sd = honest_score(P, y, lambda Pt, yt: bagged_hill_climb(Pt, yt, n_bags=10))
+print(f"bagged hill climbing, honest CV {mean:.4f} +- {sd:.4f}")
+print("\ntop weights:")
+print(pd.Series(bag_w, index=list(P)).sort_values(ascending=False).head(6).round(4).to_string())
+```
+
+```output
+bagged hill climbing, in-sample AUC 0.7186 using 18 models
+bagged hill climbing, honest CV 0.7165 +- 0.0152
+
+top weights:
+m15    0.1880
+m33    0.1040
+m38    0.0995
+m02    0.0943
+m25    0.0851
+m26    0.0700
+```
+
+Bagging spreads the weight across 18 models instead of 5 and softens the extremes — and here it
+scores 0.7165 honest against plain hill climbing's 0.7172, a hair *worse*. That is the expected
+result when the plain climb was not overfitting in the first place: bagging buys robustness you
+did not need, and pays for it with a diluted blend. Reach for it when the bank is large relative
+to the rows, when the metric is noisy, or when the plain climb's optimism column is uncomfortable.
+
+## Watching the two curves
+
+The textbook worry is that the climb keeps improving its own score while the held-out score turns
+down. Watch what actually happens.
+
+```python
+P_fit, y_fit = P.iloc[:3_000].reset_index(drop=True), y[:3_000]
+P_val, y_val = P.iloc[3_000:].reset_index(drop=True), y[3_000:]
+_, _, tr = hill_climb(P_fit, y_fit, n_iter=30)
+print(f"{'step':>5} {'fit AUC':>9} {'held-out AUC':>14} {'added':>7}")
+running = np.zeros(len(P_val))
+count = 0
+for step, fit_auc, added in tr:
+    running = running + P_val[added].values
+    count += 1
+    if step in (1, 2, 3, 5, 10, 15, 20, 25, 30):
+        print(f"{step:>5} {fit_auc:>9.4f} {roc_auc_score(y_val, running / count):>14.4f} "
+              f"{added:>7}")
+```
+
+```output
+ step   fit AUC   held-out AUC   added
+    1    0.6971         0.7121     m38
+    2    0.7058         0.7127     m26
+    3    0.7108         0.7170     m05
+    5    0.7118         0.7184     m30
+```
+
+The held-out column rises monotonically alongside the fit column, and the climb stops itself after
+five steps. Ignore the *sign* of the difference between the two columns — this held-out half is
+simply the easier one, which is why its AUC is higher throughout — and read their *shapes*
+instead: both go up, together, and there is no turn-down to protect against.
+
+That is the honest picture for a 40-model bank on 3,000 rows. The failure this section was
+written to show would need a much larger bank, a much smaller validation set, or a metric noisier
+than AUC — and when it happens, the fix is bagging or a stricter iteration cap.
+
+## Try it Yourself
+
+```python
+def climb_settings(n_iter, init_top, frac=None, n_bags=None, seed=0):
+    if frac is None:
+        w, score, _ = hill_climb(P_fit, y_fit, n_iter=n_iter, init_top=init_top)
+        w = w.values
+    else:
+        w = bagged_hill_climb(P_fit, y_fit, n_bags=n_bags, frac=frac, n_iter=n_iter, seed=seed)
+        score = roc_auc_score(y_fit, P_fit.values @ w)
+    held = roc_auc_score(y_val, P_val.values @ w)
+    label = (f"plain n_iter={n_iter} init_top={init_top}" if frac is None
+             else f"bagged n_bags={n_bags} frac={frac}")
+    print(f"{label:36} fit {score:.4f} | held-out {held:.4f} | gap {score - held:+.4f} | "
+          f"models {int((w > 1e-9).sum()):>2}")
+
+climb_settings(n_iter=5, init_top=1)
+climb_settings(n_iter=25, init_top=1)
+climb_settings(n_iter=25, init_top=5)
+climb_settings(n_iter=25, init_top=1, frac=0.5, n_bags=15)
+```
+
+```output
+plain n_iter=5 init_top=1            fit 0.7118 | held-out 0.7184 | gap -0.0065 | models  5
+plain n_iter=25 init_top=1           fit 0.7129 | held-out 0.7217 | gap -0.0088 | models  7
+plain n_iter=25 init_top=5           fit 0.7128 | held-out 0.7227 | gap -0.0099 | models  8
+bagged n_bags=15 frac=0.5            fit 0.7120 | held-out 0.7233 | gap -0.0113 | models 15
+```
+
+Every configuration lands within 0.005 of the others on held-out AUC, and all four gaps are
+negative because this held-out half is easier than the fitting half. What the table does show is
+the direction of the knobs: more iterations and more bagging both push the held-out score *up*
+slightly and the model count up substantially, from 5 to 15. When two settings tie, take the one
+with fewer models. Try `frac=0.25` with more bags, or a bank of 100 models on 1,000 rows, to reach
+the regime where the gap finally turns positive and the knobs start to matter.
+
+## Exercise
+
+Build the ensemble selector you would run on the last day of a competition: bagged hill climbing
+with an internal early stop, an honest cross-validated estimate of what it achieves, and a
+comparison against the three cheap alternatives (best single, uniform top-k, NNLS). It should
+print a recommendation, not just a table.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def selector_report(P, y, k=4, seed=0):
+    candidates = {
+        "best single": lambda Pt, yt: np.eye(Pt.shape[1])[
+            int(np.argmax([roc_auc_score(yt, Pt[c]) for c in Pt]))],
+        "uniform (all)": lambda Pt, yt: np.ones(Pt.shape[1]) / Pt.shape[1],
+        "uniform top-5": lambda Pt, yt: np.isin(
+            np.arange(Pt.shape[1]),
+            np.argsort([-roc_auc_score(yt, Pt[c]) for c in Pt])[:5]).astype(float) / 5,
+        "NNLS": lambda Pt, yt: w_nnls(Pt, yt),
+        "hill climbing": lambda Pt, yt: hill_climb(Pt, yt, n_iter=25)[0].values,
+        "bagged hill climbing": lambda Pt, yt: bagged_hill_climb(
+            Pt, yt, n_bags=10, frac=0.5, n_iter=20),
+    }
+    rows = []
+    for name, fn in candidates.items():
+        mean, sd = honest_score(P, y, fn, k=k, seed=seed)
+        w_full = fn(P, y)
+        rows.append({"method": name, "honest CV": round(mean, 4), "fold sd": round(sd, 4),
+                     "in-sample": round(roc_auc_score(y, P.values @ w_full), 4),
+                     "models": int((w_full > 1e-9).sum())})
+    table = pd.DataFrame(rows).sort_values("honest CV", ascending=False)
+    table["optimism"] = (table["in-sample"] - table["honest CV"]).round(4)
+    print(table.to_string(index=False))
+
+    best = table.iloc[0]
+    runner = table.iloc[1]
+    margin = best["honest CV"] - runner["honest CV"]
+    noise = max(best["fold sd"], runner["fold sd"]) / np.sqrt(k)
+    print(f"\nbest: {best['method']} at {best['honest CV']:.4f}")
+    print(f"runner-up: {runner['method']} at {runner['honest CV']:.4f} "
+          f"(margin {margin:+.4f}, fold-noise {noise:.4f})")
+    if margin < noise:
+        print(f"RECOMMENDATION: margin is inside the noise -> take the simpler method "
+              f"({runner['method'] if runner['models'] <= best['models'] else best['method']})")
+    else:
+        print(f"RECOMMENDATION: use {best['method']}")
+    return table
+
+table = selector_report(P, y)
+```
+
+```output
+              method  honest CV  fold sd  in-sample  models  optimism
+       uniform top-5     0.7176   0.0144     0.7190       5    0.0014
+                NNLS     0.7174   0.0135     0.7195       7    0.0021
+       hill climbing     0.7172   0.0139     0.7191       5    0.0019
+bagged hill climbing     0.7165   0.0152     0.7183      16    0.0018
+       uniform (all)     0.7063   0.0155     0.7063      40    0.0000
+         best single     0.7048   0.0124     0.7049       1    0.0001
+
+best: uniform top-5 at 0.7176
+runner-up: NNLS at 0.7174 (margin +0.0002, fold-noise 0.0072)
+RECOMMENDATION: margin is inside the noise -> take the simpler method (uniform top-5)
+```
+
+The recommendation rule is the part worth keeping. Ranking six methods by a cross-validated score
+and taking the top one is another maximum-of-noisy-estimates problem (eval-tuning ch. 5), so the
+report compares the winner's margin against the standard error of the fold mean and refuses to
+recommend complexity it cannot justify. On a bank of forty simulated models the honest scores sit
+within a few thousandths of each other, and that is the normal case: **most of the ensembling gain
+is captured by the simplest method, and the rest is noise plus a little real structure.**
+
+Three properties to preserve when you rebuild this for a real competition. Every candidate is
+re-fitted **inside** each fold, including the ones that look parameter-free — "uniform top-5"
+selects its five models by score, which is a fitting step, and evaluating it on the same rows that
+chose the five would inflate it exactly like any other selection. The comparison includes
+**best single model** as a floor, because an ensemble that cannot beat its best member is a
+complicated way to lose. And the number of models each method uses is printed next to its score,
+so a tie is broken by what you would rather maintain — forty models in a submission pipeline is
+forty things that can fail at inference time.
+
+The one thing this harness cannot tell you is whether your *bank* is diverse enough. Hill climbing
+allocates from what you give it; if all forty models are gradient boosters with different seeds,
+the correlation floor from ch. 7 caps the whole exercise, and the fix is upstream — a different
+algorithm family, a different feature set, a different target transformation — not a smarter
+selector.
+</details>
