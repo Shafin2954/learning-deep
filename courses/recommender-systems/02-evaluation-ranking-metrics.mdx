@@ -1,0 +1,463 @@
+---
+course: recommender-systems
+chapter: 02-evaluation-ranking-metrics
+title: "Evaluation: NDCG, MAP, Recall@k, Temporal Splits"
+order: 2
+---
+
+## Metrics for lists, not for cells
+
+A recommender is judged on an ordered list of length $k$. That changes what a metric has to do:
+reward hits, reward them more when they are near the top, and ignore everything past the cutoff.
+Four metrics cover almost every paper and product dashboard, and they disagree in ways worth
+knowing.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n_users, n_items = 2_500, 900
+user_taste = rng.normal(0, 1, (n_users, 4))
+genre = rng.integers(0, 6, n_items)                       # items cluster into 6 genres
+genre_centre = rng.normal(0, 1.4, (6, 4))
+item_style = genre_centre[genre] + rng.normal(0, 0.35, (n_items, 4))
+activity = rng.lognormal(-0.4, 1.0, n_users)
+exposure = rng.lognormal(-1.0, 1.7, n_items) * np.where(genre == 0, 4.0, 1.0)  # genre 0 is mainstream
+
+months = []
+for month in range(12):
+    user_taste = user_taste + rng.normal(0, 0.25, (n_users, 4))
+    logit = (user_taste @ item_style.T / 2 - 4.0
+             + np.log(activity)[:, None] + np.log(exposure)[None, :])
+    r, c = np.nonzero(rng.random((n_users, n_items)) < 1 / (1 + np.exp(-logit)) / 12)
+    months.append(pd.DataFrame({"user": r, "item": c,
+                                "ts": month * 30 + rng.integers(0, 30, len(r))}))
+events = pd.concat(months).sort_values("ts").reset_index(drop=True)
+
+cut = events["ts"].max() - 60
+train, test = events[events["ts"] <= cut], events[events["ts"] > cut]
+seen = {u: set(g) for u, g in train.groupby("user")["item"]}
+truth = {u: set(g) for u, g in test.groupby("user")["item"]}
+eval_users = [u for u in truth if truth[u] and u in seen]
+print(f"{len(events):,} interactions | train {len(train):,} | test {len(test):,}")
+print(f"evaluable users (seen in train, have test items): {len(eval_users):,}")
+print(f"test items per user: median {np.median([len(truth[u]) for u in eval_users]):.0f}")
+```
+
+```output
+126,503 interactions | train 103,416 | test 23,087
+evaluable users (seen in train, have test items): 2,381
+test items per user: median 7
+```
+
+The `u in seen` filter is not cosmetic. A user with no training history cannot be personalised for,
+so including them measures your cold-start policy (ch. 9), not your model — decide which you are
+reporting.
+
+## The four metrics, from their definitions
+
+For a user with relevant set $R$ and a ranked list $\hat{L} = (i_1, \dots, i_k)$:
+
+$$
+\mathrm{Precision@}k = \frac{|\hat{L} \cap R|}{k}, \qquad
+\mathrm{Recall@}k = \frac{|\hat{L} \cap R|}{\min(k, |R|)}
+$$
+
+$$
+\mathrm{AP@}k = \frac{1}{\min(k,|R|)}\sum_{j=1}^{k} \mathbb{1}[i_j \in R]\cdot \mathrm{Precision@}j,
+\qquad
+\mathrm{NDCG@}k = \frac{\sum_{j=1}^{k} \frac{2^{g_j} - 1}{\log_2(j+1)}}{\mathrm{IDCG@}k}
+$$
+
+```python
+def precision_at_k(rec, rel, k):
+    return len(set(rec[:k]) & rel) / k
+
+def recall_at_k(rec, rel, k):
+    return len(set(rec[:k]) & rel) / min(k, len(rel))
+
+def average_precision(rec, rel, k):
+    hits, score = 0, 0.0
+    for j, item in enumerate(rec[:k], start=1):
+        if item in rel:
+            hits += 1
+            score += hits / j
+    return score / min(k, len(rel))
+
+def ndcg_at_k(rec, rel, k, gains=None):
+    gains = gains or {}
+    dcg = sum((2 ** gains.get(i, 1.0) - 1) / np.log2(j + 1)
+              for j, i in enumerate(rec[:k], start=1) if i in rel)
+    ideal = sorted((gains.get(i, 1.0) for i in rel), reverse=True)[:k]
+    idcg = sum((2 ** g - 1) / np.log2(j + 1) for j, g in enumerate(ideal, start=1))
+    return dcg / idcg if idcg else 0.0
+
+def reciprocal_rank(rec, rel, k):
+    for j, item in enumerate(rec[:k], start=1):
+        if item in rel:
+            return 1.0 / j
+    return 0.0
+
+rel = {"a", "b", "c"}
+lists = {"perfect":        ["a", "b", "c", "x", "y"],
+         "hits at the end": ["x", "y", "a", "b", "c"],
+         "one at the top":  ["a", "x", "y", "z", "w"],
+         "one at the end":  ["x", "y", "z", "w", "a"]}
+print(f"{'list':>17} {'P@5':>6} {'R@5':>6} {'AP@5':>7} {'NDCG@5':>8} {'MRR':>6}")
+for name, rec in lists.items():
+    print(f"{name:>17} {precision_at_k(rec, rel, 5):>6.3f} {recall_at_k(rec, rel, 5):>6.3f} "
+          f"{average_precision(rec, rel, 5):>7.3f} {ndcg_at_k(rec, rel, 5):>8.3f} "
+          f"{reciprocal_rank(rec, rel, 5):>6.3f}")
+```
+
+```output
+             list    P@5    R@5    AP@5   NDCG@5    MRR
+          perfect  0.600  1.000   1.000    1.000  1.000
+  hits at the end  0.600  1.000   0.478    0.618  0.333
+   one at the top  0.200  0.333   0.333    0.469  1.000
+   one at the end  0.200  0.333   0.067    0.182  0.200
+```
+
+Read row two against row one: precision and recall cannot tell them apart, because both contain
+all three relevant items within the cutoff. AP, NDCG and MRR can. **If position matters in your
+product, you need a position-aware metric**, and if it does not — a grid where everything is
+visible at once — recall@k is the honest choice and the rank-aware metrics are measuring something
+the user never experiences.
+
+## Choosing $k$, and what happens when you do not
+
+```python
+def evaluate(recommend, users, k, metrics=("recall", "ndcg", "map", "mrr")):
+    out = {m: [] for m in metrics}
+    for u in users:
+        rec = list(recommend(u, k))
+        rel = truth[u]
+        if "recall" in out: out["recall"].append(recall_at_k(rec, rel, k))
+        if "ndcg" in out:   out["ndcg"].append(ndcg_at_k(rec, rel, k))
+        if "map" in out:    out["map"].append(average_precision(rec, rel, k))
+        if "mrr" in out:    out["mrr"].append(reciprocal_rank(rec, rel, k))
+    return {m: float(np.mean(v)) for m, v in out.items()}
+
+pop = np.zeros(n_items)
+np.add.at(pop, train["item"].values, 1.0)
+pop_order = np.argsort(-pop)
+
+def popular_rec(u, k):
+    out = []
+    for i in pop_order:
+        if i not in seen.get(u, ()):
+            out.append(int(i))
+            if len(out) == k:
+                break
+    return out
+
+sample_users = eval_users[:1_200]
+print(f"{'k':>4} {'recall@k':>10} {'ndcg@k':>9} {'map@k':>8} {'mrr@k':>8}")
+for k in (1, 5, 10, 20, 50):
+    m = evaluate(popular_rec, sample_users, k)
+    print(f"{k:>4} {m['recall']:>10.4f} {m['ndcg']:>9.4f} {m['map']:>8.4f} {m['mrr']:>8.4f}")
+```
+
+```output
+   k   recall@k    ndcg@k    map@k    mrr@k
+   1     0.0850    0.0850   0.0850   0.0850
+   5     0.0816    0.0784   0.0446   0.1497
+  10     0.0937    0.0823   0.0390   0.1681
+  20     0.1397    0.1008   0.0412   0.1812
+  50     0.2482    0.1411   0.0479   0.1875
+```
+
+Recall rises with $k$ by construction and MRR barely moves — they are answering different
+questions. **Fix $k$ to the number of slots your product actually has** before you compare
+anything, and never compare a recall@50 from one experiment to a recall@10 from another.
+
+## Beyond accuracy: coverage, novelty, diversity
+
+```python
+def catalogue_metrics(recommend, users, k=10):
+    shown, novelty, all_lists = set(), [], []
+    total = pop.sum()
+    for u in users:
+        rec = list(recommend(u, k))
+        all_lists.append(rec)
+        shown.update(rec)
+        novelty.extend(-np.log2((pop[rec] + 1) / total))
+    style = item_style / np.linalg.norm(item_style, axis=1, keepdims=True)
+    diversity = []
+    for rec in all_lists[:300]:                    # mean pairwise cosine: lower is more diverse
+        V = style[rec]
+        sims = V @ V.T
+        diversity.append(float((sims.sum() - len(rec)) / (len(rec) * (len(rec) - 1))))
+    return {"coverage": round(len(shown) / n_items, 4),
+            "novelty (bits)": round(float(np.mean(novelty)), 3),
+            "intra-list similarity": round(float(np.mean(diversity)), 3)}
+
+def random_rec(u, k, r=np.random.default_rng(1)):
+    return r.choice(n_items, size=k, replace=False)
+
+print(f"popularity: {catalogue_metrics(popular_rec, sample_users)}")
+print(f"random    : {catalogue_metrics(random_rec, sample_users)}")
+```
+
+```output
+popularity: {'coverage': 0.03, 'novelty (bits)': 7.032, 'intra-list similarity': 0.253}
+random    : {'coverage': 1.0, 'novelty (bits)': 10.979, 'intra-list similarity': 0.09}
+```
+
+Popularity beats random on accuracy by 6x and loses on every one of these: it shows **3% of the
+catalogue**, its items are 4 bits less surprising, and its lists are nearly three times as
+internally similar (0.253 against 0.090) because the mainstream genre dominates the head. That
+trade-off is the entire reason production systems do not simply ship the popularity list — a
+recommender that shows 3% of the catalogue starves the other 97%, which is the feedback loop from
+ch. 1 and the reason chapter 11's bandits exist.
+
+## Sampled metrics do not preserve the ranking of models
+
+Scoring every user against all items is expensive, so a common shortcut is to rank the true item
+against 100 random negatives. **That shortcut changes which model wins.**
+
+```python
+def full_rank_of_truth(scores, u, target):
+    order = np.argsort(-scores)
+    known = seen.get(u, set()) - {target}          # the target itself is never filtered out
+    order = [i for i in order if i not in known]
+    return order.index(target) + 1
+
+def sampled_rank_of_truth(scores, u, target, n_neg=100, r=None):
+    r = r or np.random.default_rng(0)
+    cands = r.choice(n_items, size=n_neg, replace=False)
+    known = seen.get(u, set()) - {target}
+    cands = np.array([c for c in cands if c != target and c not in known])
+    return int((scores[cands] > scores[target]).sum()) + 1
+
+model_a = (user_taste @ item_style.T / 2                 # the true generating score
+           + np.log(exposure)[None, :])
+model_b = np.tile(np.log(pop + 1), (n_users, 1))          # popularity only
+rows = []
+r = np.random.default_rng(2)
+for name, S in (("personalised", model_a), ("popularity", model_b)):
+    full_hits, samp_hits = [], []
+    for u in sample_users[:400]:
+        target = next(iter(truth[u]))
+        full_hits.append(full_rank_of_truth(S[u], u, target) <= 10)
+        samp_hits.append(sampled_rank_of_truth(S[u], u, target, r=r) <= 10)
+    rows.append({"model": name, "HR@10 (full catalogue)": round(float(np.mean(full_hits)), 4),
+                 "HR@10 (100 sampled negatives)": round(float(np.mean(samp_hits)), 4)})
+print(pd.DataFrame(rows).to_string(index=False))
+```
+
+```output
+       model  HR@10 (full catalogue)  HR@10 (100 sampled negatives)
+personalised                  0.1900                          0.670
+  popularity                  0.1125                          0.455
+```
+
+Both columns favour the personalised model here, but look at the *sizes*: on the full catalogue it
+leads 0.1900 to 0.1125, a 69% relative gap; against 100 sampled negatives the gap shrinks to 0.670
+against 0.455, or 47%. Sampling replaces "beat 899 items" with "beat 100 random items", and random
+items are mostly unpopular, so every model looks good and the differences between them compress.
+Push the sample smaller and the ordering itself can flip — the published result (Krichene and
+Rendle, 2020) is that sampled metrics are not consistent estimators of the full-catalogue ones. Use the full catalogue for anything you will make a decision on; if
+you must sample, sample the same way for every model and never compare across papers that
+sampled differently.
+
+## Temporal splitting schemes
+
+```python
+def global_cut(events, days=60):
+    c = events["ts"].max() - days
+    return events[events["ts"] <= c], events[events["ts"] > c]
+
+def leave_last_n(events, n=2):
+    ranked = events.sort_values("ts").groupby("user").cumcount(ascending=False)
+    return events[ranked >= n], events[ranked < n]
+
+def sliding(events, n_folds=3, days=30):
+    end = events["ts"].max()
+    for f in range(n_folds, 0, -1):
+        c = end - f * days
+        yield events[events["ts"] <= c], events[(events["ts"] > c) & (events["ts"] <= c + days)]
+
+for name, (tr, te) in (("global time cut", global_cut(events)),
+                       ("leave-last-2", leave_last_n(events))):
+    users = te["user"].nunique()
+    print(f"{name:>16}: train {len(tr):>7,} | test {len(te):>6,} | test users {users:>5,} | "
+          f"test items per user {len(te) / users:.2f}")
+for i, (tr, te) in enumerate(sliding(events)):
+    print(f"   sliding fold {i}: train {len(tr):>7,} | test {len(te):>6,}")
+```
+
+```output
+ global time cut: train 103,416 | test 23,087 | test users 2,382 | test items per user 9.69
+    leave-last-2: train 121,514 | test  4,989 | test users 2,498 | test items per user 2.00
+   sliding fold 0: train  92,081 | test 11,335
+   sliding fold 1: train 103,416 | test 11,444
+   sliding fold 2: train 114,860 | test 11,643
+```
+
+`global_cut` matches production — one model, one moment, everything after it is the future.
+`leave_last_n` gives every user the same weight and is the standard in sequential-recommendation
+papers (ch. 8), but it trains on some users' futures while testing others' pasts. `sliding` gives
+you several folds and therefore an error bar, which is the only one of the three that lets you say
+whether a difference is real.
+
+## Try it Yourself
+
+```python
+def full_report(recommend, users, k=10, n_boot=200, seed=0):
+    per_user = []
+    for u in users:
+        rec = list(recommend(u, k))
+        per_user.append((recall_at_k(rec, truth[u], k), ndcg_at_k(rec, truth[u], k)))
+    arr = np.array(per_user)
+    r = np.random.default_rng(seed)
+    boots = [arr[r.integers(0, len(arr), len(arr))].mean(axis=0) for _ in range(n_boot)]
+    lo, hi = np.percentile(boots, [2.5, 97.5], axis=0)
+    cat = catalogue_metrics(recommend, users, k)
+    print(f"recall@{k} {arr[:, 0].mean():.4f} [{lo[0]:.4f}, {hi[0]:.4f}] | "
+          f"ndcg@{k} {arr[:, 1].mean():.4f} [{lo[1]:.4f}, {hi[1]:.4f}] | "
+          f"coverage {cat['coverage']:.3f} | novelty {cat['novelty (bits)']:.2f}")
+
+print("popularity")
+full_report(popular_rec, sample_users)
+print("random")
+full_report(random_rec, sample_users)
+```
+
+```output
+popularity
+recall@10 0.0937 [0.0807, 0.1009] | ndcg@10 0.0823 [0.0717, 0.0891] | coverage 0.030 | novelty 7.03
+random
+recall@10 0.0143 [0.0114, 0.0171] | ndcg@10 0.0131 [0.0102, 0.0158] | coverage 1.000 | novelty 10.98
+```
+
+The confidence interval is what stops you shipping noise: with 1,200 users the interval on
+recall@10 spans about 0.020, so a "+0.005 improvement" from a new model is not one.
+Change `k`, or slice `sample_users` down to 200, and watch the interval widen.
+
+## Exercise
+
+Build the evaluation harness the rest of the course will use: it takes a scoring function, ranks
+the full catalogue with seen-item filtering, and reports recall, NDCG, MAP and MRR at several $k$
+with bootstrap intervals, plus coverage and novelty — and it compares two models with a paired
+test over users, so "better" is a claim you can defend.
+
+<details>
+<summary>Solution</summary>
+
+```python
+class RankingEvaluator:
+    def __init__(self, seen, truth, n_items, users=None, item_pop=None):
+        self.seen, self.truth, self.n_items = seen, truth, n_items
+        self.users = users or [u for u in truth if truth[u] and u in seen]
+        self.pop = item_pop
+
+    def rank(self, scores_for_user, k):
+        """Full-catalogue ranking with seen filtering. scores_for_user: (n_items,) array."""
+        out = {}
+        for u in self.users:
+            s = np.asarray(scores_for_user(u), dtype=float).copy()
+            known = list(self.seen.get(u, ()))
+            if known:
+                s[known] = -np.inf
+            out[u] = np.argpartition(-s, min(k, len(s) - 1))[:k]
+            out[u] = out[u][np.argsort(-s[out[u]])].tolist()
+        return out
+
+    def score(self, scores_for_user, ks=(5, 10, 20), n_boot=200, seed=0):
+        rows, per_user = [], {}
+        for k in ks:
+            lists = self.rank(scores_for_user, k)
+            vals = np.array([[recall_at_k(lists[u], self.truth[u], k),
+                              ndcg_at_k(lists[u], self.truth[u], k),
+                              average_precision(lists[u], self.truth[u], k),
+                              reciprocal_rank(lists[u], self.truth[u], k)]
+                             for u in self.users])
+            per_user[k] = vals
+            r = np.random.default_rng(seed)
+            boots = np.array([vals[r.integers(0, len(vals), len(vals))].mean(axis=0)
+                              for _ in range(n_boot)])
+            lo, hi = np.percentile(boots, [2.5, 97.5], axis=0)
+            shown = {i for u in self.users for i in lists[u]}
+            rows.append({"k": k,
+                         "recall": round(vals[:, 0].mean(), 4),
+                         "recall 95% CI": f"[{lo[0]:.4f}, {hi[0]:.4f}]",
+                         "ndcg": round(vals[:, 1].mean(), 4),
+                         "map": round(vals[:, 2].mean(), 4),
+                         "mrr": round(vals[:, 3].mean(), 4),
+                         "coverage": round(len(shown) / self.n_items, 4)})
+        return pd.DataFrame(rows), per_user
+
+    def compare(self, a, b, k=10, seed=0, n_boot=500):
+        la, lb = self.rank(a, k), self.rank(b, k)
+        da = np.array([ndcg_at_k(la[u], self.truth[u], k) for u in self.users])
+        db = np.array([ndcg_at_k(lb[u], self.truth[u], k) for u in self.users])
+        d = da - db
+        r = np.random.default_rng(seed)
+        boots = np.array([d[r.integers(0, len(d), len(d))].mean() for _ in range(n_boot)])
+        lo, hi = np.percentile(boots, [2.5, 97.5])
+        verdict = "A better" if lo > 0 else "B better" if hi < 0 else "indistinguishable"
+        return {"ndcg_a": round(float(da.mean()), 4), "ndcg_b": round(float(db.mean()), 4),
+                "mean_diff": round(float(d.mean()), 4),
+                "95% CI": (round(float(lo), 4), round(float(hi), 4)),
+                "users_where_a_wins": float((d > 0).mean()), "verdict": verdict}
+
+ev = RankingEvaluator(seen, truth, n_items, users=sample_users, item_pop=pop)
+pop_scores = lambda u: pop
+oracle_scores = lambda u: user_taste[u] @ item_style.T / 2 + np.log(exposure)
+noisy_pop = lambda u: pop + rng.normal(0, pop.std() * 0.05, n_items)
+
+table, _ = ev.score(pop_scores)
+print("popularity")
+print(table.to_string(index=False))
+print("\noracle (the true generating score: taste + exposure)")
+print(ev.score(oracle_scores)[0].to_string(index=False))
+print("\npaired comparisons at k=10")
+for label, a, b in (("oracle vs popularity", oracle_scores, pop_scores),
+                    ("popularity vs noisy ", pop_scores, noisy_pop)):
+    r_ = ev.compare(a, b)
+    print(f"  {label}: diff {r_['mean_diff']:+.4f} | 95% CI {r_['95% CI']} | "
+          f"A wins for {r_['users_where_a_wins']:.1%} of users | {r_['verdict']}")
+```
+
+```output
+popularity
+ k  recall    recall 95% CI   ndcg    map    mrr  coverage
+ 5  0.0814 [0.0705, 0.0893] 0.0783 0.0446 0.1496    0.0189
+10  0.0947 [0.0825, 0.1026] 0.0827 0.0391 0.1682    0.0300
+20  0.1397 [0.1280, 0.1499] 0.1009 0.0412 0.1812    0.0511
+
+oracle (the true generating score: taste + exposure)
+ k  recall    recall 95% CI   ndcg    map    mrr  coverage
+ 5  0.1304 [0.1200, 0.1413] 0.1242 0.0712 0.2295    0.1411
+10  0.1596 [0.1483, 0.1723] 0.1368 0.0663 0.2547    0.2078
+20  0.2372 [0.2244, 0.2487] 0.1686 0.0722 0.2676    0.3300
+
+paired comparisons at k=10
+  oracle vs popularity: diff +0.0541 | 95% CI (0.0474, 0.0619) | A wins for 46.8% of users | A better
+  popularity vs noisy : diff +0.0006 | 95% CI (-0.0006, 0.0018) | A wins for 7.7% of users | indistinguishable
+```
+
+The paired comparison is the piece worth internalising. Two models evaluated on the same users
+produce *paired* per-user scores, so the right question is the distribution of the per-user
+**difference**, not the gap between two averages — pairing removes the enormous variance that
+comes from users differing in how predictable they are. The bootstrap interval on that difference
+is what decides the verdict, and the `users_where_a_wins` field is the sanity check: a mean
+improvement driven by a handful of users looks very different from one where 60% of users improve.
+
+Note what the oracle comparison establishes. The oracle scorer uses the exact generating formula —
+taste, style and exposure — so recall@10 of 0.1596 is the ceiling this dataset allows, against
+popularity's 0.0947. Everything the rest of the course builds should be read against that ceiling
+rather than against zero: a model at 0.12 has closed half the available gap, which is a very
+different statement from "it beat the baseline". And the
+popularity-versus-noisy-popularity comparison is the negative control: two models that differ only
+by noise should come back `indistinguishable`, and if your harness ever says otherwise, the
+harness is broken before the model is.
+
+Three details that keep this honest in a real system. `rank` filters seen items *inside* the
+evaluator rather than trusting each model to do it, so no model can accidentally earn free recall.
+The evaluator holds a fixed user list, so every model is scored on exactly the same population.
+And coverage is reported next to accuracy at every $k$ — the number that tells you whether a
+gain came from better personalisation or from concentrating harder on the head.
+</details>
