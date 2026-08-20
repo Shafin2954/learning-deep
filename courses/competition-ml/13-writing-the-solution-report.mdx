@@ -1,0 +1,446 @@
+---
+course: competition-ml
+chapter: 13-writing-the-solution-report
+title: "Writing the Solution Report"
+order: 13
+---
+
+## The report is part of the work
+
+A competition ends with a number and a file. What you keep is the report: the document that says
+what you tried, what it was worth, and how to run it again. Write it and you find the mistakes you
+made; skip it and you repeat them next month. The good news is that most of it can be generated
+from the artefacts you already have — the run store (eval-tuning ch. 12) and the submission
+manifests (ch. 12).
+
+```python
+import numpy as np
+import pandas as pd
+import json, textwrap
+
+RUNS = [
+    {"id": 0, "name": "baseline-logreg", "cv": 0.7412, "folds": [0.740, 0.744, 0.739, 0.742],
+     "features": "raw", "notes": "reference"},
+    {"id": 1, "name": "hgb-raw", "cv": 0.7688, "folds": [0.766, 0.771, 0.768, 0.770],
+     "features": "raw", "notes": ""},
+    {"id": 2, "name": "hgb-aggs", "cv": 0.7905, "folds": [0.788, 0.793, 0.790, 0.791],
+     "features": "raw + customer aggregations", "notes": "ch. 4 patterns"},
+    {"id": 3, "name": "hgb-aggs-dev", "cv": 0.8033, "folds": [0.801, 0.806, 0.802, 0.804],
+     "features": "+ deviation-from-group", "notes": "biggest single jump"},
+    {"id": 4, "name": "hgb-te", "cv": 0.8051, "folds": [0.803, 0.808, 0.804, 0.806],
+     "features": "+ out-of-fold target encoding", "notes": "smoothing m=20"},
+    {"id": 5, "name": "hgb-te-lags", "cv": 0.8049, "folds": [0.802, 0.808, 0.803, 0.805],
+     "features": "+ lag features", "notes": "no gain, kept out"},
+    {"id": 6, "name": "catboost-te", "cv": 0.8062, "folds": [0.804, 0.809, 0.805, 0.807],
+     "features": "same as run 4", "notes": "different family for the blend"},
+    {"id": 7, "name": "blend-hillclimb", "cv": 0.8104, "folds": [0.809, 0.813, 0.810, 0.811],
+     "features": "runs 3,4,6", "notes": "weights 0.2/0.4/0.4"},
+]
+runs = pd.DataFrame(RUNS)
+runs["fold_sd"] = [float(np.std(r["folds"], ddof=1)) for r in RUNS]
+print(runs[["id", "name", "cv", "fold_sd", "features"]].to_string(index=False))
+```
+
+```output
+ id            name     cv  fold_sd                      features
+  0 baseline-logreg 0.7412 0.002217                           raw
+  1         hgb-raw 0.7688 0.002217                           raw
+  2        hgb-aggs 0.7905 0.002082   raw + customer aggregations
+  3    hgb-aggs-dev 0.8033 0.002217        + deviation-from-group
+  4          hgb-te 0.8051 0.002217 + out-of-fold target encoding
+  5     hgb-te-lags 0.8049 0.002646                + lag features
+  6     catboost-te 0.8062 0.002217                 same as run 4
+  7 blend-hillclimb 0.8104 0.001708                    runs 3,4,6
+```
+
+## Every claim needs a number and a protocol
+
+The difference between a report and a blog post is that every sentence in a report can be checked.
+The mechanical test: a claim about what helped must carry **how much**, **measured how**, and
+**against what**.
+
+```python
+def gains_table(runs):
+    df = runs.sort_values("id").copy()
+    df["delta_vs_prev"] = df["cv"].diff().round(4)
+    df["delta_vs_baseline"] = (df["cv"] - df["cv"].iloc[0]).round(4)
+    df["noise"] = (df["fold_sd"] / np.sqrt(4)).round(4)      # standard error of the fold mean
+    df["believable"] = np.where(df["delta_vs_prev"].abs() > 2 * df["noise"], "yes", "NOISE")
+    df.loc[df.index[0], ["delta_vs_prev", "believable"]] = [np.nan, "-"]
+    return df[["name", "cv", "delta_vs_prev", "delta_vs_baseline", "noise", "believable"]]
+
+print(gains_table(runs).to_string(index=False))
+```
+
+```output
+           name     cv  delta_vs_prev  delta_vs_baseline  noise believable
+baseline-logreg 0.7412            NaN             0.0000 0.0011          -
+        hgb-raw 0.7688         0.0276             0.0276 0.0011        yes
+       hgb-aggs 0.7905         0.0217             0.0493 0.0010        yes
+   hgb-aggs-dev 0.8033         0.0128             0.0621 0.0011        yes
+         hgb-te 0.8051         0.0018             0.0639 0.0011      NOISE
+    hgb-te-lags 0.8049        -0.0002             0.0637 0.0013      NOISE
+    catboost-te 0.8062         0.0013             0.0650 0.0011      NOISE
+blend-hillclimb 0.8104         0.0042             0.0692 0.0009        yes
+```
+
+The `believable` column is the honesty filter. Three of the seven steps moved the score by less
+than twice the standard error of the fold mean, and **two of those three had positive deltas** —
+target encoding at +0.0018 and a second model family at +0.0013, both against a standard error of
+0.0011. Writing "target encoding gave +0.002" reports a re-seed as a finding. The three real gains
+are 0.0276, 0.0217 and 0.0128, an order of magnitude clear of the noise, and they are the only
+ones worth a sentence.
+
+## The skeleton
+
+A solution report has seven sections, and they answer seven questions a reader actually has.
+
+```python
+SECTIONS = [
+    ("TL;DR", "final score, final model, the one thing that mattered most"),
+    ("Validation setup", "the CV scheme, why it matches the test split, its noise level"),
+    ("What worked", "each change with its measured gain and whether it beat the noise"),
+    ("What did not work", "the negative results, which are the most reusable part"),
+    ("Final model", "exact composition, weights, seeds, and how the parts were combined"),
+    ("Reproduction", "commands, data hashes, versions, runtime"),
+    ("With more time", "the ranked list of things you did not get to"),
+]
+width = max(len(s) for s, _ in SECTIONS)
+for name, purpose in SECTIONS:
+    print(f"{name:>{width}}  {purpose}")
+```
+
+```output
+            TL;DR  final score, final model, the one thing that mattered most
+ Validation setup  the CV scheme, why it matches the test split, its noise level
+      What worked  each change with its measured gain and whether it beat the noise
+What did not work  the negative results, which are the most reusable part
+      Final model  exact composition, weights, seeds, and how the parts were combined
+     Reproduction  commands, data hashes, versions, runtime
+   With more time  the ranked list of things you did not get to
+```
+
+The section people skip is **What did not work**, and it is the one with the highest value per
+line. A negative result with a number ("lag features: +0.0000 on four folds, dropped") saves the
+next person a day, and saves *you* a day when you meet the same dataset again.
+
+## Generating the report from the run store
+
+```python
+def render_report(runs, meta):
+    g = gains_table(runs)
+    best = runs.loc[runs["cv"].idxmax()]
+    winners = g[(g["believable"] == "yes") & (g["delta_vs_prev"] > 0)]
+    losers = g[(g["delta_vs_prev"] <= 0) | (g["believable"] == "NOISE")].dropna(
+        subset=["delta_vs_prev"])
+    lines = []
+    lines.append(f"# {meta['competition']} — solution report\n")
+    lines.append(f"**Final CV {best['cv']:.4f}** ({best['name']}), "
+                 f"public LB {meta['public_lb']:.4f}, private LB {meta['private_lb']:.4f}. "
+                 f"The single largest gain was {winners.iloc[winners['delta_vs_prev'].argmax()]['name']} "
+                 f"at {winners['delta_vs_prev'].max():+.4f}.\n")
+    lines.append("## Validation setup\n")
+    lines.append(f"- {meta['cv_scheme']}, seed {meta['cv_seed']}\n"
+                 f"- chosen because: {meta['cv_reason']}\n"
+                 f"- fold-mean standard error: {g['noise'].median():.4f} "
+                 f"(anything smaller is not a result)\n")
+    lines.append("## What worked\n")
+    for _, r in winners.iterrows():
+        lines.append(f"- **{r['name']}**: {r['delta_vs_prev']:+.4f} CV "
+                     f"(cumulative {r['delta_vs_baseline']:+.4f} over baseline)")
+    lines.append("\n## What did not work\n")
+    for _, r in losers.iterrows():
+        lines.append(f"- {r['name']}: {r['delta_vs_prev']:+.4f} CV — "
+                     f"{'below the noise floor' if r['believable'] == 'NOISE' else 'negative'}")
+    lines.append(f"\n## Final model\n\n{meta['final_model']}\n")
+    lines.append("## Reproduction\n")
+    for k, v in meta["repro"].items():
+        lines.append(f"- {k}: `{v}`")
+    lines.append("\n## With more time\n")
+    for item in meta["future"]:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
+
+meta = {
+    "competition": "Tabular Fraud S6E2",
+    "public_lb": 0.8087, "private_lb": 0.8112,
+    "cv_scheme": "GroupKFold(4) on customer_id",
+    "cv_seed": 0,
+    "cv_reason": "test rows are customers unseen in train (ch. 1 audit: 0.99 of groups multi-row)",
+    "final_model": "hill-climbed blend of runs 3, 4, 6 with weights 0.2 / 0.4 / 0.4, "
+                   "each refit on all training rows with 5 seeds averaged",
+    "repro": {"entry point": "python run.py --config configs/final.yaml",
+              "data hash": "bf06a9ced910/b42534562e26",
+              "env": "numpy 2.1, pandas 2.2, sklearn 1.5",
+              "runtime": "38 min on 8 cores"},
+    "future": ["adversarial validation said 0.71 — a test-like validation set was never built",
+               "no attempt at pseudo-labeling despite 40k unlabelled rows",
+               "catboost was tuned for 20 trials only"],
+}
+report = render_report(runs, meta)
+print(report[:1200])
+```
+
+```output
+# Tabular Fraud S6E2 — solution report
+
+**Final CV 0.8104** (blend-hillclimb), public LB 0.8087, private LB 0.8112. The single largest gain was hgb-raw at +0.0276.
+
+## Validation setup
+
+- GroupKFold(4) on customer_id, seed 0
+- chosen because: test rows are customers unseen in train (ch. 1 audit: 0.99 of groups multi-row)
+- fold-mean standard error: 0.0011 (anything smaller is not a result)
+
+## What worked
+
+- **hgb-raw**: +0.0276 CV (cumulative +0.0276 over baseline)
+- **hgb-aggs**: +0.0217 CV (cumulative +0.0493 over baseline)
+- **hgb-aggs-dev**: +0.0128 CV (cumulative +0.0621 over baseline)
+- **blend-hillclimb**: +0.0042 CV (cumulative +0.0692 over baseline)
+
+## What did not work
+
+- hgb-te: +0.0018 CV — below the noise floor
+- hgb-te-lags: -0.0002 CV — below the noise floor
+- catboost-te: +0.0013 CV — below the noise floor
+
+## Final model
+
+hill-climbed blend of runs 3, 4, 6 with weights 0.2 / 0.4 / 0.4, each refit on all training rows with 5 seeds averaged
+
+## Reproduction
+
+- entry point: `python run.py --config configs/final.yaml`
+- data hash: `bf06a9ced910/b42534562e26`
+- env: `numpy 2.1, pandas 2.2, sklearn 1.5`
+- runtime: `38 min on 8 cores`
+
+## With more time
+
+- adversarial v
+```
+
+Generated, not typed. Every number in it comes from the run store, so it cannot drift from the
+experiments the way a hand-written summary does — and regenerating it after one more run costs
+nothing.
+
+## A linter for unsupported claims
+
+```python
+import re
+
+HEDGES = ("seems", "feels", "probably", "clearly", "obviously", "significantly", "a lot",
+          "much better", "massive", "huge")
+
+def audit_claims(text):
+    problems = []
+    for i, line in enumerate(text.split("\n"), 1):
+        stripped = line.strip("- *#").strip()
+        if not stripped or stripped.startswith(("|", "```")):
+            continue
+        has_number = bool(re.search(r"[-+]?\d*\.?\d+", stripped))
+        claims_effect = bool(re.search(r"\b(improv|help|gain|boost|hurt|worse|better|drop)",
+                                       stripped, re.I))
+        if claims_effect and not has_number:
+            problems.append((i, "effect claimed with no number", stripped[:70]))
+        for h in HEDGES:
+            if h in stripped.lower():
+                problems.append((i, f"vague word '{h}'", stripped[:70]))
+    return problems
+
+draft = """
+## What worked
+- Target encoding helped a lot.
+- Deviation features improved CV by +0.0128 (4-fold GroupKFold, se 0.0011).
+- The blend was significantly better than any single model.
+- Lag features: +0.0000, dropped.
+"""
+for line_no, kind, text in audit_claims(draft):
+    print(f"line {line_no:>2}: {kind:<32} {text}")
+print(f"\n{len(audit_claims(draft))} issue(s); the generated report scores "
+      f"{len(audit_claims(report))}")
+```
+
+```output
+line  3: effect claimed with no number    Target encoding helped a lot.
+line  3: vague word 'a lot'               Target encoding helped a lot.
+line  5: effect claimed with no number    The blend was significantly better than any single model.
+line  5: vague word 'significantly'       The blend was significantly better than any single model.
+
+4 issue(s); the generated report scores 0
+```
+
+Two of those four sentences are unfalsifiable. Run the linter over your draft before you publish
+it — it takes seconds and it forces the sentences that matter to carry evidence.
+
+## Try it Yourself
+
+```python
+def ablation_from_runs(runs, base_id=1):
+    """What each feature block was worth, in the order it was added."""
+    df = runs.sort_values("id")
+    base = float(df.loc[df["id"] == base_id, "cv"].iloc[0])
+    rows = []
+    prev = base
+    for _, r in df[df["id"] > base_id].iterrows():
+        rows.append({"step": r["name"], "adds": r["features"],
+                     "cv": r["cv"], "delta": round(r["cv"] - prev, 4)})
+        prev = r["cv"]
+    out = pd.DataFrame(rows)
+    out["cumulative"] = (out["cv"] - base).round(4)
+    return out
+
+print(ablation_from_runs(runs).to_string(index=False))
+print(f"\nsum of individual deltas: {ablation_from_runs(runs)['delta'].sum():.4f}")
+print(f"actual end-to-end gain   : {runs['cv'].max() - runs.loc[1, 'cv']:.4f}")
+```
+
+```output
+           step                          adds     cv   delta  cumulative
+       hgb-aggs   raw + customer aggregations 0.7905  0.0217      0.0217
+   hgb-aggs-dev        + deviation-from-group 0.8033  0.0128      0.0345
+         hgb-te + out-of-fold target encoding 0.8051  0.0018      0.0363
+    hgb-te-lags                + lag features 0.8049 -0.0002      0.0361
+    catboost-te                 same as run 4 0.8062  0.0013      0.0374
+blend-hillclimb                    runs 3,4,6 0.8104  0.0042      0.0416
+
+sum of individual deltas: 0.0416
+actual end-to-end gain   : 0.0416
+```
+
+The two totals agree here because the runs form a chain, each built on the last. They will *not*
+agree if you measure blocks independently and add up the deltas — a trap worth checking for
+explicitly, because overlapping gains are the most common way a report overstates what was
+achieved (ch. 4's ablation section is the same problem).
+
+## Exercise
+
+Write the report generator you would actually ship: it reads the run store, produces all seven
+sections, runs the claims linter over its own output, computes the ablation table, and refuses to
+emit a report that contains an unsupported claim or a gain that is inside the noise. Test it on a
+run store that contains one over-claimed result.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def build_report(runs, meta, base_id=1, noise_k=2.0):
+    g = gains_table(runs)
+    noise = float(g["noise"].median())
+    best = runs.loc[runs["cv"].idxmax()]
+    real = g[(g["believable"] == "yes") & (g["delta_vs_prev"] > 0)]
+    noise_level = g[g["believable"] == "NOISE"]
+    negative = g[(g["delta_vs_prev"] < 0)]
+    abl = ablation_from_runs(runs, base_id=base_id)
+
+    parts = [f"# {meta['competition']} — solution report", ""]
+    parts += [f"## TL;DR", "",
+              f"Final CV {best['cv']:.4f} ({best['name']}); public LB {meta['public_lb']:.4f}, "
+              f"private LB {meta['private_lb']:.4f}. Total gain over the first model: "
+              f"{abl['cumulative'].iloc[-1]:+.4f} CV. Largest single step: "
+              f"{real.loc[real['delta_vs_prev'].idxmax(), 'name']} at "
+              f"{real['delta_vs_prev'].max():+.4f}.", ""]
+    parts += [f"## Validation setup", "",
+              f"- Scheme: {meta['cv_scheme']}, seed {meta['cv_seed']}.",
+              f"- Rationale: {meta['cv_reason']}.",
+              f"- Fold-mean standard error: {noise:.4f}. A change under "
+              f"{noise_k * noise:.4f} CV is reported as noise, not as a result.", ""]
+    parts += ["## What worked", ""]
+    for _, r in real.iterrows():
+        parts.append(f"- **{r['name']}**: {r['delta_vs_prev']:+.4f} CV, cumulative "
+                     f"{r['delta_vs_baseline']:+.4f}.")
+    parts += ["", "## What did not work", ""]
+    for _, r in pd.concat([noise_level, negative]).drop_duplicates(subset=["name"]).iterrows():
+        parts.append(f"- {r['name']}: {r['delta_vs_prev']:+.4f} CV, inside the "
+                     f"{noise_k * noise:.4f} noise band. Not used.")
+    parts += ["", "## Final model", "", meta["final_model"], ""]
+    parts += ["## Ablation", "", abl.to_string(index=False), ""]
+    parts += ["## Reproduction", ""]
+    parts += [f"- {k}: `{v}`" for k, v in meta["repro"].items()]
+    parts += ["", "## With more time", ""]
+    parts += [f"- {item}" for item in meta["future"]]
+    text = "\n".join(parts)
+
+    issues = audit_claims(text)
+    chain_sum = float(abl["delta"].sum())
+    chain_true = float(best["cv"] - runs.loc[runs["id"] == base_id, "cv"].iloc[0])
+    checks = []
+    if issues:
+        checks.append(f"{len(issues)} unsupported claim(s): "
+                      f"{[i[2][:40] for i in issues][:3]}")
+    if abs(chain_sum - chain_true) > 1e-6:
+        checks.append(f"ablation deltas sum to {chain_sum:+.4f} but the end-to-end gain is "
+                      f"{chain_true:+.4f} — overlapping gains")
+    overclaims = g[(g["believable"] == "NOISE") & (g["delta_vs_prev"] > 0)]
+    return text, checks, overclaims
+
+text, checks, overclaims = build_report(runs, meta)
+print(f"report length: {len(text.split(chr(10)))} lines")
+print(f"blocking checks: {checks or 'none'}")
+print(f"\nsteps that would have been over-claimed without the noise filter:")
+print(overclaims[["name", "delta_vs_prev", "noise"]].to_string(index=False))
+print("\n--- TL;DR and What worked ---")
+print("\n".join(text.split("\n")[:16]))
+```
+
+```output
+report length: 51 lines
+blocking checks: none
+
+steps that would have been over-claimed without the noise filter:
+       name  delta_vs_prev  noise
+     hgb-te         0.0018 0.0011
+catboost-te         0.0013 0.0011
+
+--- TL;DR and What worked ---
+# Tabular Fraud S6E2 — solution report
+
+## TL;DR
+
+Final CV 0.8104 (blend-hillclimb); public LB 0.8087, private LB 0.8112. Total gain over the first model: +0.0416 CV. Largest single step: hgb-raw at +0.0276.
+
+## Validation setup
+
+- Scheme: GroupKFold(4) on customer_id, seed 0.
+- Rationale: test rows are customers unseen in train (ch. 1 audit: 0.99 of groups multi-row).
+- Fold-mean standard error: 0.0011. A change under 0.0022 CV is reported as noise, not as a result.
+
+## What worked
+
+- **hgb-raw**: +0.0276 CV, cumulative +0.0276.
+- **hgb-aggs**: +0.0217 CV, cumulative +0.0493.
+```
+
+Two mechanisms in that generator do the real work, and both exist because reports drift toward
+flattery on their own.
+
+The **noise filter** demotes any step whose gain is smaller than twice the fold-mean standard
+error into the "did not work" section — including steps with a positive delta, which is the
+uncomfortable case. Target encoding at +0.0018 against a standard error of 0.0011 reads like a win
+in a chat message and is indistinguishable from a re-seed. Demoting it costs you a bullet point
+and buys the report its credibility.
+
+The **ablation consistency check** compares the sum of the individual deltas against the
+end-to-end gain and blocks the report if they disagree. On a chain of runs where each is built on
+the last, they must agree exactly; the moment you start measuring blocks against a common baseline
+instead, they will not, and the difference is the overlap you would otherwise have double-counted.
+
+What the generator deliberately does not automate is **What did not work** as prose. The table
+tells you which runs failed; it cannot tell you *why*, and the why is the reusable part — "target
+encoding added nothing because the high-cardinality column turned out to be an internal id with no
+repeat values across train and test" is worth more than every number in the report. Write those
+sentences by hand, then run the linter over them.
+</details>
+
+## Under the Trench
+
+Rare and advanced topics you should at least know the name of. You will not need them daily, but
+you will stop being surprised when you meet them.
+
+- **Multi-level stacking and out-of-fold discipline** — level-2 predictions become level-3 features; each level must be built from out-of-fold predictions of the level below, on the same fold assignment, or the leak compounds silently through the stack.
+- **Post-processing to the metric** — rounding, clipping, rank-scaling or reordering the final predictions to exploit the exact scoring function; the classic case is a metric like quadratic weighted kappa where the optimal cut points are worth more than the model.
+- **Test-time augmentation** — predict several perturbed versions of each test row and average; standard in vision, occasionally worth it on tabular data via feature noise or subsampled ensembles.
+- **Denoising and label-noise handling** — dropping or re-weighting rows whose labels the model confidently disagrees with; powerful and dangerous, because the same procedure that removes label noise removes hard-but-correct examples.
+- **GPU-efficient tabular (RAPIDS cuDF/cuML)** — dataframe and model APIs that run on the GPU, turning a 40-minute feature sweep into a 2-minute one, which changes what experiments are worth running at all.
+- **Knowledge of the metric's math** — knowing that AUC is a rank statistic, that log loss is minimised by true probabilities, that RMSLE penalises under-prediction asymmetrically; every post-processing trick in competitions comes from reading the metric's definition closely enough.
