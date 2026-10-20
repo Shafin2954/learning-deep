@@ -7,9 +7,27 @@ order: 8
 
 ## Why normalization helps
 
+Good initialization (ch. 7) gets activations to a healthy size at step zero, but training moves
+the weights and the sizes drift again. A **normalization layer** re-centres and re-scales the
+activations at every step, so the next layer always receives numbers with mean about 0 and
+spread about 1.
+
 Without normalization, the distribution of each layer's inputs shifts as the weights of the previous layer change — a phenomenon called internal covariate shift. More concretely, the loss landscape becomes ill-conditioned: gradients flow unevenly, and you need to use lower learning rates to avoid instability.
 
+**Internal covariate shift** is the name for "the inputs to this layer keep changing under its
+feet". **Ill-conditioned** means some directions of the loss are far steeper than others — the
+lopsided bowl from ch. 6, where one learning rate cannot suit every direction.
+
 Normalization layers solve this by standardizing activations within a defined axis, allowing higher learning rates, faster convergence, and more stable training with less careful initialization.
+
+**Standardizing** means subtracting the mean and dividing by the standard deviation. The
+"defined axis" is the one choice that separates the methods in this chapter: average over the
+batch (BatchNorm), over the features of one example (LayerNorm), or over groups of channels
+(GroupNorm).
+
+> **Picture it:** a teacher grading on a curve. Whatever the raw scores were this year — an
+> easy exam, a hard one — the teacher rescales them so the class average and spread are the
+> same every year. The next teacher in line always gets marks on a familiar scale.
 
 ```python
 import numpy as np
@@ -24,21 +42,49 @@ print(f"After batch norm: mean={normed.mean():.4f}, std={normed.std():.4f}")
 ```
 
 ```output
-Before norm: mean=2.98, std=5.03
+Before norm: mean=3.08, std=4.98
 After batch norm: mean=0.0000, std=1.0000
 ```
 
+The raw activations have mean 3.08 and std 4.98, matching the `* 5 + 3` that created them.
+After subtracting each column's mean and dividing by its std, the mean is 0.0000 and the std is
+1.0000. `axis=0` means "per feature, across the 32 examples" — that is batch normalization.
+
 ## Batch Normalization
+
+**BatchNorm** standardizes each feature using the mean and spread of that feature across the
+current mini-batch, then lets the network rescale the result with two learned numbers per feature.
 
 BatchNorm normalizes over the batch and spatial dimensions for each feature channel. For a mini-batch of activations $\{x^{(1)}, \ldots, x^{(B)}\}$:
 
 $$\mu_B = \frac{1}{B}\sum_{i=1}^B x^{(i)} \qquad \sigma_B^2 = \frac{1}{B}\sum_{i=1}^B (x^{(i)}-\mu_B)^2$$
 
+> **In plain words:** $\mu_B$ ("mu-B") is the average of one feature over the $B$ examples in
+> the batch, and $\sigma_B^2$ is its variance (average squared distance from that mean).
+
 $$\hat{x}^{(i)} = \frac{x^{(i)} - \mu_B}{\sqrt{\sigma_B^2 + \epsilon}} \qquad y^{(i)} = \gamma \hat{x}^{(i)} + \beta$$
+
+> **In plain words:** subtract the batch mean, divide by the batch std ($\epsilon$, a tiny
+> number like $10^{-5}$, avoids dividing by 0), giving $\hat{x}$ with mean 0 and std 1. Then
+> multiply by a learned scale $\gamma$ ("gamma") and add a learned shift $\beta$ ("beta").
 
 $\gamma$ (scale) and $\beta$ (shift) are learnable parameters — they let the network undo normalization if needed.
 
+If the best thing for the network is activations with mean 3 and std 5, it can learn
+$\gamma = 5$, $\beta = 3$. Normalization fixes the *default* scale without taking away freedom.
+
 **At inference**: use running statistics accumulated during training (exponential moving average), not the batch statistics. This is why you must call `model.eval()` — otherwise inference uses the batch stats from 1-sample batches, giving wrong results.
+
+**Inference** means using the trained model to make predictions. A single example has no batch
+to average over — its "batch std" is 0 — so BatchNorm keeps **running statistics**, a slow
+moving average of the means and variances it saw during training, and uses those instead.
+
+> **Watch out:** forgetting `model.eval()` before evaluation is one of the most common bugs in
+> deep learning. The model then normalizes each test batch with its own statistics, so the same
+> image can get a different prediction depending on what else is in the batch. Forgetting
+> `model.train()` afterwards is the mirror bug: the running statistics stop updating.
+
+The class below implements the forward pass (with running statistics) and the full backward pass.
 
 ```python
 class BatchNorm1D:
@@ -84,13 +130,27 @@ print(f"Output: mean={out.mean(axis=0).round(4)}, std={out.std(axis=0).round(4)}
 ```
 
 ```output
-Input:  mean=[ 2.13  1.94  2.17  1.87], std=[3.12 2.98 3.01 3.24]
-Output: mean=[ 0.  0.  0. -0.], std=[1. 1. 1. 1.]
+Input:  mean=[ 1.94 -0.08  3.25  2.8 ], std=[2.51 2.21 2.69 2.84]
+Output: mean=[ 0. -0.  0.  0.], std=[1. 1. 1. 1.]
 ```
+
+The four input features have means between $-0.08$ and 3.25 and stds between 2.21 and 2.84.
+After BatchNorm every feature has mean 0 and std 1 (the `-0.` is a tiny negative number that
+rounds to zero). With $\gamma = 1$ and $\beta = 0$ at the start, the output is exactly the
+standardized $\hat{x}$.
 
 ### BatchNorm backward pass
 
 The backward pass is non-trivial because $\mu_B$ and $\sigma_B$ depend on all elements in the batch, creating cross-example dependencies in the gradient.
+
+Here is the twist in plain words. Changing one example's value also changes the batch mean and
+std, which changes *every other* example's output. So the gradient for $x^{(1)}$ includes a
+contribution through all $B$ outputs, not only its own. The `dvar` and `dmu` lines in
+`backward` collect exactly those indirect paths.
+
+> **Picture it:** one student's score changes, and because the class is graded on a curve,
+> everybody's curved grade moves a little. Asking "how does this student's score affect the
+> grades?" must count all the grades, not only theirs.
 
 ```python
 # Numerical gradient check
@@ -113,17 +173,32 @@ print(f"Numerical  dx[0,0]: {num_grad:.6f}")
 ```
 
 ```output
-Analytical dx[0,0]: 0.043218
-Numerical  dx[0,0]: 0.043221
+Analytical dx[0,0]: -0.591161
+Numerical  dx[0,0]: -0.591161
 ```
 
+The analytical and numerical gradients agree to six decimals ($-0.591161$). The numerical
+version sums `dout * (change in output)` over the *whole* output, so it automatically includes
+the cross-example effects — and the match proves the backward pass counts them correctly.
+
 ## Layer Normalization
+
+**LayerNorm** flips the axis: instead of averaging one feature across examples, it averages all
+features within one example. Each example is standardized on its own, so the batch never matters.
 
 LayerNorm normalizes over the feature dimension for each example independently. No batch dependency — so it works identically at training and inference, and with batch size 1.
 
 $$\mu_i = \frac{1}{H}\sum_{j=1}^H x_{ij} \qquad \hat{x}_{ij} = \frac{x_{ij}-\mu_i}{\sqrt{\sigma_i^2+\epsilon}} \qquad y_{ij} = \gamma_j \hat{x}_{ij} + \beta_j$$
 
+> **In plain words:**
+> - $i$ indexes the example (or token) and $j$ the feature; $H$ is the number of features.
+> - $\mu_i$ and $\sigma_i^2$ are the mean and variance of example $i$'s own $H$ features.
+> - $\gamma_j$, $\beta_j$ are learned per feature, exactly like BatchNorm's.
+
 This is the default normalization in Transformers, LSTMs, and any architecture where the batch dimension is not meaningful.
+
+In a language model, a batch mixes sentences of different lengths and topics, so averaging a
+feature across it says little. Each token's own 512 numbers are a more sensible group.
 
 ```python
 class LayerNorm:
@@ -148,20 +223,37 @@ print(f"Output per-token std range:  [{out.std(axis=-1).min():.4f}, {out.std(axi
 ```
 
 ```output
-Input  per-token mean range: [-1.23, 5.87]
+Input  per-token mean range: [1.44, 2.69]
 Output per-token mean range: [-0.0000, 0.0000]
 Output per-token std range:  [1.0000, 1.0000]
 ```
 
+The input has shape (4, 16, 512): 4 sequences of 16 tokens, 512 features each. Before
+LayerNorm, the per-token means range from 1.44 to 2.69. After it, every one of the 64 tokens
+has mean 0.0000 and std 1.0000 — the range collapses to a single value, because each token
+was standardized separately.
+
 ## GroupNorm and other variants
 
+The remaining variants change *which* numbers get averaged together, trading off batch
+independence against how much structure they keep. One (RMSNorm) also drops the mean
+subtraction to save work.
+
 **GroupNorm**: divide $C$ channels into $G$ groups, normalize within each group. Works with batch size 1 — critical for detection/segmentation where memory limits batch to 1–2 images.
+
+A **channel** is one feature map in an image network (for example the "red" plane, or a learned
+edge detector's output). With 32 channels and $G = 8$, each group of 4 channels shares one mean
+and std per image.
 
 **InstanceNorm**: $G = C$ (one group per channel). Removes style information per-channel — used in style transfer.
 
 **RMSNorm**: skip the mean subtraction, only divide by RMS. Simpler and slightly faster; used in Llama/Mistral:
 
 $$\text{RMSNorm}(x)_i = \frac{x_i}{\text{RMS}(x)} \cdot \gamma_i \qquad \text{RMS}(x) = \sqrt{\frac{1}{H}\sum_j x_j^2 + \epsilon}$$
+
+> **In plain words:** **RMS** (root mean square) is the square root of the average squared
+> value — a measure of size that does not subtract the mean first. Divide each feature by it,
+> then scale by $\gamma_i$. There is no shift $\beta$ and no centring.
 
 ```python
 class RMSNorm:
@@ -180,10 +272,30 @@ print(f"RMSNorm output rms: {np.sqrt((out**2).mean(axis=-1)).mean():.4f}")
 ```
 
 ```output
-RMSNorm output rms: 1.0001
+RMSNorm output rms: 1.0000
 ```
 
+The input had values of size about 5, and after RMSNorm the average RMS per token is exactly
+1.0000. Its mean is not forced to 0 — that is the work RMSNorm skips.
+
+> **Watch out:** GroupNorm, LayerNorm, InstanceNorm and RMSNorm behave the same in training
+> and evaluation, so `model.eval()` does not change them. BatchNorm is the odd one out — and
+> the only one that breaks with batch size 1 in training mode.
+
+## Recap in plain words
+
+- Normalization re-centres and re-scales activations at every step so each layer gets inputs of a stable size.
+- BatchNorm averages each feature over the batch, then applies a learned scale $\gamma$ and shift $\beta$.
+- BatchNorm needs running statistics for inference, so `model.eval()` matters.
+- Its backward pass has cross-example terms because every example affects the batch mean and std.
+- LayerNorm averages over one example's own features, so batch size never matters; it is the Transformer default.
+- GroupNorm averages over channel groups; RMSNorm skips the mean and divides by the RMS.
+
 ## Try it Yourself
+
+This block trains the same tiny tanh network on XOR twice — once with the `BatchNorm1D` class
+from above between the hidden layer and the output, once without — using a full manual backward
+pass and plain SGD. The weights start small (scale 0.1) on purpose.
 
 ```python
 import numpy as np
@@ -196,36 +308,67 @@ y = np.array([0, 1, 1, 0], dtype=float).reshape(-1, 1)
 def sigmoid(z): return 1/(1+np.exp(-z))
 def bce(pred, target): return -np.mean(target*np.log(pred+1e-8) + (1-target)*np.log(1-pred+1e-8))
 
-np.random.seed(0)
-W1 = np.random.randn(2, 8)*0.1; b1 = np.zeros(8)
-W2 = np.random.randn(8, 1)*0.1; b2 = np.zeros(1)
-bn = BatchNorm1D(8)
+def train(use_bn, steps=500, lr=0.5):
+    np.random.seed(0)
+    W1 = np.random.randn(2, 8)*0.1; b1 = np.zeros(8)
+    W2 = np.random.randn(8, 1)*0.1; b2 = np.zeros(1)
+    bn = BatchNorm1D(8)
+    for step in range(steps):
+        h = np.tanh(X @ W1 + b1)
+        h_bn = bn.forward(h) if use_bn else h
+        out = sigmoid(h_bn @ W2 + b2)
+        loss = bce(out, y)
+        if step % 100 == 0:
+            print(f"  step {step:3d}: loss={loss:.4f}")
+        # Backward: sigmoid + BCE gives (out - y) / N at the logit
+        dlogit = (out - y) / len(X)
+        dW2 = h_bn.T @ dlogit; db2 = dlogit.sum(axis=0)
+        dh = dlogit @ W2.T
+        if use_bn:
+            dh, dgamma, dbeta = bn.backward(dh)
+            bn.gamma -= lr * dgamma; bn.beta -= lr * dbeta
+        dz1 = dh * (1 - h**2)              # tanh gradient
+        dW1 = X.T @ dz1; db1 = dz1.sum(axis=0)
+        W1 -= lr * dW1; b1 -= lr * db1; W2 -= lr * dW2; b2 -= lr * db2
+    print(f"  final    loss={loss:.4f}")
 
-losses = []
-for step in range(500):
-    h = np.tanh(X @ W1 + b1)
-    h_bn = bn.forward(h)
-    out = sigmoid(h_bn @ W2 + b2)
-    loss = bce(out, y)
-    losses.append(loss)
-    # Skip full backprop for brevity — just show loss curve shape
-    if step % 100 == 0:
-        print(f"Step {step:3d}: loss={loss:.4f}")
+print("With BatchNorm:")
+train(use_bn=True)
+print("Without BatchNorm:")
+train(use_bn=False)
 ```
 
 ```output
-Step   0: loss=0.6934
-Step 100: loss=0.6821
-Step 200: loss=0.6583
-Step 300: loss=0.6102
-Step 400: loss=0.5423
+With BatchNorm:
+  step   0: loss=0.7006
+  step 100: loss=0.0287
+  step 200: loss=0.0052
+  step 300: loss=0.0026
+  step 400: loss=0.0017
+  final    loss=0.0012
+Without BatchNorm:
+  step   0: loss=0.6936
+  step 100: loss=0.6931
+  step 200: loss=0.6930
+  step 300: loss=0.6922
+  step 400: loss=0.6319
+  final    loss=0.2585
 ```
 
-Replace the `bn.forward(h)` line with just `h` (no BatchNorm) and observe how much slower the loss decreases.
+With BatchNorm the loss falls from 0.7006 to 0.0287 within 100 steps and ends at 0.0012.
+Without it the loss sits at about 0.693 — that is $\log 2$, the loss of always predicting 0.5 —
+for 300 steps, and only starts moving near step 400, ending at 0.2585. The small initial weights
+make the hidden activations tiny; BatchNorm rescales them to std 1 immediately, while the plain
+network has to grow its weights slowly first. Try `lr=2.0` without BatchNorm, or change the
+weight scale from `0.1` to `1.0`, and see how much of BatchNorm's advantage remains.
 
 ## Exercise
 
 Implement `LayerNorm` backward pass analytically. Verify it against a numerical gradient check on a `(4, 8)` input tensor with `normalized_shape=8`.
+
+> **Hint:** the BatchNorm backward pass works unchanged if you swap the axis: sum over the last
+> axis with `keepdims=True` instead of over `axis=0`, and divide by $D$ (features) instead of
+> $B$ (batch size).
 
 <details>
 <summary>Solution</summary>
@@ -276,4 +419,8 @@ print(f"Max abs error: {np.abs(dx - num_dx).max():.2e}")
 ```
 
 The key insight: LayerNorm backward has two correction terms — one from the variance gradient (scaling) and one from the mean gradient (centering) — both of which redistribute the gradient across the feature dimension of each example.
+
+The script prints a max absolute error of about $5 \times 10^{-11}$, so the analytic gradient is
+right. One detail: `dmu` here omits BatchNorm's extra `dvar * mean(-2(x - mu))` term. That term
+is always exactly 0, because deviations from a mean always average to 0.
 </details>

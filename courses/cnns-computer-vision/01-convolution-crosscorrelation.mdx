@@ -7,31 +7,68 @@ order: 1
 
 ## Why convolution for images?
 
-Fully-connected layers treat every input pixel as independent — a 256×256 image has 65,536 inputs,
-and a single FC layer with 1,024 hidden units needs 67 million parameters just to process it once.
-Two structural priors make images tractable:
+A photo is a grid of numbers, and the numbers that matter are the ones sitting next to each
+other: an edge is "dark here, bright right next to it". Convolution is a way to build a layer
+that only looks at small neighbourhoods and reuses the same small detector everywhere.
+
+A **fully-connected (FC) layer** — one where every input is wired to every output with its own
+weight — treats every input pixel as independent. A $256 \times 256$ image has 65,536 inputs,
+and a single FC layer with 1,024 hidden units needs 67 million parameters just to process it
+once ($65{,}536 \times 1{,}024 \approx 67.1$ million weights). Two structural **priors** —
+assumptions you build into the model before it sees any data — make images tractable:
 
 - **Local structure:** nearby pixels are correlated; distant pixels rarely interact directly.
 - **Translation invariance:** the edge detector that fires on the left should fire the same way on the right.
 
-Convolution exploits both. One kernel slides over the entire image; each output is the dot product
-of the kernel with the local patch. The same weights are reused everywhere — **weight sharing**.
+Convolution exploits both. One **kernel** (also called a filter: a small grid of weights, often
+$3 \times 3$) slides over the entire image; each output is the dot product of the kernel with
+the local patch underneath it. The same weights are reused everywhere — **weight sharing**.
+
+> **Picture it:** a magnifying glass with a stencil printed on it. You slide it across a
+> newspaper, and at every stop you write down one number: how well the patch under the glass
+> matches the stencil. The stencil never changes as you slide — that is weight sharing — and
+> the glass only ever sees a small patch — that is locality.
 
 ## Cross-correlation vs convolution
+
+There are two almost-identical ways to slide a kernel: one flips the kernel upside-down and
+left-right first, the other does not. Deep learning uses the no-flip version and still calls
+it "convolution".
 
 Mathematical convolution flips the kernel: $(f * g)(t) = \int f(\tau)g(t-\tau)\,d\tau$.
 Cross-correlation doesn't: $(f \star g)(t) = \int f(\tau)g(t+\tau)\,d\tau$.
 
+Read the two formulas side by side. The only difference is $t-\tau$ versus $t+\tau$: walking
+the kernel backwards (flipped) or forwards (as-is) while you multiply and add.
+
 PyTorch's `nn.Conv2d` computes **cross-correlation** but calls it "convolution". That's fine —
 the network learns the kernel values, so the flip doesn't matter; it just learns the flipped version.
 
+> **Watch out:** the flip does matter when you copy a hand-designed kernel (say, from a
+> signal-processing textbook) into `nn.Conv2d`. A textbook convolution kernel must be flipped
+> on both axes to give the same answer in PyTorch. For learned kernels it never matters.
+
 ## 2D cross-correlation from scratch
+
+To compute one output number, you lay the kernel over a patch of the image, multiply the
+overlapping numbers pair by pair, and add them all up. Then you shift one pixel and repeat.
 
 For input $X$ (shape $H \times W$) and kernel $K$ (shape $k \times k$):
 
 $$
 Y[i, j] = \sum_{m=0}^{k-1} \sum_{n=0}^{k-1} X[i+m,\; j+n] \cdot K[m, n]
 $$
+
+> **In plain words:**
+> - $Y[i, j]$ is the output at row $i$, column $j$.
+> - $m$ and $n$ walk over the rows and columns of the kernel, from 0 to $k-1$.
+> - $X[i+m, j+n]$ is the image pixel sitting under kernel cell $(m, n)$ when the kernel's
+>   top-left corner is at $(i, j)$.
+> - The double sum multiplies each pixel by its kernel weight and adds all $k^2$ products.
+
+The code below does exactly that with two Python loops. The kernel is a **Sobel kernel**, a
+classic hand-made detector for vertical edges: positive weights on the left column, negative on
+the right, so it responds when brightness changes from left to right.
 
 ```python
 import numpy as np
@@ -66,16 +103,31 @@ Input shape: (6, 6)
 Kernel shape: (3, 3)
 Output shape: (4, 4)
 Output:
- [[ 0.635 -1.802  1.453 -0.364]
- [-0.211 -1.031  3.021 -1.156]
- [-1.045  0.752  0.893 -0.826]
- [-0.218  2.476 -0.817 -1.274]]
+ [[ 2.422  4.701  0.314 -3.286]
+ [ 0.39   2.916 -0.947 -1.124]
+ [ 1.648  0.881  0.086  0.472]
+ [ 2.984  0.958 -0.409 -1.083]]
 ```
+
+Look at the shapes first. A $6 \times 6$ input and a $3 \times 3$ kernel give a $4 \times 4$
+output: the kernel only fits in 4 positions across each row. The numbers themselves are noisy
+(the input is random noise), but each one is a weighted sum of 9 pixels — for example the
+top-left value 2.422 summarises the patch `X[0:3, 0:3]`.
 
 The output is $(H - k + 1) \times (W - k + 1) = 4 \times 4$ when the kernel is $3 \times 3$ and
 there is no padding.
 
+> **Watch out:** without padding, the output shrinks by $k-1$ pixels in each direction on
+> every layer. Stack ten $3 \times 3$ layers and a $32 \times 32$ image becomes $12 \times 12$.
+> Ch. 2 shows how padding stops this shrinkage.
+
 ## Verify against PyTorch
+
+Your hand-written version should give the same numbers as the library. Checking that is the
+cheapest way to prove you understood the formula.
+
+PyTorch wants 4-dimensional tensors shaped (batch, channels, height, width), so the code adds
+two size-1 dimensions with `unsqueeze` before calling `F.conv2d`.
 
 ```python
 import torch
@@ -89,17 +141,38 @@ print("Max abs diff vs PyTorch:", np.abs(Y - Y_torch).max())
 ```
 
 ```output
-Max abs diff vs PyTorch: 0.0
+Max abs diff vs PyTorch: 3.3273631316887986e-07
 ```
+
+The largest difference is about $3.3 \times 10^{-7}$, not exactly 0. That gap is rounding:
+your NumPy version adds up 64-bit floats, while the PyTorch tensors are 32-bit floats, which
+keep only about 7 significant digits. A difference that small means the two compute the same
+thing — PyTorch really does cross-correlation, no kernel flip.
+
+> **Watch out:** never test float code with `==`. Compare with a tolerance, for example
+> `np.allclose(Y, Y_torch, atol=1e-5)`, or you will chase "bugs" that are only rounding.
 
 ## Weight sharing and sparse connectivity
 
-A 6×6 image with a 3×3 kernel produces 16 output values. Each output uses only 9 of the 36 input
-values — **sparse connectivity**. The same 9 kernel weights are shared across all 16 outputs —
-**weight sharing**. Compare to a fully-connected layer on the same input: $36 \times 16 = 576$ weights.
+A conv layer wins on two counts: each output only listens to a small patch, and every output
+uses the very same small set of weights. Together, these cut the parameter count from hundreds
+to a handful.
+
+A $6 \times 6$ image with a $3 \times 3$ kernel produces 16 output values. Each output uses only
+9 of the 36 input values — **sparse connectivity**: each output is wired to a few inputs, not
+all of them. The same 9 kernel weights are shared across all 16 outputs — **weight sharing**.
+Compare to a fully-connected layer on the same input: $36 \times 16 = 576$ weights.
 Here: 9. And the 9 weights generalise across the image.
 
+> **Picture it:** a factory inspector with one checklist. Sparse connectivity means the
+> inspector looks at one small box at a time; weight sharing means the same checklist is used
+> for every box on the conveyor belt. You train one checklist instead of hiring 16 inspectors
+> with their own lists.
+
 ### Multiple kernels → multiple channels
+
+One kernel finds one kind of pattern. A real layer runs many kernels side by side, and each
+one produces its own output image, called a **feature map** or **channel**.
 
 In practice, a conv layer applies $C_{out}$ kernels simultaneously, producing $C_{out}$ feature maps.
 Each kernel detects a different pattern. The full conv operation for an input of shape
@@ -108,6 +181,13 @@ $(C_{in}, H, W)$ and weight tensor $(C_{out}, C_{in}, k, k)$:
 $$
 Y[c_{out}, i, j] = \sum_{c_{in}} \sum_m \sum_n W[c_{out}, c_{in}, m, n] \cdot X[c_{in}, i+m, j+n] + b[c_{out}]
 $$
+
+> **In plain words:**
+> - $c_{out}$ picks which output channel (which detector) you are computing.
+> - $c_{in}$ walks over the input channels (red, green, blue for a photo), so each kernel is
+>   really a small 3-D block of weights, $C_{in} \times k \times k$.
+> - $W[c_{out}, c_{in}, m, n]$ is one weight; $X[c_{in}, i+m, j+n]$ is the pixel under it.
+> - $b[c_{out}]$ is one **bias** — a constant added to every output of that channel.
 
 ```python
 import torch
@@ -130,10 +210,30 @@ Kernel tensor shape: torch.Size([16, 3, 3, 3])
 Parameters: 448
 ```
 
+The output has 16 channels (one per kernel) and is $30 \times 30$ — again $32 - 3 + 1 = 30$.
+The weight tensor shape `[16, 3, 3, 3]` reads as "16 kernels, each $3 \times 3$ deep across 3
+input channels". The last line counts 448 parameters:
+
 $16 \times (3 \times 3 \times 3) + 16 = 432 + 16 = 448$ parameters.
 A fully-connected equivalent would need $3072 \times 14400 = 44{,}236{,}800$.
 
+That FC number comes from $3 \times 32 \times 32 = 3072$ inputs times
+$16 \times 30 \times 30 = 14{,}400$ outputs: about 100,000 times more weights for the same
+input and output shapes.
+
+## Recap in plain words
+
+- A conv layer slides a small grid of weights (a kernel) across the image and writes one dot product per position.
+- Deep learning's "convolution" is really cross-correlation: no kernel flip, and for learned kernels the difference does not matter.
+- Without padding, a $k \times k$ kernel shrinks each side by $k - 1$ pixels.
+- Sparse connectivity (each output sees a small patch) and weight sharing (one kernel reused everywhere) make conv layers tiny compared with FC layers.
+- A layer with $C_{out}$ kernels makes $C_{out}$ feature maps; each kernel spans all input channels.
+
 ## Try it Yourself
+
+This experiment runs two Sobel kernels over the same random $8 \times 8$ image: one tuned to
+horizontal edges (brightness changing top to bottom) and one to vertical edges (changing left to
+right).
 
 ```python
 import numpy as np
@@ -164,25 +264,38 @@ print("Vertical response:\n",   conv2d_naive(X, K_vert).round(2))
 
 ```output
 Horizontal response:
- [[-1.97  0.14 -0.9  -0.46  2.84  0.43]
- [ 0.88 -3.44  3.62 -0.36 -3.12 -1.76]
- [-2.67 -1.29  0.64 -0.41  3.13  1.04]
- [ 2.62  1.22 -0.18 -1.01 -0.77  1.11]
- [ 2.44 -0.39 -1.53  0.27 -2.29 -2.46]
- [-0.26 -0.55  2.01 -0.57  0.37  0.57]]
+ [[-0.35  0.65  0.09 -3.16 -4.1  -2.97]
+ [-0.24  0.61  0.83  0.42 -0.63 -3.1 ]
+ [ 0.85 -0.8  -2.17 -1.16  2.29  3.45]
+ [-1.76  1.63  1.76  0.94  1.99  2.12]
+ [-2.63  0.27  2.67  2.66 -0.05  0.06]
+ [-0.68 -1.29  0.53  3.42  3.62  1.61]]
 Vertical response:
- [[-1.74  0.64  2.4  -0.39 -2.12  0.62]
- [-3.61 -2.41  1.93  1.95  0.67 -3.51]
- [-0.47  0.36 -0.08 -1.66  0.94  0.33]
- [ 1.25 -0.37 -0.68  1.18 -0.01 -0.56]
- [ 0.86  0.88 -2.33 -1.96 -1.07 -0.43]
- [-0.29 -1.52  2.64 -0.17 -0.9   2.17]]
+ [[-2.75 -6.15  5.39  2.17 -4.29  2.46]
+ [-2.88 -4.17  3.06  0.85 -4.95  1.77]
+ [-3.56 -4.29  2.03  2.47 -4.15 -0.34]
+ [-1.81 -4.29  0.8   3.89 -1.06 -2.15]
+ [ 2.08 -1.88  0.91  2.95 -1.79 -1.18]
+ [ 2.78 -0.29  3.53  3.22 -4.57 -0.29]]
 ```
+
+Both outputs are $6 \times 6$ ($8 - 3 + 1$). The input is pure noise, so neither map shows a
+clean edge — but the two maps are clearly different numbers from the same pixels, because each
+kernel asks a different question. Try replacing `X` with a real edge, for example
+`X = np.zeros((8, 8)); X[:, 4:] = 1.0` (dark left half, bright right half). The vertical
+response then lights up as a band two columns wide at the boundary (every value there is
+$-4$: the kernel's left column sees 0s and its right column sees 1s, so
+$1 \cdot 0 + 2 \cdot 0 + 1 \cdot 0 - (1 + 2 + 1) \cdot 1 = -4$), and the horizontal response is all
+zeros, because nothing changes from top to bottom.
 
 ## Exercise
 
 Implement a faster version of `conv2d_naive` using `np.lib.stride_tricks.as_strided` to
 extract all patches at once (no Python loops), then verify it gives identical results.
+
+> **Hint:** a patch starting at $(i, j)$ is reached by moving $i$ rows and $j$ columns, and
+> moving inside the patch also moves by rows and columns. So the 4-D view of shape
+> `(out_h, out_w, kh, kw)` uses the row stride and the column stride twice each.
 
 <details>
 <summary>Solution</summary>
@@ -215,4 +328,10 @@ print("Max diff:", np.abs(Y_naive - Y_strided).max())
 The stride trick creates a zero-copy view of all patches simultaneously.
 `einsum('ijmn,mn->ij', ...)` contracts the patch and kernel dimensions, giving the same result
 without any Python loops over spatial positions.
+
+The key insight: a **stride** is how many bytes you step in memory to move one position along
+an axis. Overlapping patches share memory, so `as_strided` builds the $(4, 4, 3, 3)$ patch array
+without copying a single pixel. The max difference prints about $2.2 \times 10^{-16}$ — one
+unit of 64-bit rounding — because the two versions add the same nine products in a different
+order.
 </details>

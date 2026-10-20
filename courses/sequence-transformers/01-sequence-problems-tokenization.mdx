@@ -7,31 +7,72 @@ order: 1
 
 ## What makes a problem sequential
 
+Some data only makes sense in order. Shuffle the words of a sentence, the notes of a song, or
+the days of a stock chart, and you lose the meaning. Those are sequence problems.
+
 A problem is sequential when the **order of inputs matters** and the output depends on context across positions. A bag of words ignores order — "dog bites man" and "man bites dog" are identical. Sequences preserve that order, making position meaningful.
+
+A **bag of words** is a representation that only counts which words appear, like dumping the
+words of a sentence into a bag and shaking it. Both sentences above give the same bag
+(`dog: 1, bites: 1, man: 1`), yet only one of them is news.
 
 Three distinguishing properties: inputs are variable-length; position carries information; and outputs may themselves be sequences of different lengths.
 
+> **Picture it:** a sentence is a train of carriages. A bag of words tells you which
+> carriages exist; a sequence model also knows which carriage is coupled behind which.
+
 ## The core sequence tasks
+
+Almost every sequence problem has one of four shapes, depending on how many outputs you want
+per input: one per sequence, one per token, a whole new sequence, or a sequence of a
+different length.
 
 **Sequence classification** — one label per sequence. Sentiment analysis ("positive"), spam detection, intent recognition. The entire input maps to one output.
 
 **Sequence labeling** — one label per token. Named entity recognition (NER) tags "London" as `LOC`; part-of-speech (POS) tags "runs" as `VB`. Output length equals input length.
 
+A **token** is one unit of input after you chop the text up — a character, a word, or a piece
+of a word. **NER** marks which tokens are names of places, people, or organizations; **POS**
+tagging marks each word's grammar role (noun, verb, ...).
+
 **Sequence generation** — produce a new sequence from scratch, conditioned on a prompt. Language modeling, code completion.
 
 **Sequence-to-sequence (seq2seq)** — map one sequence to another of potentially different length. Machine translation, summarization, question answering.
 
+> **Picture it:** classification is a judge giving one verdict for a whole speech; labeling is
+> a proofreader writing one mark above every word; generation is a storyteller continuing a
+> tale; seq2seq is an interpreter who listens to a full French sentence and then speaks an
+> English one that may be shorter or longer.
+
 ## Characters vs words vs subwords
+
+Before a model can read text, you must cut it into pieces and give every piece a number. How
+big you make the pieces decides how many different pieces exist and what happens with words
+you have never seen.
 
 The unit you tokenize into determines vocabulary size and how you handle unknown text.
 
-**Character tokenization** gives the smallest vocabulary (≈100 for ASCII, ≈thousands for Unicode). Every string is representable with no out-of-vocabulary (OOV) tokens. The downside: sequences get very long, and the model must learn that "c", "a", "t" together mean something.
+The **vocabulary** is the full list of distinct tokens the model knows, each with an integer
+ID. Anything outside it is **out-of-vocabulary (OOV)** — a piece the model has no ID for.
+
+**Character tokenization** gives the smallest vocabulary (about 100 for ASCII, thousands for Unicode). Every string is representable with no out-of-vocabulary (OOV) tokens. The downside: sequences get very long, and the model must learn that "c", "a", "t" together mean something.
 
 **Word tokenization** splits on whitespace and punctuation. Vocabulary balloons to 50k–500k for real corpora. Rare words and misspellings become `<UNK>`. "unhappiness" might not appear in training but "unhappy" does.
 
 **Subword tokenization** (BPE, WordPiece, Unigram) finds a middle ground: common words stay whole, rare words split into pieces. "unhappiness" → ["un", "##happiness"] or ["un", "happy", "ness"]. Covered in Course 12 (NLP & LLMs); here we use characters.
 
+> **Picture it:** characters are single LEGO studs (you can build anything, but slowly),
+> words are pre-built houses (fast, but you're stuck if you need a castle), and subwords are
+> the standard LEGO bricks in between.
+
+> **Watch out:** character tokenization has no OOV problem only for characters you saw at
+> build time. A vocabulary built from lowercase text still has no ID for "T" — you will see
+> this happen in the Try it block below.
+
 ## Building a character vocabulary
+
+A character vocabulary is a numbered list of every distinct character in your text, plus a
+few reserved "control" tokens at the front.
 
 ```python
 corpus = [
@@ -53,10 +94,15 @@ print(f"'a' index: {char2idx['a']}, 't' index: {char2idx['t']}")
 ```
 
 ```output
-Vocab size: 30
+Vocab size: 22
 First 10 tokens: ['<PAD>', '<UNK>', '<BOS>', '<EOS>', ' ', 'a', 'b', 'c', 'd', 'e']
-'a' index: 5, 't' index: 21
+'a' index: 5, 't' index: 19
 ```
+
+Look at the first line: 22 tokens. That is 4 special tokens plus 18 distinct characters in
+the corpus (the space and 17 letters). The vocabulary is sorted, so the space comes first at
+index 4 and `'a'` lands at index 5. The letter `'t'` is at 19, not 23, because letters like
+`f`, `i`, `j`, `l`, `q` never appear in these three sentences and get no slot.
 
 The four special tokens serve fixed roles:
 - `<PAD>` (index 0) — fill shorter sequences to match batch length
@@ -64,7 +110,14 @@ The four special tokens serve fixed roles:
 - `<BOS>` (index 2) — "beginning of sequence" marker for decoders
 - `<EOS>` (index 3) — "end of sequence" signal; generation stops here
 
+> **Watch out:** the IDs depend on the corpus. Add one sentence with a new letter and every
+> later letter's index shifts. Save the vocabulary alongside the model; never rebuild it from
+> different data at inference time.
+
 ## Tokenizing and encoding
+
+**Encoding** turns text into a list of integer IDs; **decoding** turns IDs back into text.
+They must be exact inverses on the characters the vocabulary covers.
 
 ```python
 def encode(text, char2idx, add_bos=False, add_eos=False):
@@ -88,13 +141,23 @@ print(f"Decoded: {decode(encoded, idx2char)}")
 ```
 
 ```output
-Encoded: [2, 21, 10, 8, 4, 7, 5, 21, 3]
+Encoded: [2, 19, 11, 9, 4, 7, 5, 19, 3]
 Decoded: the cat
 ```
 
+Read the encoded list: it starts with 2 (`<BOS>`) and ends with 3 (`<EOS>`). In between, 19
+is `t`, 4 is the space, and the two 19s show the same letter always gets the same ID.
+Decoding drops the markers and gives back exactly `the cat`.
+
 ## Padding to batch
 
+Computers process data fastest in neat rectangular grids. Sentences have different lengths,
+so you stretch the short ones with filler and keep a note of which slots are filler.
+
 Neural networks process fixed-size tensors. When you batch sequences of different lengths, you pad the shorter ones to match the longest, then tell the model which positions to ignore.
+
+A **batch** is a group of examples processed together; **padding** fills the empty slots with
+`<PAD>` (ID 0); a **padding mask** is a grid of 1s and 0s saying "real token" or "filler".
 
 ```python
 import numpy as np
@@ -122,15 +185,32 @@ print("Mask row 2 (short seq):", mask[2].astype(int))
 ```output
 Batch shape: (3, 26)
 Lengths: [11, 26, 2]
-Batch row 0: [21 10  8  4  7  5 21  4 20  5 21  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0]
+Batch row 0: [19 11  9  4  7  5 19  4 18  5 19  0  0  0  0  0  0  0  0  0  0  0  0  0
+  0  0]
 Mask row 2 (short seq): [1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
 ```
 
+The longest sentence has 26 characters, so the batch is $3 \times 26$. Row 0 holds 11 real
+IDs and then fifteen 0s of padding (NumPy wraps the long row onto a second line when it
+prints). The mask for `"hi"` is two 1s followed by 24 zeros: only 2 of its 26 slots are real.
+
 The mask is fed to the model so attention and loss computations skip pad positions.
+
+> **Picture it:** an egg carton with 26 cups. Short sentences leave cups empty; the mask is a
+> sticky note on each cup saying "egg" or "empty", so nobody tries to cook the empty ones.
+
+> **Watch out:** if you forget the mask, the model learns from (and attends to) thousands of
+> meaningless `<PAD>` tokens, and the loss looks better than it really is.
 
 ## One-hot encoding
 
+A token ID like 5 is only a name tag — 5 is not "bigger" than 4 in any meaningful way. A
+**one-hot vector** expresses an ID without fake ordering: a long row of zeros with a single
+1 in the token's slot.
+
 Before learned embeddings, each token index becomes a one-hot vector of size `|V|`. It's sparse and high-dimensional, but shows the structural idea clearly.
+
+Here `|V|` means the vocabulary size. **Sparse** means almost every entry is zero.
 
 ```python
 def one_hot(idx, vocab_size):
@@ -146,11 +226,35 @@ print(f"First 8 values: {oh[:8]}")
 ```
 
 ```output
-One-hot for 'a': shape=(30,), nonzero at 5
+One-hot for 'a': shape=(22,), nonzero at 5
 First 8 values: [0. 0. 0. 0. 0. 1. 0. 0.]
 ```
 
+The vector has 22 entries (one per vocabulary item), and the only 1 is at position 5, the ID
+of `'a'`. In the first eight values you can see it as the sixth number.
+
 One-hot vectors have no notion of similarity — every pair of tokens is equidistant. Learned embeddings fix this by projecting tokens into a dense space where similar tokens cluster.
+
+To be precise: any two different one-hot vectors are at distance $\sqrt{2}$ from each other,
+so `'a'` is exactly as far from `'e'` as from `' '`. An **embedding** is a short, dense
+vector of learned numbers per token; training can pull related tokens close together.
+
+> **Picture it:** one-hot is a building with one light switch per room — you can say which
+> room, but not which rooms are neighbours. An embedding is a map with coordinates, where
+> nearby rooms have nearby coordinates.
+
+## Recap in plain words
+
+- A sequence problem is one where order carries meaning; a bag of words throws that away.
+- The four task shapes are classification, labeling, generation, and seq2seq.
+- Characters give a tiny vocabulary but long sequences; words give the reverse; subwords sit
+  between.
+- A vocabulary maps every token to an integer ID, with special tokens for padding, unknowns,
+  start, and end.
+- Batches need padding to a common length, and a mask that tells the model to ignore the
+  padding.
+- One-hot vectors encode IDs without fake order, but treat every pair of tokens as equally
+  different.
 
 ## Try it Yourself
 
@@ -187,11 +291,17 @@ print("UNK index:", char2idx["<UNK>"])
 ```
 
 ```output
-Encoded: [2, 21, 10, 8, 4, 12, 16, 24, 3]
-Vocab size: 29
+Encoded: [2, 24, 12, 9, 4, 10, 19, 28, 3]
+Vocab size: 31
 Uppercase (OOV) encoded: [1, 1, 1, 4, 1, 1, 1]
 UNK index: 1
 ```
+
+This corpus is a pair of pangrams, so it contains all 26 lowercase letters: 4 specials + space
++ 26 letters = 31. Now look at the uppercase line: every letter of `THE FOX` became 1
+(`<UNK>`), and only the space (4) survived. That is the OOV problem appearing even at the
+character level. Try lowercasing the input with `.lower()` before encoding, or add `"THE FOX"`
+to the corpus, and watch the 1s disappear.
 
 ## Exercise
 
@@ -203,7 +313,15 @@ Build a word-level tokenizer for the corpus below. Your tokenizer should:
 
 ```python
 corpus = ["the cat sat", "the dog ran far", "a bird flew"]
+print(len(corpus), "sentences")
 ```
+
+```output
+3 sentences
+```
+
+> **Hint:** reuse the character recipe, but build the set from `s.split()` instead of from the
+> characters of `s`. `dict.get(word, unk_id)` handles OOV words in one line.
 
 <details>
 <summary>Solution</summary>
@@ -235,4 +353,10 @@ print("Batch:\n", batch)
 ```
 
 OOV tokens map to index 1 (`<UNK>`). The padding mask is `batch != 0`.
+
+Running it, the test sentence encodes to `[12, 6, 1, 1]`: `the` is 12 and `cat` is 6 (the
+nine words sort to IDs 4–12), while `chases` and `rats` both collapse to 1. The solution adds
+the test sentence as a fourth row, so the batch is $4 \times 4$, padded to the length of
+"the dog ran far". Notice the cost of word-level tokens: two different unknown words become
+the same `<UNK>` and the model can no longer tell them apart.
 </details>
