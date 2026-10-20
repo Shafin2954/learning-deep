@@ -6,6 +6,16 @@ belongs, whether the probabilities mean anything, how to search hyperparameters 
 yourself, what the model actually used, where it fails, and how to compare two candidates
 honestly.
 
+**In plain words:** a trained model is only useful once you can trust its numbers. Chapters 1–2
+teach you to pick the score that matches your real question, for yes/no models, number-predicting
+models, and ranked lists. Chapters 3–4 turn scores into decisions: choosing the cutoff from the
+cost of each mistake, and making sure a "30%" from the model really means 30%. Chapters 5–7 make
+testing and tuning honest: cross-validation that imitates launch day, and grid, random, Bayesian,
+and Optuna searches that do not fool you. Chapters 8–11 open the model up — what it relies on,
+why it scored one person the way it did, what shape it learned, and where it fails most — and
+chapter 12 records everything so a result can be repeated and two models compared fairly, before
+the capstone (ch. 13) puts it all into one shippable report.
+
 ## Chapters
 
 1. Classification metrics: precision, recall, F1, ROC vs PR
