@@ -7,24 +7,38 @@ order: 2
 
 ## Why Python loops are slow
 
+Adding two lists of numbers one pair at a time in Python is like paying a toll at every
+single step of a long road. **Vectorization** means handing the whole job to NumPy in one
+go, so the work happens on a highway with no tolls.
+
 A Python `for` loop is fast for general computation. For numerical arrays it's catastrophically
 slow. Three reasons:
 
 1. **Type checking on every step.** Python doesn't know `a[i]` is a float until it looks at
    the box around it. NumPy knows the dtype up front — no check needed.
-2. **No SIMD.** Modern CPUs can add 8 float32s in a single instruction (AVX2). A Python loop
-   adds one at a time.
-3. **No parallelism.** NumPy's C routines can release the GIL and use multiple cores. Python
-   loops hold the GIL.
+2. **No SIMD.** **SIMD** ("single instruction, multiple data") is the CPU's ability to do the
+   same operation on several numbers at once. Modern CPUs can add 8 float32s in a single
+   instruction (AVX2). A Python loop adds one at a time.
+3. **No parallelism.** NumPy's C routines can release the **GIL** (the Global Interpreter
+   Lock — the rule that only one thread runs Python code at a time) and use multiple cores.
+   Python loops hold the GIL.
+
+> **Picture it:** a Python loop is a cashier who scans one item, asks "is this a banana or
+> a TV?", rings it up, and repeats. NumPy is a conveyor belt that already knows every item
+> is a banana and weighs eight at once.
 
 The fix is **vectorization**: pass the entire array to a compiled NumPy function (a *ufunc*)
 that loops in C with SIMD.
 
 ## Ufuncs — the compiled loop you call once
 
+A **ufunc** is a function that does one simple thing to every element, and does the
+looping for you in fast compiled code. You call it once; it handles millions of elements.
+
 A ufunc (*universal function*) operates element-wise on arrays of any shape. NumPy ships ~60
 of them: `np.add`, `np.multiply`, `np.sqrt`, `np.sin`, `np.exp`, etc. Python operators `+`,
-`*`, `**` are just syntax sugar for the corresponding ufuncs.
+`*`, `**` are just syntax sugar for the corresponding ufuncs — `a + b` on arrays *is*
+`np.add(a, b)`.
 
 ```python
 import numpy as np
@@ -51,20 +65,34 @@ print(f"Speedup: {loop_ms / vec_ms:.0f}×")
 ```
 
 ```output
-Loop :  1847 ms
-Vec  :  7.3 ms
-Speedup: 253×
+Loop :  906 ms
+Vec  :  14.5 ms
+Speedup: 63×
 ```
 
-*(Times vary by machine. The 100–300× ratio is typical for float64 on modern hardware.)*
+*(Times vary by machine. Anywhere from about 50× to 300× is typical for float64 on modern
+hardware.)*
+
+Look at the last line: the same 5 million additions, the same answer, but the vectorized
+version is dozens of times faster. Nothing about the math changed — only *who* runs the
+loop (the Python interpreter, or compiled C).
 
 The entire array traversal happens inside the ufunc — one Python call, millions of C operations.
 
+> **Watch out:** `c_loop` is a Python list of 5 million separate Python floats, not an
+> array. Building it also costs far more memory than the 40 MB float64 array `c_vec`.
+
 ## Broadcasting — the shape arithmetic
+
+**Broadcasting** is NumPy's rule for combining arrays of different shapes: a smaller array
+is "stretched" to fit a bigger one, as if it were repeated, but without actually copying
+anything.
 
 Broadcasting lets ufuncs operate on arrays with **compatible but unequal shapes** without
 copying data. The rule: compare shapes from the trailing (rightmost) dimension; dimensions are
 compatible if they are equal, or if one of them is 1.
+
+The simplest case is an array plus a single number:
 
 ```python
 import numpy as np
@@ -77,6 +105,9 @@ print(a + 10)            # 10 is treated as shape (1,) → broadcast to (3,)
 ```output
 [11. 12. 13.]
 ```
+
+The `10` was added to every element. Next, a table plus one row: the row is reused for
+every row of the table.
 
 ```python
 import numpy as np
@@ -92,6 +123,12 @@ print(M + bias)                     # bias broadcast across rows
 [[11. 22. 33.]
  [14. 25. 36.]]
 ```
+
+Check the shapes on the right: `(2, 3)` and `(3,)` line up at the last axis (3 = 3), so
+`bias` slides down across both rows. Row 0 became `1+10, 2+20, 3+30`; row 1 became
+`4+10, 5+20, 6+30`.
+
+To add something per *row* instead, make it a column — shape `(2, 1)`:
 
 ```python
 import numpy as np
@@ -109,6 +146,13 @@ print(M + col)                      # col broadcast across columns
  [204. 205. 206.]]
 ```
 
+Now the `100` lands on every element of row 0 and the `200` on every element of row 1:
+the size-1 axis (the columns of `col`) stretched to 3.
+
+> **Picture it:** broadcasting is like a rubber stamp. A `(3,)` row is a stamp you press
+> once per row of the table; a `(2, 1)` column is a stamp you press once per column. A
+> dimension of size 1 is the stamp's "repeat me here" mark.
+
 ### The broadcasting rules in full
 
 Align shapes on the right:
@@ -121,10 +165,24 @@ A dimension of 1 stretches to match the other. The stretch is **virtual** — no
 NumPy just adjusts the stride to 0 for that axis: stepping along it costs nothing and reads the
 same element repeatedly.
 
+> **In plain words:** (1) write the two shapes right-aligned; (2) pad the shorter one on
+> the left with 1s; (3) at every position the sizes must be equal or one must be 1; (4) the
+> result takes the bigger size at each position. If any position has two different sizes
+> neither of which is 1 — say 3 and 4 — NumPy raises an error.
+
+Recall strides from ch. 1: a stride is "bytes to jump per step along an axis". A stride of
+0 means "don't move", so every step re-reads the same number. That is how a 3-element row
+can pretend to be a 1000-row table without using any extra memory.
+
 ## A practical example: normalizing rows
 
+To **normalize** (or **standardize**) a set of numbers means shifting them so their average
+is 0 and scaling them so their spread is 1. Broadcasting lets you do that for every row of a
+table at once.
+
 Given a matrix of shape `(N, D)`, subtract each row's mean and divide by its std — the
-standard scaler operation. Broadcasting makes this a two-liner.
+standard scaler operation. Broadcasting makes this a two-liner. (scikit-learn's
+`StandardScaler` applies the same formula per *column*, i.e. with `axis=0`.)
 
 ```python
 import numpy as np
@@ -141,14 +199,26 @@ print("std  of each normalized row:", X_norm.std(axis=1).round(5))
 ```
 
 ```output
-mean of each normalized row: [ 0.  0. -0.  0.]
+mean of each normalized row: [ 0. -0.  0.  0.]
 std  of each normalized row: [1. 1. 1. 1.]
 ```
+
+Every normalized row now has mean 0 and standard deviation 1 — exactly what the operation
+promises. The `-0.` is a tiny negative rounding error (like `-0.0000001`) printed after
+rounding to 5 decimals; it is still zero.
 
 `keepdims=True` is the key: it preserves the (4, 1) shape so broadcasting works along columns.
 Without it, `mu` has shape `(4,)` which would broadcast along rows — wrong direction.
 
+> **Watch out:** with `X` of shape `(4, 3)`, a `(4,)` mean is aligned against the *last*
+> axis (size 3) and raises a shape error. With a square `(4, 4)` matrix it would *not*
+> error — it would silently subtract the wrong numbers. `keepdims=True` protects you from
+> both.
+
 ## Aggregation along axes
+
+An **aggregation** squashes many numbers into one: a sum, a max, a mean. The `axis`
+argument tells NumPy which direction to squash.
 
 Most NumPy aggregations accept an `axis` argument. Think of it as "collapse this axis into a
 single number":
@@ -174,6 +244,26 @@ max axis=1: [3. 6.]
 argmax    : [2 2]
 ```
 
+Read the output with the table in mind: `axis=0` collapses the rows, so you get one number
+per column (`1+4=5, 2+5=7, 3+6=9`). `axis=1` collapses the columns, so you get one number per
+row (`1+2+3=6, 4+5+6=15`). `argmax` says *where* the max is: position 2 in both rows.
+
+> **Picture it:** `axis=0` squashes the table from top to bottom like closing an accordion
+> vertically; the row labels disappear and the columns survive. `axis=1` squashes it from
+> left to right; the columns disappear and the rows survive. The axis you name is the one
+> that vanishes.
+
+## Recap in plain words
+
+- Python loops pay a type check per element, use no SIMD, and hold the GIL; ufuncs do the
+  loop in compiled code, often 100×+ faster.
+- Operators like `+` and `*` on arrays are ufuncs.
+- Broadcasting stretches size-1 axes (and missing leading axes) to match, by setting their
+  stride to 0 — no copying.
+- Shapes are compared right-aligned: each position must be equal or contain a 1.
+- `keepdims=True` keeps a collapsed axis as size 1 so the result broadcasts back correctly.
+- The `axis` you pass to an aggregation is the axis that disappears.
+
 ## Try it Yourself
 
 ```python
@@ -197,18 +287,23 @@ print("outer product:\n", u * v)        # (3,3) with no np.outer call
 
 ```output
 distance matrix:
- [[0.   2.13 3.54 5.48 4.37]
-  [2.13 0.   2.01 4.62 5.79]
-  [3.54 2.01 0.   2.76 6.05]
-  [5.48 4.62 2.76 0.   3.39]
-  [4.37 5.79 6.05 3.39 0.  ]]
+ [[0.   6.89 3.26 6.24 4.62]
+ [6.89 0.   8.04 9.74 2.44]
+ [3.26 8.04 0.   3.   6.41]
+ [6.24 9.74 3.   0.   8.67]
+ [4.62 2.44 6.41 8.67 0.  ]]
 outer product:
  [[10. 20. 30.]
-  [20. 40. 60.]
-  [30. 60. 90.]]
+ [20. 40. 60.]
+ [30. 60. 90.]]
 ```
 
 *(Distance values depend on the random seed — the zero diagonal and symmetry are what matter.)*
+
+The distance trick is broadcasting in 3-D: `pts[:, np.newaxis, :]` has shape `(5, 1, 2)`
+and `pts[np.newaxis, :, :]` has shape `(1, 5, 2)`, so their difference is `(5, 5, 2)` —
+every point minus every other point. The diagonal is 0 (each point's distance to itself),
+and `D[i, j] == D[j, i]`. Try 1000 points instead of 5: the code doesn't change.
 
 ## Exercise
 
@@ -218,7 +313,15 @@ $$
 \text{softmax}(z)_i = \frac{e^{z_i - \max(z)}}{\sum_j e^{z_j - \max(z)}}
 $$
 
+> **In plain words:** exponentiate every score so it becomes positive, then divide by the
+> row's total so the row sums to 1 — the scores turn into probabilities. Subtracting the
+> row's max first changes nothing in the answer (it cancels between top and bottom) but
+> keeps $e^{z}$ from overflowing to infinity for big scores.
+
 Use `np.random.default_rng(0).standard_normal((4, 5))` as input. Verify: each row sums to 1.
+
+> **Hint:** you need two per-row reductions (the max and the sum), and both must stay shape
+> `(4, 1)` to broadcast back against `(4, 5)`.
 
 <details>
 <summary>Solution</summary>

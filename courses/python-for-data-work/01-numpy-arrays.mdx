@@ -7,13 +7,31 @@ order: 1
 
 ## What NumPy is, and why it exists
 
-Python lists are flexible but slow for numerical work: every element is a boxed Python
-object, comparisons and arithmetic invoke the interpreter per element, and nothing is
-contiguous in memory. NumPy replaces them with **ndarray** — a block of raw memory holding
-homogeneous elements, processed by compiled C/Fortran code. That's the whole story. Every
-performance advantage flows from those two decisions: one dtype, contiguous layout.
+NumPy is a way to store a big pile of numbers so the computer can crunch them fast. That is
+the whole job, and it does it by making two promises about the numbers: they are all the
+same kind, and they sit right next to each other in memory.
+
+Python lists make neither promise. They are flexible but slow for numerical work: every
+element is a **boxed Python object** — a full Python value with its own type tag and
+bookkeeping, stored somewhere else in memory — so arithmetic and comparisons have to ask the
+interpreter "what are you?" once per element, and nothing is **contiguous** (packed side by
+side) in memory.
+
+> **Picture it:** a Python list is a row of envelopes. Each envelope holds a slip saying
+> where the real number lives and what kind of thing it is, so reading one number means
+> opening an envelope and walking somewhere. A NumPy array is an egg carton: identical
+> slots, side by side, holding the numbers themselves. You can scan a carton in one sweep.
+
+NumPy's array type is the **ndarray** ("n-dimensional array") — a block of raw memory
+holding **homogeneous** elements (all the same type), processed by compiled C/Fortran code
+instead of the Python interpreter. That's the whole story. Every performance advantage
+flows from those two decisions: one dtype, contiguous layout.
 
 ## Creating arrays and reading their metadata
+
+Every array carries a small label describing its numbers: what kind they are, how many,
+and how they are arranged. Reading that label is how you answer "how big is this?" and
+"what shape is this?" without printing the data.
 
 ```python
 import numpy as np
@@ -39,13 +57,27 @@ a itemsize: 8 bytes
 a nbytes  : 24 bytes
 ```
 
-`nbytes = size × itemsize`. A float64 is 8 bytes; a float32 is 4. Choosing the right dtype
-cuts memory in half and often halves compute time (more data fits in cache).
+Read the output top to bottom: the **dtype** is the kind of number in every slot
+(`float64`, a 64-bit decimal number); the **shape** `(3,)` says "one axis, 3 long"; `ndim` is
+the number of axes; `size` is the total count of elements; `itemsize` is the bytes per
+element; and `nbytes` is the bytes for the whole thing.
+
+`nbytes = size × itemsize`. Here that is 3 numbers × 8 bytes = 24 bytes. A float64 is 8
+bytes; a float32 is 4. Choosing the right dtype cuts memory in half and often halves
+compute time (more data fits in cache — the CPU's small, very fast memory, covered below).
+
+> **In plain words:** the size of an array in memory is just "how many numbers" times "how
+> big each number is". Halve the size of each number and the whole array halves.
 
 ## The dtype is everything
 
-NumPy's type hierarchy starts with four families: integers, unsigned integers, floats, and
-booleans. The suffix is the bit width.
+A dtype is a promise about what every slot can hold. A small dtype is cheap but can only
+hold a small range of values; a big dtype holds more but costs more memory.
+
+NumPy's type hierarchy starts with four families: integers, unsigned integers (whole
+numbers that can't be negative), floats (numbers with a decimal point), and booleans. The
+suffix is the bit width — how many bits (0/1 switches) each number gets: `int8` has 8 bits,
+`float32` has 32.
 
 ```python
 import numpy as np
@@ -69,17 +101,41 @@ int8         1 bytes  range: [-128, 127]
 int16        2 bytes  range: [-32768, 32767]
 int32        4 bytes  range: [-2147483648, 2147483647]
 int64        8 bytes  range: [-9223372036854775808, 9223372036854775807]
-float16      2 bytes  range: eps=9.77e-04
-float32      4 bytes  range: eps=1.19e-07
-float64      8 bytes  range: eps=2.22e-16
-bool_        1 bytes
+float16      2 bytes  range: [-65504.0, 65504.0]
+float32      4 bytes  range: [-3.4028234663852886e+38, 3.4028234663852886e+38]
+float64      8 bytes  range: [-1.7976931348623157e+308, 1.7976931348623157e+308]
+bool         1 bytes
 ```
 
+Each line shows the bytes per element and the **range** — the smallest and largest value
+that fits. `int8` gets 8 bits, which is $2^8 = 256$ patterns, so it covers $-128$ to $127$.
+Each extra byte multiplies the range enormously. Floats reach much further for the same
+bytes (`float32` tops out near $3.4 \times 10^{38}$), but notice `float16`: its largest
+value is only 65504.
+
+Range is only half the story for floats. What they really trade away is **precision**,
+measured by **eps** (machine epsilon) — the gap between 1.0 and the next number the type
+can represent. `np.finfo(np.float16).eps` is about `9.77e-04` (roughly 3 trustworthy decimal
+digits), float32's is `1.19e-07` (about 7 digits), and float64's is `2.22e-16` (about 16).
+`bool` uses a whole byte per True/False, not one bit.
+
+> **Picture it:** integer dtypes are rulers of different lengths — a longer ruler measures
+> bigger things. Float dtypes are rulers with finer or coarser tick marks — finer ticks
+> measure more precisely.
+
+> **Watch out:** integer arithmetic that overflows its dtype silently wraps around: in
+> `int8`, `100 + 100` comes out as `-56`, with no error. Storing pixel values (0–255) in
+> `int8` instead of `uint8` is a classic version of this bug.
+
 **Rule of thumb:** use float32 for model weights / training data (halves RAM vs float64,
-GPU-native). Use float64 for intermediate statistics where precision matters. Use int32/int64
-for indices; int8/uint8 for image pixel data.
+GPU-native — graphics cards are built to crunch 32-bit floats). Use float64 for intermediate
+statistics where precision matters (long sums and variances lose digits in float32). Use
+int32/int64 for indices; int8/uint8 for image pixel data.
 
 ## 2-D arrays and shapes
+
+A 2-D array is a table: rows and columns. Its shape is written `(rows, cols)`, and the
+same numbers can be re-arranged into a different table shape without moving them.
 
 ```python
 import numpy as np
@@ -107,15 +163,32 @@ nbytes : 48
 reshaped: (3, 2)
 ```
 
-`reshape` returns a **view**, not a copy, whenever the data is contiguous. Modifying `v`
-modifies `M`. This is not a bug — it's a feature. Views are free; unnecessary copies
-are one of the main sources of accidental memory bloat in NumPy code.
+The shape `(2, 3)` means 2 rows and 3 columns, so `size` is $2 \times 3 = 6$ and `nbytes` is
+6 × 8 = 48. Reshaping to `(3, 2)` keeps the same 6 numbers and only changes how you index
+them — the total must stay 6, or NumPy refuses.
+
+`reshape` returns a **view**, not a copy, whenever the data is contiguous. A view is a new
+array object that looks at the *same* memory through a different shape. Modifying `v`
+modifies `M`. This is not a bug — it's a feature. Views are free; unnecessary copies are one
+of the main sources of accidental memory bloat in NumPy code.
+
+> **Picture it:** a view is a second pair of glasses on the same page. One pair reads the
+> numbers as 2 rows of 3, the other as 3 rows of 2. Scribble on the page and both pairs see
+> the scribble.
 
 ### Memory layout: row-major (C) vs column-major (F)
 
-NumPy stores 2-D arrays in **row-major** order by default: the elements of row 0 come
-first in memory, then row 1, and so on. The **strides** tell you how many bytes to jump
-to move one step along each axis.
+Memory is one long line of bytes, not a grid. So a table has to be laid out flat
+somehow — and there are two natural choices: row after row, or column after column.
+
+NumPy stores 2-D arrays in **row-major** order by default (also called **C order**, after
+the C language): the elements of row 0 come first in memory, then row 1, and so on.
+**Column-major** (**F order**, after Fortran) stores column 0 first instead. The **strides**
+tell you how many bytes to jump to move one step along each axis.
+
+> **Picture it:** a 4×3 table of float32 is really one shelf of 12 boxes, each box 4 bytes
+> wide. To step one column to the right, you move one box: 4 bytes. To step one row down,
+> you skip a whole row of 3 boxes: 12 bytes. Those two jump sizes are the strides.
 
 ```python
 import numpy as np
@@ -136,15 +209,27 @@ F strides: (4, 16)
 ```
 
 Row stride = 3 columns × 4 bytes = 12. Column stride = 4 bytes (one element). For the
-Fortran layout it flips: 4 bytes per row step, 4×4=16 bytes per column step.
+Fortran layout it flips: 4 bytes per row step, 4×4=16 bytes per column step (in F order,
+going one column over means skipping a whole column of 4 elements).
 
-Why does this matter? Iterating along the axis where stride is largest (wrong direction)
-causes **cache misses**. Column-by-column iteration on a row-major array is slow; row-by-
-row is fast. NumPy operations along `axis=0` (columns) vs `axis=1` (rows) have different
-performance profiles — this is why you'll sometimes see a 10× difference just from
-changing axis order or transposing first.
+Why does this matter? Your CPU never fetches one number at a time. It pulls a whole chunk
+of neighbouring bytes (a **cache line**, typically 64 bytes) into its cache. If your next
+read is in that chunk, it is nearly free; if it is far away, the CPU waits for a new chunk —
+a **cache miss**. Iterating along the axis where stride is largest (wrong direction) causes
+cache misses. Column-by-column iteration on a row-major array is slow; row-by-row is fast.
+NumPy operations along `axis=0` (columns) vs `axis=1` (rows) have different performance
+profiles — this is why you'll sometimes see a 10× difference just from changing axis order
+or transposing first.
+
+> **Picture it:** reading a book line by line, you turn pages rarely. Reading the first
+> word of every line on every page, then the second word of every line, you'd be flipping
+> pages constantly. Same book, same words — the order of access is what's slow.
 
 ## Views vs copies
+
+When you pull part of an array out, NumPy either hands you a window onto the same memory
+(a view) or photocopies those numbers into new memory (a copy). Which one you get decides
+whether changing the piece also changes the original.
 
 Understanding when NumPy copies is essential for writing fast, bug-free code.
 
@@ -176,9 +261,35 @@ a after fancy-index mutation: [ 10 999  30  40  50]
 a after copy mutation: [ 10 999  30  40  50]
 ```
 
+Follow the `999` through the three lines. The slice `a[1:4]` is a view, so setting `s[0]`
+wrote straight into `a` — the first line shows `999` in `a`. The fancy-indexed `c` and the
+`.copy()` `d` are copies: setting their first element to `0` and `-1` left `a` alone, so the
+second and third lines are unchanged (the `999` you still see is from the first step).
+
 The rule: **slices (`:`) give views; fancy indexing (integer arrays, booleans) gives
-copies.** Scalar/slice indexing is free; fancy indexing pays for the allocation.
-If you need to pass data to a function without risking mutation, `.copy()` it first.
+copies.** **Fancy indexing** means picking elements with a list/array of positions or a
+true/false mask instead of a `start:stop` range. Scalar/slice indexing is free; fancy
+indexing pays for the allocation (new memory has to be reserved and filled). If you need to
+pass data to a function without risking mutation, `.copy()` it first.
+
+> **In plain words:** a slice can be a view because it is a regular pattern — "start
+> here, step this many bytes" — which strides can describe. Positions like `[1, 3]` or a
+> scattered mask have no single step size, so NumPy has to gather them into new memory.
+
+> **Watch out:** a function that receives a slice and edits it in place edits the caller's
+> array too. That is the most common "where did my data change?" bug in NumPy code.
+
+## Recap in plain words
+
+- An ndarray is an egg carton of numbers: one dtype, packed side by side, crunched by
+  compiled code.
+- `nbytes = size × itemsize`; halving the dtype (float64 → float32) halves the memory.
+- Integer dtypes trade range for size; float dtypes trade precision (eps) for size.
+- Memory is a flat line; strides say how many bytes to jump per axis. NumPy defaults to
+  row-major (C order).
+- Walk memory in order (along the small stride) and the cache helps you; jump around and
+  you pay for cache misses.
+- Slices and most reshapes are views (shared memory, free); fancy indexing makes copies.
 
 ## Try it Yourself
 
@@ -211,11 +322,21 @@ M contiguous: True
 T contiguous: False
 ```
 
+Notice two things in the output. The memory column doubles exactly as the dtype doubles
+(2 → 4 → 8 MB for a million numbers). And `M[0,0]` became 999 even though you only wrote
+to `T` — a transpose just swaps the strides, so it is a view of the same memory, and that
+view is not C-contiguous. Try a `(1000, 1000)` array, or a `uint8` one, and predict
+`nbytes` before you run it.
+
 ## Exercise
 
 A float64 array with shape `(1024, 1024)` has how many megabytes? What about float32?
 Write code to verify. Then create the array with `np.ones`, check `.nbytes`, and confirm
 the `strides` match your expectation for row-major layout.
+
+> **Hint:** multiply rows × columns × bytes per element, then divide by $1024^2$ to get MB.
+> For strides, ask: how many bytes to step one column right, and how many to step one row
+> down?
 
 <details>
 <summary>Solution</summary>
@@ -233,5 +354,7 @@ for dt, expected_mb in [(np.float64, 8.0), (np.float32, 4.0)]:
 ```
 
 Row-major strides for (1024, 1024) float64: `(8192, 8)` — move one row = 1024×8 = 8192
-bytes; move one column = 8 bytes. For float32 it's `(4096, 4)`.
+bytes; move one column = 8 bytes. For float32 it's `(4096, 4)`. The key insight: memory is
+always rows × columns × itemsize, and in row-major layout the row stride is "one whole row
+of bytes" while the column stride is "one element".
 </details>

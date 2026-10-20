@@ -7,6 +7,10 @@ order: 3
 
 ## Three ways to index an array
 
+**Indexing** means pointing at the parts of an array you want. You can point with a range
+("items 1 to 3"), with a list of positions ("items 0, 2 and 4"), or with a yes/no answer for
+every item ("only the positive ones").
+
 NumPy has three indexing modes. They look similar but behave very differently:
 
 | Mode | Example | Returns | Copies? |
@@ -15,10 +19,17 @@ NumPy has three indexing modes. They look similar but behave very differently:
 | Fancy (int array) | `a[[0, 2, 4]]` | new array | yes |
 | Boolean mask | `a[a > 0]` | new array | yes |
 
+> **Picture it:** a slice is a window you look through — same memory, nothing moves. Fancy
+> indexing and masks are a shopping list: NumPy walks the shelves, picks each item, and puts
+> it in a new basket (a copy).
+
 You already know slices (ch. 1). This chapter covers the other two, plus `np.where` and
 `np.einsum`, which together handle most indexing patterns in ML code.
 
 ## Fancy indexing with integer arrays
+
+Give NumPy a list of positions and it hands back those elements, in that order. You can
+skip, reorder, and repeat positions freely.
 
 Pass an array of integers to select (and reorder) elements. The result shape matches the
 index array.
@@ -35,8 +46,13 @@ print(a[idx])                   # result shape = idx.shape = (4,)
 [40 10 50 20]
 ```
 
+Position 3 holds `40`, position 0 holds `10`, position 4 holds `50`, position 1 holds `20` —
+so you get them back in exactly the order you asked for.
+
 In 2-D: index rows and columns independently. This is how batch look-ups in an embedding
-matrix work — grab `B` rows out of an `(V, D)` table in one call.
+matrix work — grab `B` rows out of an `(V, D)` table in one call. An **embedding matrix** is
+a table with one row of numbers per word (or token) in the vocabulary; `V` is the vocabulary
+size and `D` is the length of each row.
 
 ```python
 import numpy as np
@@ -56,7 +72,13 @@ print(E[token_ids])                                  # shape (4, 4)
 Row 2 appears twice (id=2 selected twice) — that's legal and common. Because fancy indexing
 copies, modifying the result doesn't touch `E`.
 
+> **Picture it:** `E` is a phone book with 5 entries. `token_ids` is a list of names to
+> look up; asking for the same name twice just gives you two copies of that entry.
+
 ### Simultaneous row + column fancy indexing
+
+Two index arrays work like coordinates: the first gives the row, the second gives the
+column, and they are read in pairs.
 
 To select element `(i, j)` pairs (not a sub-grid), pass two arrays of the same length:
 
@@ -76,10 +98,22 @@ print(M[rows, cols])   # picks M[0,2], M[1,0], M[2,1]
 [3 4 8]
 ```
 
+The pairs are `(0, 2)`, `(1, 0)`, `(2, 1)`: row 0 column 2 is `3`, row 1 column 0 is `4`,
+row 2 column 1 is `8`. You get one element per pair, not a 3×3 sub-grid.
+
 This is the pattern for cross-entropy: `log_probs[np.arange(B), y]` picks the log-probability
-of the true class for each of the `B` examples in the batch.
+of the true class for each of the `B` examples in the batch. **Cross-entropy** is the
+standard loss for classification; it only needs, for each example, the model's
+log-probability of the *correct* answer — and this one line fetches exactly those.
+
+> **Watch out:** `M[[0, 1], [2, 0]]` (pairs) and `M[[0, 1]][:, [2, 0]]` (rows, then columns)
+> are different. The first returns 2 elements; the second returns a 2×2 block. If you want
+> the block in one step, use `M[np.ix_([0, 1], [2, 0])]`.
 
 ## Boolean masking — filter without a loop
+
+A **boolean mask** is an array of `True`/`False` answers, one per element. Indexing with it
+keeps exactly the elements whose answer is `True`.
 
 A boolean array of the same shape as `a` selects elements where the mask is `True`.
 
@@ -97,11 +131,15 @@ print("count   :", mask.sum())        # True counts as 1
 ```
 
 ```output
-x       : [-0.44 -0.6   0.06  1.44  0.59 -1.25  0.74  0.88]
-mask    : [False False  True  True  True False  True  True]
-x[mask] : [0.06 1.44 0.59 0.74 0.88]
-count   : 5
+x       : [-0.8  -1.32 -0.25  0.42  1.14  0.11 -0.55 -0.78]
+mask    : [False False False  True  True  True False False]
+x[mask] : [0.42 1.14 0.11]
+count   : 3
 ```
+
+Line up the first two lines: wherever `mask` says `True`, the value above it is positive,
+and those are exactly the values in `x[mask]`. The count works because `True` counts as 1
+and `False` as 0 when you sum them.
 
 Compound conditions: use `&` (and), `|` (or), `~` (not). Always wrap each condition in
 parentheses — Python's operator precedence bites here.
@@ -116,10 +154,17 @@ print(small_pos)
 ```
 
 ```output
-[0.06]
+[0.42 0.11]
 ```
 
+> **Watch out:** without the parentheses, `x > 0 & x < 0.5` is read as `x > (0 & x) < 0.5`,
+> because `&` binds tighter than `>`. You get an error or a nonsense mask. And `and` / `or`
+> don't work on arrays at all — they raise "truth value of an array is ambiguous".
+
 ## `np.where` — conditional element selection
+
+`np.where` is an "if/else" applied to every element at once: where the condition is true,
+take one value; otherwise, take another.
 
 `np.where(condition, x, y)` returns elements from `x` where condition is True, else from `y`.
 Both `x` and `y` broadcast normally.
@@ -137,18 +182,36 @@ print("clipped:", clipped)
 ```
 
 ```output
-relu: [0.  1.  0.  2.  0. ]
-clipped: [-2.  1. -1.  2. -0.5]
+relu: [0. 1. 0. 2. 0.]
+clipped: [-2.   1.  -1.   2.  -0.5]
 ```
+
+In the first line, every negative entry became `0.0` and every positive one kept its value —
+that is **ReLU** (rectified linear unit), the most common activation function in neural
+nets. In the second, only `-3.0` had $|a| > 2$, so only it was replaced by $-2$; everything
+else passed through untouched.
 
 `np.where` is a ufunc: it applies the condition element-wise with no Python loop and
 broadcasts `x` and `y` against each other if needed.
 
+> **Watch out:** `np.where` computes *both* `x` and `y` in full before choosing. So
+> `np.where(a > 0, np.log(a), 0)` still evaluates `np.log` on the negatives and warns. It
+> picks the right answer, but it doesn't skip the work.
+
 ## `np.einsum` — express any tensor contraction in one string
+
+`einsum` lets you describe an array calculation with letters, one letter per axis. Letters
+that disappear on the right of the arrow get multiplied together and summed away; letters
+that stay are kept.
 
 `np.einsum` uses Einstein summation notation to express any axis-based operation concisely.
 The string `'ij,jk->ik'` means: contract axes `j` (the inner dimension), keep `i` and `k`.
-That's matrix multiplication.
+That's matrix multiplication. To **contract** an axis means to multiply matching entries
+along it and add them up.
+
+> **In plain words:** read `'ij,jk->ik'` as "for every row `i` of A and column `k` of B,
+> walk along the shared letter `j`, multiply pairs, and add". That is exactly the textbook
+> rule for matrix multiplication: $C_{ik} = \sum_j A_{ij} B_{jk}$.
 
 ```python
 import numpy as np
@@ -175,20 +238,27 @@ print("outer:\n", np.einsum('i,j->ij', u[:2], v[:2]))
 ```output
 matmul:
  [[19. 22.]
-  [43. 50.]]
+ [43. 50.]]
 dot: 32.0
 trace: 5.0
 outer:
  [[ 4.  5.]
-  [ 8. 10.]]
+ [ 8. 10.]]
 ```
+
+Each string maps to one operation: `'i,i->'` keeps nothing, so it multiplies matching
+elements and sums everything ($1 \cdot 4 + 2 \cdot 5 + 3 \cdot 6 = 32$). `'ii->'` uses the
+same letter for both axes, so it only visits the diagonal and sums it ($1 + 4 = 5$, the
+**trace**). `'i,j->ij'` shares no letter, so nothing is summed: you get every pair's product
+in a grid — the **outer product**.
 
 ### When to use einsum vs standard ops
 
 Use `einsum` when the operation involves three or more arrays, unusual contraction patterns,
 or when the alternative requires an awkward chain of `transpose` + `matmul`. For standard
 matrix multiply, `A @ B` or `np.matmul` is clearer and sometimes faster (it calls BLAS
-directly). For complex batched attention operations, `einsum` wins on readability.
+directly — **BLAS** is the highly tuned linear-algebra library NumPy uses under the hood).
+For complex batched attention operations, `einsum` wins on readability.
 
 ```python
 import numpy as np
@@ -204,6 +274,22 @@ print("batched matmul shape:", C.shape)
 ```output
 batched matmul shape: (4, 3, 2)
 ```
+
+The letter `b` (batch) appears in both inputs *and* in the output, so it is kept: 4
+independent matrix multiplies run side by side. Only `i` disappears, so only `i` is summed
+over. The result is 4 matrices of shape `(3, 2)`.
+
+## Recap in plain words
+
+- Slices are windows (views); integer arrays and boolean masks are shopping lists (copies).
+- Fancy indexing returns elements in the order you list, repeats allowed — the embedding
+  look-up pattern.
+- Two index arrays are read as `(row, col)` pairs; `log_probs[np.arange(B), y]` grabs each
+  example's true-class score.
+- Masks keep the `True` positions; combine conditions with `&`, `|`, `~` and always
+  parenthesize each one.
+- `np.where(cond, x, y)` is an element-wise if/else (both branches are computed).
+- In `einsum`, letters that vanish on the right are summed; letters that stay are kept.
 
 ## Try it Yourself
 
@@ -234,10 +320,16 @@ print("first query scores:", scores[0].round(3))
 ```
 
 ```output
-CE loss: 1.5793
+CE loss: 1.3678
 attention scores shape: (3, 6)
-first query scores: [-0.469  0.221 -0.287 -0.447  0.632 -0.065]
+first query scores: [ 0.469  0.388 -0.433 -0.245 -0.325  0.101]
 ```
+
+The loss line is cross-entropy: `log_probs[np.arange(5), y]` picks each example's
+log-probability of its true class, and the minus-mean turns "high probability on the right
+answer" into "small loss". The scores line is the heart of attention: `'qd,kd->qk'` takes the
+dot product of every query with every key. Try changing `y` to classes the model scores
+higher and watch the loss drop.
 
 ## Exercise
 
@@ -249,6 +341,9 @@ following **without any Python loop**:
 3. Verify the clipped array has no negative values.
 
 Use `np.random.default_rng(42).standard_normal((100, 5))` as input.
+
+> **Hint:** a 1-D mask with one `True`/`False` per row selects whole rows. Build it from
+> the row sums.
 
 <details>
 <summary>Solution</summary>

@@ -244,9 +244,50 @@ chapter's topic name when helpful: `(ch. 12, feature selection)`.
 
 ### 11. Prose style
 - Second-person voice: "You know…", "This gives you…"
-- Dense but not padded. Target 110–200 lines per teaching chapter.
+- Clear before dense. Target 180–350 lines per teaching chapter (the ELI5 layer in rule 12
+  adds length; that is expected, padding is not).
 - No filler openers ("In this chapter, we will…"). Start the section with the thing itself.
 - Derive fundamentals in `###` sub-sections with display math — don't state without showing.
+
+### 12. The ELI5 layer — smart reader, new to the topic
+Every chapter must be followable by a motivated beginner **without losing any rigor**. The
+technical content (code, outputs, math, facts, edge cases) stays complete; the ELI5 layer
+adds understanding around it. Write as if explaining to a curious 12-year-old who is good
+at puzzles: plain words first, then the precise version.
+
+- **Plain idea first.** Open every `##` section with one or two sentences that state the
+  idea in everyday words, before any jargon, symbols, or code.
+- **Define on first use.** The first time a term appears, bold it and say what it means in
+  plain words in the same sentence: "a **dtype** — the *kind* of number every slot holds".
+- **One honest analogy per big idea**, as a callout: `> **Picture it:** …`. The analogy must
+  map onto the real mechanism; say where it breaks if that matters.
+- **Read every display equation out loud** right after it: a `> **In plain words:** …`
+  callout, or a short bullet list naming each symbol when there are three or more.
+- **Walk through every output.** After an `output` block, point at the exact number or line
+  that proves the point ("look at the second line: 24 bytes = 3 numbers × 8 bytes").
+- **Name the trap** with `> **Watch out:** …` callouts for the mistakes people actually make.
+- **Recap before practice.** The last concept section before `## Try it Yourself` is
+  `## Recap in plain words`: 3–7 one-sentence bullets.
+- **Hint before the solution.** Exercises get a `> **Hint:** …` line above `<details>`.
+- Use short sentences and concrete numbers. No baby talk, and never "simply", "just",
+  "obviously", or "trivially" — if it were obvious, the reader wouldn't need the page.
+- The only callout labels are **Picture it**, **In plain words**, **Watch out**, **Hint**.
+- When rewriting an existing chapter, code, outputs, and math are kept verbatim: write a
+  template with `@@B#@@` / `@@M#@@` placeholders and build it with `tools/eli5.py` (below).
+
+---
+
+## Authoring tools
+
+- `python tools/eli5.py show FILE` — print a chapter with `[B#]` (fenced block) and `[M#]`
+  (display math) markers.
+- `python tools/eli5.py build TEMPLATE FILE` — fill a template's `@@B#@@`/`@@M#@@` lines
+  verbatim from the committed chapter and write it.
+- `python tools/eli5.py check FILE...` — fail if any block, heading, or inline formula of
+  the committed version was lost; lint rules 2–9.
+- `python tools/run_chapter.py FILE_OR_DIR` — run every python block on the real kernel (one
+  session per chapter, top to bottom) and diff against its `output` block; `--fix B12` /
+  `--fix-all` pastes the real output. Needs the `environment/` stack installed.
 
 ---
 
