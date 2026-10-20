@@ -7,14 +7,28 @@ order: 12
 
 ## The multiple comparisons problem
 
+Each test has a small chance of a false alarm. Run a hundred tests and those small chances
+pile up: some false alarms become almost certain. Multiple-testing corrections make the
+threshold stricter so the *whole batch* of tests stays honest.
+
 When you run $m$ independent tests at level $\alpha$, the probability of at least one false positive is $1-(1-\alpha)^m$. For $m=100$ and $\alpha=0.05$, that's 99.4%. Without correction, multiple testing inflates your false-positive rate catastrophically.
+
+> **Picture it:** buy one lottery ticket and you almost surely lose. Buy a hundred and
+> winning *something* becomes likely. Testing 100 features is buying 100 tickets in the
+> "spurious significance" lottery.
 
 Two error rates to control:
 
 - **FWER (family-wise error rate):** $P(\text{at least one false positive})$. Strict — needed for clinical trials.
 - **FDR (false discovery rate):** Expected fraction of rejected nulls that are false positives. Less strict — better for discovery (genomics, feature selection).
 
+> **In plain words:** FWER promises "probably *zero* false alarms in the whole batch". FDR
+> promises "of the things I flag, only about 5% are false alarms on average" — you accept a
+> few duds in exchange for finding many more real effects.
+
 ## Bonferroni correction
+
+The simplest fix: if you run $m$ tests, demand each one be $m$ times stricter.
 
 Control FWER by testing each hypothesis at level $\alpha/m$. If any $p_i < \alpha/m$, reject $H_i$.
 
@@ -43,20 +57,37 @@ print(f"FWER uncorrected: {(p_vals < alpha).any():.0f}")
 
 ```output
 Tests: 100,  all null,  alpha=0.05
-Rejections (uncorrected):  6
+Rejections (uncorrected):  3
 Rejections (Bonferroni):   0
 FWER uncorrected: 1
 ```
 
+All 100 tests compare pure noise with pure noise, so every "rejection" is false. Uncorrected,
+3 tests came out significant and the batch had at least one false positive (FWER line = 1).
+With Bonferroni's threshold $0.05/100 = 0.0005$, none survived.
+
 Bonferroni is conservative — it controls FWER but loses power when there are many true effects.
 
+> **Watch out:** Bonferroni treats every test as if it were the only chance for a false
+> alarm. When the tests are strongly correlated (overlapping features), it's even more
+> conservative than necessary.
+
 ## Benjamini-Hochberg procedure
+
+**Benjamini–Hochberg** (BH) uses a sliding threshold: the smallest p-value faces the strictest
+bar, the next one a slightly looser bar, and so on. It's the standard tool when you want
+discoveries, not certainty.
 
 BH controls the FDR at level $\alpha$ (or less) while having more power than Bonferroni. The procedure:
 
 1. Sort the $m$ p-values: $p_{(1)} \le p_{(2)} \le \cdots \le p_{(m)}$.
 2. Find the largest $k$ such that $p_{(k)} \le \frac{k}{m}\alpha$.
 3. Reject all $H_{(i)}$ for $i \le k$.
+
+> **In plain words:** line the p-values up from smallest to largest and draw a rising line
+> $\frac{k}{m}\alpha$ next to them. Find the last p-value that sits under the line, and reject
+> it and everything smaller. The $k$-th smallest p-value only needs to beat $k$ times the
+> Bonferroni threshold.
 
 ```python
 import numpy as np
@@ -101,17 +132,26 @@ for p, r, a in sorted(zip(p_vals, rejected, adj_p)):
 p-val    rejected   adj-p
 0.001     YES       0.0100
 0.008     YES       0.0400
-0.039     YES       0.0650
-0.041     YES       0.0513
-0.042     YES       0.0420
+0.039     no        0.0840
+0.041     no        0.0840
+0.042     no        0.0840
 0.060     no        0.1000
 0.074     no        0.1057
 0.200     no        0.2500
-0.300     no        0.3000
+0.300     no        0.3333
 0.500     no        0.5000
 ```
 
+With 10 p-values the BH line is $0.005, 0.010, 0.015, \ldots$. The smallest two (0.001 and
+0.008) sit under it, so both are rejected; 0.039 would need to be below $3/10 \times 0.05 =
+0.015$ and isn't. The **adjusted p-values** in the last column are the same decision written
+another way: reject exactly those with adjusted $p \le 0.05$. Bonferroni (threshold 0.005)
+would have rejected only the first.
+
 ## FDR control simulation
+
+To check the guarantee, simulate a study where you *know* which effects are real: 1000 tests,
+100 of them with a real medium-sized effect.
 
 ```python
 import numpy as np
@@ -135,7 +175,7 @@ for sim in range(N_sims):
     x1 = rng.normal(0, 1, (n, m))
     x2 = rng.normal(effect, 1, (n, m))
 
-    p_vals = np.array([stats.ttest_ind(x1[:,j], x2[:,j]).pvalue for j in range(m)])
+    p_vals = stats.ttest_ind(x1, x2, axis=0).pvalue   # all m tests at once
     rejected, _ = bh_correction(p_vals, alpha)
 
     # FDR = false positives / total rejections
@@ -156,11 +196,20 @@ print(f"  Empirical power: {power_vals.mean():.4f}")
 ```output
 m=1000 tests, 100 true effects, d=0.5, n=30
 BH FDR control at alpha=0.05
-  Empirical FDR:   0.0425  (should be <= 0.05)
-  Empirical power: 0.4793
+  Empirical FDR:   0.0509  (should be <= 0.05)
+  Empirical power: 0.0316
 ```
 
-BH controls FDR ≤ 0.05 while recovering ~48% of true effects.
+The empirical FDR is 0.051. BH's guarantee for independent tests is
+$\text{FDR} \le \frac{m_0}{m}\alpha = \frac{900}{1000} \times 0.05 = 0.045$ on average ($m_0$ =
+number of true nulls), and 0.051 is within the Monte Carlo noise of that: when only a handful
+of tests are rejected, each simulation's false-discovery *proportion* is lumpy (0, 1/3, 1/2,
+…), so its average converges slowly.
+
+The power is the sobering part. BH controls FDR close to 0.05 while recovering only about 3%
+of the true effects here. A medium effect ($d = 0.5$) with 30 per group has 47% power in a
+single test (ch. 11), but surviving a 1000-test correction needs a far smaller p-value. Large
+$m$ with weak effects and small samples is a recipe for finding almost nothing.
 
 ## Bonferroni vs BH comparison
 
@@ -176,9 +225,9 @@ effect_size = 0.6
 bon_power, bh_power = 0.0, 0.0
 for _ in range(n_sims):
     eff = np.zeros(m); eff[:m_true] = effect_size
-    p = np.array([stats.ttest_ind(
-            rng.normal(0,1,n), rng.normal(eff[j],1,n)
-        ).pvalue for j in range(m)])
+    x1 = rng.normal(0, 1, (n, m))
+    x2 = rng.normal(eff, 1, (n, m))
+    p = stats.ttest_ind(x1, x2, axis=0).pvalue      # all m tests at once
     bon_power += (p[:m_true] < alpha/m).mean()
     rej, _ = bh_correction(p, alpha)
     bh_power  += rej[:m_true].mean()
@@ -188,11 +237,25 @@ print(f"BH power:         {bh_power/n_sims:.4f}")
 ```
 
 ```output
-Bonferroni power: 0.3108
-BH power:         0.5661
+Bonferroni power: 0.0464
+BH power:         0.0834
 ```
 
+BH found nearly twice as many of the real effects as Bonferroni (8.3% vs 4.6%) on the same
+data, while controlling a looser but still meaningful error rate. Both numbers are low because
+$n = 25$ per group is small for $d = 0.6$ after a 200-test correction.
+
 BH has substantially higher power than Bonferroni — use BH for discovery tasks (e.g., finding predictive features), Bonferroni when any false positive is unacceptable.
+
+## Recap in plain words
+
+- Many tests at $\alpha$ each make at least one false positive likely: $1 - (1 - \alpha)^m$.
+- FWER = chance of any false positive (strict); FDR = expected share of false positives among
+  your discoveries (looser).
+- Bonferroni tests each at $\alpha/m$ and controls FWER; it's conservative.
+- Benjamini–Hochberg compares the $k$-th smallest p-value with $\frac{k}{m}\alpha$ and controls
+  FDR, with more power.
+- Corrections can't create power: weak effects, small $n$, and huge $m$ still find little.
 
 ## Try it Yourself
 
@@ -221,15 +284,24 @@ print(f"  False discoveries (rest):    {rej[15:].sum()}")
 
 ```output
 Uncorrected (alpha=0.05): 15 selected
-Bonferroni:               4 selected
-BH (FDR=0.05):            11 selected
-  True discoveries (first 15): 9
-  False discoveries (rest):    2
+Bonferroni:               2 selected
+BH (FDR=0.05):            3 selected
+  True discoveries (first 15): 3
+  False discoveries (rest):    0
 ```
+
+Fifteen features were built to correlate with `y`. Uncorrected testing flags 15 features,
+but some of those could be noise and some real ones could be missing — you can't tell which.
+Bonferroni keeps 2 and BH keeps 3, and all 3 of BH's picks are genuinely correlated. The price
+of honesty is missing 12 of the 15 real features at this sample size. Try `n = 300` and watch
+both corrected counts climb toward 15.
 
 ## Exercise
 
 In a gene expression study with 5,000 tests (50 true effects, effect size 0.8, $n=20$), compare: (1) expected false positives without correction; (2) expected true positives with BH at $\alpha=0.05$. Run a simulation.
+
+> **Hint:** uncorrected, every one of the 4,950 null tests is a 5% false alarm. For BH, reuse
+> `bh_correction` and count rejections among the first 50 features.
 
 <details>
 <summary>Solution</summary>
@@ -246,9 +318,9 @@ N_sims = 500
 fdr_list, power_list = [], []
 for _ in range(N_sims):
     eff = np.zeros(m); eff[:m_true] = effect_size
-    p = np.array([stats.ttest_ind(
-            rng.normal(0,1,n), rng.normal(eff[j],1,n)
-        ).pvalue for j in range(m)])
+    x1 = rng.normal(0, 1, (n, m))
+    x2 = rng.normal(eff, 1, (n, m))
+    p = stats.ttest_ind(x1, x2, axis=0).pvalue      # all m tests at once
 
     # (1) Without correction: expected FP = alpha * (m - m_true)
     rej_none = p < alpha
@@ -265,4 +337,9 @@ print(f"Expected FP without correction: {alpha * (m - m_true):.1f}")
 print(f"BH FDR: {np.mean(fdr_list):.4f}  (should be <= {alpha})")
 print(f"BH power: {np.mean(power_list):.4f}")
 ```
+
+Without correction you'd expect $0.05 \times 4950 \approx 248$ false positives — burying the
+50 real effects. BH keeps the FDR at or below 0.05, at the cost of detecting only a fraction of
+the 50 true effects with $n = 20$. The t-tests are vectorized (`axis=0`), so all 5,000 run in
+one call; a per-test Python loop here would take minutes.
 </details>

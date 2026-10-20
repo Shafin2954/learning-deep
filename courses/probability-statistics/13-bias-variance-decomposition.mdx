@@ -7,6 +7,11 @@ order: 13
 
 ## The decomposition
 
+A model's mistakes come from three places: it can be **systematically off** (bias — too
+simple to capture the pattern), it can be **jumpy** (variance — too sensitive to which
+training data it happened to see), and the data itself is **noisy** (nobody can predict the
+coin-flip part). Every model trades the first two against each other.
+
 The expected test MSE of a predictor $\hat{f}$ at a point $x$ decomposes as:
 
 $$
@@ -14,6 +19,16 @@ E\!\left[(y - \hat{f}(x))^2\right] = \underbrace{\left(E[\hat{f}(x)] - f(x)\righ
 $$
 
 The expectation is over repeated draws of training datasets. The noise $\sigma^2_\varepsilon = \text{Var}(\varepsilon)$ is irreducible — no model can remove it.
+
+> **Picture it:** four archers. Bias is how far the *centre* of an archer's arrows is from the
+> bullseye; variance is how widely the arrows scatter around their own centre. A simple model
+> is a steady archer aiming at the wrong spot; a complex model is an archer aiming at the
+> bullseye with shaking hands. Wind (noise) pushes every arrow, whoever shoots.
+
+> **In plain words:** imagine retraining the same kind of model on many different training
+> sets. **Bias²** = how far the *average* prediction is from the truth, squared.
+> **Variance** = how much individual predictions wobble around that average.
+> **Noise** = the part of $y$ that was random to begin with.
 
 ### Algebraic derivation
 
@@ -29,7 +44,16 @@ $$
 
 The cross term $2(f-\bar{f})E[\bar{f}-\hat{f}] = 0$ since $E[\hat{f}-\bar{f}]=0$.
 
+> **In plain words:** the first line splits off the noise (it's independent of the model, so
+> its cross term vanishes too). The second line is the trick from ch. 2's variance formula:
+> add and subtract the average prediction $\bar{f}$. The middle term disappears because the
+> wobble around an average always averages to zero. ($\mathcal{D}$ is the training dataset.)
+
 ## Simulating the decomposition
+
+You can't compute bias and variance from one dataset, but in a simulation you can: generate
+500 training sets from a known truth, fit a model to each, and look at how the 500 predictions
+spread.
 
 ```python
 import numpy as np
@@ -71,13 +95,24 @@ for d, preds in results.items():
 ```output
 Degree    Bias²       Variance    Total       Noise
 -------------------------------------------------------
-1         0.3987      0.0483      2.4970      2.2500
-3         0.0228      0.1185      2.3913      2.2500
-9         0.0051      0.5913      2.8464      2.2500
-15        0.0202      3.8126      6.0828      2.2500
+1         0.1682      0.1353      2.5535      2.2500
+3         0.0035      0.2763      2.5298      2.2500
+9         0.1130      59.0464     61.4094     2.2500
+15        36290.1447  30820265.7802  30856558.1749  2.2500
 ```
 
-Degree 1 (linear): high bias, low variance. Degree 15: low bias, enormous variance. Degree 3 hits near-optimal.
+Read across the rows. The straight line (degree 1) is too stiff for a sine wave: high bias
+(0.17), low variance. Degree 3 nearly eliminates the bias (0.004) for a small increase in
+variance and has the lowest total. Degree 9 is already very wobbly (variance 59), and degree 15
+explodes to millions — high-degree polynomials fitted to 40 noisy points swing wildly,
+especially near the edges of the range where there are few points to pin them down. Even
+the bias of degree 15 is enormous: its average prediction is dragged around by rare, extreme
+fits.
+
+Degree 1 (linear): high bias, low variance. Degree 15: low bias in principle, enormous variance in practice. Degree 3 hits near-optimal.
+
+> **Watch out:** the noise floor (2.25 here, $\sigma^2 = 1.5^2$) is the best any model could
+> ever do. A test error below it means a bug or a leak, not a great model.
 
 ```python
 import numpy as np
@@ -108,11 +143,20 @@ print(f"At degree {best_d}: bias²={bias2_all[best_d-1]:.4f}  var={var_all[best_
 ```
 
 ```output
-Best degree (min total error): 4
-At degree 4: bias²=0.0098  var=0.2231
+Best degree (min total error): 3
+At degree 3: bias²=0.0034  var=0.2639
 ```
 
+Sweeping every degree from 1 to 15 with 1000 training sets each confirms it: the total error
+is smallest at degree 3, where bias is almost gone (0.003) and variance is still modest (0.26).
+That sweet spot is what **model selection** (Classical ML, Eval & Tuning) tries to find without
+being able to run this simulation.
+
 ## Bagging reduces variance
+
+If a model is jumpy, train many copies and average them. Their wobbles partly cancel. That's
+**bagging** — short for **b**ootstrap **agg**regat**ing** — and it's the idea behind random
+forests.
 
 Bootstrap aggregation averages $B$ independent models:
 
@@ -122,13 +166,20 @@ $$
 
 If models are i.i.d. with variance $\sigma^2_f$: $\text{Var}[\hat{f}_{\text{bag}}] = \sigma^2_f/B$. In practice models are correlated, so variance reduction is partial but still substantial.
 
+> **In plain words:** averaging $B$ independent noisy guesses divides their variance by $B$.
+> But bootstrap models are trained on overlapping resamples of the *same* data, so they make
+> correlated mistakes, and only part of the variance cancels.
+
+The demo below uses a fully grown **decision tree** — an extremely jumpy model, because one
+different training point can change a split and the whole prediction around it.
+
 ```python
 import numpy as np
+from sklearn.tree import DecisionTreeRegressor
 
 rng = np.random.default_rng(2)
 n_train, n_test = 30, 200
 sigma_noise = 1.5
-degree = 10   # high-variance model
 B = 50        # number of bootstrap models
 n_sims = 300
 
@@ -142,30 +193,52 @@ for sim in range(n_sims):
     x_tr = rng.uniform(-3, 3, n_train)
     y_tr = np.sin(x_tr) + rng.normal(0, sigma_noise, n_train)
 
-    # Single model
-    single_preds[sim] = np.polyval(np.polyfit(x_tr, y_tr, degree), x_test)
+    # Single model: a fully grown tree (low bias, high variance)
+    tree = DecisionTreeRegressor().fit(x_tr[:, None], y_tr)
+    single_preds[sim] = tree.predict(x_test[:, None])
 
     # Bagged models (bootstrap resample + fit)
     boot_preds = np.zeros((B, n_test))
     for b in range(B):
         idx = rng.integers(0, n_train, n_train)
-        boot_preds[b] = np.polyval(np.polyfit(x_tr[idx], y_tr[idx], degree), x_test)
+        tree_b = DecisionTreeRegressor().fit(x_tr[idx, None], y_tr[idx])
+        boot_preds[b] = tree_b.predict(x_test[:, None])
     bag_preds[sim] = boot_preds.mean(axis=0)
 
 var_single = np.mean(single_preds.var(axis=0))
 var_bag    = np.mean(bag_preds.var(axis=0))
-print(f"Degree-{degree} polynomial, n_train={n_train}, B={B} bootstrap models")
+print(f"Fully grown tree, n_train={n_train}, B={B} bootstrap models")
 print(f"Variance (single): {var_single:.4f}")
 print(f"Variance (bagged): {var_bag:.4f}")
 print(f"Variance reduction: {var_single/var_bag:.2f}×")
 ```
 
 ```output
-Degree-10 polynomial, n_train=30, B=50 bootstrap models
-Variance (single): 2.8943
-Variance (bagged): 0.6120
-Variance reduction: 4.73×
+Fully grown tree, n_train=30, B=50 bootstrap models
+Variance (single): 2.2682
+Variance (bagged): 1.0897
+Variance reduction: 2.08×
 ```
+
+Averaging 50 bootstrap trees roughly halved the prediction variance (2.27 down to 1.09, a
+2.08× reduction) — far from $50\times$, because the trees are correlated, but a large gain for
+free. Random forests push further by also randomizing which features each split may use,
+which de-correlates the trees.
+
+> **Watch out:** bagging only helps **unstable** models — ones whose predictions change a lot
+> when the training data changes slightly (deep trees, high-variance nets). Least-squares fits
+> like polynomial regression are *linear* in the data: averaging their bootstrap refits gives
+> roughly the same fit back, plus extra noise from the resampling. Try it with
+> `np.polyfit` and you'll see bagging make the variance *worse*.
+
+## Recap in plain words
+
+- Expected test error = bias² + variance + irreducible noise.
+- Bias: the average model is wrong (too simple). Variance: individual models wobble (too
+  sensitive to the training set). Noise: unpredictable even in principle.
+- More flexible models trade bias for variance; the best total error is in the middle.
+- Bagging averages bootstrap models to cut variance; it works for unstable learners like deep
+  trees, not for linear least squares.
 
 ## Try it Yourself
 
@@ -198,16 +271,25 @@ for d in [1, 3, 5, 10, 20]:
 ```
 
 ```output
-degree=1    bias²=0.1695  var=0.0239  total=1.1934
-degree=3    bias²=0.0874  var=0.0449  total=1.1323
-degree=5    bias²=0.0571  var=0.0706  total=1.1277
-degree=10   bias²=0.0485  var=0.2253  total=1.2738
-degree=20   bias²=0.0426  var=1.8734  var=2.9160
+degree=1    bias²=0.0626  var=0.0435  total=1.1061
+degree=3    bias²=0.0353  var=0.0946  total=1.1299
+degree=5    bias²=0.0256  var=0.2164  total=1.2420
+degree=10   bias²=0.2406  var=56.5233  total=57.7639
+degree=20   bias²=1090590.6202  var=759018593.7378  total=760109185.3580
 ```
+
+A step function is hard for smooth polynomials: no degree can make a sharp jump, so bias never
+reaches zero. Low degrees win here — degree 1 has the lowest total (1.106) because its small
+variance outweighs its bias. Degree 10 already wobbles badly, and degree 20 explodes. Try a
+decision tree on the same data: a single split at 0 has almost no bias for a step.
 
 ## Exercise
 
 Implement the bias-variance decomposition for k-nearest-neighbors regression ($k=1,3,5,15,30$) on $f(x)=\cos(2x)$ with $n=80$ training points and $\sigma=0.5$. Which $k$ minimizes total error?
+
+> **Hint:** in KNN, $k$ works backwards from polynomial degree: small $k$ = flexible (high
+> variance), large $k$ = smooth (high bias). Average over many simulated training sets, as in
+> the examples above.
 
 <details>
 <summary>Solution</summary>
@@ -242,4 +324,7 @@ for k in [1, 3, 5, 15, 30]:
 ```
 
 Low $k$ (e.g., 1) gives low bias but very high variance. Optimal $k$ balances the two.
+Running it, $k = 5$ wins (total about 0.315): $k = 1$ has almost no bias but variance 0.26;
+$k = 30$ averages so many neighbours that it flattens the cosine's peaks, and its bias (0.33)
+dominates. The noise floor is $\sigma^2 = 0.25$, so $k = 5$ is within about 0.06 of perfect.
 </details>

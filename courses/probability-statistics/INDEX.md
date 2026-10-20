@@ -7,6 +7,14 @@ competition. Bayesian and frequentist perspectives are both given their due.
 Pitched at: solid calculus and linear algebra, first exposure to probability may be rusty.
 No statistics prerequisites assumed.
 
+**In plain words:** probability is the maths of not knowing for sure, and statistics is how
+you learn from data anyway. This course goes from "what does 30% chance mean?" (ch. 1–6) to
+why averages behave predictably (ch. 7–8), how to estimate things and say how sure you are
+(ch. 9–10), how to test claims without fooling yourself (ch. 11–12), and the ideas machine
+learning leans on every day — bias vs variance, cross-validation, calibrated probabilities,
+and Bayesian updating (ch. 13–16). Every result is simulated with real code, and every
+output on the page is what that code actually prints.
+
 ---
 
 ## Chapters

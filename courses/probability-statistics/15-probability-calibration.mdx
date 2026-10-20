@@ -7,15 +7,34 @@ order: 15
 
 ## What calibration means
 
+A weather forecaster who says "70% chance of rain" is **calibrated** if it actually rains on
+about 70% of those days. A model's probabilities can rank cases well (riskiest first) and still
+be badly calibrated — too timid or too bold. Calibration is about whether the numbers mean what
+they say.
+
 A classifier that outputs $\hat{p}(x) = 0.8$ is well-calibrated if, among all examples where the model says 0.8, roughly 80% are truly positive. Formally:
 
 $$
 P(Y=1 \mid \hat{p}(X) = p) = p \quad \text{for all } p \in [0,1]
 $$
 
-Raw model scores are often miscalibrated: Random Forests tend to be overconfident (predicted probabilities too extreme), while Naive Bayes can be underconfident (probabilities too close to 0.5).
+> **In plain words:** gather every case where the model said $p$; the fraction that turned
+> out positive should be $p$. Do that for every $p$ from 0 to 1.
+
+Raw model scores are often miscalibrated. Random Forests tend to be **underconfident**: averaging
+many trees pulls their probabilities toward 0.5, so true positives rarely get scores near 1.
+Naive Bayes tends to be **overconfident** (probabilities too extreme), because it treats
+correlated features as independent and counts the same evidence several times. Well-regularized
+logistic regression is usually close to calibrated, since it directly optimizes log-loss.
+
+> **Watch out:** many write-ups say the reverse for random forests. The tables below let you
+> check the direction yourself: if the actual frequencies are *more* extreme than the
+> predictions, the model is underconfident.
 
 ## The reliability diagram
+
+A **reliability diagram** sorts predictions into buckets (0–10%, 10–20%, …) and, for each
+bucket, compares the average prediction with how often the positive class really happened.
 
 Bin predicted probabilities into $B$ equal-width buckets. For each bucket, plot the mean predicted probability (x-axis) vs the empirical fraction of positives (y-axis). A perfectly calibrated model lies on the diagonal.
 
@@ -53,22 +72,34 @@ for m, f, c in zip(means, fracs, counts):
 
 ```output
 Reliability diagram (predicted vs actual):
-    Pred prob   Actual freq      Gap   Count
-  0.083         0.127         +0.044 >    156
-  0.168         0.211         +0.043 >    180
-  0.254         0.283         +0.029 >    218
-  0.344         0.374         +0.030 >    225
-  0.448         0.467         +0.019 =    219
-  0.550         0.558         +0.008 =    216
-  0.650         0.659         +0.009 =    199
-  0.749         0.732         -0.017 =    175
-  0.850         0.804         -0.046 <    195
-  0.935         0.857         -0.078 <    217
+   Pred prob   Actual freq       Gap   Count
+  0.058         0.000         -0.058 <    214
+  0.142         0.029         -0.113 <    277
+  0.249         0.068         -0.181 <    207
+  0.349         0.128         -0.221 <    117
+  0.445         0.361         -0.083 <    144
+  0.551         0.577         +0.026 >    175
+  0.657         0.780         +0.123 >    159
+  0.752         0.934         +0.183 >    228
+  0.845         0.980         +0.135 >    305
+  0.933         0.994         +0.061 >    173
 ```
 
-The RF underestimates probability at low values and overestimates at high values — a classic S-curve miscalibration where extreme scores are pulled toward 0.5.
+Read the first and last rows. When the forest said about 6%, the true rate was 0%; when it said
+about 85%, the true rate was 98%. Every low bucket is *too high* and every high bucket is *too
+low*: the forest's scores are squashed toward the middle. The `cross_val_predict` call makes
+sure every probability comes from a model that didn't train on that row.
+
+The RF overestimates probability at low values and underestimates it at high values — a classic S-curve miscalibration where extreme scores are pulled toward 0.5.
+
+> **Picture it:** a timid forecaster who never dares say less than 10% or more than 90%. Their
+> "10%" days are actually dry, their "90%" days are always wet — the numbers are right in
+> order but squeezed toward the middle.
 
 ## Expected Calibration Error
+
+**ECE** turns the reliability diagram into one number: the average gap between predicted and
+actual, weighted by how many predictions fall in each bucket.
 
 ECE summarizes miscalibration as a weighted average of gap magnitudes:
 
@@ -77,6 +108,11 @@ $$
 $$
 
 MCE is the maximum gap across bins.
+
+> **In plain words:** $n_b / n$ is the share of predictions in bucket $b$; $\bar{p}_b$ is their
+> average prediction and $\bar{y}_b$ their actual positive rate. ECE = "on average, how many
+> percentage points off are the probabilities?" **MCE** (maximum calibration error) is the
+> worst single bucket.
 
 ```python
 import numpy as np
@@ -103,12 +139,20 @@ print(f"Brier score = {brier:.4f}  (0=perfect, 0.25=random)")
 ```
 
 ```output
-ECE = 0.0269
-MCE = 0.0780
-Brier score = 0.1423
+ECE = 0.1183
+MCE = 0.2209
+Brier score = 0.0957  (0=perfect, 0.25=random)
 ```
 
+The forest's probabilities are off by about 12 percentage points on average, and by 22 in its
+worst bucket. The **Brier score** (mean squared error between probability and the 0/1 outcome)
+mixes calibration and sharpness; 0.25 is what always predicting 0.5 scores on a balanced
+problem.
+
 ## Platt scaling
+
+**Platt scaling** fixes a squashed or stretched probability scale by fitting a small logistic
+regression that maps the model's scores to new, calibrated probabilities.
 
 Fit a logistic regression on out-of-fold predictions to re-map scores to calibrated probabilities. The logistic model $\sigma(a\hat{p} + b)$ stretches or compresses the score distribution.
 
@@ -140,15 +184,29 @@ print(f"After  Platt:  ECE={ece_after:.4f}  Brier={brier_after:.4f}")
 ```
 
 ```output
-Before Platt:  ECE=0.0269  Brier=0.1423
-After  Platt:  ECE=0.0120  Brier=0.1398
+Before Platt:  ECE=0.1183  Brier=0.0957
+After  Platt:  ECE=0.0152  Brier=0.0780
 ```
 
-Platt scaling roughly halves the ECE while slightly improving the Brier score.
+A big improvement: ECE falls from 0.118 to 0.015, about 8× smaller, and the Brier score improves
+too (0.096 to 0.078) because better-calibrated probabilities are also closer to the truth. The
+calibrator itself is trained with 5-fold CV, so no row is calibrated by a mapping fitted on that
+same row.
+
+Platt scaling cuts the ECE by roughly 8× here while also improving the Brier score.
+
+> **In plain words:** with a slope $a > 1$, $\sigma(a\hat{p} + b)$ stretches the middle-heavy
+> scores back out toward 0 and 1 — exactly the fix an underconfident forest needs. Its limit is
+> its shape: it can only apply S-shaped corrections.
 
 ## Isotonic regression calibration
 
-Isotonic regression is a more flexible calibrator: it fits a non-decreasing step function from scores to probabilities (no parametric assumption). Better when the miscalibration is non-monotone.
+**Isotonic regression** is a more flexible fix: any staircase that only goes up. It can bend
+the scale into whatever monotone shape the data demands.
+
+Isotonic regression is a more flexible calibrator: it fits a non-decreasing step function from scores to probabilities (no parametric assumption). Better when the miscalibration is not S-shaped
+(any monotone distortion). Because it's flexible, it needs more data and can overfit small
+calibration sets.
 
 ```python
 import numpy as np
@@ -172,11 +230,31 @@ print(f"Platt:    ECE={ece_after:.4f}  Brier={brier_after:.4f}")
 ```
 
 ```output
-Isotonic: ECE=0.0078  Brier=0.1394
-Platt:    ECE=0.0120  Brier=0.1398
+Isotonic: ECE=0.0104  Brier=0.0799
+Platt:    ECE=0.0152  Brier=0.0780
 ```
 
+Isotonic reaches the lowest ECE (0.010), while Platt has the slightly better Brier score
+(0.0780 vs 0.0799) — the staircase fits the calibration bins more tightly but is a bit noisier
+point by point. With 2000 rows both are fine; with a few hundred, Platt is usually the safer
+choice.
+
 Isotonic achieves lower ECE when the miscalibration is complex.
+
+> **Watch out:** never fit a calibrator on the same data the model was trained on — training
+> predictions are overconfident by construction. Use out-of-fold predictions (as here) or a
+> separate calibration set. scikit-learn's `CalibratedClassifierCV` does this for you.
+
+## Recap in plain words
+
+- Calibrated means "of the cases scored $p$, a fraction $p$ are positive".
+- Reliability diagrams compare predicted and actual rates per bucket; ECE averages the gaps.
+- Random forests tend to be underconfident (squashed toward 0.5); Naive Bayes tends to be
+  overconfident.
+- Platt scaling (logistic, S-shaped) and isotonic regression (any increasing staircase)
+  re-map scores to calibrated probabilities; fit them on out-of-fold predictions.
+- Calibration changes the probabilities, not the ranking — AUC stays the same under a
+  monotone re-mapping.
 
 ## Try it Yourself
 
@@ -205,25 +283,34 @@ for m, f in zip(means_nb, fracs_nb):
 
 ```output
 Naive Bayes calibration:
-  ECE=0.0622  MCE=0.1497
+  ECE=0.0362  MCE=0.1144
   (NB often overestimates confidence — probabilities too extreme)
 
 Reliability:
-  pred=0.022  actual=0.108  gap=+0.086
-  pred=0.086  actual=0.179  gap=+0.093
-  pred=0.171  actual=0.256  gap=+0.085
-  pred=0.307  actual=0.352  gap=+0.045
-  pred=0.479  actual=0.466  gap=-0.013
-  pred=0.522  actual=0.547  gap=+0.025
-  pred=0.696  actual=0.633  gap=-0.063
-  pred=0.832  actual=0.724  gap=-0.108
-  pred=0.916  actual=0.822  gap=-0.094
-  pred=0.979  actual=0.893  gap=-0.086
+  pred=0.035  actual=0.009  gap=-0.027
+  pred=0.141  actual=0.026  gap=-0.114
+  pred=0.252  actual=0.223  gap=-0.029
+  pred=0.346  actual=0.417  gap=+0.070
+  pred=0.450  actual=0.484  gap=+0.034
+  pred=0.555  actual=0.595  gap=+0.040
+  pred=0.652  actual=0.669  gap=+0.017
+  pred=0.753  actual=0.729  gap=-0.024
+  pred=0.856  actual=0.868  gap=+0.013
+  pred=0.965  actual=0.934  gap=-0.032
 ```
+
+This Naive Bayes model is actually reasonably calibrated (ECE 0.036) — much better than the
+forest. Its worst bucket is near 14% (actually 2.6%), and the printed comment about extreme
+probabilities is the *typical* pattern rather than what this run shows: with only 5 informative
+features and mostly uninformative noise, there's little correlated evidence to double-count. Try
+`n_informative=15` with `n_redundant=5` and watch the extremes get worse.
 
 ## Exercise
 
 Using the Random Forest probabilities from this chapter: (1) Compute ECE for 5, 10, and 20 bins. (2) Does the ECE change substantially? (3) Which bin count is most reliable?
+
+> **Hint:** reuse `calibration_errors` with different `n_bins`. Think about how many predictions
+> land in each bin as bins get narrower.
 
 <details>
 <summary>Solution</summary>
@@ -242,4 +329,7 @@ print("10 bins is standard. For small datasets, 5 bins is safer.")
 ```
 
 ECE is roughly stable across bin counts when $n$ is large. With small $n$ (<500), more bins leads to noisy per-bin estimates; prefer 5–10 bins.
+More bins also bias ECE *upward*: with few predictions per bin, random noise in each bin's
+positive rate looks like miscalibration. That's why ECE values are only comparable when
+computed with the same binning.
 </details>

@@ -7,11 +7,21 @@ order: 14
 
 ## Why held-out data matters
 
+A model graded on the questions it studied will always look brilliant. To know how it does on
+*new* questions, you must test it on data it never saw. Cross-validation is a fair way to do
+that many times over, using all your data.
+
 Training loss always decreases as model complexity grows. To estimate **generalization error** — how well the model performs on unseen data — you need to evaluate on data not used for fitting.
 
 The train/test split is the simplest approach, but it wastes data and has high variance (results depend on which rows land in the test set). Cross-validation averages over multiple splits to get a lower-variance estimate.
 
+> **Picture it:** a teacher with 100 practice questions. Instead of one fixed exam of 20, she
+> splits them into 5 piles; each round the student studies 4 piles and is tested on the fifth.
+> After 5 rounds every question has been an exam question exactly once.
+
 ## k-fold cross-validation
+
+**k-fold** cross-validation is exactly that teacher's plan with $k$ piles.
 
 Partition the data into $k$ equal folds. Repeat $k$ times: hold out fold $i$, train on the remaining $k-1$ folds, evaluate on fold $i$. Average the $k$ estimates.
 
@@ -34,12 +44,20 @@ print(f"Std  RMSE: {np.sqrt(-scores).std():.4f}")
 ```
 
 ```output
-5-fold CV RMSE per fold: [14.96 16.29 16.47 15.82 17.33]
-Mean RMSE: 16.1899
-Std  RMSE: 0.8225
+5-fold CV RMSE per fold: [14.56 16.01 17.71 15.47 17.52]
+Mean RMSE: 16.2992
+Std  RMSE: 1.2043
 ```
 
+Five test scores, one per fold, ranging from 14.6 to 17.7. Their average (16.3) is the CV
+estimate of how a Ridge model trained on this kind of data would do on new data. (scikit-learn
+reports *negative* MSE because its tools always maximize a score.)
+
 The std across folds reflects estimation variance — not model instability.
+
+> **Watch out:** the folds share most of their training data, so the five scores are
+> correlated. Their standard deviation understates the uncertainty of the mean — don't divide
+> it by $\sqrt{5}$ and call it a standard error.
 
 ### Why k=5 or k=10?
 
@@ -47,7 +65,15 @@ The std across folds reflects estimation variance — not model instability.
 - **High $k$ → LOOCV:** train on almost all data (nearly unbiased), but $k$ evaluations on size-1 sets → high variance; $O(n)$ model fits.
 - **$k=5$ or $k=10$:** empirical sweet spot — low bias and manageable variance.
 
+**LOOCV** = leave-one-out CV ($k = n$): each fold is a single data point. "Biased upward"
+means the error estimate is pessimistic, because each model trains on less data than the final
+model will.
+
 ## Stratified k-fold
+
+With rare classes, a random split can give one fold most of the rare examples and another fold
+none. **Stratified** splitting deals the rare class out evenly, like dealing cards so every
+player gets the same number of aces.
 
 For classification with imbalanced classes, random splitting may put all examples of a rare class in one fold. Stratified k-fold preserves class proportions in each fold.
 
@@ -77,11 +103,11 @@ for fold, (_, val_idx) in enumerate(skf.split(X, y)):
 
 ```output
 KFold (unstratified):
-  Fold 1: 20 samples, class-1 frac=0.10
+  Fold 1: 20 samples, class-1 frac=0.15
   Fold 2: 20 samples, class-1 frac=0.10
   Fold 3: 20 samples, class-1 frac=0.05
   Fold 4: 20 samples, class-1 frac=0.15
-  Fold 5: 20 samples, class-1 frac=0.10
+  Fold 5: 20 samples, class-1 frac=0.05
 
 StratifiedKFold:
   Fold 1: 20 samples, class-1 frac=0.10
@@ -91,13 +117,21 @@ StratifiedKFold:
   Fold 5: 20 samples, class-1 frac=0.10
 ```
 
+With 10 positives among 100 rows, plain KFold gave folds with 1, 2, or 3 positives (5%–15%);
+stratified KFold gave every fold exactly 2 (10%). With rarer classes, an unstratified fold can
+end up with zero positives, and metrics like recall become undefined.
+
 ## GroupKFold: no entity leakage
+
+When several rows come from the same person (or store, or patient), the model can learn to
+recognize that person instead of learning the real pattern. **GroupKFold** keeps all of one
+person's rows on the same side of the split, so validation always asks about *new* people.
 
 When observations belong to groups (patients, users, stores), the same entity must not appear in both train and validation. GroupKFold ensures this.
 
 ```python
 import numpy as np
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import KFold, GroupKFold, cross_val_score
 
 rng = np.random.default_rng(2)
@@ -109,10 +143,14 @@ n = n_groups * obs_per_group
 group_ids = np.repeat(np.arange(n_groups), obs_per_group)
 group_effects = rng.normal(0, 5, n_groups)
 
-X = rng.standard_normal((n, 3))
-y = X @ np.array([1.0, -0.5, 2.0]) + group_effects[group_ids] + rng.normal(0, 1, n)
+# 3 ordinary features + 2 group-level features (constant within a group, e.g. a
+# patient's age and height) that let a flexible model recognize the group
+X_obs = rng.standard_normal((n, 3))
+X_grp = rng.standard_normal((n_groups, 2))[group_ids]
+X = np.column_stack([X_obs, X_grp])
+y = X_obs @ np.array([1.0, -0.5, 2.0]) + group_effects[group_ids] + rng.normal(0, 1, n)
 
-model = LinearRegression()
+model = RandomForestRegressor(n_estimators=100, random_state=0)
 
 # KFold (ignores groups — leaks group effects into validation)
 kf_scores  = cross_val_score(model, X, y, cv=KFold(5, shuffle=True, random_state=0),
@@ -129,13 +167,28 @@ print(f"GroupKFold RMSE: {np.sqrt(-gkf_scores.mean()):.4f}  (correct generalizat
 ```
 
 ```output
-KFold RMSE:      2.3814  (leaks group effects → optimistic)
-GroupKFold RMSE: 5.1227  (correct generalization estimate)
+KFold RMSE:      2.6263  (leaks group effects → optimistic)
+GroupKFold RMSE: 5.8733  (correct generalization estimate)
 ```
 
-KFold (2.38) is wildly optimistic because seeing 9 examples of a group lets the model implicitly learn its offset. GroupKFold (5.12) shows the true test performance on a new group.
+KFold (2.63) looks more than twice as good as GroupKFold (5.87) on the same data and model. The
+two group-level features are constant within a group, so a random forest can recognize "this
+row belongs to group 7" and recall group 7's offset from the training rows of that group. On a
+truly new group there's nothing to recall, and the error rises to about the size of the group
+effects ($\sigma = 5$).
+
+KFold is wildly optimistic here because seeing 8 examples of a group lets the model implicitly
+learn its offset. GroupKFold shows the true test performance on a new group.
+
+> **Watch out:** leakage needs a way in. With a plain linear model on features unrelated to
+> the group, KFold and GroupKFold give similar numbers — the model *can't* recognize groups. Add
+> a user ID, a device fingerprint, or a flexible model, and the gap opens. If your deployment
+> will face new entities, use GroupKFold regardless.
 
 ## TimeSeriesSplit: forward-chaining
+
+With time-ordered data, the honest test is always "train on the past, predict the future" —
+exactly what will happen once the model is deployed.
 
 For time series, the future cannot inform the past. Use TimeSeriesSplit: train on the first $k$ folds, validate on fold $k+1$, expanding the training window each iteration.
 
@@ -153,20 +206,32 @@ for fold, (tr_idx, val_idx) in enumerate(splits.split(np.arange(n))):
 
 ```output
 TimeSeriesSplit fold boundaries:
-  Fold 1: train [0..32]  val [33..66]
-  Fold 2: train [0..66]  val [67..100]
+  Fold 1: train [0..34]  val [35..67]
+  Fold 2: train [0..67]  val [68..100]
   Fold 3: train [0..100]  val [101..133]
   Fold 4: train [0..133]  val [134..166]
   Fold 5: train [0..166]  val [167..199]
 ```
 
+Each fold trains on everything up to a point in time and validates on the next block: fold 1
+learns from rows 0–34 and is tested on 35–67, fold 5 learns from 0–166 and is tested on
+167–199. No validation row ever comes before a training row.
+
 Training window expands; validation window always lies entirely in the future. Never shuffle time-series data before this split.
 
 ## Nested CV for model selection
 
+If you try ten settings and report the best CV score, that score is flattered — you picked the
+luckiest one. **Nested CV** keeps a separate, untouched test loop around the whole selection
+process.
+
 A single CV loop used for both model selection and error estimation produces an optimistic estimate (you've selected the model that happened to do well). Nested CV uses:
 - **Outer loop:** estimates generalization error.
 - **Inner loop:** selects hyperparameters.
+
+> **Picture it:** choosing your best of ten penalty-kick takers by watching them shoot, then
+> claiming the winner's score as their true ability. A fair estimate needs a *new* set of
+> kicks after the choice is made — the outer loop.
 
 ```python
 import numpy as np
@@ -191,8 +256,24 @@ print(f"Nested CV RMSE: {np.sqrt(-nested_scores.mean()):.4f} ± {np.sqrt(-nested
 ```
 
 ```output
-Nested CV RMSE: 21.2347 ± 2.1843
+Nested CV RMSE: 20.9959 ± 2.1779
 ```
+
+`GridSearchCV` (the inner loop) picks $\alpha$ using 3-fold CV inside each outer training
+set; `cross_val_score` (the outer loop) then scores that whole "tune-and-fit" procedure on 5
+held-out folds. The 21.0 is an honest estimate for *the procedure*, including the tuning
+step. (A **hyperparameter**, like Ridge's $\alpha$, is a setting chosen before training, not
+learned from the data.)
+
+## Recap in plain words
+
+- Evaluate on data the model never trained on; k-fold CV does this $k$ times and averages.
+- $k = 5$ or $10$ balances pessimistic bias (small $k$) against noisy estimates and cost
+  (large $k$).
+- Stratify with imbalanced classes; use GroupKFold when rows share an entity; use
+  TimeSeriesSplit for time-ordered data.
+- Leakage needs a channel (identifying features, flexible models) — but assume it exists.
+- Tuning and evaluating on the same CV flatters the score; nested CV fixes it.
 
 ## Try it Yourself
 
@@ -232,13 +313,22 @@ print(f"GroupKFold accuracy: {np.mean(gkf_accs):.4f}  (true generalization to ne
 ```
 
 ```output
-KFold accuracy:      0.7870  (optimistic due to user leakage)
-GroupKFold accuracy: 0.6980  (true generalization to new users)
+KFold accuracy:      0.7217  (optimistic due to user leakage)
+GroupKFold accuracy: 0.6950  (true generalization to new users)
 ```
+
+Here the gap is small (0.72 vs 0.695): the five features are plain noise with no user
+signature, so logistic regression can't recognize users, and the per-user bias acts like
+extra noise in both cases. Try adding the user's bias as a feature column, or a one-hot user
+ID, and the KFold accuracy will jump while GroupKFold's won't — that's the leakage channel.
 
 ## Exercise
 
 You have 500 time-ordered observations. Compare 5-fold shuffled KFold vs TimeSeriesSplit(5) for an AR(1) model. Which gives a more honest estimate of future performance and why?
+
+> **Hint:** an **AR(1)** series is one where each value is a fraction of the previous value
+> plus fresh noise. With "yesterday's value" as the only feature, ask what a shuffled fold can
+> actually learn that a forward split can't.
 
 <details>
 <summary>Solution</summary>
@@ -280,4 +370,14 @@ print(f"True noise std: 1.0")
 ```
 
 Shuffled KFold leaks future AR information into training (it sees values $y_{t+1}$ when predicting $y_{t+1}$). TimeSeriesSplit respects temporal ordering and gives a realistic test estimate.
+
+Run it, though, and the two RMSEs come out almost the same (about 0.96 and 0.97, both near the
+noise level 1.0). The first sentence above overstates the risk for this setup: each row is a
+self-contained (yesterday → today) pair and the target $y_{t+1}$ itself is never in the
+training set, while the process is **stationary** (its behaviour doesn't change over time), so
+a linear model learns the same slope from any shuffled subset. Shuffling becomes genuinely
+dangerous when the series drifts or changes regime, when features are computed with future
+values (centred rolling windows, full-series scaling), or when a flexible model can interpolate
+between neighbouring time points. TimeSeriesSplit is still the honest default: it is the only
+split that mirrors how the model will be used.
 </details>
