@@ -7,17 +7,49 @@ order: 13
 
 ## Why not just sklearn's GBM?
 
+The three big boosting libraries run the same recipe as ch. 12 — add trees that fix the
+current mistakes — but each has engineering tricks that make it far faster and better
+regularized. They are the default tools for tabular data in industry and competitions.
+
 sklearn's `GradientBoostingRegressor` is correct but slow: it uses first-order (gradient-only) updates and builds trees with an exact sort. XGBoost, LightGBM, and CatBoost are production-grade libraries that each make different speed/accuracy trade-offs.
+
+**First-order** means the update uses only the slope of the loss. **Exact sort** means every
+split search sorts every feature's values and tries every boundary between them.
+
+> **Picture it:** three car makers building on the same engine design. XGBoost added a
+> better fuel injector (second-order steps), LightGBM made the car lighter (binning,
+> leaf-wise growth), CatBoost built in a special gearbox for categorical data. All three still
+> drive the same road.
+
+(sklearn also has `HistGradientBoostingRegressor`, which borrows LightGBM's binning and is
+much faster than `GradientBoostingRegressor`.)
 
 ## XGBoost: second-order Taylor expansion
 
+XGBoost looks at both the slope of the loss and how fast that slope is changing (its
+curvature), so each tree knows not only which way to move but also how far.
+
 XGBoost minimises a regularised objective using **second-order Taylor expansion** of the loss:
+
+A **Taylor expansion** approximates a curve near a point by a simple polynomial. Second order
+means a parabola: slope term plus curvature term.
 
 $$
 L^{(m)} \approx \sum_i \left[g_i f_m(x_i) + \frac{1}{2}h_i f_m(x_i)^2\right] + \Omega(f_m)
 $$
 
+> **In plain words:** the loss after adding tree $f_m$ is approximated, point by point, as
+> (slope times the change the tree makes) plus half (curvature times the change squared),
+> plus a penalty $\Omega$ for the tree's complexity. Minimizing a parabola has a formula
+> answer, so the best value for each leaf is computed directly.
+
 where $g_i = \partial L/\partial \hat{y}_i$ (gradient) and $h_i = \partial^2 L/\partial \hat{y}_i^2$ (Hessian). The regularisation $\Omega(f) = \gamma T + \frac{\lambda}{2}\sum_j w_j^2$ penalises tree complexity.
+
+The **Hessian** is the second derivative — the curvature. In $\Omega$, $T$ is the number of
+leaves, $w_j$ is the value predicted in leaf $j$, $\gamma$ charges a fee per leaf, and
+$\lambda$ is a Ridge-style penalty (ch. 3) on the leaf values. For squared error, every
+$h_i = 1$, so XGBoost's method is close to ordinary gradient boosting; the curvature matters
+most for losses like log-loss.
 
 ### Split gain formula
 
@@ -27,7 +59,15 @@ $$
 \text{Gain} = \frac{1}{2}\left[\frac{G_L^2}{H_L+\lambda} + \frac{G_R^2}{H_R+\lambda} - \frac{(G_L+G_R)^2}{H_L+H_R+\lambda}\right] - \gamma
 $$
 
+> **In plain words:** $G$ is the sum of the gradients in a leaf and $H$ the sum of the
+> curvatures. $G^2/(H + \lambda)$ is how much loss a leaf can remove. Gain is (left's
+> removal + right's removal − the unsplit parent's removal), halved, minus the fee $\gamma$
+> for adding a leaf. Split only if it pays for itself.
+
 where $G = \sum g_i$, $H = \sum h_i$ over the leaf. Splits with Gain $< 0$ are pruned.
+
+The example below uses XGBoost's native API. A **DMatrix** is XGBoost's own data container.
+`early_stopping_rounds=20` stops training if the test score fails to improve for 20 rounds.
 
 ```python
 import numpy as np
@@ -63,10 +103,22 @@ print(f"XGBoost RMSE: {rmse:.2f} ({model.best_iteration} rounds)")
 ```
 
 ```output
-XGBoost RMSE: 15.23 (284 rounds)
+XGBoost RMSE: 66.23 (299 rounds)
 ```
 
+XGBoost reaches a test RMSE of 66.23. The "299 rounds" is telling: `best_iteration` counts
+from 0, so the best round was the *last* of the 300 allowed. Early stopping never triggered —
+the model was still improving and would do better with more rounds.
+
+> **Watch out:** this code early-stops on the *test* set, which leaks test information into the
+> choice of round. It is a common shortcut in demos and a real mistake in practice. Stop on a
+> separate validation split, as in the "Early stopping pattern" section below.
+
 ## LightGBM: leaf-wise growth and histogram binning
+
+LightGBM's speed comes from two shortcuts: it groups each feature's values into a few hundred
+buckets so split search is cheap, and it always grows the single most useful branch next
+instead of growing every branch evenly.
 
 LightGBM makes two key algorithmic choices that make it much faster:
 
@@ -74,9 +126,18 @@ LightGBM makes two key algorithmic choices that make it much faster:
 
 **Histogram binning:** continuous features are bucketed into 256 bins. Computing split scores on bin boundaries (instead of all unique values) is $O(\text{bins})$ instead of $O(n)$, and enables vectorised operations.
 
+> **Picture it:** level-wise growth is filling a bookshelf row by row. Leaf-wise growth puts
+> the next book wherever the shelf is most empty, even if that makes one corner tall and
+> another bare. Binning is sorting books into 256 labelled boxes instead of alphabetizing
+> every single title.
+
 Additional tricks:
 - **GOSS (Gradient-based One-Side Sampling):** keep all high-gradient samples, subsample low-gradient ones.
 - **EFB (Exclusive Feature Bundling):** bundle mutually exclusive sparse features into one.
+
+High-gradient samples are the ones the model still gets badly wrong, so they carry most of
+the information. Mutually exclusive features are ones that are never nonzero at the same time
+(like one-hot columns), so they can share one column without losing anything.
 
 ```python
 import lightgbm as lgb
@@ -108,10 +169,21 @@ print(f"LightGBM RMSE: {rmse_lgb:.2f} (best iter: {model_lgb.best_iteration})")
 ```
 
 ```output
-LightGBM RMSE: 14.87 (best iter: 291)
+LightGBM RMSE: 61.60 (best iter: 491)
 ```
 
+LightGBM scores 61.60, better than XGBoost's 66.23 on the same split — but its best iteration
+is 491 of 500, so it too was still improving when the round limit hit. Neither number is the
+library's best; both are "where the budget ran out".
+
+> **Watch out:** in LightGBM, `num_leaves` — not depth — is the main complexity knob. A
+> depth-limited tree of depth $d$ has at most $2^d$ leaves, so `num_leaves=31` is roughly
+> depth 5. Setting `num_leaves` far above $2^{\text{max depth}}$ does nothing.
+
 ### Feature importance in LightGBM
+
+Gain importance totals how much loss each feature's splits removed across all trees — the
+boosting version of ch. 11's impurity importance.
 
 ```python
 import numpy as np
@@ -125,18 +197,37 @@ for i in top:
 
 ```output
 Top 5 features by gain:
-  feature_7: 3412.8
-  feature_2: 2891.4
-  feature_15: 2234.9
-  feature_4: 1887.2
-  feature_11: 1623.6
+  feature_11: 55844910.3
+  feature_14: 50126154.4
+  feature_10: 43867510.1
+  feature_5: 41966663.4
+  feature_7: 37479674.2
 ```
+
+The gains are in squared target units summed over 491 trees, so only their *ratios* mean
+anything: feature 11 (about $5.6 \times 10^7$) contributed about 1.5 times as much as feature 7
+(about $3.7 \times 10^7$). The top five are close together, which fits a target that is a
+linear mix of many features.
 
 ## CatBoost: ordered boosting and native categoricals
 
+CatBoost's special trick is honesty about the past: when it works out a statistic for a row,
+it uses only rows that came "before" it in a random order, so no row ever peeks at its own
+answer.
+
 CatBoost introduces **ordered boosting**: to avoid target leakage when computing leaf values, it uses a random permutation of the data and builds each tree using only the samples that appeared *before* each sample in the permutation. This is more expensive but avoids overfitting on small datasets.
 
+**Target leakage** means the label of a row sneaks into the features or statistics used to
+predict that same row. A **permutation** is a shuffled order of the rows.
+
 **Native categorical handling:** CatBoost converts categoricals to numeric using ordered target statistics (a permutation-based form of target encoding that avoids leakage), so you don't need to one-hot encode.
+
+**Target encoding** replaces a category (say, "city = Paris") with the average label of rows in
+that category. Done naively, each row's own label is part of its average — a leak. CatBoost
+averages only over earlier rows in the permutation.
+
+> **Picture it:** a teacher grading essays in a random order who is allowed to compare each
+> essay only with the ones already graded. No essay can influence its own grade.
 
 ```python
 from catboost import CatBoostRegressor
@@ -158,10 +249,23 @@ print(f"CatBoost RMSE: {rmse_cb:.2f} (best iter: {cb.best_iteration_})")
 ```
 
 ```output
-CatBoost RMSE: 15.06 (best iter: 276)
+CatBoost RMSE: 34.35 (best iter: 499)
 ```
 
+CatBoost scores 34.35 — roughly half the RMSE of XGBoost and LightGBM. That gap is real for
+this dataset but not a general ranking. A likely reason: CatBoost builds **symmetric (oblivious) trees**, where
+every node at the same depth asks the same question; on a smooth, linear synthetic target
+like this one, that rigid structure seems to suit the data much better. Its best iteration, 499, is again
+the last allowed.
+
+> **Watch out:** never conclude "library X is best" from one run with default-ish settings
+> and an untuned round budget. Tune each one (or at least give each enough rounds) before
+> comparing.
+
 ## Key hyperparameters compared
+
+The three libraries expose the same few knobs under different names. Learn the knob, then
+look up its name.
 
 | Parameter | XGBoost | LightGBM | CatBoost | Effect |
 |---|---|---|---|---|
@@ -173,6 +277,10 @@ CatBoost RMSE: 15.06 (best iter: 276)
 | L2 penalty | `lambda` | `reg_lambda` | `l2_leaf_reg` | Regularisation |
 
 ## Early stopping pattern
+
+**Early stopping** means: set a generous tree budget, watch the score on a validation set, and
+stop when it hasn't improved for a while. The validation set must be carved out of the
+training data, never the test set.
 
 ```python
 import lightgbm as lgb
@@ -194,8 +302,25 @@ print(f"Best iteration: {m.best_iteration}, best val RMSE: {m.best_score['valid_
 ```
 
 ```output
-Best iteration: 312, best val RMSE: 14.93
+Best iteration: 999, best val RMSE: 79.67
 ```
+
+Even with a budget of 1000 rounds and patience 50, the best iteration is 999 — the last one.
+The validation RMSE (79.67) was still falling. On this data, learning rate 0.05 is slow
+enough that 1000 trees aren't enough; raise the budget or the learning rate until early
+stopping actually stops.
+
+> **Watch out:** if `best_iteration` equals your round limit minus one, early stopping did
+> nothing. You are under-fitted, not tuned.
+
+## Recap in plain words
+
+- XGBoost, LightGBM, and CatBoost are fast, regularized implementations of gradient boosting.
+- XGBoost uses gradients and curvatures (a second-order approximation) and a per-leaf fee $\gamma$ to decide splits.
+- LightGBM bins features into 256 buckets and grows the most useful leaf first; `num_leaves` is its main complexity knob.
+- CatBoost's ordered boosting and ordered target statistics prevent rows from leaking their own labels.
+- Early-stop on a validation split carved from training data, and check that it actually stopped before the limit.
+- Compare libraries only after giving each a fair tuning budget.
 
 ## Try it Yourself
 
@@ -223,15 +348,28 @@ for num_leaves in [15, 31, 63, 127]:
 ```
 
 ```output
-num_leaves= 15: RMSE=22.84 (231 iters)
-num_leaves= 31: RMSE=21.57 (287 iters)
-num_leaves= 63: RMSE=21.23 (312 iters)
-num_leaves=127: RMSE=21.41 (298 iters)
+num_leaves= 15: RMSE=54.45 (349 iters)
+num_leaves= 31: RMSE=60.45 (224 iters)
+num_leaves= 63: RMSE=62.58 (259 iters)
+num_leaves=127: RMSE=62.58 (259 iters)
 ```
+
+Fewer leaves win here: 15 leaves gives 54.45, 31 gives 60.45, and 63 gives 62.58. Simpler
+trees suit a linear target. The rows for 63 and 127 leaves are identical — 62.58 with 259
+iterations — because the trees can't actually reach 127 leaves. LightGBM's default
+`min_data_in_leaf=20` with 1360 training rows caps each tree at about 52 leaves, so both
+settings grow the same trees.
+
+Try adding `'min_data_in_leaf': 5` to the parameters. The cap lifts and the two rows
+separate — but both get worse (about 70.7 for 63 leaves and 81.8 for 127), because leaves of 5
+rows fit noise. The default was protecting you.
 
 ## Exercise
 
 Using `make_regression` (1500 samples, 25 features, noise=20), tune a LightGBM model: sweep `num_leaves` ∈ {15,31,63} and `learning_rate` ∈ {0.01, 0.05, 0.1} using early stopping (patience=30). Report the best combination and its test RMSE. Compare to a baseline `GradientBoostingRegressor` with default settings.
+
+> **Hint:** split the training set again into train and validation for early stopping, loop
+> over the 9 combinations, and keep a dictionary of the best one.
 
 <details>
 <summary>Solution</summary>
@@ -263,4 +401,9 @@ print(f"Best: num_leaves={best['nl']}, lr={best['lr']}, RMSE={best['rmse']:.2f} 
 baseline = GradientBoostingRegressor(random_state=0).fit(X_tr, y_tr)
 print(f"sklearn GBM baseline RMSE: {np.sqrt(np.mean((baseline.predict(X_te)-y_te)**2)):.2f}")
 ```
+
+A run printed: best `num_leaves=15`, `lr=0.05`, test RMSE 43.07 after 350 iterations, against
+50.59 for the default `GradientBoostingRegressor` — about 15% lower. One flaw to fix: the
+loop picks the winner by *test* RMSE, so 43.07 is optimistic. Select by
+`m.best_score['valid_0']['rmse']` instead, and evaluate only the chosen model on the test set.
 </details>

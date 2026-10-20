@@ -7,6 +7,10 @@ order: 3
 
 ## The chain rule is all you need
 
+Training a network means asking, for every weight, "if I nudge you a little, how much does
+the loss change?" **Backpropagation** answers that question for all weights at once by
+walking the computational graph (ch. 2) backward and multiplying slopes along the way.
+
 Backpropagation is systematic application of the chain rule. If $L = g(f(x))$:
 
 $$
@@ -15,13 +19,39 @@ $$
 
 The term $\partial L / \partial z$ is called the **upstream gradient** (it flows backward from the loss). $\partial z / \partial x$ is the **local gradient** (it depends only on the operation at this node).
 
+> **In plain words:** to find how $L$ reacts to $x$, multiply two slopes: how $L$ reacts to
+> the middle value $z$, and how $z$ reacts to $x$. A **gradient** is that slope — the
+> "change in output per tiny change in input". If $z$ moves 3 units per unit of $x$, and $L$
+> moves 2 units per unit of $z$, then $L$ moves $2 \times 3 = 6$ units per unit of $x$.
+
+> **Picture it:** a line of gears. Turning the first gear once turns the second gear 3 times,
+> and each turn of the second turns the third twice. The first-to-last ratio is $3 \times 2$.
+> Each gear only needs to know its own ratio (the local gradient); the product along the line
+> is the chain rule.
+
+The split into "upstream" and "local" is what makes backprop modular. Each operation only has
+to know its own local slope. It receives the upstream gradient from the node after it,
+multiplies, and passes the result to the nodes before it.
+
 ## Gradients for common operations
+
+A network is built from a handful of operation types, so you only need a handful of local
+gradient rules. Learn the rule for matrix multiply and for each activation, and you can
+backprop through any MLP.
 
 ### Matrix multiply
 
 $$
 Z = X W^T \quad\Rightarrow\quad \frac{\partial L}{\partial W} = \left(\frac{\partial L}{\partial Z}\right)^T X, \qquad \frac{\partial L}{\partial X} = \frac{\partial L}{\partial Z} \cdot W
 $$
+
+> **In plain words:** $\partial L / \partial Z$ is the upstream gradient, same shape as $Z$.
+> To get the weight gradient, multiply it (transposed) by the layer's *input* $X$ — this is
+> why ch. 2 stored the inputs. To get the gradient for $X$ (to pass further back), multiply by
+> the weights $W$. Each result has exactly the shape of the thing it is the gradient of.
+
+The shape rule is your safety net: there is usually only one way to multiply the available
+matrices that gives the right shape. The code checks it.
 
 ```python
 import numpy as np
@@ -50,11 +80,23 @@ dL/dW shape: (5, 3)   (should match W: (5, 3) )
 dL/dX shape: (4, 3)   (should match X: (4, 3) )
 ```
 
+Both checks pass: `dL/dW` is $(5, 3)$ like `W`, and `dL/dX` is $(4, 3)$ like `X`. A gradient
+always has the shape of the variable it belongs to, because it holds one slope per entry.
+
+> **Watch out:** a wrong transpose often still runs when matrices happen to be square, and
+> gives a silently wrong gradient. Test your backprop with non-square, all-different sizes
+> (like 4, 3, 5 here) so shape mistakes crash instead of hiding.
+
 ### ReLU and sigmoid gradients
 
 $$
 \frac{\partial \text{ReLU}(z)}{\partial z} = \mathbf{1}_{z > 0}, \qquad \frac{\partial \sigma(z)}{\partial z} = \sigma(z)(1 - \sigma(z))
 $$
+
+> **In plain words:** ReLU's slope is 1 where its input was positive and 0 elsewhere — it
+> either passes the gradient through or blocks it. ($\mathbf{1}_{z > 0}$ is an **indicator**:
+> 1 when the condition is true, 0 when false.) Sigmoid's slope is its output times one minus
+> its output, so it can be computed from the stored forward value without recomputing exponentials.
 
 ```python
 import numpy as np
@@ -77,12 +119,25 @@ print("sig_grad  :", sig_grad.round(4))
 ```output
 z         : [-1.5 -0.2  0.   0.8  2. ]
 relu_grad : [0. 0. 0. 1. 1.]
-sig_grad  : [0.1824 0.2500 0.2500 0.2099 0.1050]
+sig_grad  : [0.1491 0.2475 0.25   0.2139 0.105 ]
 ```
+
+ReLU's gradient is 1 only for the two positive inputs (0.8 and 2.0). Sigmoid's gradient peaks
+at exactly 0.25 for $z = 0$ (third entry), is 0.2475 for the nearby $z = -0.2$, and has
+already fallen to 0.105 at $z = 2.0$ and 0.1491 at $z = -1.5$.
 
 Note: the ReLU gradient is 0 at $z=0$ (undefined, but 0 by convention). Sigmoid gradient is maximum at 0 (0.25) and decays toward 0 for large $|z|$ — causing vanishing gradients in deep networks.
 
+**Vanishing gradients** means the slope reaching early layers is so small they barely learn.
+With sigmoid, each layer multiplies the backward signal by at most 0.25, so ten sigmoid
+layers can shrink it by a factor of $0.25^{10} \approx 10^{-6}$. This is one reason ReLU
+replaced sigmoid in hidden layers (ch. 7 returns to it).
+
 ## Full 2-layer MLP backprop
+
+Now you chain the rules through a whole network: loss, output layer, ReLU, hidden layer. You
+compute one "error signal" per layer, called $\delta$, and every weight gradient is that
+signal times the layer's stored input.
 
 Setup: $X \to Z^{(1)} \to A^{(1)} \to Z^{(2)} \to \hat{y} \to L$
 
@@ -90,23 +145,47 @@ $$
 L = \frac{1}{N}\|Z^{(2)} - y\|_F^2
 $$
 
+> **In plain words:** the loss is the mean squared error — square every prediction error,
+> add them, divide by the number of examples $N$. ($\|\cdot\|_F^2$, the squared **Frobenius
+> norm**, means "sum of squares of every entry".)
+
 Working backward:
 
 $$
 \delta^{(2)} = \frac{\partial L}{\partial Z^{(2)}} = \frac{2}{N}(Z^{(2)} - y)
 $$
 
+> **In plain words:** $\delta^{(2)}$ ("delta two") is the gradient at the output's raw score.
+> It is the prediction error, scaled by $2/N$ — the 2 comes from differentiating a square,
+> the $1/N$ from the average.
+
 $$
 \nabla W^{(2)} = (\delta^{(2)})^T A^{(1)}, \qquad \nabla b^{(2)} = \delta^{(2)T}\mathbf{1}
 $$
+
+> **In plain words:** the output weights' gradient is the error signal times the hidden
+> activations $A^{(1)}$ that fed those weights. The bias gradient is the error signal summed
+> over the batch ($\mathbf{1}$ is a column of ones, so multiplying by it sums).
 
 $$
 \delta^{(1)} = \frac{\partial L}{\partial Z^{(1)}} = (\delta^{(2)} W^{(2)}) \odot \mathbf{1}_{Z^{(1)}>0}
 $$
 
+> **In plain words:** send the error back through $W^{(2)}$ to get a signal for each hidden
+> unit, then multiply element by element ($\odot$) by ReLU's gate: units that were off in the
+> forward pass get zero gradient.
+
 $$
 \nabla W^{(1)} = (\delta^{(1)})^T X, \qquad \nabla b^{(1)} = \delta^{(1)T}\mathbf{1}
 $$
+
+> **In plain words:** the same pattern as the output layer, one level down — error signal
+> times this layer's input, which is the raw data $X$.
+
+> **Picture it:** a relay race run backward. The loss hands a baton (the error) to the output
+> layer; that layer takes its share of blame (its weight gradient) and hands an adjusted
+> baton to the hidden layer, which does the same. ReLU units that were "asleep" during the
+> forward run simply drop the baton.
 
 ```python
 import numpy as np
@@ -144,12 +223,26 @@ print(f"dW2 norm: {np.linalg.norm(dW2):.4f}  shape: {dW2.shape}")
 ```
 
 ```output
-Loss: 1.1247
-dW1 norm: 0.2138  shape: (8, 4)
-dW2 norm: 0.3704  shape: (1, 8)
+Loss: 1.1018
+dW1 norm: 0.8228  shape: (8, 4)
+dW2 norm: 1.3690  shape: (1, 8)
 ```
 
+The output shows two things. The gradient shapes match the weights, $(8, 4)$ and $(1, 8)$.
+And the norms (0.8228 for `dW1`, 1.3690 for `dW2`) are of order 1, so neither layer has
+vanishing or exploding gradients at this initialization. The **norm** is the square root of
+the sum of squared entries — one number for "how big is this gradient overall".
+
+> **Watch out:** the $1/N$ in `dZ2` must match how the loss averages. Here `d_out = 1`, so
+> `np.mean` divides by $N$ and so does `dZ2`. With several outputs, `np.mean` divides by
+> $N \times d_{\text{out}}$ and the gradient must too — the Try it block below has exactly
+> that situation.
+
 ### Verify with finite differences
+
+A **finite-difference check** tests your calculus with brute force: nudge one weight up by a
+tiny $\varepsilon$, nudge it down, and measure how the loss changed. If that measured slope
+matches your formula, the formula is right.
 
 ```python
 import numpy as np
@@ -174,14 +267,30 @@ print(f"Relative error    : {abs(dW2[0,0]-fd_grad)/abs(fd_grad+1e-12):.2e}")
 ```
 
 ```output
-Analytic dW2[0,0] : 0.064821
-Finite-diff       : 0.064821
-Relative error    : 1.14e-09
+Analytic dW2[0,0] : 0.102648
+Finite-diff       : 0.102648
+Relative error    : 8.64e-11
 ```
 
-Analytic and finite-difference gradients agree to nine decimal places.
+The analytic gradient (0.102648) and the measured one agree on every printed digit, and the
+relative error is $8.64 \times 10^{-11}$. That means the two numbers agree to about ten
+significant digits. As a rule of thumb, a relative error below $10^{-7}$ means the gradient
+is right; around $10^{-2}$ or more means a bug.
+
+Finite differences are too slow for training — one pair of forward passes per weight — but perfect for testing.
+
+## Recap in plain words
+
+- Backprop is the chain rule applied node by node: upstream gradient times local gradient.
+- For a matrix multiply, the weight gradient is the upstream gradient times the layer's stored input.
+- ReLU's local gradient is a 0/1 gate; sigmoid's is $\sigma(1-\sigma)$, at most 0.25.
+- Every gradient has the same shape as the variable it belongs to.
+- Check any hand-written gradient against a finite difference; relative error near $10^{-10}$ means it is right.
 
 ## Try it Yourself
+
+This block backprops through a single linear layer with 5 outputs and MSE loss, and also
+computes `dX`, the gradient you would hand to an earlier layer.
 
 ```python
 import numpy as np
@@ -198,7 +307,7 @@ Z = X @ W.T + b
 loss = np.mean((Z - y)**2)
 
 # Backward — MSE then linear layer
-dZ = 2 * (Z - y) / N
+dZ = 2 * (Z - y) / Z.size   # np.mean averages over all N*5 entries
 dW = dZ.T @ X
 db = dZ.sum(axis=0)
 dX = dZ  @ W
@@ -208,13 +317,22 @@ print(f"dX shape: {dX.shape}  dW shape: {dW.shape}")
 ```
 
 ```output
-loss=1.2943  dW norm=0.8041
+loss=2.9918  dW norm=1.6534
 dX shape: (10, 3)  dW shape: (5, 3)
 ```
+
+`dX` has shape $(10, 3)$ like `X`, and `dW` has shape $(5, 3)$ like `W`. Note the line
+`dZ = 2 * (Z - y) / Z.size`: because `y` has 5 columns, `np.mean` divides by $10 \times 5 = 50$,
+so the gradient must divide by 50 too. Dividing by $N = 10$ instead would inflate every
+gradient by 5 (the dW norm would read 8.2672 instead of 1.6534). Try adding a finite-difference
+check on `W[0, 0]` to confirm the 1.6534 version is the right one.
 
 ## Exercise
 
 Implement backpropagation for a 2-layer network with **sigmoid** (not ReLU) hidden activation. Verify `dW1[0,0]` against a finite-difference estimate.
+
+> **Hint:** only one line of the ReLU backward pass changes — the local gradient of the
+> hidden activation. Use the stored `A1` to compute it.
 
 <details>
 <summary>Solution</summary>
@@ -258,4 +376,8 @@ print(f"Relative error   : {abs(dW1[0,0]-fd)/abs(fd+1e-12):.2e}")
 ```
 
 Replace `(Z1 > 0)` with `A1 * (1 - A1)` — the sigmoid local gradient.
+
+With seed 99 the analytic and finite-difference values both print 0.070066, and the relative
+error is about $1.7 \times 10^{-11}$. Everything else in the backward pass is unchanged: the
+matrix-multiply rules do not care which activation sits between them.
 </details>

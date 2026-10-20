@@ -8,6 +8,17 @@ Pitched at: solid Python + linear algebra, wants to understand what sklearn is d
 The tabular-kaggle fast-track covers many of these topics at competition depth; this course
 covers the theory and derivations underneath.
 
+**In plain words:** this course teaches the standard machine-learning models by building each
+one yourself and checking it against the library version. Chapters 1–5 set up the rules of the
+game — what a loss is, why training error lies, and how linear, logistic, and other generalized
+linear models fit a weighted sum of features. Chapters 6–9 cover models that classify by
+similarity or probability (k-NN, Naive Bayes, LDA/QDA) and by the widest margin (SVMs and
+kernels). Chapters 10–13 grow decision trees and combine many of them into random forests and
+boosted ensembles, ending with XGBoost, LightGBM, and CatBoost. Chapters 14–16 drop the labels
+entirely: clustering with k-Means, mixtures, density, hierarchies, and graphs, then squeezing
+data into fewer dimensions with PCA, t-SNE, and UMAP; the capstone (ch. 17) has you rebuild the
+key algorithms from scratch.
+
 ---
 
 ## Chapters

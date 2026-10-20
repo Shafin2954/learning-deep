@@ -7,7 +7,17 @@ order: 2
 
 ## Computational graphs
 
+Any formula can be broken into a chain of tiny steps — multiply these two, add those, square
+that — and drawn as boxes connected by arrows. That drawing is a **computational graph**, and
+once you have it, computing derivatives becomes a mechanical walk backward along the arrows
+(ch. 3–4).
+
 Every computation in a neural network can be drawn as a **directed acyclic graph (DAG)**: leaf nodes are inputs and parameters, internal nodes are operations, edges carry values. This representation makes automatic differentiation mechanical.
+
+"Directed" means every arrow has a direction (values flow one way). "Acyclic" means no arrow
+loops back to an earlier box, so there is always a clear "first" and "last". A **leaf node**
+is a starting value nobody computed: an input like $x_1$ or a **parameter** (a learnable
+number) like $w_1$.
 
 For the scalar loss $L = (w_1 x_1 + w_2 x_2 - y)^2$, the graph is:
 
@@ -19,9 +29,25 @@ s, y   → sub → e
 e      → sq  → L
 ```
 
+Read it top to bottom: two multiplications make `a` and `b`, an add makes the weighted sum
+`s`, a subtraction makes the error `e`, and squaring makes the loss `L`. Five operations,
+five boxes.
+
+> **Picture it:** a recipe card. Ingredients (leaves) go into steps ("whisk eggs and sugar"),
+> each step's result feeds the next, and the cake (loss) comes out at the end. If the cake is
+> too sweet, you trace back through the steps to find which ingredient to change — that trace
+> is backpropagation.
+
 The forward pass evaluates this graph left to right, storing every intermediate value. Storage is the price you pay to make backward efficient.
 
+The **forward pass** is "run the recipe": compute every box from its inputs, in order. The
+**backward pass** (ch. 3) later reuses those stored values instead of recomputing them.
+
 ## A scalar Value class
+
+You can make Python build the graph for you. Wrap every number in a small object that
+remembers its value, which operation made it, and which objects it came from. Then ordinary
+`+`, `*`, `**` expressions quietly record the whole recipe as they run.
 
 Build the graph node-by-node:
 
@@ -75,9 +101,26 @@ e (error): Value(data=-0.9000, grad=0.0000)
 L (loss): Value(data=0.8100, grad=0.0000)
 ```
 
+Check the numbers by hand. $s = 0.5 \cdot 2 + (-0.3) \cdot 3 = 1.0 - 0.9 = 0.1$, which is the
+`s (pre-output)` line. Then $e = 0.1 - 1.0 = -0.9$ and $L = (-0.9)^2 = 0.81$. Every `grad`
+reads 0.0000 because nothing has run backward yet.
+
 Every node stores its data and a `grad` slot (initially 0) for the gradient that backprop will fill in.
 
+Two details make this work. `__add__` and `__mul__` are Python's **operator hooks**: writing
+`w1 * x1` calls `w1.__mul__(x1)`, which returns a new `Value` and records `(w1, x1)` in
+`_prev`. And there is no subtraction method, so the code writes $e = s + (-1) \cdot y$; the
+graph has a `*` and a `+` node where the diagram above drew one `sub`.
+
+> **Watch out:** `_prev` is a `set`, so if the same `Value` feeds an operation twice (like
+> `a * a`), it is stored only once. That is fine for walking the graph, but the gradient code
+> in ch. 4 must still add *both* contributions — it does so by using `+=` on `grad`.
+
 ## Matrix form of the forward pass
+
+Running one example at a time is slow. Instead you stack many examples as rows of a matrix
+and push the whole stack through each layer with one matrix multiply. A group of examples
+processed together is a **batch**.
 
 In practice you compute with batches. For a layer with $n^{(l)}$ neurons processing a batch of $N$ samples:
 
@@ -86,6 +129,14 @@ Z^{(l)} = A^{(l-1)} W^{(l)T} + \mathbf{1} b^{(l)T}, \qquad A^{(l)} = f(Z^{(l)})
 $$
 
 where $A^{(l-1)} \in \mathbb{R}^{N \times n^{(l-1)}}$ and $Z^{(l)} \in \mathbb{R}^{N \times n^{(l)}}$.
+
+> **In plain words:**
+> - $A^{(l-1)}$ is the previous layer's output: $N$ rows (one per example), $n^{(l-1)}$ columns.
+> - $W^{(l)T}$ is the weight matrix flipped on its side, so that row-times-column gives each
+>   neuron's weighted sum for each example.
+> - $\mathbf{1} b^{(l)T}$ is the bias row copied $N$ times — one copy per example. NumPy does
+>   this copying for you (**broadcasting**) when you write `+ b`.
+> - $Z^{(l)}$ is the result: one row per example, one column per neuron. $f$ is applied to every entry.
 
 ```python
 import numpy as np
@@ -120,8 +171,13 @@ print("Z2 stats: mean={:.3f}  std={:.3f}".format(Z2.mean(), Z2.std()))
 X  shape: (32, 4)
 Z1 shape: (32, 8)   A1 shape: (32, 8)
 Z2 shape: (32, 1)
-Z2 stats: mean=0.033  std=0.568
+Z2 stats: mean=0.237  std=0.652
 ```
+
+Follow the shapes line by line: 32 examples with 4 features become 32 rows of 8 hidden
+values, then 32 rows of 1 output. The batch size $N = 32$ never changes — only the number of
+columns does. The output statistics (mean 0.237, std 0.652) show values of order 1, which is
+what the $\sqrt{2/\text{fan-in}}$ scaling is designed to keep (ch. 7).
 
 You must store `X`, `Z1`, `A1` during the forward pass — backpropagation needs them to compute gradients.
 
@@ -129,7 +185,28 @@ You must store `X`, `Z1`, `A1` during the forward pass — backpropagation needs
 
 The gradient of the loss with respect to $W^{(1)}$ requires $A^{(0)} = X$ (the input to layer 1). The gradient with respect to $W^{(2)}$ requires $A^{(1)}$. Each layer needs its *input* from the forward pass. This is the memory cost of backprop: $O(N \times \sum n^{(l)})$.
 
+The reason is the product rule in miniature: for $z = w \cdot a$, the slope of $z$ with
+respect to $w$ is $a$. So to know how much a weight mattered, you need the value it was
+multiplied by. The memory cost grows with the batch size $N$ times the total number of
+neurons across all layers — this is why big models run out of GPU memory during training but
+not during inference (ch. 13 shows ways around it).
+
+> **Picture it:** a hiker dropping breadcrumbs. The way out (backward pass) is only fast
+> because the crumbs are already on the path. Throwing them away saves bread (memory) but
+> means re-walking the whole trail (recomputing) to find your way back.
+
+## Recap in plain words
+
+- A computational graph breaks a formula into small operations connected by arrows.
+- The forward pass computes every node in order and keeps the intermediate values.
+- A `Value` class with operator hooks can record the graph automatically as ordinary Python runs.
+- In matrix form, a batch of $N$ examples flows through each layer as an $N$-row matrix.
+- Each layer's input must be stored, because its weight gradient is built from that input.
+
 ## Try it Yourself
+
+This loop runs a $3 \to 5 \to 5 \to 2$ network on 8 examples and saves every `Z` and `A` in a
+`cache` dictionary, the way a real backprop implementation would.
 
 ```python
 import numpy as np
@@ -158,19 +235,29 @@ print("Final output A3:", A.round(3))
 
 ```output
 Stored cache keys: ['A0', 'Z1', 'A1', 'Z2', 'A2', 'Z3', 'A3']
-Final output A3: [[ 0.037 -0.127]
- [ 0.283  0.078]
- [ 0.    -0.   ]
- [-0.157 -0.085]
- [ 0.14  -0.104]
- [-0.007  0.104]
- [ 0.054  0.059]
- [-0.187 -0.056]]
+Final output A3: [[-0.007 -0.079]
+ [-0.001 -0.014]
+ [ 0.     0.001]
+ [ 0.003  0.004]
+ [ 0.007 -0.058]
+ [ 0.     0.   ]
+ [ 0.     0.006]
+ [ 0.     0.   ]]
 ```
+
+The key list shows the pattern: one `Z` (before the bend) and one `A` (after) per layer, plus
+`A0` for the input. The outputs are tiny (largest magnitude 0.079), and two rows are
+`[0. 0.]` exactly. That is ReLU at work: with weights scaled by 0.5, 55% of layer-1 units and
+75% of layer-2 units are zero, and for those two examples every layer-2 unit is dead, so
+nothing reaches the output. Change the `0.5` to `np.sqrt(2 / layer_sizes[i])` and see the
+outputs grow back to order 1.
 
 ## Exercise
 
 Implement a forward pass for a 2-layer MLP $(4 \to 8 \to 1)$ with ReLU on the hidden layer and no activation on the output. Return both the prediction and a cache dict with all intermediates. Compute MSE loss between predictions and a target vector.
+
+> **Hint:** copy the shape pattern from the matrix-form example: `Z1 = X @ W1.T + b1`, ReLU,
+> `Z2 = A1 @ W2.T + b2`, then average the squared differences against `y`.
 
 <details>
 <summary>Solution</summary>
@@ -201,4 +288,8 @@ print("Cache keys:", list(cache.keys()))
 ```
 
 All intermediate values are stored; `Z2` is the prediction, `loss` is MSE.
+
+With seed 0 this prints prediction shape `(16, 1)` and an MSE of 1.3025. That is about what
+you expect when random predictions are compared to standard-normal targets: the target alone
+has variance about 1, and the untrained predictions add their own error on top.
 </details>

@@ -7,15 +7,37 @@ order: 5
 
 ## What a loss function does
 
+A **loss function** is the scorecard for a prediction: it compares what the model said with
+what was true and returns one number, where smaller is better. Training is nothing more than
+nudging the weights to make that number go down, so the loss defines what "better" means.
+
 A loss function maps your model's prediction $\hat{y}$ and the ground truth $y$ to a single scalar. The optimizer minimizes this scalar. Choosing the wrong loss yields incorrect gradients — even a perfect optimizer cannot recover.
 
+$\hat{y}$ ("y-hat") is the model's prediction and $y$ is the true answer. The **optimizer**
+(ch. 6) is the rule that changes the weights using the gradient of this loss (ch. 3–4).
+
+> **Picture it:** the loss is the referee, the optimizer is the player. A brilliant player
+> following the wrong referee — one who rewards fouls — gets very good at fouling. A wrong
+> loss gives perfectly computed gradients toward the wrong goal.
+
 ## Regression losses
+
+**Regression** means predicting a number (a price, a temperature). The losses below differ in
+one thing: how harshly they punish a big miss compared with a small one.
 
 ### Mean Squared Error (MSE)
 
 $$
 L_\text{MSE} = \frac{1}{N}\sum_{i=1}^N (\hat{y}_i - y_i)^2
 $$
+
+> **In plain words:** for each of the $N$ examples, take the miss $\hat{y}_i - y_i$, square
+> it, and average. Squaring makes every miss positive and makes big misses count far more:
+> a miss of 3 costs 9, a miss of 10 costs 100.
+
+The code compares MSE with two relatives. **RMSE** (root mean squared error) is the square root
+of MSE, which puts it back in the units of $y$. **MAE** (mean absolute error) averages the
+size of the misses without squaring.
 
 ```python
 import numpy as np
@@ -34,18 +56,34 @@ print(f"MAE  = {mae:.4f}")
 ```
 
 ```output
-MSE  = 0.2299
-RMSE = 0.4795
-MAE  = 0.3909
+MSE  = 0.1222
+RMSE = 0.3496
+MAE  = 0.2851
 ```
+
+Here the predictions are the truth plus noise with standard deviation 0.5. The RMSE of 0.3496
+says "a typical miss is about 0.35" — in the same units as `y`. The MAE (0.2851) is smaller
+than the RMSE, which is always true: squaring gives the larger misses extra weight before the
+square root brings the scale back.
 
 MSE heavily penalises outliers ($O(e^2)$). MAE is robust to outliers ($O(|e|)$) but its gradient is undefined at zero — use Huber loss as a compromise.
 
+An **outlier** is a data point far from the rest, often a measurement error. $O(e^2)$ means
+the cost grows like the square of the error $e$; $O(|e|)$ means it grows in a straight line.
+MAE's kink at zero means its slope jumps from $-1$ to $+1$ with no value at exactly 0.
+
 ### Huber loss
+
+**Huber loss** behaves like MSE for small misses and like MAE for big ones. You pick the
+switch-over point $\delta$ ("delta").
 
 $$
 L_\text{Huber}(e) = \begin{cases} \frac{1}{2}e^2 & |e| \le \delta \\ \delta(|e| - \frac{\delta}{2}) & |e| > \delta \end{cases}
 $$
+
+> **In plain words:** if the miss $e$ is within $\pm\delta$, cost is half its square (smooth,
+> like MSE). Beyond $\delta$, the cost grows in a straight line, so an outlier's influence is
+> capped. The $-\delta/2$ makes the two pieces meet without a jump at $|e| = \delta$.
 
 ```python
 import numpy as np
@@ -65,19 +103,42 @@ print(f"Huber = {huber_loss(y_pred, y_true):.4f}")
 ```
 
 ```output
-MSE   = 20.0188
-Huber = 8.5150
+MSE   = 18.8380
+Huber = 1.8500
 ```
+
+Four predictions are close (misses of 0.1 or 0.2) and one target is an outlier at 10. MSE
+reaches 18.8380 almost entirely because of that one point: $9.7^2 = 94.09$ out of a total of
+$94.19$, divided by 5. Huber charges the outlier only $1 \cdot (9.7 - 0.5) = 9.2$, and the
+average drops to 1.8500 — ten times smaller.
 
 The outlier at position 4 dominates MSE but is capped by Huber.
 
+> **Watch out:** capping the outlier's *loss* also caps its *gradient* at $\pm\delta$. With
+> MSE, that one point would pull the model with a gradient proportional to 9.7; with Huber it
+> pulls with at most 1. That is the whole benefit — and also why Huber is wrong if the
+> "outliers" are real signal you need to fit.
+
 ## Classification losses
+
+**Classification** means picking a category. The model outputs probabilities, and the loss
+punishes it for putting low probability on the right answer — gently if it was a bit unsure,
+heavily if it was confidently wrong.
 
 ### Binary cross-entropy (BCE)
 
 $$
 L_\text{BCE} = -\frac{1}{N}\sum_{i=1}^N \left[y_i \log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)\right]
 $$
+
+> **In plain words:** $\hat{p}_i$ is the model's probability that example $i$ is class 1, and
+> $y_i$ is 1 or 0. For a positive example only the first term survives, $-\log \hat{p}_i$; for
+> a negative, only $-\log(1 - \hat{p}_i)$. Each term is "minus the log of the probability you
+> gave to the truth". Probability 0.9 on the truth costs 0.105; probability 0.01 costs 4.6.
+
+The code takes **logits** — raw scores before the sigmoid — and converts them to probabilities
+inside the loss. `np.clip` keeps probabilities away from exactly 0 or 1 so the log never
+returns infinity.
 
 ```python
 import numpy as np
@@ -96,15 +157,36 @@ print(f"Predictions: {(1/(1+np.exp(-logits))).round(3)}")
 ```
 
 ```output
-BCE loss: 0.2891
+BCE loss: 0.3340
 Predictions: [0.881 0.269 0.622 0.426 0.818]
 ```
 
+Every prediction leans the right way: the three positives get 0.881, 0.622, 0.818, and the two
+negatives get 0.269 and 0.426. The loss 0.3340 is the average of the five
+"minus log of probability on the truth" terms. The biggest single term is the fourth
+example: a negative given 0.426, so the truth got $0.574$ and costs $-\log 0.574 \approx 0.555$.
+The confident first example (0.881) costs only 0.127.
+
+> **Watch out:** in PyTorch, use `BCEWithLogitsLoss` on raw logits instead of applying
+> `sigmoid` and then `BCELoss`. The combined version uses a stable formula and never needs
+> clipping; the two-step version can produce `inf` or `nan` for large logits.
+
 ### Categorical cross-entropy with softmax
+
+With more than two classes, **softmax** turns a row of scores into probabilities that are all
+positive and add up to 1. Cross-entropy then charges minus the log of the probability on the
+correct class.
 
 $$
 p_k = \frac{e^{z_k}}{\sum_j e^{z_j}}, \qquad L_\text{CE} = -\sum_{k} y_k \log p_k
 $$
+
+> **In plain words:** $z_k$ is the score for class $k$. Exponentiating makes every score
+> positive; dividing by the sum makes them add to 1. $y_k$ is 1 for the true class and 0 for
+> the others, so the sum in $L_\text{CE}$ keeps only $-\log p_{\text{true class}}$.
+
+The code subtracts the row's largest score before exponentiating. That changes nothing
+mathematically (it cancels in the fraction) but stops `np.exp` from overflowing on large scores.
 
 ```python
 import numpy as np
@@ -133,19 +215,35 @@ print(f"CE loss: {loss:.4f}")
 
 ```output
 Probs:
- [[0.799 0.164 0.036]
- [0.033 0.924 0.044]
+ [[0.786 0.175 0.039]
+ [0.049 0.896 0.054]
  [0.212 0.212 0.576]]
-CE loss: 0.2434
+CE loss: 0.3008
 ```
 
+Read the diagonal: the correct classes get 0.786, 0.896, and 0.576. Their losses are
+$-\log 0.786 = 0.241$, $-\log 0.896 = 0.110$, and $-\log 0.576 = 0.552$, and the average is
+the printed 0.3008. Row 3 contributes the most: its correct class (score 2.0) wins, but the
+two rivals tied at 1.0 still take 0.212 each.
+
 ### Focal loss
+
+When 99% of examples are easy negatives, their many small losses can drown out the few hard
+positives. **Focal loss** multiplies each example's cross-entropy by a factor that shrinks
+toward 0 as the model gets that example right.
 
 For imbalanced datasets, BCE treats all examples equally. Focal loss down-weights easy examples:
 
 $$
 L_\text{focal} = -\alpha (1 - p)^\gamma \log(p)
 $$
+
+> **In plain words:**
+> - $p$ is the probability the model gave to the *true* class (called `pt` in the code).
+> - $-\log(p)$ is the ordinary cross-entropy.
+> - $(1 - p)^\gamma$ is the "focus" factor: at $p = 0.9$ and $\gamma = 2$ it is $0.01$, so an
+>   easy example keeps only 1% of its loss; at $p = 0.5$ it is 0.25.
+> - $\alpha$ is a fixed weight (0.25 here) that rebalances the classes.
 
 ```python
 import numpy as np
@@ -166,19 +264,44 @@ print(f"Focal : {focal_loss(logits, y_true):.4f}")
 ```
 
 ```output
-BCE   : 0.1704
-Focal : 0.0143
+BCE   : 0.3298
+Focal : 0.0194
 ```
+
+Focal loss (0.0194) is about 17 times smaller than BCE (0.3298). The per-example values show
+where it comes from. The three easy examples (logits 3.0, $-2.5$, 2.5 on the right side) have
+BCE terms around 0.05–0.08 but focal terms of 0.0001 or less. The two hard ones (logits 0.1 and
+0.2, near a coin flip) keep focal terms of 0.036 and 0.060, so they now supply almost all of
+the loss — and of the gradient.
 
 Focal loss is much smaller because the confident, easy samples contribute very little.
 
+Part of the drop is the constant $\alpha = 0.25$, which scales everything by 4. The rest is
+the $(1 - p)^\gamma$ factor, which is what changes the *balance* between easy and hard examples.
+
 ## KL divergence
+
+**KL divergence** measures how different two probability distributions are: how much extra
+surprise you get if you expect distribution $Q$ but the world actually follows $P$. It is zero
+when they match and positive otherwise.
 
 $$
 D_\text{KL}(P \| Q) = \sum_k P(k) \log \frac{P(k)}{Q(k)}
 $$
 
+> **In plain words:** for every outcome $k$, compare the true probability $P(k)$ with the
+> guess $Q(k)$ through the log of their ratio, weighted by how often $k$ really happens under
+> $P$. Outcomes where $Q$ badly underestimates $P$ cost the most.
+
+> **Picture it:** $P$ is the real weather in your city; $Q$ is the forecast you packed for.
+> KL is how surprised you are, on average, by the weather you meet. Packing for London and
+> landing in Cairo is a different surprise from the reverse — which is why KL is not symmetric.
+
 Used in VAEs and knowledge distillation:
+
+A **VAE** (variational autoencoder) uses KL to keep its hidden code close to a simple
+distribution. **Knowledge distillation** trains a small "student" model to copy a large
+"teacher" model's output distribution, using KL as the gap to shrink.
 
 ```python
 import numpy as np
@@ -196,11 +319,22 @@ print(f"KL(Q||P) = {kl_div(q, p):.6f}  (not symmetric)")
 ```
 
 ```output
-KL(P||Q) = 0.009456
-KL(Q||P) = 0.009487  (not symmetric)
+KL(P||Q) = 0.020698
+KL(Q||P) = 0.020481  (not symmetric)
 ```
 
+The two directions give 0.020698 and 0.020481: close, but not equal. For distributions this
+similar the gap is small; for very different distributions (one with near-zero probabilities)
+the two directions can differ wildly.
+
+> **Watch out:** `torch.nn.functional.kl_div` expects its *first* argument as
+> log-probabilities of $Q$ and its second as probabilities of $P$ — the reverse of how the
+> formula reads. Passing plain probabilities gives a wrong number without an error.
+
 ## Choosing a loss
+
+The right loss follows from two questions: what kind of answer are you predicting, and which
+mistakes should hurt most?
 
 | Task | Loss | Why |
 |------|------|-----|
@@ -211,7 +345,22 @@ KL(Q||P) = 0.009487  (not symmetric)
 | Imbalanced binary | Focal | Suppresses easy-example gradient |
 | Distribution matching | KL divergence | Measures information gap |
 
+"Log-sum-exp" is the stable way of computing $\log(1 + e^z)$-style expressions without
+overflow; it is what the "with logits" versions use internally.
+
+## Recap in plain words
+
+- The loss defines what "good" means; the optimizer only follows it.
+- MSE squares misses, so one outlier can dominate; Huber caps outliers' pull.
+- BCE and cross-entropy cost minus the log of the probability given to the right answer.
+- Softmax turns scores into probabilities; subtract the max first to avoid overflow.
+- Focal loss shrinks easy examples' contribution so hard ones drive learning.
+- KL divergence measures the gap between two distributions, and the two directions differ.
+
 ## Try it Yourself
+
+**Temperature** $T$ divides the logits before softmax. Low temperature sharpens the
+distribution toward the top class; high temperature flattens it. This block sweeps $T$.
 
 ```python
 import numpy as np
@@ -231,14 +380,23 @@ for T in [0.1, 0.5, 1.0, 2.0, 5.0]:
 ```output
 T=0.1: [[1. 0. 0.]]
 T=0.5: [[0.982 0.018 0.   ]]
-T=1.0: [[0.844 0.114 0.041]]
-T=2.0: [[0.659 0.242 0.099]]
-T=5.0: [[0.483 0.306 0.211]]
+T=1.0: [[0.867 0.117 0.016]]
+T=2.0: [[0.665 0.245 0.09 ]]
+T=5.0: [[0.472 0.316 0.212]]
 ```
+
+At $T = 0.1$ the logits become 30, 10, $-10$, and softmax puts essentially all probability on
+the first class (it prints as 1). At $T = 1.0$ you get the ordinary softmax (0.867, 0.117,
+0.016). At $T = 5.0$ the top class falls to 0.472 and the distribution is close to uniform.
+Distillation uses $T > 1$ to expose the teacher's "second choices". Try $T = 100$, and try
+logits that are all equal.
 
 ## Exercise
 
 Implement label-smoothed cross-entropy: replace hard labels $y_k \in \{0,1\}$ with soft labels $y_k^\text{smooth} = (1-\varepsilon)y_k + \varepsilon/K$ where $K$ is the number of classes. Use $\varepsilon = 0.1$. Compare the loss value to standard cross-entropy on the same batch.
+
+> **Hint:** build a one-hot matrix `y_hard`, mix it with the uniform value $\varepsilon/K$,
+> then compute $-\sum_k y_k \log p_k$ row by row with the full probability matrix.
 
 <details>
 <summary>Solution</summary>
@@ -270,4 +428,9 @@ print(f"Soft CE: {soft_ce:.4f}  (higher — penalises overconfidence)")
 ```
 
 Label smoothing raises the loss floor slightly, which prevents the model from being excessively confident and improves calibration.
+
+On this batch the hard cross-entropy is 0.1755 and the smoothed one is 0.3455. The smoothed
+loss is higher because every wrong class now has a small target ($0.1/3 \approx 0.033$), so
+the model is charged for pushing those probabilities toward 0. Even a perfect model can no
+longer reach a loss of 0 — that is the "floor".
 </details>

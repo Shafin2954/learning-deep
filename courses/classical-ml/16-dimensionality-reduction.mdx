@@ -7,9 +7,19 @@ order: 16
 
 ## Why high dimensions hurt
 
+Data with hundreds of columns is hard to look at, slow to model, and full of empty space.
+**Dimensionality reduction** squeezes it into a few columns while keeping the structure that
+matters — like a good map that flattens the round Earth but keeps the coastlines recognizable.
+
 As dimensionality grows, two things break down simultaneously. First, the volume of the space grows exponentially — 100 uniformly distributed points fill a unit square adequately, but the same 100 points in 100 dimensions leave almost all the volume empty. Second, distances concentrate: in high dimensions the ratio of the maximum to the minimum pairwise distance approaches 1, so "nearest neighbor" becomes meaningless.
 
+You measured both effects in ch. 6: a small box catching $10^{-70}$ of the space in 100
+dimensions, and nearest and farthest distances only 17% apart in 1000 dimensions.
+
 Dimensionality reduction finds a lower-dimensional representation that preserves the structure you care about — variance, local neighborhoods, or global topology.
+
+The dataset for this chapter is sklearn's **digits**: 1797 small images of handwritten digits,
+each $8 \times 8$ pixels, so each image is a row of 64 numbers.
 
 ```python
 import numpy as np
@@ -28,14 +38,34 @@ print("Mean pairwise dist (sample):",
 ```output
 Shape: (1797, 64)
 Classes: [0 1 2 3 4 5 6 7 8 9]
-Mean pairwise dist (sample): 47.83
+Mean pairwise dist (sample): 46.91
 ```
+
+1797 images, 64 pixel features each, 10 digit classes. The average distance between two of
+the first 50 images is 46.91 in raw pixel units — a number to compare against after scaling.
 
 ## PCA: maximum variance projections
 
+**PCA** (principal component analysis) finds the directions in which the data spreads out
+most and keeps only the top few. It is like photographing a 3D object from the angle that
+shows the most detail.
+
 PCA finds orthogonal directions (principal components) that capture the most variance. The first PC is the direction along which data varies most; the second is orthogonal to the first and captures the next most variance; and so on.
 
+**Orthogonal** means at right angles: each new direction carries information the earlier ones
+don't. A **principal component** (PC) is one of these directions; a point's coordinate along
+it is that point's PC score.
+
+> **Picture it:** a cloud of points shaped like a rugby ball. The first PC runs along the
+> ball's long axis; the second across its widest side; the third across the thinnest side.
+> Dropping the third keeps the ball's shadow on the table — most of what makes it a rugby
+> ball.
+
 Computationally, PCA is eigen-decomposition of the covariance matrix $\Sigma = \frac{1}{n}X^\top X$ (when X is centered), or equivalently SVD of X. sklearn's implementation uses the SVD path.
+
+**Centered** means each column has had its mean subtracted. The eigenvectors of the
+covariance matrix are the PCs, and each eigenvalue is the variance along its PC. **SVD**
+(singular value decomposition) gets the same directions directly from $X$, more accurately.
 
 ```python
 from sklearn.preprocessing import StandardScaler
@@ -54,14 +84,30 @@ for thresh in [0.90, 0.95, 0.99]:
 ```
 
 ```output
-90% variance: 21 components
-95% variance: 29 components
-99% variance: 41 components
+90% variance: 31 components
+95% variance: 40 components
+99% variance: 54 components
 ```
+
+Keeping 90% of the variance needs 31 of the 64 components; 95% needs 40, and 99% needs 54.
+Each extra slice of variance costs more components than the last: the first 31 components buy
+90%, the last 10 components needed for 99% buy 4% between them.
 
 Reducing 64 dimensions to 21 (90% variance) cuts the feature space to a third while retaining almost all information.
 
+The numbers above correct that sentence: 90% takes 31 components, about half of the 64. Twenty-one
+components keep about 80.7% of the variance (the Try-it below prints 0.807). On standardized
+digits, variance is spread over many directions, so PCA compresses less than the sentence
+claims.
+
+> **Watch out:** standardizing first matters. Without `StandardScaler`, the pixels with the
+> biggest raw spread dominate the components. With it, every pixel starts with variance 1 —
+> including near-constant edge pixels, whose tiny noise gets blown up to full size.
+
 ### Two-component projection for visualization
+
+Two components are the most you can draw on a flat page, so PCA to 2D is the standard first
+look at any dataset.
 
 ```python
 pca2 = PCA(n_components=2, random_state=42)
@@ -73,17 +119,27 @@ print("First 3 points:\n", np.round(X_pca[:3], 2))
 ```
 
 ```output
-Explained variance ratio (2 PCs): [0.121 0.097]
+Explained variance ratio (2 PCs): [0.12  0.096]
 X_pca shape: (1797, 2)
 First 3 points:
- [[ 1.93 -0.59]
- [ 0.59  0.85]
- [ 1.54 -0.46]]
+ [[-1.91 -0.95]
+ [-0.59  0.92]
+ [-1.3  -0.32]]
 ```
+
+The first PC holds 12.0% of the variance and the second 9.6%. Each image is now two numbers —
+the first image sits at $(-1.91, -0.95)$.
 
 Two PCs capture only 22% of variance — enough to see cluster structure in a plot but not enough for a downstream classifier. For classification, use 21–41 components.
 
+Given the output of the previous block, a range of roughly 31 to 40 components (90% to 95% of
+variance) is the better rule of thumb here; the "Comparing all three" section shows 21
+components already keeping k-NN close to its full-data accuracy.
+
 ### Whitening
+
+**Whitening** stretches or shrinks each component so they all have the same spread, like
+resizing a stretched photo back to a square.
 
 `PCA(whiten=True)` scales each component to unit variance after projection. This decorrelates features and normalizes their scales — useful before algorithms that assume spherical input (k-Means, RBF-kernel SVMs).
 
@@ -95,18 +151,46 @@ print("Whitened component variances (should be ~1):",
 ```
 
 ```output
-Whitened component variances (should be ~1): [1. 1. 1. 1. 1.]
+Whitened component variances (should be ~1): [0.999 0.999 0.999 0.999 0.999]
 ```
+
+Every whitened component has variance 0.999 instead of exactly 1. The tiny gap is a
+convention mismatch: sklearn scales components using the $n-1$ ("sample") variance, while
+NumPy's `.var()` divides by $n$, and $1796/1797 \approx 0.999$.
+
+> **Watch out:** whitening gives low-variance components (often mostly noise) the same weight
+> as the main ones. Never whiten with all components kept; drop the small ones first.
 
 ## t-SNE: preserve local neighborhoods
 
+**t-SNE** forgets about overall shape and focuses on one job: points that are neighbours in the
+original space should stay neighbours in the 2D picture. It is the go-to tool for plots that
+show clusters.
+
 t-SNE constructs a probability distribution over pairs of high-dimensional points (Gaussian kernel, bandwidth set to match a target perplexity), then builds a matching distribution in 2D using Student-t kernels (heavy tails prevent the crowding problem). It minimizes the KL divergence between the two distributions.
+
+Unpacking the terms:
+
+- Each pair of points gets a "how likely are these two to be neighbours" score $p_{ij}$, from a bell curve around each point.
+- **Perplexity** sets each bell curve's width so that each point has roughly that many effective neighbours.
+- In 2D, the matching scores $q_{ij}$ come from a **Student-t** curve, which has fatter tails than a bell curve.
+- The **crowding problem**: 2D has far less room than 64D, so moderately distant points get crammed together. Fat tails give them room.
+- **KL divergence** measures how different two sets of probabilities are; t-SNE moves the 2D points to make it small.
 
 $$
 KL(P \| Q) = \sum_{i \neq j} p_{ij} \log \frac{p_{ij}}{q_{ij}}
 $$
 
+> **In plain words:** for every pair $i, j$, compare the neighbour score in the original space
+> ($p_{ij}$) with the one in the 2D picture ($q_{ij}$). The penalty is large when $p_{ij}$ is big
+> but $q_{ij}$ is small — true neighbours drawn far apart. The reverse mistake (non-neighbours
+> drawn close) is penalized far less, which is why t-SNE keeps local structure but not global.
+
 The heavy t-distribution tails in the low-D space mean that moderately-distant high-D points can be placed far apart in 2D without penalty — this "spreads out" clusters and is why t-SNE plots look crisp.
+
+> **Picture it:** seating guests at a wedding from a list of who knows whom. Close friends
+> must sit at the same table. Whether two tables are next to each other or across the hall
+> barely matters to the planner — so don't read meaning into the distance between tables.
 
 ```python
 from sklearn.manifold import TSNE
@@ -114,7 +198,7 @@ import time
 
 t0 = time.perf_counter()
 tsne = TSNE(n_components=2, perplexity=30, random_state=42,
-            n_iter=1000, learning_rate='auto', init='pca')
+            max_iter=1000, learning_rate='auto', init='pca')
 X_tsne = tsne.fit_transform(X_scaled)
 print(f"t-SNE time: {time.perf_counter()-t0:.1f}s")
 print("X_tsne shape:", X_tsne.shape)
@@ -128,19 +212,24 @@ for digit in range(10):
 ```
 
 ```output
-t-SNE time: 4.2s
+t-SNE time: 7.4s
 X_tsne shape: (1797, 2)
-Digit 0: spread=9.3
-Digit 1: spread=14.7
-Digit 2: spread=9.8
-Digit 3: spread=11.2
-Digit 4: spread=10.1
-Digit 5: spread=10.4
-Digit 6: spread=8.9
-Digit 7: spread=11.8
-Digit 8: spread=13.2
-Digit 9: spread=13.5
+Digit 0: spread=5.4
+Digit 1: spread=13.4
+Digit 2: spread=8.1
+Digit 3: spread=7.4
+Digit 4: spread=7.5
+Digit 5: spread=7.9
+Digit 6: spread=6.0
+Digit 7: spread=6.9
+Digit 8: spread=7.4
+Digit 9: spread=18.4
 ```
+
+The fit took 7.4 s on this machine (your time will differ). The spread is the average distance
+from each digit's points to that digit's centre in the 2D map. Most digits form tight groups
+(spread 5.4 to 8.1), but digit 1 (13.4) and digit 9 (18.4) are much looser — 9s probably split
+into more than one group, since there are several common ways to write them.
 
 ### t-SNE pitfalls
 
@@ -149,10 +238,13 @@ Digit 9: spread=13.5
 - **Non-deterministic.** Different random seeds give qualitatively different layouts. Always set `random_state`.
 - **Perplexity** controls the effective number of neighbors (5–50 is typical). Too low: fragmented clusters. Too high: global structure overwrites local.
 
+The code below tries three perplexities and scores each map by how far apart the digit
+centres are, relative to how spread out each digit is. Higher means cleaner separation.
+
 ```python
 for perplexity in [5, 30, 50]:
     ts = TSNE(n_components=2, perplexity=perplexity, random_state=42,
-              n_iter=500, learning_rate='auto', init='pca')
+              max_iter=500, learning_rate='auto', init='pca')
     X_ts = ts.fit_transform(X_scaled)
     # Count how many of the 10 digits form visually distinct blobs
     # Proxy: ratio of max inter-cluster distance to mean intra-cluster spread
@@ -165,18 +257,32 @@ for perplexity in [5, 30, 50]:
 ```
 
 ```output
-perplexity=  5  inter/intra=2.81
-perplexity= 30  inter/intra=4.37
-perplexity= 50  inter/intra=4.12
+perplexity=  5  inter/intra=3.68
+perplexity= 30  inter/intra=4.84
+perplexity= 50  inter/intra=4.94
 ```
+
+Perplexity 5 gives the least separated map (ratio 3.68): with only about 5 effective
+neighbours, each digit breaks into small fragments. Perplexity 30 (4.84) and 50 (4.94) are
+close, with 50 slightly ahead. On 1797 points, anything from 30 to 50 works.
 
 ## UMAP: faster, better global structure
 
+**UMAP** has the same goal as t-SNE — keep neighbours together in 2D — but it is faster,
+keeps the big-picture layout somewhat better, and can place new points into an existing map.
+
 UMAP (Uniform Manifold Approximation and Projection) builds a fuzzy topological graph in high dimensions, then finds a low-dimensional representation that has the same fuzzy topology. In practice this means:
 
-- **Faster** than t-SNE: O(n log n) vs O(n²) (t-SNE uses Barnes-Hut).
+A **fuzzy topological graph** is a network linking each point to its nearest neighbours, with
+link strengths between 0 and 1. A **manifold** is a lower-dimensional surface curled up inside
+the high-dimensional space, like a sheet of paper crumpled in a room.
+
+- **Faster** than t-SNE: $O(n \log n)$ vs $O(n^2)$ (t-SNE uses Barnes-Hut).
 - **Preserves more global structure** — clusters that are genuinely similar in high-D remain closer in 2D.
 - **Transform is reproducible** — you can `fit` on train, then `transform` on test. t-SNE cannot.
+
+(Plain t-SNE is $O(n^2)$; the **Barnes-Hut** approximation sklearn uses brings it down to about
+$O(n \log n)$ too, but UMAP is still usually faster in practice.)
 
 ```python
 from umap import UMAP
@@ -193,9 +299,15 @@ print("Transformed 5 new points:", X_new_umap.shape)
 ```
 
 ```output
-UMAP time: 1.1s
+UMAP time: 13.9s
 Transformed 5 new points: (5, 2)
 ```
+
+UMAP took 13.9 s here — *slower* than t-SNE's 7.4 s on this run, which contradicts the
+"faster" bullet. The first UMAP call in a session compiles its code with `numba`, which costs
+several seconds; a second call is much faster, and UMAP's speed advantage shows on larger
+datasets. The last line shows the out-of-sample feature: 5 points mapped into the existing 2D
+layout, shape `(5, 2)`.
 
 Key hyperparameters:
 
@@ -204,6 +316,9 @@ Key hyperparameters:
 - `metric` — Euclidean by default; cosine is common for text/embeddings.
 
 ### Comparing all three
+
+A fair test of a reduction: train a simple classifier on the reduced data and see how much
+accuracy survives. Here, 5-nearest-neighbours with 5-fold cross-validation.
 
 ```python
 from sklearn.neighbors import KNeighborsClassifier
@@ -223,16 +338,38 @@ for name, Xm in methods.items():
 ```
 
 ```output
-Raw (64d)        kNN-5 accuracy: 0.986 ± 0.005
-PCA (21d)        kNN-5 accuracy: 0.984 ± 0.006
-PCA (2d)         kNN-5 accuracy: 0.840 ± 0.014
-t-SNE (2d)       kNN-5 accuracy: 0.960 ± 0.009
-UMAP (2d)        kNN-5 accuracy: 0.971 ± 0.008
+Raw (64d)        kNN-5 accuracy: 0.944 ± 0.015
+PCA (21d)        kNN-5 accuracy: 0.938 ± 0.021
+PCA (2d)         kNN-5 accuracy: 0.514 ± 0.025
+t-SNE (2d)       kNN-5 accuracy: 0.954 ± 0.018
+UMAP (2d)        kNN-5 accuracy: 0.957 ± 0.025
 ```
+
+Raw 64D gives 0.944. PCA to 21 dimensions keeps nearly all of it (0.938). PCA to 2D collapses
+to 0.514. The surprise is t-SNE (0.954) and UMAP (0.957): their 2D maps score *higher* than the
+raw data.
 
 For downstream classification: use PCA to 90–95% variance, not t-SNE/UMAP. t-SNE/UMAP are visualization tools. UMAP at 2D outperforms t-SNE here because it better preserves the global structure kNN relies on.
 
+The first two sentences are still the right advice, but the scores above need careful reading.
+The t-SNE and UMAP maps were fitted on *all* 1797 images before cross-validation split them,
+so each test fold helped shape the map it was scored on — a leak that PCA's linear projection
+barely suffers from. And UMAP's 0.957 against t-SNE's 0.954 is far inside the $\pm 0.02$ spread,
+so this run doesn't support "UMAP outperforms t-SNE" at all.
+
+> **Watch out:** to test a reduction honestly, fit it inside each training fold (a sklearn
+> `Pipeline`) and transform the test fold. t-SNE has no `transform`, so it can't be used this
+> way at all — one more reason it is for pictures only.
+
 ## Choosing n_components for PCA
+
+Two common rules for "how many components to keep" give different answers, so it helps to
+know what each measures.
+
+The **Kaiser criterion** keeps components whose eigenvalue is above 1. On standardized data
+each original feature has variance 1, so this keeps components that explain more than one
+feature's worth of variance. The variance threshold keeps enough components to reach a target
+share, here 95%.
 
 ```python
 # Elbow/scree plot heuristic
@@ -250,9 +387,22 @@ print("95% variance threshold:", thresh_n)
 ```
 
 ```output
-Kaiser criterion n_components: 19
-95% variance threshold: 29
+Kaiser criterion n_components: 17
+95% variance threshold: 40
 ```
+
+Kaiser says 17 components; the 95% rule says 40. The gap is typical: Kaiser tends to keep
+fewer components. Neither is "right" — if the components feed a model, choose the number by
+cross-validating that model.
+
+## Recap in plain words
+
+- High-dimensional space is mostly empty and its distances bunch together, so fewer, better dimensions help.
+- PCA keeps the directions of greatest variance; on standardized digits, 90% of variance takes 31 of 64 components.
+- Two PCs make a quick picture but lose most of the information (here 22% of variance kept).
+- t-SNE keeps neighbours together for crisp cluster plots, but distances between clusters and cluster sizes mean nothing.
+- UMAP has the same aim, can map new points with `transform`, and keeps somewhat more global layout.
+- Use PCA (fitted inside the training folds) for modelling; use t-SNE and UMAP for looking.
 
 ## Try it Yourself
 
@@ -279,18 +429,26 @@ print("Sample of 2D coords:", X_2d[:3].round(2))
 ```
 
 ```output
-Variance kept by PCA: 0.951
+Variance kept by PCA: 0.807
 UMAP embedding shape: (1797, 2)
-Sample of 2D coords: [[ 3.21 -2.14]
- [-1.07  4.83]
- [ 2.89 -1.98]]
+Sample of 2D coords: [[14.3   5.23]
+ [-4.11  3.82]
+ [-2.11  1.45]]
 ```
+
+This is the common two-step pipeline: PCA to 21 dimensions first (keeping 80.7% of the
+variance and discarding the noisiest directions), then UMAP from 21 to 2 for the picture.
+UMAP on 21 inputs runs faster than on 64. The coordinates themselves (like 14.3, 5.23) have
+no meaning on their own — only which points land near which.
 
 Try changing `n_neighbors` to 5 and 50. Try `min_dist=0.5`. See how the embedding changes character.
 
 ## Exercise
 
 You have a 500-feature gene-expression matrix (5000 samples). You want to (1) speed up a downstream classifier and (2) visualize cluster structure. What dimensionality reduction pipeline would you use, in what order, and why?
+
+> **Hint:** think about which method can `transform` new samples, and which one is cheap to
+> run on 500 columns before anything else.
 
 <details>
 <summary>Solution</summary>
@@ -321,6 +479,12 @@ Pipeline rationale:
 3. **Classifier on PCA output** (50 components), not UMAP — UMAP distances are not meaningful for ML; PCA preserves variance, which correlates with predictive signal.
 4. **Never train on UMAP embeddings** — they are fit-specific and cannot be reliably transferred to test data unless you use `transform`, and the 2D compression loses information.
 
+One caution about the demo: it uses pure random noise as stand-in "genes", and on such data
+the 50 PCs keep only about 15.7% of the variance (the script prints 0.157), not the 80–90% the
+code comment mentions. Random noise has no dominant directions, so every PC is worth about
+the same. Real expression data is strongly correlated, which is why the comment's figure is
+typical there. Also note that point 3's "variance correlates with predictive signal" is a
+hope, not a law: here the label depends on gene 0 alone, and PCA has no reason to keep it.
 </details>
 
 ## Under the Trench
@@ -328,13 +492,13 @@ Pipeline rationale:
 Rare and advanced topics you should at least know the name of. You won't need them daily,
 but you'll stop being surprised when you meet them.
 
-- **Splines & GAMs** — flexible nonlinearity you can still interpret; sklearn's `HistGradientBoosting` can mimic GAM-like behavior with low max_depth.
-- **Kernel smoothing / LOESS** — fit curves without a model form; good for trend visualization in EDA.
-- **Isotonic & quantile regression** — monotone fits / predict intervals not means; `sklearn.isotonic` and `sklearn.linear_model.QuantileRegressor`.
+- **Splines & GAMs** — flexible nonlinearity you can still interpret; sklearn's `HistGradientBoosting` can mimic GAM-like behavior with low max_depth. A **GAM** (generalized additive model) predicts with a sum of one smooth curve per feature.
+- **Kernel smoothing / LOESS** — fit curves without a model form; good for trend visualization in EDA. Each point's fitted value is a weighted average of its neighbours.
+- **Isotonic & quantile regression** — monotone fits / predict intervals not means; `sklearn.isotonic` and `sklearn.linear_model.QuantileRegressor`. Isotonic means "only ever goes up" (or only down).
 - **Gaussian processes (preview)** — full Bayesian regression with uncertainty; see the Bayesian ML course.
-- **ICA & NMF** — source separation / parts-based factorization; `sklearn.decomposition.FastICA` and `NMF`.
-- **Manifold methods (Isomap, LLE, spectral embedding)** — nonlinear structure in `sklearn.manifold`; Isomap is geodesic PCA.
-- **Association rules (Apriori/FP-growth)** — market-basket "X→Y" patterns; `mlxtend` library.
-- **One-class SVM & Isolation Forest** — anomaly detection without labeled negatives; `sklearn.svm.OneClassSVM` and `sklearn.ensemble.IsolationForest`.
-- **Multi-output / multi-label / ordinal classification** — beyond single-label; `sklearn.multioutput.MultiOutputClassifier`.
-- **Conformal prediction** — distribution-free prediction sets with coverage guarantees; `nonconformist` and `MAPIE` libraries.
+- **ICA & NMF** — source separation / parts-based factorization; `sklearn.decomposition.FastICA` and `NMF`. ICA can pull separate voices out of a recording of a crowded room.
+- **Manifold methods (Isomap, LLE, spectral embedding)** — nonlinear structure in `sklearn.manifold`; Isomap is geodesic PCA. "Geodesic" means distance measured along the surface, like walking, not tunnelling.
+- **Association rules (Apriori/FP-growth)** — market-basket "X→Y" patterns; `mlxtend` library. Example: shoppers who buy nappies often also buy beer.
+- **One-class SVM & Isolation Forest** — anomaly detection without labeled negatives; `sklearn.svm.OneClassSVM` and `sklearn.ensemble.IsolationForest`. Isolation Forest flags points that random splits isolate unusually quickly.
+- **Multi-output / multi-label / ordinal classification** — beyond single-label; `sklearn.multioutput.MultiOutputClassifier`. Ordinal means the classes have an order, like "bad, okay, good".
+- **Conformal prediction** — distribution-free prediction sets with coverage guarantees; `nonconformist` and `MAPIE` libraries. It wraps any model and returns a set of answers guaranteed to contain the truth, say, 90% of the time.

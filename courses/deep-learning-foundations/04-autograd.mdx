@@ -7,22 +7,54 @@ order: 4
 
 ## Two modes of automatic differentiation
 
+In ch. 3 you wrote every gradient by hand. **Automatic differentiation (AD)** makes the
+computer do it: each basic operation knows its own local slope, and a program chains those
+slopes together for you. There are two directions you can chain them in, and the choice
+decides how fast it is.
+
 **Forward mode:** alongside every value $x$ you carry a derivative $\dot{x} = \partial x / \partial \theta$ for one input $\theta$. Cost: $O(n)$ forward passes for $n$ inputs. Good when you have few inputs and many outputs.
 
 **Reverse mode (backprop):** one forward pass builds the computation graph; one backward pass accumulates $\bar{x} = \partial L / \partial x$ for every node. Cost: one forward + one backward pass regardless of the number of parameters. Essential for neural networks where $n \gg 1$.
 
+Read the dot and bar notation as follows. $\dot{x}$ ("x-dot") is "how much $x$ moves when the
+one chosen input $\theta$ moves". $\bar{x}$ ("x-bar") is "how much the loss moves when $x$
+moves" — the `grad` field you will fill in below. A network has millions of parameters and
+one scalar loss, so forward mode would need millions of passes. Reverse mode needs two.
+
+> **Picture it:** forward mode is asking "if I change this one ingredient, how does every dish
+> on the menu change?" — once per ingredient. Reverse mode is asking "this one dish tasted
+> wrong; how much is each ingredient to blame?" — once, for all ingredients together. Training
+> has one dish (the loss) and millions of ingredients (the weights).
+
 ### Dual numbers (forward mode glimpse)
+
+A **dual number** is an ordinary number with a little "derivative passenger" attached. The
+rule $\varepsilon^2 = 0$ makes the passenger obey exactly the rules of calculus when you
+multiply.
 
 Represent $x$ as $x + \dot{x}\varepsilon$ where $\varepsilon^2 = 0$. Then:
 $$
 (a + \dot{a}\varepsilon)(b + \dot{b}\varepsilon) = ab + (a\dot{b} + b\dot{a})\varepsilon
 $$
 
+> **In plain words:** multiply out the brackets. The $\dot{a}\dot{b}\varepsilon^2$ term
+> vanishes because $\varepsilon^2 = 0$. What is left is the product $ab$ plus
+> $(a\dot{b} + b\dot{a})\varepsilon$ — and $a\dot{b} + b\dot{a}$ is exactly the product rule
+> from calculus. So the passenger carries the derivative along for free.
+
 The $\varepsilon$ coefficient automatically computes the derivative. You don't need this for backprop, but it shows that AD is just arithmetic in an augmented number system.
 
 ## Building a scalar autograd engine
 
+You will now upgrade ch. 2's `Value` class so that it can run backward. Each operation, when
+it creates its output, also leaves behind a tiny function that says "here is how to send
+gradient back to my inputs". The `backward()` method then calls those functions in the right order.
+
 The core idea: each `Value` node stores its parents (`_prev`) and a `_backward` closure that knows how to push gradient back to those parents.
+
+A **closure** is a function defined inside another function that remembers the local
+variables around it — here, `self`, `other`, and `out`. That memory is what lets `_backward`
+run long after the forward operation has finished.
 
 ```python
 import numpy as np
@@ -112,7 +144,26 @@ print("Value class defined with add/mul/pow/exp/log/relu + backward()")
 Value class defined with add/mul/pow/exp/log/relu + backward()
 ```
 
+The one printed line only confirms the class compiled. The interesting parts are in the code:
+
+- `__add__`: addition passes the upstream gradient through unchanged to both inputs (local slope 1).
+- `__mul__`: each input gets the *other* input's value times the upstream gradient (product rule).
+- `__pow__`, `exp`, `log`, `relu`: each uses its textbook derivative — $n x^{n-1}$, $e^x$, $1/x$, the 0/1 gate.
+- `backward()`: sorts the graph so every node comes after its inputs (a **topological sort**), sets
+  the loss's own gradient to 1, then calls `_backward` from the loss toward the leaves.
+
+> **Watch out:** every `_backward` uses `+=`, never `=`. When one value feeds two places (for
+> example `x` in `x * (x + 1)`), it receives gradient from both paths, and those contributions
+> must be added. Writing `=` would keep only the last path and give a wrong gradient with no error.
+
+The topological sort matters because a node may only push its gradient back once it has
+received gradient from *every* node that used it. Processing nodes in reverse topological
+order guarantees that.
+
 ## Verify on $L = (ax^2 + b)^2$
+
+Test the engine on a formula small enough to differentiate by hand. If the engine's gradients
+match the hand-derived ones, the plumbing is right.
 
 ```python
 a, x, b = Value(2.0), Value(3.0), Value(1.0)
@@ -134,13 +185,23 @@ print(f"b.grad   = {b.grad:.4f}")
 ```output
 L.data   = 361.0   (expected 361)
 x.grad   = 456.0000  (analytic: 456.0000)
-a.grad   = 684.0000
+a.grad   = 342.0000
 b.grad   = 38.0000
 ```
+
+The loss is $(2 \cdot 9 + 1)^2 = 19^2 = 361$, as expected. Check every gradient by the chain
+rule, with $u = ax^2 + b = 19$:
+
+- $\partial L / \partial x = 2u \cdot 2ax = 2 \cdot 19 \cdot 12 = 456$, matching `x.grad`.
+- $\partial L / \partial a = 2u \cdot x^2 = 38 \cdot 9 = 342$, matching `a.grad`.
+- $\partial L / \partial b = 2u \cdot 1 = 38$, matching `b.grad`.
 
 All gradients are exact.
 
 ## Finite-difference verification
+
+As in ch. 3, you can double-check autograd by nudging the input and measuring the change in
+the output. This does not use any of the backward machinery, so it is an independent test.
 
 ```python
 def f(xval):
@@ -157,10 +218,18 @@ print(f"Error           = {abs(x.grad - fd_dL_dx):.2e}")
 ```output
 Autograd  dL/dx = 456.000000
 Finite-diff     = 456.000000
-Error           = 6.00e-06
+Error           = 8.32e-09
 ```
 
+Autograd says 456 and the measured slope also prints 456.000000. The gap is
+$8.32 \times 10^{-9}$, which is floating-point rounding in the finite difference, not an error
+in autograd. Relative to 456, that is about $2 \times 10^{-11}$.
+
 ## Tiny MLP demo
+
+Now put the engine to work: build a $2 \to 4 \to 1$ network out of individual `Value` scalars,
+train it on the XOR data from ch. 1 with plain gradient descent, and watch whether the loss
+goes down. Nothing here uses NumPy for gradients.
 
 ```python
 # XOR-like task with the Value autograd
@@ -206,43 +275,71 @@ print("Loss at steps 0,10,20,30,40:", losses)
 ```
 
 ```output
-Loss at steps 0,10,20,30,40: [1.0163, 0.8921, 0.7534, 0.6118, 0.4852]
+Loss at steps 0,10,20,30,40: [1.0009, 0.9988, 0.9963, 0.9937, 0.9903]
 ```
+
+The loss moves from 1.0009 at step 0 to 0.9903 at step 40. It is going down, which proves the
+gradients point the right way, but it is going down slowly: about 1% in 40 steps. Two reasons:
+the weights start small (scale 0.5), so the sigmoid output sits near 0.5 where the summed
+squared error is about $4 \times 0.25 = 1$; and a learning rate of 0.1 is cautious for this tiny
+problem. The loss here is a sum over 4 examples, not a mean.
 
 Loss decreasing — the autograd engine correctly computes gradients and gradient descent is working.
 
+> **Watch out:** every step resets `p.grad = 0.0` before the backward pass. Because
+> `_backward` accumulates with `+=`, forgetting the reset adds this step's gradient to all
+> previous ones. PyTorch has the same behaviour, which is why its training loops call
+> `optimizer.zero_grad()` (ch. 10).
+
+This engine is slow — one Python object per number — but it is the same algorithm PyTorch
+runs. PyTorch replaces scalars with tensors and Python closures with fast C++ kernels.
+
+## Recap in plain words
+
+- Reverse-mode AD gets the gradient for every parameter in one backward pass; forward mode needs one pass per input.
+- Each operation stores a small closure that sends gradient back to its inputs.
+- `backward()` sorts the graph and calls those closures from the loss toward the leaves.
+- Gradients accumulate with `+=`, so a value used twice gets both contributions — and you must reset them between steps.
+- The engine matched hand-derived gradients (456, 342, 38) and finite differences exactly.
+
 ## Try it Yourself
+
+This block uses the engine on a new function, $\log(\mathrm{sigmoid}(x))$, by rewriting it in
+operations `Value` already supports: $x - \log(1 + e^x)$.
 
 ```python
 # Compute d/dx [log(sigmoid(x))] at x=1.5 using Value
+# Rewrite with ops Value supports: log(sigmoid(x)) = x - log(1 + e^x)
 x = Value(1.5)
-neg_x = x * Value(-1.)
-exp_neg = neg_x.exp()
-sig_denom = Value(1.) + exp_neg
-sig = Value(1.) / sig_denom if False else Value(1.0 / (1 + np.exp(-1.5)))
-# Use a simpler route: log(sigmoid(x)) = x - log(1 + e^x)
-ex  = x.exp()
-log_sum_exp = (Value(1.) + ex).log()   # needs __add__ for Value+Value
-result = x - log_sum_exp if False else x + log_sum_exp * Value(-1.)
+L = x - (Value(1.) + x.exp()).log()
+L.backward()
 
-# Actually compute directly
-x2 = Value(1.5)
-sig2_data = 1 / (1 + np.exp(-1.5))
-L2 = Value(np.log(sig2_data))   # leaf, no backward through sigmoid
-# True gradient: d/dx log(sigmoid(x)) = 1 - sigmoid(x)
-analytic = 1 - sig2_data
-print(f"sigmoid(1.5) = {sig2_data:.6f}")
-print(f"d/dx log(sig(x)) at x=1.5 = {analytic:.6f}")
+sig = 1 / (1 + np.exp(-1.5))
+analytic = 1 - sig   # d/dx log(sigmoid(x)) = 1 - sigmoid(x)
+print(f"sigmoid(1.5)      = {sig:.6f}")
+print(f"log(sigmoid(1.5)) = {L.data:.6f}")
+print(f"autograd d/dx     = {x.grad:.6f}")
+print(f"analytic d/dx     = {analytic:.6f}")
 ```
 
 ```output
-sigmoid(1.5) = 0.817574
-d/dx log(sig(x)) at x=1.5 = 0.182426
+sigmoid(1.5)      = 0.817574
+log(sigmoid(1.5)) = -0.201413
+autograd d/dx     = 0.182426
+analytic d/dx     = 0.182426
 ```
+
+Autograd's answer (0.182426) matches the analytic formula $1 - \mathrm{sigmoid}(x)$ on every
+digit. Notice `x` appears twice in the formula — once alone, once inside `exp` — and the `+=`
+accumulation adds the two paths ($1$ and $-\mathrm{sigmoid}(1.5) = -0.817574$) correctly. Try
+$x = -3$ or $x = 10$, and try adding a `tanh` method to `Value` (its local slope is $1 - \tanh^2$).
 
 ## Exercise
 
 Extend `Value` to support division (`__truediv__`) using `a / b = a * b**(-1)`. Verify `d/dx [x / (x+1)]` at $x=2$ against the analytic result $(1/(x+1)^2 = 1/9)$.
+
+> **Hint:** division needs no new derivative rule. Combine the `**` rule (with exponent $-1$)
+> and the `*` rule you already have.
 
 <details>
 <summary>Solution</summary>
@@ -263,4 +360,8 @@ print(f"dy/dx = {x.grad:.6f}  (analytic: {1/9:.6f})")
 ```
 
 `x / (x+1)` → `x * (x+1)**(-1)` → backward gives $1/(x+1) - x/(x+1)^2 = 1/(x+1)^2 = 1/9$.
+
+The printed values are $y = 0.6667$ and $dy/dx = 0.111111$, matching $1/9$. Again `x` is used
+twice, and the two contributions ($1/3$ through the direct path, $-2/9$ through the
+denominator) add to $1/9$ only because of `+=`.
 </details>

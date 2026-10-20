@@ -7,13 +7,26 @@ order: 6
 
 ## SGD: the baseline
 
+Once backprop (ch. 3) tells you which way is downhill for every weight, the **optimizer**
+decides how far to step. The simplest rule: step against the gradient, by a fixed fraction of
+it. Every other optimizer in this chapter is a smarter version of that one line.
+
 Stochastic gradient descent updates each parameter by subtracting a scaled gradient:
 
 $$
 \theta_{t+1} = \theta_t - \eta \nabla_\theta \mathcal{L}(\theta_t)
 $$
 
+> **In plain words:** new weights $\theta_{t+1}$ = current weights $\theta_t$ minus the
+> **learning rate** $\eta$ ("eta", the step size) times the gradient of the loss
+> $\mathcal{L}$. $\theta$ ("theta") stands for all the parameters at once; $t$ counts steps.
+
 The "stochastic" part means you compute $\nabla \mathcal{L}$ on a mini-batch, not the full dataset. This adds noise but also acts as regularization and makes each step cheap.
+
+A **mini-batch** is a small random sample of training examples (say 32 or 256). Its gradient
+is a noisy estimate of the full-data gradient — right on average, a bit off each time — and
+costs a tiny fraction to compute. The demo below uses the exact gradient of a bowl-shaped
+function so you can see the stepping rule without noise.
 
 ```python
 import numpy as np
@@ -37,11 +50,24 @@ print(f"True min:   x=3.0000, y=2.0000")
 ```
 
 ```output
-SGD result: x=2.9999, y=1.9998
+SGD result: x=2.8728, y=2.0000
 True min:   x=3.0000, y=2.0000
 ```
 
+After 30 steps, $y$ is at its target 2.0000 but $x$ is only at 2.8728. The bowl is ten times
+steeper in $y$ (coefficient 10 versus 1), so the $y$ gradient is ten times larger and $y$
+gets there fast. In $x$ each step only removes 10% of the remaining gap ($1 - 0.05 \cdot 2 =
+0.9$), and $3 - 3 \cdot 0.9^{30} \approx 2.8728$ — exactly what printed.
+
+> **Picture it:** two marbles in a long narrow trough. The one rolling down the steep side
+> wall reaches the bottom of the trough in a flash; the one rolling along the gentle floor of
+> the trough creeps. One learning rate has to serve both.
+
 ## Momentum
+
+Plain SGD forgets everything between steps. **Momentum** gives it a memory: it keeps a running
+average of recent gradients, called the **velocity**, and steps along that. Directions that
+agree step after step build up speed; directions that flip back and forth cancel out.
 
 Plain SGD oscillates when gradients point in conflicting directions across steps. Momentum damps oscillations by accumulating a velocity vector — an exponential moving average of past gradients:
 
@@ -49,7 +75,18 @@ $$
 v_t = \beta v_{t-1} + (1-\beta)\nabla_\theta \mathcal{L} \qquad \theta_{t+1} = \theta_t - \eta v_t
 $$
 
+> **In plain words:** the new velocity $v_t$ is $\beta$ (say 90%) of the old velocity plus
+> 10% of today's gradient. You then step along the velocity, not the raw gradient. An
+> **exponential moving average** is exactly this kind of "mostly the past, a bit of today" average.
+
 Common convention: $v_t = \beta v_{t-1} + \nabla \mathcal{L}$ (no $(1-\beta)$ factor). Both work; the learning rate absorbs the difference. $\beta=0.9$ is nearly universal.
+
+Without the $(1 - \beta)$ factor, a steady gradient builds a velocity about $1/(1-\beta) = 10$
+times larger, so the same $\eta$ gives ten times bigger steps. The demo below uses this
+convention.
+
+> **Picture it:** a heavy ball rolling down a valley. It does not stop and re-aim at every
+> bump; its weight carries it along the valley floor, and side-to-side wobbles get smoothed out.
 
 **Nesterov momentum** looks ahead before computing the gradient:
 
@@ -57,7 +94,14 @@ $$
 v_t = \beta v_{t-1} + \nabla_\theta \mathcal{L}(\theta_t - \eta \beta v_{t-1})
 $$
 
+> **In plain words:** first guess where the velocity is about to carry you
+> ($\theta_t - \eta \beta v_{t-1}$), then measure the gradient *there*. If you are about to
+> overshoot, the look-ahead gradient already points back and brakes you.
+
 You evaluate the gradient at the predicted next position, so the correction is less late.
+
+The test below uses an **ill-conditioned** bowl, one where one direction is far steeper than
+the other (here 50 times). That is the situation where plain SGD struggles most.
 
 ```python
 # Momentum vs SGD on an ill-conditioned bowl
@@ -86,11 +130,24 @@ print(f"After 200 steps — SGD: {sgd_l[-1]:.6f}, Momentum: {mom_l[-1]:.8f}")
 ```
 
 ```output
-After 50 steps — SGD: 0.1023, Momentum: 0.000124
-After 200 steps — SGD: 0.000312, Momentum: 0.00000001
+After 50 steps — SGD: 3.3155, Momentum: 0.167486
+After 200 steps — SGD: 0.007733, Momentum: 0.00000000
 ```
 
+After 50 steps, SGD's loss is 3.3155 while momentum's is 0.167486 — about 20 times lower.
+After 200 steps, SGD has crawled to 0.007733, while momentum prints 0.00000000 (below
+$5 \times 10^{-9}$). SGD's bottleneck is the gentle $x$ direction, where each step shrinks
+the gap by only 2%; momentum's accumulated velocity carries it along that direction much faster.
+
+> **Watch out:** momentum makes overshoot easier. If you add momentum to a learning rate that
+> was already near the edge of stability, the loss can start oscillating or blow up. Lower the
+> learning rate when you switch from plain SGD to momentum with this "no $(1-\beta)$" convention.
+
 ## AdaGrad and RMSProp
+
+Instead of one learning rate for all weights, these methods give each weight its own. A
+weight whose gradients have been large gets smaller steps; a weight whose gradients have been
+small gets larger ones. That evens out a lopsided bowl.
 
 **AdaGrad** adapts the learning rate per parameter by accumulating squared gradients:
 
@@ -98,7 +155,15 @@ $$
 G_t = G_{t-1} + g_t^2 \qquad \theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{G_t + \epsilon}} g_t
 $$
 
+> **In plain words:** $g_t$ is today's gradient and $G_t$ is the running total of its squares
+> (one total per parameter). Each step is divided by $\sqrt{G_t}$, so parameters with a
+> history of big gradients take smaller steps. $\epsilon$ ("epsilon", like $10^{-8}$) stops a
+> division by zero.
+
 Parameters that receive large or frequent gradients get smaller effective LRs. Useful for sparse features (NLP). The problem: $G_t$ only grows, so the effective LR monotonically decays to zero.
+
+A **sparse feature** is one that is zero most of the time, like a rare word. Its parameter
+gets few gradient updates, so AdaGrad keeps its learning rate large for the rare moments it matters.
 
 **RMSProp** fixes the monotonic decay with a leaky accumulation:
 
@@ -106,9 +171,17 @@ $$
 G_t = \rho G_{t-1} + (1-\rho) g_t^2 \qquad \theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{G_t + \epsilon}} g_t
 $$
 
+> **In plain words:** replace the running *total* with a running *average*: keep $\rho$
+> ("rho", 90%) of the old value and add 10% of today's squared gradient. Old gradients fade,
+> so the divisor tracks recent gradient size instead of growing forever.
+
 $\rho=0.9$ is typical. The accumulator "forgets" old gradients, preventing the LR from vanishing.
 
 ## Adam: first and second moments
+
+**Adam** is momentum and RMSProp at once. It keeps a running average of the gradient (which
+direction to go) and a running average of the squared gradient (how big gradients usually
+are), and steps along the first divided by the square root of the second.
 
 Adam combines momentum (first moment) with RMSProp (second moment) and adds bias correction for the initialization at zero:
 
@@ -116,13 +189,26 @@ $$
 m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t \qquad v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2
 $$
 
+> **In plain words:** $m_t$ is the momentum-style average of gradients (the **first moment**,
+> i.e. the mean). $v_t$ is the RMSProp-style average of squared gradients (the **second
+> moment**). $\beta_1 = 0.9$ and $\beta_2 = 0.999$ set how long each memory lasts.
+
 $$
 \hat{m}_t = \frac{m_t}{1-\beta_1^t} \qquad \hat{v}_t = \frac{v_t}{1-\beta_2^t}
 $$
 
+> **In plain words:** both averages start at 0, so early on they are too small. Dividing by
+> $1 - \beta^t$ scales them back up. At step $t = 1$, $1 - \beta_1 = 0.1$, so $m_1$ is
+> multiplied by 10; by $t = 50$ the correction is almost 1 and does nothing.
+
 $$
 \theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{\hat{v}_t} + \epsilon} \hat{m}_t
 $$
+
+> **In plain words:** step along the corrected average gradient, divided by the square root
+> of the corrected average squared gradient. When gradients are steady, the ratio
+> $\hat{m}_t / \sqrt{\hat{v}_t}$ is close to $\pm 1$, so each parameter moves by about $\eta$
+> per step, whatever the gradient's raw size.
 
 Default: $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$, $\eta=10^{-3}$.
 
@@ -149,19 +235,42 @@ print(f"Adam after 1000 steps: x={result[0]:.6f}, y={result[1]:.6f}")
 ```
 
 ```output
-Adam after 200 steps: loss=2.37e-05
-Adam after 1000 steps: x=0.000021, y=0.000003
+Adam after 200 steps: loss=2.81e+01
+Adam after 1000 steps: x=4.044722, y=0.013533
 ```
+
+This is a surprise worth understanding. After 200 steps the loss is still 28.1, and after
+1000 steps $x$ is at 4.044722 — it started at 5.0 and has only moved about 0.96. That is the
+"about $\eta$ per step" property in action: with $\eta = 0.001$, 1000 steps can move a
+parameter by at most about 1 unit. Meanwhile $y$, which only had 0.5 to travel, is nearly done
+(0.013533). Adam's default $\eta = 10^{-3}$ is tuned for neural-network weights of size
+around 0.01–1, not for a toy problem that needs to travel 5 units.
+
+> **Watch out:** because Adam's steps are roughly $\eta$ in size regardless of the gradient,
+> the right learning rate depends on how far parameters need to move, not on how steep the
+> loss is. A learning rate that works for SGD is usually far too large or too small for Adam;
+> retune when you switch.
 
 ### AdamW: decoupled weight decay
 
+**Weight decay** shrinks every weight a little toward 0 at each step, which discourages large
+weights (ch. 9). The question is where to apply that shrink: inside Adam's rescaling, or outside it.
+
 Standard Adam applies weight decay as L2 regularization added to the gradient. This couples the decay with the adaptive scaling — parameters with small gradients still get the same proportional decay, which is wrong.
+
+Concretely, adding $\lambda \theta$ to the gradient means the decay term also gets divided by
+$\sqrt{\hat{v}_t}$. Weights with large historical gradients then decay *less*, and weights with
+small gradients decay *more*, which is not what "shrink everything by the same fraction" intends.
 
 **AdamW** decouples: subtract weight decay directly from the parameter after the Adam step:
 
 $$
 \theta_{t+1} = \theta_t - \frac{\eta}{\sqrt{\hat{v}_t}+\epsilon}\hat{m}_t - \eta \lambda \theta_t
 $$
+
+> **In plain words:** do the normal Adam step, then separately shrink every weight by the
+> fraction $\eta\lambda$ ($\lambda$, "lambda", is the decay strength). The shrink is the same
+> fraction for every weight, untouched by Adam's per-weight scaling.
 
 AdamW is now the default for most transformer training.
 
@@ -183,19 +292,39 @@ print(f"AdamW final params: {res}, loss: {final_loss:.2e}")
 ```
 
 ```output
-AdamW final params: [0.00012 0.000003], loss: 1.44e-08
+AdamW final params: [4.48800154 0.12884895], loss: 2.10e+01
 ```
 
+AdamW ran 500 steps from $[5, 0.5]$ and ended at $x \approx 4.488$, loss 21.0. As with Adam,
+the small learning rate limits travel to about $500 \times 0.001 = 0.5$ units. The decay term
+pulls toward 0 as well, which here happens to be the same direction as the minimum at the origin.
+
 ## Learning rate schedules
+
+The best step size changes during training: big steps early to cover ground, small steps late
+to settle into the bottom. A **schedule** is a rule that changes the learning rate over time.
 
 A fixed LR is rarely optimal. Common schedules:
 
 **Step decay**: halve LR every $k$ epochs. Simple, requires manual tuning of $k$.
 
+An **epoch** is one full pass through the training data.
+
 **Cosine annealing**: smoothly decays LR from $\eta_{max}$ to $\eta_{min}$:
 $$\eta_t = \eta_{min} + \frac{1}{2}(\eta_{max}-\eta_{min})\left(1 + \cos\frac{t\pi}{T}\right)$$
 
+> **In plain words:** $t$ is the current step and $T$ the total. At $t = 0$ the cosine is 1
+> and the rate is $\eta_{max}$; at $t = T/2$ it is halfway; at $t = T$ the cosine is $-1$
+> and the rate is $\eta_{min}$. The curve is flat at both ends, steepest in the middle.
+
 **Linear warmup + cosine**: start from near-zero, warm up for a few thousand steps, then cosine decay. Standard for transformers — the warmup stabilizes early-training updates when gradients are large and inconsistent.
+
+> **Picture it:** driving a car out of a parking garage, onto the motorway, and into a new
+> parking spot. You creep at first (warmup) while you get your bearings, go fast in the middle,
+> and slow down smoothly as you arrive.
+
+Warmup also helps Adam specifically: in the first steps its $\hat{v}_t$ is estimated from very
+few gradients and can be badly off, so small early steps protect against one wild update.
 
 ```python
 def cosine_schedule(t, T, eta_max=0.1, eta_min=1e-4):
@@ -219,11 +348,32 @@ print(f"step=999: lr={lrs[999]:.5f}")
 step=0:   lr=0.00000
 step=50:  lr=0.05000
 step=100: lr=0.10000  (end of warmup)
-step=500: lr=0.05005
+step=500: lr=0.05872
 step=999: lr=0.00010
 ```
 
+The warmup climbs in a straight line: 0 at step 0, half of $\eta_{max}$ (0.05) at step 50, full
+0.1 at step 100. Then cosine takes over. At step 500 the cosine phase is $400/900 \approx 44\%$
+done, so the rate (0.05872) is a bit above halfway. At step 999 it has reached
+$\eta_{min} = 0.0001$.
+
+> **Watch out:** a schedule counts *steps*, and so does `T`. If you resume training from a
+> checkpoint and forget to restore the scheduler's step count, warmup runs again from zero —
+> a sudden drop in learning rate halfway through training (ch. 10 saves it).
+
+## Recap in plain words
+
+- SGD steps against the gradient by a fixed fraction; on a lopsided bowl the gentle direction crawls.
+- Momentum averages recent gradients, so consistent directions speed up and wobbles cancel.
+- AdaGrad and RMSProp give each parameter its own step size based on its gradient history.
+- Adam combines momentum and RMSProp; each parameter moves about $\eta$ per step, so travel is limited by $\eta$.
+- AdamW applies weight decay outside Adam's rescaling, so every weight shrinks by the same fraction.
+- Warmup plus cosine decay is the standard schedule: ramp up, then glide down smoothly.
+
 ## Try it Yourself
+
+This block runs Adam with a larger learning rate (0.1) on the first bowl, but with random noise
+added to every gradient, the way mini-batch gradients behave.
 
 ```python
 import numpy as np
@@ -250,15 +400,26 @@ print(f"Target: x=3.000, y=2.000")
 ```
 
 ```output
-Adam with noisy grads: x=2.981, y=1.994
+Adam with noisy grads: x=2.959, y=1.999
 Target: x=3.000, y=2.000
 ```
 
+With $\eta = 0.1$ Adam now has enough travel, and it lands at $x = 2.959$, $y = 1.999$ despite the
+noise. The leftover error in $x$ (0.04) is larger than in $y$ (0.001): in the gentle $x$
+direction the noise is large compared with the true gradient, so it jitters more.
+
 Try changing `noise` from 0.5 to 2.0 and see how much Adam's final error grows vs plain SGD.
+
+(For reference, with `noise=2.0` Adam ends near $x = 2.944$, $y = 1.992$.) To compare against
+SGD, write a `run_sgd` with the same noisy gradient and try `lr=0.05`.
 
 ## Exercise
 
 Implement RMSProp from scratch and run it on the ill-conditioned quadratic `f(x,y) = x² + 50y²` starting from `[5.0, 0.5]`. Use `lr=0.05`, `rho=0.9`, 300 steps. What final loss do you reach? Compare against plain SGD with the same LR.
+
+> **Hint:** RMSProp is SGD with one change — divide each step by `np.sqrt(G) + eps`, where `G`
+> is the leaky average of squared gradients. For SGD, check the stability limit: the $y$
+> direction has curvature 100.
 
 <details>
 <summary>Solution</summary>
@@ -289,4 +450,12 @@ print(f"SGD:     loss={sl:.2e}, params={s}")
 ```
 
 RMSProp adapts per-axis, converging much faster on the ill-conditioned direction ($y$) than SGD, which either oscillates or crawls depending on LR choice.
+
+The actual numbers are more dramatic than "oscillates or crawls". RMSProp reaches a loss of
+$3.19 \times 10^{-2}$ with both parameters near 0.025. SGD with the same `lr=0.05` *diverges*:
+its loss prints `inf` and $y$ ends near $10^{180}$. In the $y$ direction each SGD step multiplies
+the error by $1 - 0.05 \times 100 = -4$, which grows without limit. RMSProp is immune because
+dividing by $\sqrt{G}$ turns every step into roughly $\eta$ in size. That same property is why it
+stalls around 0.025 instead of reaching exactly 0: steps of about $\eta$ keep it hopping around
+the minimum. A decaying learning rate would fix that.
 </details>
