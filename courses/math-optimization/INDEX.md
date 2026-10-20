@@ -7,6 +7,14 @@ it rebuilds those tools with ML as the explicit target, so nothing later feels u
 Pitched at: someone who knows what a matrix is but has never computed a Jacobian by hand,
 derived Adam, or thought carefully about numerical conditioning.
 
+**In plain words:** a model is a pile of numbers, and training is walking downhill on a
+landscape made from those numbers. This course gives you the map-reading skills: vectors and
+matrices to describe where you are (ch. 1–2), derivatives to know which way is downhill
+(ch. 3), eigenvalues and the SVD to understand the landscape's shape (ch. 4–7), and the
+walking strategies themselves — gradient descent, momentum, Adam (ch. 8–11) — plus the
+floating-point traps that can trip you up on the way (ch. 12). Every formula is followed by
+what it means in words, and every claim by real code and its real output.
+
 ---
 
 ## Chapters

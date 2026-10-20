@@ -7,6 +7,10 @@ order: 5
 
 ## Every matrix has a singular value decomposition
 
+Eigenvectors (ch. 4) only work nicely for square, symmetric matrices. The **SVD** (singular
+value decomposition) works for *every* matrix: it says any linear map is a rotation, then a
+stretch along the axes, then another rotation. Nothing more.
+
 The SVD factors any real $m \times n$ matrix $A$ as
 
 $$
@@ -14,6 +18,15 @@ A = U \Sigma V^T
 $$
 
 where $U \in \mathbb{R}^{m \times m}$ is orthogonal (left singular vectors), $\Sigma \in \mathbb{R}^{m \times n}$ is diagonal with non-negative entries $\sigma_1 \ge \sigma_2 \ge \cdots \ge 0$ (singular values), and $V \in \mathbb{R}^{n \times n}$ is orthogonal (right singular vectors).
+
+> **In plain words:** to apply $A$ to a vector, $V^T$ first rotates it (into the right
+> singular directions), $\Sigma$ then stretches each axis by its singular value — and drops
+> or adds dimensions if $A$ isn't square — and $U$ finally rotates the result into the
+> output space. The singular values are the stretch factors, sorted biggest first.
+
+> **Picture it:** put a ball of clay through a machine that turns it, squashes it into an
+> egg along fixed axes, then turns the egg. Every matrix is that machine; the SVD tells you
+> the two turns and how hard each axis was squashed.
 
 Unlike eigendecomposition, SVD works for **any** matrix — rectangular, rank-deficient, or asymmetric.
 
@@ -36,8 +49,13 @@ A shape : (4, 6)
 U shape : (4, 4)
 s shape : (4,)
 Vt shape: (6, 6)
-singular values: [3.6821 2.3057 1.5462 0.6901]
+singular values: [3.0069 2.1916 1.7491 0.8347]
 ```
+
+A 4×6 matrix has $\min(4, 6) = 4$ singular values, sorted from largest (3.01) to smallest
+(0.83). $U$ is 4×4 (the output space) and $V^T$ is 6×6 (the input space). Since only 4 axes
+can be stretched in a 4-dimensional output, two input directions are crushed to zero — the
+null space from ch. 2.
 
 Reconstruct $A$ from its factors:
 
@@ -57,12 +75,19 @@ print("Max reconstruction error:", np.max(np.abs(A - A_reconstructed)))
 ```
 
 ```output
-Max reconstruction error: 8.881784197001252e-16
+Max reconstruction error: 2.220446049250313e-15
 ```
 
 The reconstruction is numerically exact (error at floating-point epsilon).
 
+`np.linalg.svd` returns the singular values as a 1-D array `s`, so the code first rebuilds
+the rectangular diagonal $\Sigma$ (zeros everywhere except the diagonal) to multiply the
+three factors back together.
+
 ## Connection to eigendecomposition
+
+The SVD and the eigendecomposition are cousins: the SVD of $A$ is hiding inside the
+eigendecomposition of the symmetric matrix $A^T A$.
 
 The singular values and vectors relate directly to the eigendecomposition of $A^T A$ and $A A^T$:
 
@@ -71,6 +96,11 @@ A^T A = V \Sigma^T \Sigma V^T \qquad A A^T = U \Sigma \Sigma^T U^T
 $$
 
 So the right singular vectors $V$ are the eigenvectors of $A^T A$, and the singular values are $\sigma_i = \sqrt{\lambda_i(A^T A)}$. You never need to form $A^T A$ explicitly — the SVD extracts this information more stably.
+
+> **In plain words:** $A^T A$ applies $A$ and then its mirror image, so every stretch happens
+> twice — that's why its eigenvalues are the *squares* of $A$'s singular values. Forming
+> $A^T A$ also squares the condition number (ch. 2), which is why the SVD is the more
+> accurate route.
 
 ```python
 import numpy as np
@@ -89,11 +119,18 @@ print("eigvals of A^T A:", np.round(eigvals_desc, 6))
 ```
 
 ```output
-sigma^2 from SVD: [10.700603  4.420088  1.030456]
-eigvals of A^T A: [10.700603  4.420088  1.030456]
+sigma^2 from SVD: [3.645085 1.686197 0.236021]
+eigvals of A^T A: [3.645085 1.686197 0.236021]
 ```
 
+The squared singular values and the eigenvalues of $A^T A$ match to all six printed
+digits.
+
 ## The Eckart–Young theorem: best low-rank approximation
+
+Keep only the biggest few stretches and throw away the rest, and you get the best possible
+cheap copy of the matrix. That is the Eckart–Young theorem, and it powers compression,
+PCA, recommender systems, and LoRA fine-tuning.
 
 Truncate the SVD to the top $k$ singular values:
 
@@ -101,11 +138,19 @@ $$
 \hat{A}_k = U_k \Sigma_k V_k^T = \sum_{i=1}^k \sigma_i u_i v_i^T
 $$
 
+Each term $\sigma_i u_i v_i^T$ is a rank-1 layer (an outer product); the truncated SVD stacks
+the $k$ heaviest layers.
+
 The Eckart–Young theorem states this is the **best rank-$k$ approximation** in both Frobenius and spectral norm:
 
 $$
 \hat{A}_k = \arg\min_{\text{rank}(B) \le k} \|A - B\|_F \qquad \|A - \hat{A}_k\|_F^2 = \sum_{i=k+1}^r \sigma_i^2
 $$
+
+> **In plain words:** among all matrices of rank at most $k$, none is closer to $A$ than the
+> truncated SVD. And the squared error is exactly the sum of the squared singular values you
+> threw away — so the singular values tell you, *before* you compute anything, how much each
+> extra rank buys you.
 
 ```python
 import numpy as np
@@ -124,15 +169,22 @@ for k in [1, 3, 5, 10, 15]:
 ```
 
 ```output
-  rank k     fro error  % variance kept
-       1       264.2019              9.2%
-       3       213.4107             26.7%
-       5       168.2083             41.8%
-      10        82.1751             71.7%
-      15         0.0000            100.0%
+  rank k     fro error   % variance kept
+       1      250.3740             19.4%
+       3      158.9114             48.8%
+       5       98.9062             68.2%
+      10       17.6685             94.3%
+      15        0.0000            100.0%
 ```
 
+Read down the table: rank 1 keeps 19.4% of the "energy" $\|A\|_F^2$, rank 10 keeps 94.3%,
+and rank 15 (full rank for a 20×15 matrix) keeps everything. For random noise the
+percentages climb slowly; for structured data a small $k$ often keeps over 90%.
+
 ### Image compression analogy
+
+A grayscale image is a matrix of brightness values, so the same truncation compresses it:
+store $k$ columns of $U$, $k$ singular values, and $k$ rows of $V^T$ instead of every pixel.
 
 ```python
 import numpy as np
@@ -152,14 +204,34 @@ for k in [1, 4, 8, 16, 32]:
 ```
 
 ```output
-k= 1  rel error=0.941  params=65 vs 1024
-k= 4  rel error=0.874  params=260 vs 1024
-k= 8  rel error=0.828  params=520 vs 1024
-k=16  rel error=0.696  params=1040 vs 1024
+k= 1  rel error=0.486  params=65 vs 1024
+k= 4  rel error=0.406  params=260 vs 1024
+k= 8  rel error=0.317  params=520 vs 1024
+k=16  rel error=0.171  params=1040 vs 1024
 k=32  rel error=0.000  params=2080 vs 1024
 ```
 
+The `params` column counts what you'd store: $k$ columns of 32 numbers from $U$, $k$
+singular values, and $k$ rows of 32 numbers from $V^T$, so $k \times 65$ numbers. At $k = 16$
+that's already more than the 1024 raw pixels — no saving at all. Notice too that $k = 1$
+already has a relative error under 0.5: the first singular layer captures the image's
+average brightness (all pixels are between 0 and 255), and the rest is pure noise.
+
 For a random image there's no structure to compress. Real photographs have low intrinsic rank — a handful of singular values capture most visual information.
+
+> **Watch out:** truncated SVD pays off only when $k(m + n + 1) < mn$. For a 32×32 image,
+> break-even is $k \approx 15$; for a 1000×1000 image it's $k \approx 500$, so real photos
+> compress well at $k = 50$.
+
+## Recap in plain words
+
+- Every matrix factors as rotate ($V^T$), stretch ($\Sigma$), rotate ($U$); the stretch
+  factors are the singular values, sorted biggest first.
+- Squared singular values are the eigenvalues of $A^T A$; the SVD gets them without
+  squaring the condition number.
+- Truncating to the top $k$ singular values gives the best rank-$k$ approximation
+  (Eckart–Young), and the error is the sum of the dropped $\sigma_i^2$.
+- Low-rank storage costs $k(m + n + 1)$ numbers instead of $mn$.
 
 ## Try it Yourself
 
@@ -178,19 +250,27 @@ for k in range(1, 9):
 ```
 
 ```output
-k=1  relative Frobenius error: 0.8614
-k=2  relative Frobenius error: 0.7434
-k=3  relative Frobenius error: 0.6143
-k=4  relative Frobenius error: 0.4820
-k=5  relative Frobenius error: 0.3381
-k=6  relative Frobenius error: 0.1980
-k=7  relative Frobenius error: 0.0830
+k=1  relative Frobenius error: 0.8180
+k=2  relative Frobenius error: 0.6325
+k=3  relative Frobenius error: 0.4676
+k=4  relative Frobenius error: 0.3513
+k=5  relative Frobenius error: 0.2236
+k=6  relative Frobenius error: 0.1513
+k=7  relative Frobenius error: 0.0397
 k=8  relative Frobenius error: 0.0000
 ```
+
+The error falls with every extra rank and hits zero at $k = 8$ — a 10×8 matrix has only 8
+singular values, so rank 8 is the whole matrix. Note the big drop from $k = 6$ (0.15) to
+$k = 7$ (0.04): it means $\sigma_8$ is small compared to the others. Try printing `s` next to
+the errors and confirm that each error equals $\sqrt{\sum_{i>k} \sigma_i^2} / \|A\|_F$.
 
 ## Exercise
 
 Reconstruct a 10×8 random matrix at rank 3. Verify that your Frobenius reconstruction error equals $\sqrt{\sigma_4^2 + \cdots + \sigma_8^2}$ (the Eckart–Young bound).
+
+> **Hint:** with Python's 0-based indexing, "the singular values after the first 3" is
+> `s[3:]`.
 
 <details>
 <summary>Solution</summary>
@@ -214,4 +294,6 @@ print(f"Match: {np.isclose(actual_err, optimal_err)}")
 ```
 
 The two values agree exactly, confirming the rank-3 truncated SVD is the optimal rank-3 approximation.
+The error of a truncated SVD is not something you have to measure — it's written in the
+singular values you dropped.
 </details>

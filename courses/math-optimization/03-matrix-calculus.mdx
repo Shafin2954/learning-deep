@@ -7,12 +7,23 @@ order: 3
 
 ## Why matrix calculus
 
+Training a model means nudging thousands of numbers so the error shrinks. To know which
+way to nudge each number, you need its **derivative** — how much the error changes when that
+number changes a tiny bit. Matrix calculus is how you get all those derivatives at once.
+
 Backpropagation is matrix calculus. When you call `loss.backward()` in PyTorch, it applies
 the chain rule to a composition of matrix operations — automatically. Understanding the
 derivations by hand means you can debug gradient bugs, implement custom layers, and read
 papers that derive gradients without referencing a library.
 
+> **Picture it:** you're blindfolded on a hillside and want to walk downhill. Feeling the
+> slope under your feet in every direction is taking derivatives; the gradient is the
+> single arrow that summarizes "uphill is this way, this steeply".
+
 ## The gradient: scalar output
+
+When a function takes many numbers and returns one (like a loss), its **gradient** lists,
+for every input, how fast the output changes as that input moves.
 
 If $f : \mathbb{R}^n \to \mathbb{R}$, the **gradient** is the vector of partial derivatives:
 
@@ -20,10 +31,16 @@ $$
 \nabla_x f(x) = \begin{bmatrix} \frac{\partial f}{\partial x_1} \\ \vdots \\ \frac{\partial f}{\partial x_n} \end{bmatrix} \in \mathbb{R}^n
 $$
 
+A **partial derivative** $\partial f / \partial x_i$ is the ordinary slope of $f$ when you
+move only $x_i$ and hold every other input fixed.
+
 The gradient points in the direction of steepest *increase* of $f$. Gradient descent
 moves in the direction $-\nabla f$ to decrease $f$.
 
 ### Gradient of a quadratic
+
+Quadratics ($x$ times something times $x$) are the bowls of optimization: almost every loss
+looks like one when you zoom in. Their gradients have tidy formulas.
 
 For $f(x) = x^\top A x$ with symmetric $A$:
 
@@ -37,8 +54,18 @@ $$
 \nabla_x (b^\top x) = b
 $$
 
+> **In plain words:** these are the matrix versions of the school rules
+> $\frac{d}{dx}(a x^2) = 2ax$ and $\frac{d}{dx}(bx) = b$. The vector $x$ plays the role of
+> the single number $x$, and the matrix $A$ plays the role of $a$.
+
 Combining: $f(x) = \tfrac{1}{2} x^\top A x - b^\top x$ gives $\nabla f = Ax - b$.
 This is the gradient of the least-squares objective — setting it to zero gives $Ax = b$.
+(The $\tfrac{1}{2}$ is there only so the 2 from the first rule cancels.)
+
+The code below checks the formula with **finite differences**: nudge one input up by a
+tiny `eps`, nudge it down by `eps`, and divide the change in $f$ by $2 \cdot \text{eps}$.
+That's the slope measured directly, with no calculus — the gold-standard test for a
+hand-derived gradient.
 
 ```python
 import numpy as np
@@ -74,12 +101,22 @@ print("max diff :", np.abs(g_analytic - g_fd).max())
 ```
 
 ```output
-analytic : [ 1.748632 -2.306194  1.983841 -0.547618]
-finite-d : [ 1.748632 -2.306194  1.983841 -0.547618]
-max diff : 1.5099033134506492e-09
+analytic : [-0.150127  3.176075 -1.372719 -1.193802]
+finite-d : [-0.150127  3.176075 -1.372719 -1.193802]
+max diff : 2.8120616946125665e-11
 ```
 
+The two rows agree to every printed digit, and the largest difference is about $10^{-11}$ —
+pure rounding error. When you derive a gradient by hand, this check is how you know you got
+it right; a wrong formula shows differences of order 1, not $10^{-11}$.
+
+> **Watch out:** finite differences cost two function evaluations *per input*, so they're
+> far too slow for training a real network. Use them only to test a small case.
+
 ## The Jacobian: vector-to-vector
+
+When a function takes $n$ numbers and returns $m$ numbers, there's one slope for every
+(output, input) pair. Lay them out in an $m \times n$ grid and you have the Jacobian.
 
 If $f : \mathbb{R}^n \to \mathbb{R}^m$, the **Jacobian** is the $m \times n$ matrix of all
 partial derivatives:
@@ -92,8 +129,15 @@ J = \frac{\partial f}{\partial x} = \begin{bmatrix}
 \end{bmatrix} \in \mathbb{R}^{m \times n}
 $$
 
+Row $i$ of the Jacobian is the gradient of output $f_i$; column $j$ says how every output
+reacts to input $x_j$.
+
 The chain rule for vector functions: if $h = f \circ g$ then
-$J_h = J_f \cdot J_g$ (matrix multiply).
+$J_h = J_f \cdot J_g$ (matrix multiply). ($f \circ g$ means "apply $g$, then $f$".)
+
+> **In plain words:** the chain rule says slopes of steps in a chain multiply. If $g$
+> doubles small changes and $f$ triples them, the chain multiplies them by 6. With vectors,
+> "multiply" becomes matrix multiplication of the Jacobians.
 
 ### Jacobian of a linear layer
 
@@ -106,6 +150,9 @@ $$
 The Jacobian is just $W$ itself. This is why the backward pass through a linear layer
 multiplies the upstream gradient by $W^\top$: if $\ell$ is the scalar loss,
 $\frac{\partial \ell}{\partial x} = W^\top \frac{\partial \ell}{\partial y}$.
+
+That makes sense once you remember that a linear map has the same slope everywhere: output
+$y_i$ changes by $W_{ij}$ for every unit of $x_j$, no matter where you start.
 
 ```python
 import numpy as np
@@ -136,16 +183,25 @@ print("max |J_analytic - J_numerical|:", np.abs(J_analytic - J_numerical).max())
 
 ```output
 J_analytic:
- [[ 0.4714  0.2726  1.4659  0.1065]
-  [-0.4873  0.1547 -0.1799  1.2302]
-  [-0.2122  0.4992  0.4106 -0.6625]]
-max |J_analytic - J_numerical|: 3.3306690738754696e-12
+ [[ 0.3456  0.8216  0.3304 -1.3032]
+ [ 0.9054  0.4464 -0.537   0.5811]
+ [ 0.3646  0.2941  0.0284  0.5467]]
+max |J_analytic - J_numerical|: 1.3004486376644309e-11
 ```
+
+The numerical Jacobian matches $W$ to about $10^{-11}$, confirming $\partial y / \partial x
+= W$. The bias $b$ doesn't appear in the Jacobian at all: shifting the output by a constant
+doesn't change any slope.
 
 ## Gradient of the softmax cross-entropy
 
+**Softmax** turns a model's raw scores (**logits**) into probabilities; **cross-entropy**
+is the loss "minus log of the probability given to the right answer". Its gradient is the
+most famous formula in deep learning, and it's beautifully simple.
+
 This is the derivation every LLM practitioner should know. Let $z$ be the logit vector,
-$p = \text{softmax}(z)$, $y$ the one-hot target, and $L = -\log p_y$.
+$p = \text{softmax}(z)$, $y$ the one-hot target, and $L = -\log p_y$. (**One-hot** means a
+vector of zeros with a single 1 at the correct class.)
 
 The cross-entropy gradient with respect to $z$:
 
@@ -159,6 +215,28 @@ the log and the $p_y(1-p_i)$ from softmax's Jacobian cancel:
 $$
 \frac{\partial L}{\partial z_i} = p_i - \mathbf{1}[i = y]
 $$
+
+### The derivation, step by step
+
+Softmax is $p_k = e^{z_k} / \sum_j e^{z_j}$. Its derivative has two cases, which the
+indicator $\mathbf{1}[i = k]$ (1 if $i = k$, else 0) packs into one line:
+
+$$
+\frac{\partial p_k}{\partial z_i} = p_k \big(\mathbf{1}[i = k] - p_i\big)
+$$
+
+The loss only looks at the correct class, $L = -\log p_y$, so the chain rule gives
+
+$$
+\frac{\partial L}{\partial z_i}
+= -\frac{1}{p_y} \cdot \frac{\partial p_y}{\partial z_i}
+= -\frac{1}{p_y} \cdot p_y \big(\mathbf{1}[i = y] - p_i\big)
+= p_i - \mathbf{1}[i = y]
+$$
+
+The $p_y$ cancels — that's the "magic". For the correct class the gradient is $p_y - 1$
+(negative, so descent *raises* its score); for every wrong class it's $p_i$ (positive, so
+descent *lowers* its score, more strongly the more probability it stole).
 
 ```python
 import numpy as np
@@ -192,12 +270,21 @@ print("max diff:", np.abs(g_a - g_n).max())
 ```
 
 ```output
-analytic: [-0.129813 -0.045612 -0.736432  0.587011  0.324847]
-numeric : [-0.129813 -0.045612 -0.736432  0.587011  0.324847]
-max diff: 9.992007221626409e-12
+analytic: [ 0.140518  0.06896  -0.923045  0.010123  0.703444]
+numeric : [ 0.140518  0.06896  -0.923045  0.010123  0.703444]
+max diff: 1.7028711774003114e-11
 ```
 
+The correct class is index 2, and its gradient is the only negative entry ($-0.923$, i.e.
+$p_2 - 1$, so the model gave it only about 8% probability). The other entries are just the
+probabilities of the wrong classes, and the whole vector sums to zero — probabilities sum to
+1, the target sums to 1. Finite differences agree to about $10^{-11}$.
+
 ## The Hessian: second-order information
+
+The gradient tells you the slope; the **Hessian** tells you how the slope itself changes —
+the *curvature*. A sharp valley and a gentle bowl can have the same slope at a point but
+very different Hessians.
 
 For $f : \mathbb{R}^n \to \mathbb{R}$, the **Hessian** is the $n \times n$ matrix of
 second partial derivatives:
@@ -209,6 +296,10 @@ $$
 For $f(x) = \tfrac{1}{2} x^\top A x - b^\top x$ with symmetric $A$, the Hessian is $A$
 itself. The Hessian tells you the curvature: a large Hessian eigenvalue means the loss
 changes rapidly in that direction — requiring a small learning rate.
+
+> **Picture it:** walking downhill in a narrow ravine, a big stride sideways sends you up
+> the opposite wall. The Hessian measures how narrow the ravine is in each direction; the
+> narrowest direction limits how big your steps can be (ch. 9 makes this exact).
 
 ```python
 import numpy as np
@@ -240,15 +331,32 @@ print("max diff:", np.abs(H_num - A).max())
 
 ```output
 Hessian (numeric):
- [[ 2.0437  0.5199 -0.9162]
-  [ 0.5199  2.0063 -0.0693]
-  [-0.9162 -0.0693  2.3985]]
+ [[ 2.7272  1.1622 -0.7992]
+ [ 1.1622  2.2014 -0.9448]
+ [-0.7992 -0.9448  2.0361]]
 A (analytic):
- [[ 2.0437  0.5199 -0.9162]
-  [ 0.5199  2.0063 -0.0693]
-  [-0.9162 -0.0693  2.3985]]
-max diff: 2.6645352591003757e-12
+ [[ 2.7272  1.1622 -0.7992]
+ [ 1.1622  2.2014 -0.9448]
+ [-0.7992 -0.9448  2.0361]]
+max diff: 6.759398196720667e-08
 ```
+
+The numeric Hessian matches $A$ to about $10^{-8}$ (second differences divide by
+$\text{eps}^2$, so they're noisier than first differences). It's also symmetric, as every
+Hessian of a smooth function is: the order you take the two partial derivatives in doesn't
+matter.
+
+## Recap in plain words
+
+- The gradient lists the slope of a scalar function along every input and points uphill;
+  descent goes the opposite way.
+- Quadratic rules: $\nabla(x^\top A x) = 2Ax$ (symmetric $A$) and $\nabla(b^\top x) = b$.
+- The Jacobian is the grid of slopes of a vector function; the chain rule multiplies
+  Jacobians.
+- A linear layer's Jacobian is $W$, so backprop multiplies by $W^\top$.
+- Softmax + cross-entropy has gradient $p - y$: prediction minus target.
+- The Hessian is the curvature; large eigenvalues mean you need small steps.
+- Always check a hand-derived gradient against finite differences.
 
 ## Try it Yourself
 
@@ -282,16 +390,25 @@ print("max err :", np.abs(g_a - g_n).max())
 ```
 
 ```output
-analytic: [-1.7498  4.8501  3.0116 -5.3447]
-numeric : [-1.7498  4.8501  3.0116 -5.3447]
-max err : 2.3803228660007862e-08
+analytic: [ 2.7872 -8.1294  2.5306 -9.8915]
+numeric : [ 2.7872 -8.1294  2.5306 -9.8915]
+max err : 1.7371393212783914e-10
 ```
+
+Same recipe, new loss: the analytic gradient $2X^\top(Xw - y)$ and the finite-difference
+slope agree to about $10^{-10}$. Read the formula as "residuals $Xw - y$, sent back through
+$X^\top$ to each weight, doubled". Try breaking the formula on purpose (drop the 2, or use
+`X` instead of `X.T`) and watch the error jump to order 1.
 
 ## Exercise
 
 Derive by hand the gradient $\nabla_W L$ where $L = \|XW - Y\|_F^2$, $X \in \mathbb{R}^{m \times d}$,
 $W \in \mathbb{R}^{d \times k}$, $Y \in \mathbb{R}^{m \times k}$ and $\|\cdot\|_F$ is the
 Frobenius norm. Then implement it and verify with finite differences.
+
+> **Hint:** the **Frobenius norm** squared is the sum of squares of every entry — the L2
+> norm of the matrix flattened into one long vector. Each column of $W$ behaves exactly like
+> the $w$ in the Try it Yourself, so the answer should look familiar.
 
 <details>
 <summary>Solution</summary>
@@ -331,4 +448,6 @@ print("max |grad_analytic - grad_fd|:", np.abs(g_a - g_n).max())
 
 The derivation: $L = \text{tr}(R^\top R)$ where $R = XW - Y$.
 $\frac{\partial}{\partial W} \text{tr}(R^\top R) = 2X^\top R = 2X^\top(XW - Y)$.
+The shape check is a free sanity test: $X^\top$ is $d \times m$ and $R$ is $m \times k$, so
+the gradient is $d \times k$ — the same shape as $W$, as every gradient must be.
 </details>

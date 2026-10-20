@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import re
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -141,8 +143,10 @@ def main():
     files: list[Path] = []
     for p in map(Path, args.paths):
         files += sorted(p.glob("*.mdx")) if p.is_dir() else [p]
-    files = [f for f in files if "capstone" not in f.name]
+    files = [f.resolve() for f in files if "capstone" not in f.name]
 
+    # kernels inherit the cwd; keep files that examples write out of the repo
+    os.chdir(tempfile.mkdtemp(prefix="run_chapter_"))
     pool = KernelPool()
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         reports = list(ex.map(lambda f: run_file(pool, f, args.timeout), files))
