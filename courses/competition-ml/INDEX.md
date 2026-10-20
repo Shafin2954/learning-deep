@@ -6,6 +6,17 @@ resembles the test set, which feature blocks pay, how to encode a high-cardinali
 memorising the labels, how to combine models without fooling yourself, and how to ship a file that
 is what you think it is.
 
+**In plain words:** a competition is a contest to predict a hidden answer key, and this course
+teaches you to win it honestly instead of by luck. Chapters 1–3 are about reading the contest
+before you play: what the score rewards, where the answers might leak, how to build a practice
+exam (your CV) shaped like the real one, and how to get a first score within the hour. Chapters
+4–6 turn raw columns into useful ones — group summaries, safe target encoding, and detective work
+on columns with no names. Chapters 7–11 combine many models into one better prediction, and show
+how to measure how much each combining trick flatters itself; pseudo-labeling and train/test drift
+checks sit in the same stretch. Chapters 12–13 cover the last mile: seeds, a submission validator
+that catches misaligned files, and a solution report generated from your own records, followed by
+the capstone in chapter 14.
+
 ## Chapters
 
 1. Reading a competition: metric, leak risk, CV design

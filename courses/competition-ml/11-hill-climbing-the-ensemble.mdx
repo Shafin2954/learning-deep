@@ -7,10 +7,23 @@ order: 11
 
 ## Greedy selection beats optimisation when the bank is large
 
+By the end of a competition you may have dozens of saved models. Instead of solving for dozens of
+weights at once, add the single most helpful model, then the next, and stop when nothing helps.
+
 Fitting weights over four models is easy (ch. 8). Fitting weights over sixty is not: the optimiser
 has sixty free parameters, your out-of-fold matrix has finite rows, and the result is a beautifully
 overfitted weight vector. **Greedy ensemble selection** — hill climbing — solves the same problem
 with one parameter at a time and a built-in stopping rule.
+
+A **model bank** is your collection of saved out-of-fold predictions, one column per model.
+**Greedy** means taking the best single step available right now, without planning ahead.
+
+> **Picture it:** picking a pub-quiz team from forty friends. You do not compute the perfect
+> mixture of everyone. You pick the strongest person, then whoever adds the most *on top of*
+> them, and so on — and you stop when another member would only add arguments.
+
+The simulated bank has 40 models of mixed quality. They fall into 4 "families" that share part
+of their errors, as models built on the same features or algorithm do.
 
 ```python
 import numpy as np
@@ -46,11 +59,20 @@ best single 0.7049 (m38) | median 0.6528 | worst 0.6174
 simple average of all: 0.7063
 ```
 
+The best single model, m38, scores 0.7049; the median model only 0.6528. Averaging all forty
+gives 0.7063 — hardly better than m38 alone, because the many weak members dilute the strong ones.
+
 ## The algorithm
+
+Start with the best model. At each step, try adding each model in turn, keep the one that raises
+the blend score most, and repeat. Stop the moment no addition helps.
 
 Start from the empty ensemble. At each step, try adding **every** candidate — including ones
 already in the ensemble — and keep the addition that improves the blend most. Selecting a model
 twice doubles its weight, so the weights emerge from the counts.
+
+This is Caruana's **ensemble selection** method. Picking "with replacement" (the same model can be
+chosen again) is what lets it give some models more weight than others.
 
 ```python
 def hill_climb(P, y, n_iter=40, metric=roc_auc_score, init_top=1, verbose=False):
@@ -96,12 +118,19 @@ m33    0.2
 m38    0.2
 ```
 
+The climb starts from m38 (step 1, not printed), then adds m33 (0.7139), m02 (0.7169), m26
+(0.7185) and m15 (0.7191). At step 6 no candidate helps, so it stops. Each of the five models was
+picked once, so each gets weight 1/5 = 0.2.
+
 Three properties fall out of the algorithm rather than being designed in. It **selects and weights
 in one pass**; it **stops on its own** when nothing helps; and its weights are multiples of
 $1/k$, which is a coarse grid that cannot express the fine-tuned nonsense a continuous optimiser
 will happily produce.
 
 ## How it compares
+
+Put the climb side by side with the alternatives from earlier chapters: the best single model,
+uniform averages, NNLS, and Nelder-Mead (ch. 8).
 
 ```python
 from scipy.optimize import nnls, minimize
@@ -143,20 +172,29 @@ for name, w in methods.items():
      hill climbing   0.7191             5
 ```
 
-Four of the six land within 0.0005 of each other, and the two that do not are the instructive
-ones. **Uniform over all forty** (0.7063) is barely better than the single best model: thirty-five
+Three of the six land within 0.0005 of each other — uniform top-5 (0.7190), NNLS (0.7195) and hill
+climbing (0.7191) — and the other three are the instructive ones. **Uniform over all forty**
+(0.7063) is barely better than the single best model: thirty-five
 mediocre members drown the five good ones, exactly as ch. 7's variance formula predicts when
 quality is uneven. **Nelder-Mead** (0.7165) does worse than greedy selection while using all forty
 models — forty free parameters is too many to fit against 6,000 rows, and it cannot set a weight
 cleanly to zero the way selection does.
 
-Hill climbing reaches the top of the table using five models. That is its real advantage: not a
-higher score than NNLS, but the same score from a submission pipeline with five models in it.
+Hill climbing reaches the top group of the table using five models. That is its real advantage:
+not a higher score than NNLS, but the same score from a submission pipeline with five models in it.
+
+> **Watch out:** "uniform top-5" looks free, but choosing *which* five is itself a fit to these
+> rows. It only looks this good because you picked the five on the same data you scored them on.
 
 ## The number that matters is the honest one
 
+Every score so far was fitted and graded on the same rows. To see what each method really
+delivers, fit it on part of the data and score it on the rest.
+
 Every method above was fitted and scored on the same rows. Refit each inside cross-validation
 folds and the ranking changes, because the methods differ enormously in how much they can overfit.
+
+**Optimism** is the in-sample score minus the honest CV score: how much a method flatters itself.
 
 ```python
 from sklearn.model_selection import StratifiedKFold
@@ -191,6 +229,10 @@ for name, fn in fitters.items():
      hill climbing      0.7191      0.7172   0.0139    +0.0019
 ```
 
+Honest CV keeps the same order — NNLS 0.7174, hill climbing 0.7172, Nelder-Mead 0.7141 — and the
+fold standard deviation (about 0.014) is far bigger than any gap between them. Uniform has zero
+optimism, because it fits nothing.
+
 The optimism column is the surprise: hill climbing inflates its own score by +0.0019, essentially
 the same as NNLS's +0.0021, despite choosing *which* models to use as well as how to weight them.
 The self-stopping rule is why — it added five models and quit, so there was never much to overfit.
@@ -199,9 +241,15 @@ five parameters, not forty.
 
 ## Bagged hill climbing
 
+Run the climb many times, each time letting it see only a random half of the models, and average
+the results. A model that wins only by luck will not keep winning against different rivals.
+
 Caruana's refinement: run the climb many times, each on a random **subset of the models**, and
 average the resulting weight vectors. A model that only wins because of noise will not survive
 being asked repeatedly with different competitors.
+
+**Bagging** in general means repeating a procedure on random subsets and averaging; here the
+subsets are of models, not rows.
 
 ```python
 def bagged_hill_climb(P, y, n_bags=20, frac=0.5, n_iter=25, seed=0):
@@ -242,7 +290,14 @@ result when the plain climb was not overfitting in the first place: bagging buys
 did not need, and pays for it with a diluted blend. Reach for it when the bank is large relative
 to the rows, when the metric is noisy, or when the plain climb's optimism column is uncomfortable.
 
+The top weight goes to m15 (0.1880), the last model the plain climb added; m38, the best single
+model, gets only 0.0995. When m38 is missing from a subset, other models fill its role, so its
+share gets spread around.
+
 ## Watching the two curves
+
+The usual fear is that the climb keeps improving on the rows it fits while getting worse on new
+rows. Fit on one half, track the other half step by step, and look.
 
 The textbook worry is that the climb keeps improving its own score while the held-out score turns
 down. Watch what actually happens.
@@ -257,7 +312,7 @@ count = 0
 for step, fit_auc, added in tr:
     running = running + P_val[added].values
     count += 1
-    if step in (1, 2, 3, 5, 10, 15, 20, 25, 30):
+    if step <= 10 or step % 5 == 0:
         print(f"{step:>5} {fit_auc:>9.4f} {roc_auc_score(y_val, running / count):>14.4f} "
               f"{added:>7}")
 ```
@@ -267,19 +322,43 @@ for step, fit_auc, added in tr:
     1    0.6971         0.7121     m38
     2    0.7058         0.7127     m26
     3    0.7108         0.7170     m05
+    4    0.7116         0.7201     m15
     5    0.7118         0.7184     m30
+    6    0.7125         0.7196     m04
+    7    0.7126         0.7200     m31
+    8    0.7129         0.7217     m38
 ```
 
-The held-out column rises monotonically alongside the fit column, and the climb stops itself after
-five steps. Ignore the *sign* of the difference between the two columns — this held-out half is
-simply the easier one, which is why its AUC is higher throughout — and read their *shapes*
-instead: both go up, together, and there is no turn-down to protect against.
+Fit AUC rises at every step, from 0.6971 to 0.7129, and the climb stops itself after eight steps
+(step 8 picks m38 a second time, doubling its weight). Held-out AUC goes from 0.7121 to 0.7217 and
+tracks the fit column closely: it dips once, at step 5 (0.7201 to 0.7184), and recovers by step 8.
+
+Ignore the *sign* of the difference between the two columns — this held-out half is the
+easier one, which is why its AUC is higher throughout — and read their *shapes* instead: both go
+up, together, and there is no lasting turn-down to protect against. Late steps add only 0.0001 to
+0.0007 on the fit side, which is why one of them can wobble on fresh rows.
 
 That is the honest picture for a 40-model bank on 3,000 rows. The failure this section was
 written to show would need a much larger bank, a much smaller validation set, or a metric noisier
 than AUC — and when it happens, the fix is bagging or a stricter iteration cap.
 
+> **Watch out:** a climb that never stops on its own (it hits `n_iter` every time) is the warning
+> sign. It means some candidate always improves the fit score by a hair — usually noise.
+
+## Recap in plain words
+
+- Hill climbing adds one model at a time, the one that helps most, and stops when nothing helps.
+- Picking a model twice doubles its weight, so selection and weighting happen together.
+- On a 40-model bank it matched NNLS (about 0.719) using only 5 models.
+- Its honest optimism was small (+0.0019), because it stopped after a handful of steps.
+- Bagging the climb over random model subsets spreads weight and adds robustness, but cost a little
+  here.
+- When methods tie within the fold noise, keep the one with fewer models.
+
 ## Try it Yourself
+
+`climb_settings` fits on the first half of the rows and scores on the second half, for plain or
+bagged climbs with different settings.
 
 ```python
 def climb_settings(n_iter, init_top, frac=None, n_bags=None, seed=0):
@@ -315,12 +394,23 @@ slightly and the model count up substantially, from 5 to 15. When two settings t
 with fewer models. Try `frac=0.25` with more bags, or a bank of 100 models on 1,000 rows, to reach
 the regime where the gap finally turns positive and the knobs start to matter.
 
+Why does `n_iter=25` use 7 models? It is the same eight-step climb as the curves section: m38 is
+picked twice, so eight picks cover seven distinct models. `n_iter=5` cuts that climb off after
+five steps.
+
+Variation to try: `P, y = model_bank(n_models=100, n_rows=1_000)`, then re-split into `P_fit` and
+`P_val` as in the curves section and re-run the four settings.
+
 ## Exercise
 
 Build the ensemble selector you would run on the last day of a competition: bagged hill climbing
 with an internal early stop, an honest cross-validated estimate of what it achieves, and a
 comparison against the three cheap alternatives (best single, uniform top-k, NNLS). It should
 print a recommendation, not just a table.
+
+> **Hint:** reuse `honest_score` for every candidate. For the recommendation, compare the winner's
+> margin over the runner-up with the fold standard deviation divided by $\sqrt{k}$; if the margin is
+> smaller, prefer the method with fewer models.
 
 <details>
 <summary>Solution</summary>
@@ -387,6 +477,10 @@ report compares the winner's margin against the standard error of the fold mean 
 recommend complexity it cannot justify. On a bank of forty simulated models the honest scores sit
 within a few thousandths of each other, and that is the normal case: **most of the ensembling gain
 is captured by the simplest method, and the rest is noise plus a little real structure.**
+
+Here the winner is uniform top-5 at 0.7176, only 0.0002 ahead of NNLS, while the fold noise is
+0.0072 — 36 times the margin. The top four methods are a statistical tie, and the report says so.
+Only "uniform (all)" and "best single" are clearly worse.
 
 Three properties to preserve when you rebuild this for a real competition. Every candidate is
 re-fitted **inside** each fold, including the ones that look parameter-free — "uniform top-5"
