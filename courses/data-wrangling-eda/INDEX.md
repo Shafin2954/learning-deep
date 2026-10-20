@@ -7,6 +7,17 @@ course: the best model on a leaky pipeline is worse than a logistic regression o
 Pitched at: knows Python for Data Work (ch. 1–12), understands basic probability and
 distributions. No prior sklearn experience required.
 
+**In plain words:** this course teaches you to get a raw data file into a state a model can
+trust, and to prove the model's score is honest. Chapters 1–5 cover understanding what each
+column is, loading files without silent errors, reshaping tables into a tidy layout, and
+dealing with blanks and extreme values. Chapters 6–7 are about exploring: looking at each
+column, then at pairs of columns, and measuring how strongly they are linked. Chapters 8–11
+turn raw columns into good features — transforms, encodings for categories, time and text
+features, and scaling. Chapters 12–14 are the most important part: how information leaks
+from the answer into the model, how to choose a validation split that copies real use, and
+how scikit-learn Pipelines make the leak-free way automatic; the capstone (ch. 15) puts it
+all together on one messy dataset.
+
 ---
 
 ## Chapters
