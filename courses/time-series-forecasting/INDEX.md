@@ -12,6 +12,16 @@ You know Python and pandas and have seen regression before. You want to understa
 ARIMA actually fits, why random-shuffle CV is wrong for time series, and when to reach
 for LightGBM instead of statsmodels.
 
+**In plain words:** a time series is data where order matters, and forecasting is guessing the
+next values from the past without peeking at the future. Chapters 1–3 teach you to take a
+series apart: trend, seasonal wave and noise, and how to tell whether its behaviour is stable.
+Chapters 4–5 build the classic forecasters — exponential smoothing and ARIMA — and check what
+they leave behind. Chapter 6 shows how to score any forecaster honestly by replaying history,
+and chapters 7–8 turn forecasting into ordinary machine learning with lag and calendar features
+and gradient boosting. Chapters 9–12 widen the view to several series at once (VAR), forecasting
+risk itself (GARCH), honest uncertainty ranges (prediction intervals) and deep global models;
+chapter 13 asks you to build the whole system yourself.
+
 ---
 
 ## Part 1 — Classical Foundations (ch. 1–5)

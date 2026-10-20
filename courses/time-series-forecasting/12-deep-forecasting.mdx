@@ -7,7 +7,20 @@ order: 12
 
 ## Why deep models for time series
 
+Every model so far learned from one series at a time. A deep forecasting model can learn from
+thousands of series at once — every product in a shop — and notice that "Christmas spikes"
+look similar across many of them. A new product with little history then benefits from what
+the others taught.
+
 Classical models (ARIMA, ETS, gradient boosting with lags) handle one series at a time — they're **local** models. Deep forecasting models are **global**: a single model is trained across many related series simultaneously and learns shared patterns (trend shapes, seasonality profiles, response to external variables). This gives them leverage that per-series models lack.
+
+**ETS** is the exponential-smoothing family from ch. 4 (Error, Trend, Seasonal). **Local**
+means one model per series; **global** means one model shared by all series.
+
+> **Picture it:** a local model is a private tutor who has only ever taught one pupil. A global
+> model is a teacher who has taught a thousand pupils: she has seen most mistakes before and
+> recognises a pattern from one pupil in another. She may know any single pupil less
+> intimately, though.
 
 Three situations where deep models consistently win:
 
@@ -15,9 +28,16 @@ Three situations where deep models consistently win:
 - **Rich covariates** — promotions, holidays, weather, categorical metadata that ARIMA can't easily absorb.
 - **Complex, long-range seasonality** — multiple overlapping periods that seasonal ARIMA struggles to parameterize.
 
-The tradeoff: they require substantially more data, are harder to debug, and need GPU training. For a single short series with no covariates, classical methods usually win.
+A **SKU** (stock-keeping unit) is one sellable item, like "red T-shirt, size M". **Borrows
+strength** means the patterns learned from many series help each individual one.
+
+The tradeoff: they require substantially more data, are harder to debug, and usually want a GPU for training at scale. For a single short series with no covariates, classical methods usually win.
 
 ## DeepAR: probabilistic autoregressive LSTM
+
+DeepAR reads a series one step at a time with a memory cell, and at each step it outputs not one
+number but a whole probability distribution for the next value. Sampling from those
+distributions gives you many possible futures, and from them any interval you like.
 
 DeepAR (Salinas et al., 2020 — Amazon) models each time series as:
 
@@ -25,9 +45,33 @@ $$
 y_{t,i} \sim p_\theta(y \mid \mathbf{h}_{t,i}), \quad \mathbf{h}_{t,i} = \text{LSTM}(\mathbf{h}_{t-1,i},\ y_{t-1,i},\ \mathbf{x}_{t,i})
 $$
 
+- $y_{t,i}$ is the value of series $i$ at time $t$.
+- $\mathbf{h}_{t,i}$ is the **hidden state**: the LSTM's running memory summary of everything
+  it has read so far in series $i$.
+- An **LSTM** (long short-term memory network) is a recurrent neural network: it updates its
+  memory from the previous memory, the last value $y_{t-1,i}$ and the covariates
+  $\mathbf{x}_{t,i}$.
+- $p_\theta$ turns the memory into a probability distribution with parameters $\theta$ learned
+  in training; the $\sim$ means "is drawn from".
+
 where $i$ indexes the series, $\mathbf{x}_{t,i}$ are covariates (age of series, calendar features, item embeddings), and $p_\theta$ is a parametric distribution — typically Gaussian (for real-valued) or Negative Binomial (for count data like demand).
 
+An **embedding** is a learned list of numbers that represents a category (an item, a store),
+so similar items end up with similar lists. The **Negative Binomial** distribution only produces
+whole numbers $\ge 0$ and allows a lot of spread, which suits counts like "units sold".
+
 Training: maximize log-likelihood of the observed values given the LSTM hidden state. No separate decoder — it autoregressively conditions on previous actuals during training and on its own samples during inference.
+
+So training uses the real previous value (**teacher forcing**), while forecasting feeds the
+model its own sampled guess — the recursive strategy from ch. 8, run many times with random
+draws.
+
+> **Watch out:** the training/inference mismatch is real. During training the model never sees
+> its own mistakes, so long horizons can drift. Checking calibration (ch. 11) on a held-out
+> period is not optional.
+
+Before any model, the data has to be in the shape these libraries expect: one long table with
+a series ID, a date and a value.
 
 ```python
 # Minimal DeepAR-style training loop using neuralforecast
@@ -41,7 +85,7 @@ import numpy as np
 rng = np.random.default_rng(0)
 records = []
 for uid in range(5):
-    dates = pd.date_range("2020-01", periods=48, freq="M")
+    dates = pd.date_range("2020-01", periods=48, freq="ME")
     trend = np.linspace(uid * 2, uid * 2 + 20, 48)
     noise = rng.normal(0, 1, 48)
     for d, v in zip(dates, trend + noise):
@@ -53,29 +97,51 @@ print(f"\nSeries: {df['unique_id'].nunique()}, rows per series: {df.groupby('uni
 ```
 
 ```output
-  unique_id         ds          y
-0  series_0 2020-01-31   0.124561
-1  series_0 2020-02-29   0.621803
-2  series_0 2020-03-31   1.384512
-3  series_0 2020-04-30   1.743218
+  unique_id         ds         y
+0  series_0 2020-01-31  0.125730
+1  series_0 2020-02-29  0.293427
+2  series_0 2020-03-31  1.491486
+3  series_0 2020-04-30  1.381496
 
 Series: 5, rows per series: 48
 ```
+
+This is **long format**: one row per (series, date) pair, with columns `unique_id`, `ds`
+(the date stamp) and `y`. Five series of 48 months gives 240 rows. The first rows of
+`series_0` start near 0 (0.125730, 0.293427, …) because its trend runs from 0 to 20; series 4
+runs from 8 to 28. The code only prepares data — it imports `DeepAR` but does not train it.
 
 DeepAR forecasts a *distribution* per step, letting you sample many trajectories and derive any quantile. This makes it naturally probabilistic — no conformal post-processing needed, though calibration should still be checked.
 
 ## N-BEATS: backward and forward residual blocks
 
+N-BEATS is a stack of plain neural layers. Each block looks at the recent past, explains as much
+of it as it can, hands the unexplained part to the next block, and adds its own piece to the
+forecast.
+
 N-BEATS (Oreshkin et al., 2020) is fully feed-forward (no recurrence, no attention). Each **block** does:
 
 1. Takes a backcast window as input.
 2. Produces two outputs via separate linear projections: a **backcast** (fit to the past window) and a **forecast** (h steps ahead).
-3. The residual passed to the next block = input − backcast.
+3. The residual passed to the next block = input minus backcast.
+
+**Feed-forward** means data flows straight through the layers, with no loop and no memory. The
+**backcast window** is the stretch of recent history the block looks at (`input_size`). The
+final forecast is the *sum* of every block's forecast piece.
+
+> **Picture it:** a team of sculptors working on one block of marble. The first knocks off the
+> big shape (the trend), the next carves the repeating pattern (the season), the next the fine
+> detail. Each works only on what the previous one left, and the statue is the sum of their
+> work.
 
 Stacking blocks removes structure layer by layer, so each successive block explains the residual of the previous one. Two stack configurations:
 
 - **Generic** — unconstrained basis; best MSE for data without clear decomposition.
 - **Interpretable** — polynomial basis for trend blocks, Fourier basis for seasonality blocks; you can read off the components.
+
+A **basis** is the set of shapes a block may combine. A **polynomial** basis means smooth curves
+($1, t, t^2$); a **Fourier** basis means sine and cosine waves. Restricting a block to waves
+forces it to model seasonality, so you can read its output as "the seasonal component".
 
 ```python
 from neuralforecast.models import NBEATS
@@ -95,17 +161,24 @@ print(model)
 ```
 
 ```output
-NBEATS(
-  h=12, input_size=24
-  stacks: ['trend', 'seasonality']
-  blocks per stack: [3, 3]
-  mlp_units: [[256, 256], [256, 256]]
-)
+NBEATS
 ```
+
+`print(model)` only shows the class name, NBEATS: the model is built but not trained. The
+settings say: forecast 12 steps (`h=12`) from a 24-step lookback (`input_size=24`); one trend
+stack and one seasonality stack, 3 blocks each; `n_polynomials=2` lets the trend blocks use
+curves up to degree 2, and `n_harmonics=2` controls how many sine/cosine waves the seasonality
+blocks get.
 
 **N-HiTS** (Neural Hierarchical Interpolation for Time Series) extends N-BEATS with multi-rate sampling: different blocks look at different resolutions (coarse, medium, fine) before interpolating back to the full resolution. It often outperforms N-BEATS on longer horizons and is faster to train.
 
+**Multi-rate sampling** means some blocks see a shrunk, low-detail copy of the history (e.g.
+every 4th point) to catch slow movements cheaply, while others see full detail for fast ones.
+
 ## Temporal Fusion Transformer (TFT)
+
+TFT is the "everything included" model: it decides which inputs matter, remembers recent
+history, can look far back with attention, and outputs several quantiles at once.
 
 TFT (Lim et al., 2021 — Google) is the most feature-rich architecture:
 
@@ -115,32 +188,49 @@ TFT (Lim et al., 2021 — Google) is the most feature-rich architecture:
 - **Multi-head attention** on the sequence — captures long-range dependencies.
 - **Quantile output** — directly predicts $[q_{0.1}, q_{0.5}, q_{0.9}]$ (or any quantiles) via a single forward pass.
 
+**Attention** is a learned weighting: for each forecast step the model scores every past time
+step and takes a weighted mix, so it can jump straight to "same week last year" instead of
+remembering it step by step. **Multi-head** means several such weightings run side by side.
+**Known-future inputs** are covariates you know in advance, like the calendar or a planned
+promotion. The quantile output uses the pinball loss from ch. 11.
+
 The variable importance weights are inspectable: you can see which lags, which calendar features, and which external regressors the model is relying on for each series.
 
 ```python
 from neuralforecast.models import TFT
+from neuralforecast.losses.pytorch import MQLoss
 import pandas as pd
 
 model = TFT(
     h=12,
     input_size=24,
     hidden_size=64,
-    attention_head_size=4,
+    n_head=4,
     dropout=0.1,
-    loss_fn="QuantileLoss",
-    quantiles=[0.1, 0.5, 0.9],
+    loss=MQLoss(quantiles=[0.1, 0.5, 0.9]),
     max_steps=200,
 )
 print(f"TFT parameters (approx): {sum(p.numel() for p in model.parameters()):,}")
 ```
 
 ```output
-TFT parameters (approx): 142,896
+TFT parameters (approx): 220,179
 ```
+
+This TFT has 220,179 trainable numbers, against 4 for a GARCH(1,1) with a mean term or a handful for an ARIMA.
+That scale is why it needs many series: with 48 monthly points and 220 thousand parameters, a
+single series would be memorised, not learned.
+
+> **Watch out:** in `neuralforecast`, unknown keyword arguments do not raise an error — they are
+> passed through to the PyTorch Lightning trainer. Writing `loss_fn="QuantileLoss"` instead of
+> `loss=MQLoss(...)` builds a model that silently trains on the default MAE loss. Check
+> `type(model.loss)` after construction.
 
 TFT's attention weights over time steps give you a built-in interpretability signal: peaks show which historical timestamps the model found most informative for the forecast — effectively a learned seasonality detector.
 
 ## Comparison: classical vs gradient boosting vs deep
+
+Each family wins somewhere. The table sums up what each one gives you and what it needs.
 
 ```python
 import pandas as pd
@@ -158,31 +248,55 @@ print(df.to_string())
 ```
 
 ```output
-                    Global? Probabilistic      Covariates Interpretable     Data needed
+                     Global?      Probabilistic         Covariates Interpretable  Data needed
 Model
-ARIMA/SARIMA           No    Yes (parametric) Limited (SARIMAX)     Yes        < 100 pts
-LightGBM + lag feats  No*    Via quantile loss    Yes (any)    Via SHAP        ~500+ pts
-DeepAR                Yes    Yes (parametric)     Yes              No       Many series
-N-BEATS               Yes    No / quantile        No           Partial       Many series
-TFT                   Yes    Yes (quantile)       Yes (rich)   Partial       Many series
+ARIMA/SARIMA              No   Yes (parametric)  Limited (SARIMAX)           Yes    < 100 pts
+LightGBM + lag feats     No*  Via quantile loss          Yes (any)      Via SHAP    ~500+ pts
+DeepAR                   Yes   Yes (parametric)                Yes            No  Many series
+N-BEATS                  Yes      No / quantile                 No       Partial  Many series
+TFT                      Yes     Yes (quantile)         Yes (rich)       Partial  Many series
 ```
+
+Read across a row to see a model's profile, or down a column to compare one property. ARIMA is
+the only one that works with under 100 points but handles covariates only in its SARIMAX form;
+the three deep models are all global and all need many series; only TFT combines rich covariates
+with quantile output. **SHAP** is a method that splits a tree model's prediction into
+per-feature contributions.
 
 *LightGBM can be made global by including a series-ID categorical feature.
 
 ## When to use deep forecasting models
 
+Deep models are a bet: they pay off with lots of related data and side information, and cost
+you time and accuracy when data is scarce.
+
 Choose deep models when:
 
-- You have **≥ 100 series** (ideally thousands) or very long individual series (> 5 years daily).
+- You have **at least 100 series** (ideally thousands) or very long individual series (> 5 years daily).
 - You have **rich time-varying covariates** (promotions, price, weather, related series).
 - You need a **probabilistic output** natively (inventory/safety-stock decisions).
 - **Seasonality is complex** or multiple overlapping (weekly + annual + holiday).
+
+**Safety stock** is the extra inventory kept to cover demand above the forecast; sizing it needs
+an upper quantile, not a mean.
 
 Stick to classical/gradient boosting when:
 
 - You have **few series** or **short history** (< 200 observations).
 - You need **fast iteration** and interpretability for stakeholders.
 - You're in a **low-data domain** where overfitting is a real risk.
+
+> **Watch out:** always benchmark a deep model against seasonal naive, ETS and a LightGBM with
+> lags (ch. 4, 6, 8) on the same rolling-origin backtest. In forecasting competitions, simple
+> baselines and well-tuned boosting beat poorly tuned deep models more often than you'd expect.
+
+## Recap in plain words
+
+- Local models fit one series each; global deep models learn shared patterns across many series.
+- DeepAR is an LSTM that outputs a probability distribution per step, so you can sample futures and read off quantiles.
+- N-BEATS stacks feed-forward blocks that each explain part of the past and add a piece to the forecast; its interpretable version separates trend and seasonality.
+- N-HiTS adds multi-resolution blocks for long horizons; TFT adds variable selection, attention and quantile output.
+- Deep models need many series or long histories; on short single series, classical methods and boosting usually win.
 
 ## Try it Yourself
 
@@ -196,7 +310,7 @@ import numpy as np
 rng = np.random.default_rng(7)
 records = []
 for uid, phase in enumerate([0, np.pi/3, 2*np.pi/3]):
-    dates = pd.date_range("2019-01", periods=60, freq="M")
+    dates = pd.date_range("2019-01", periods=60, freq="ME")
     vals = 10 + 5*np.sin(2*np.pi*np.arange(60)/12 + phase) + rng.normal(0, 0.5, 60)
     for d, v in zip(dates, vals):
         records.append({"unique_id": f"s{uid}", "ds": d, "y": float(v)})
@@ -205,7 +319,7 @@ df = pd.DataFrame(records)
 
 nf = NeuralForecast(
     models=[NBEATS(h=6, input_size=24, max_steps=50)],
-    freq="M"
+    freq="ME"
 )
 nf.fit(df)
 pred = nf.predict()
@@ -213,23 +327,38 @@ print(pred.head(9))
 ```
 
 ```output
-   unique_id         ds     NBEATS
-0         s0 2024-01-31   9.843721
-1         s0 2024-02-29  12.156803
-2         s0 2024-03-31  14.102341
-3         s1 2024-01-31  11.234512
-4         s1 2024-02-29  12.987634
-5         s1 2024-03-31  11.564823
-6         s2 2024-01-31   6.812345
-7         s2 2024-02-29   8.234761
-8         s2 2024-03-31  11.094512
+  unique_id         ds     NBEATS
+0        s0 2024-01-31   9.976299
+1        s0 2024-02-29  12.602291
+2        s0 2024-03-31  13.940641
+3        s0 2024-04-30  14.712464
+4        s0 2024-05-31  14.117408
+5        s0 2024-06-30  12.297418
+6        s1 2024-01-31  13.923992
+7        s1 2024-02-29  14.723392
+8        s1 2024-03-31  14.149442
 ```
 
+One N-BEATS model is trained on all three series together (a global model), then forecasts six
+months for each. Series `s0` is $10 + 5\sin(2\pi t/12)$ with phase 0, and the forecast traces
+that wave: 9.98 in January 2024 ($t = 60$, where the sine is 0), up to 14.71 in April (the peak,
+true value 15), back to 12.30 by June. Series `s1` is shifted by $\pi/3$, so it starts higher
+(13.92) and peaks earlier. After only 50 training steps the forecasts are already within about
+0.4 of the noise-free wave. The last few decimals can differ slightly between runs, because
+neural-network training on CPU is not bit-for-bit reproducible.
+
 Try switching `stack_types` to `["generic"]` and compare the forecasts.
+
+Then raise the noise from 0.5 to 2 and see how much worse the forecasts get, or add a fourth
+series with a different period and check whether the shared model still fits it.
 
 ## Exercise
 
 You have a dataset with 200 product SKUs, each with 3 years of daily sales. You want to generate 30-day-ahead probabilistic forecasts. Describe: (1) which deep model you'd pick and why, (2) what covariates you'd include, (3) what metric you'd use to evaluate the probabilistic intervals.
+
+> **Hint:** go back through the comparison table. Which model is global, takes known-future
+> covariates like promotions, and outputs quantiles directly? Then reuse ch. 11 for the
+> evaluation: pinball loss plus a coverage check.
 
 <details>
 <summary>Solution</summary>
@@ -281,6 +410,9 @@ Evaluation:
 
 TFT handles all four of: global training across 200 SKUs, known-future covariates (holidays/promotions), static embeddings for product/store, and quantile outputs in one model. Evaluate with pinball loss (optimized during training) and verify coverage empirically.
 
+DeepAR with a Negative Binomial output is a strong alternative for spiky integer sales. Whatever
+you pick, compare it against a seasonal-naive and a LightGBM baseline on the same rolling-origin
+backtest (ch. 6, ch. 8) before claiming a win.
 </details>
 
 ## Under the Trench
@@ -288,9 +420,9 @@ TFT handles all four of: global training across 200 SKUs, known-future covariate
 Rare and advanced topics you should at least know the name of. You won't need them daily,
 but you'll stop being surprised when you meet them.
 
-- **State-space models & Kalman filter** — recursive estimation behind ETS and structural time series; the theoretically clean alternative to ARIMA with an exact likelihood.
+- **State-space models & Kalman filter** — recursive estimation behind ETS and structural time series; the theoretically clean alternative to ARIMA with an exact likelihood. In plain words: keep a best guess of hidden quantities (level, slope) and correct it a little with each new observation.
 - **Prophet** — additive trend + seasonality + holidays with robust defaults; useful when you need fast, explainable forecasts with minimal tuning.
-- **Hierarchical forecasting & reconciliation** — make bottom-up and top-down forecasts agree; MinT reconciliation ensures coherency across aggregation levels.
+- **Hierarchical forecasting & reconciliation** — make bottom-up and top-down forecasts agree; MinT reconciliation ensures coherency across aggregation levels. In plain words: the store forecasts should add up to the region forecast.
 - **Dynamic time warping** — align or compare series of different speeds; used in kNN classifiers and clustering for series.
 - **Change-point & anomaly detection** — find regime shifts with PELT, BOCPD, or Isolation Forest on residuals; critical for adaptive retraining triggers.
 - **Intermittent demand (Croston's method)** — forecasting sparse, spiky series where zero demand is common; splits frequency and size into separate models.

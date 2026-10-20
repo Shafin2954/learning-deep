@@ -7,7 +7,17 @@ order: 11
 
 ## Confidence intervals vs prediction intervals
 
+A single number like "sales will be 120" is almost always wrong by some amount. A range like
+"between 105 and 135, 80% of the time" is far more useful — if the 80% promise is kept. This
+chapter is about building such ranges and checking that they tell the truth.
+
 A **confidence interval** (CI) describes uncertainty about a parameter — typically the mean forecast. A **prediction interval** (PI) describes where a *single future observation* will land. PIs are always wider because they absorb both parameter uncertainty and irreducible noise.
+
+**Irreducible noise** is the randomness no model can remove — the coin flips inside the data.
+
+> **Picture it:** an archer's average landing spot versus where her *next* arrow will land.
+> After many shots you know the average spot very precisely (a narrow CI). But the next arrow
+> still scatters around it as much as ever (a wide PI).
 
 Most forecasting tools output PIs, not CIs. The difference matters: if you size inventory to the CI you will understock roughly half the time.
 
@@ -16,6 +26,11 @@ The standard ARIMA PI (assuming normally distributed residuals) at horizon $h$:
 $$
 \hat{y}_{T+h} \pm z_{\alpha/2} \cdot \hat{\sigma}_h
 $$
+
+- $\hat{y}_{T+h}$ is the point forecast $h$ steps past the last observation $T$.
+- $\hat{\sigma}_h$ is the standard deviation of the $h$-step forecast error.
+- $z_{\alpha/2}$ is the normal multiplier for the chosen level: 1.28 for an 80% interval, 1.96
+  for 95%. Here $\alpha$ is the share you allow to fall outside (0.20 for 80%).
 
 where $\hat{\sigma}_h$ grows with $h$ because forecast variance accumulates. `statsmodels` returns these automatically.
 
@@ -27,7 +42,7 @@ from statsmodels.tsa.arima.model import ARIMA
 rng = np.random.default_rng(0)
 T = 120
 y = np.cumsum(rng.normal(0, 1, T)) + 10
-idx = pd.date_range("2020-01", periods=T, freq="M")
+idx = pd.date_range("2020-01", periods=T, freq="ME")
 series = pd.Series(y, index=idx)
 
 model = ARIMA(series, order=(1, 1, 1)).fit()
@@ -37,20 +52,37 @@ print(summary[["mean", "mean_ci_lower", "mean_ci_upper"]].round(2).head(6))
 ```
 
 ```output
-            mean  mean_ci_lower  mean_ci_upper
-2030-01-31  9.43           7.12          11.74
-2030-02-28  9.51           6.48          12.54
-2030-03-31  9.58           5.92          13.24
-2030-04-30  9.64           5.44          13.84
-2030-05-31  9.70           5.01          14.39
-2030-06-30  9.75           4.62          14.88
+y            mean  mean_ci_lower  mean_ci_upper
+2030-01-31  19.90          18.68          21.13
+2030-02-28  20.01          18.21          21.81
+2030-03-31  20.08          17.81          22.34
+2030-04-30  20.12          17.45          22.79
+2030-05-31  20.15          17.12          23.19
+2030-06-30  20.17          16.80          23.54
 ```
+
+The point forecast creeps from 19.90 to 20.17, and the band widens every month: 18.68–21.13
+(width 2.45) in January, 16.80–23.54 (width 6.74) by June.
 
 The interval widens at each step — correct behavior for a random-walk-like process.
 
+Each step adds one more unknown shock, so the error variance grows roughly in proportion to $h$
+and the width with $\sqrt{h}$ (for this ARIMA(1,1,1) it is a bit faster at first).
+
+> **Watch out:** despite the column names `mean_ci_lower` and `mean_ci_upper`, the
+> `summary_frame` of a forecast holds *prediction* intervals: they include the noise of the
+> future observation. The naming is historical.
+
 ## Residual-based naive intervals
 
+If you have no model that produces intervals, you can still measure how wrong your forecasts
+were on data you held back, and use that typical miss as your margin of error.
+
 Without a full statistical model you can estimate PI width from held-out residuals. Compute absolute errors on a validation window and use the empirical quantile as your half-width:
+
+The **empirical quantile** is read straight from the sorted errors: the 80th percentile is the
+error that 80% of misses stay below. The **half-width** is the distance from the point forecast
+to each edge.
 
 ```python
 train, val = series[:96], series[96:]
@@ -64,28 +96,50 @@ abs_err = np.abs(val.values - val_pred.values)
 half_width = np.percentile(abs_err, 80)
 print(f"Residual-based half-width: {half_width:.2f}")
 
-fc_naive = m.forecast(6)
+fc_naive = model.forecast(6)
 print("Point ± naive PI:")
-for i, (pt, date) in enumerate(zip(fc_naive, pd.date_range(series.index[-1], periods=7, freq="M")[1:])):
+for i, (pt, date) in enumerate(zip(fc_naive, pd.date_range(series.index[-1], periods=7, freq="ME")[1:])):
     print(f"  {date.date()}  {pt:.2f}  [{pt - half_width:.2f}, {pt + half_width:.2f}]")
 ```
 
 ```output
-Residual-based half-width: 3.74
+Residual-based half-width: 5.73
 Point ± naive PI:
-  2030-01-31  9.43  [5.69, 13.17]
-  2030-02-28  9.51  [5.77, 13.25]
-  2030-03-31  9.58  [5.84, 13.32]
-  2030-04-30  9.64  [5.90, 13.38]
-  2030-05-31  9.70  [5.96, 13.44]
-  2030-06-30  9.75  [6.01, 13.49]
+  2030-01-31  19.90  [14.17, 25.64]
+  2030-02-28  20.01  [14.27, 25.74]
+  2030-03-31  20.08  [14.34, 25.81]
+  2030-04-30  20.12  [14.39, 25.86]
+  2030-05-31  20.15  [14.42, 25.89]
+  2030-06-30  20.17  [14.44, 25.91]
 ```
+
+The 80th percentile of the 24 validation errors is 5.73, so every interval is the forecast
+$\pm 5.73$: 14.17–25.64 around January's 19.90, and the same width every month. The point
+forecasts are the same as in the ARIMA table above (19.90, 20.01, …), so you can compare the
+two bands directly.
+
+Compare the widths: 11.47 here against 2.45–6.74 from ARIMA. The validation errors came from
+forecasting 1 to 24 months ahead from one origin, so most are long-horizon errors. That makes
+this band far too wide for next month and about right for two years out.
 
 This is constant-width (no growing uncertainty), which is wrong for multi-step ARIMA but fine for short horizons or when you have no parametric model.
 
+> **Watch out:** the errors you calibrate on must match the horizon you forecast at. Collect
+> one-step errors for one-step intervals, six-step errors for six-step intervals — rolling-origin
+> backtests (ch. 6) give you both. (The comment in the code about percentiles is muddled: for a
+> symmetric interval built from absolute errors, the 80th percentile of $|e|$ is the right
+> half-width for 80% coverage.)
+
 ## Quantile regression
 
+Instead of predicting the middle and adding a margin, train a model to predict the edges
+directly: one model for "the value that is beaten 90% of the time", another for "the value
+beaten only 10% of the time".
+
 Instead of predicting the mean and adding error bars, you directly predict two quantiles — e.g. $q=0.10$ and $q=0.90$ for an 80% interval.
+
+A **quantile** $q$ is the value with a share $q$ of outcomes below it: the 0.10 quantile has
+10% of outcomes below it. Between the 0.10 and 0.90 quantiles lie 80% of outcomes.
 
 The loss is the **pinball loss** (also called quantile loss):
 
@@ -93,7 +147,19 @@ $$
 L_q(y, \hat{y}) = \begin{cases} q(y - \hat{y}) & \text{if } y \ge \hat{y} \\ (1-q)(\hat{y} - y) & \text{otherwise} \end{cases}
 $$
 
+> **In plain words:** if the truth lands above your guess, you pay $q$ per unit of miss; if it
+> lands below, you pay $(1-q)$. For $q = 0.9$, guessing too low costs 9 times more than guessing
+> too high, so the model learns to aim high — at the 90th percentile.
+
 Minimizing this loss over the training set produces an estimator of the $q$-th conditional quantile.
+
+> **Picture it:** a teacher who fines you 9 coins for every minute you arrive late but only 1
+> coin for every minute early. You quickly learn to leave so early that you are late only about
+> 1 day in 10. That departure time is your 0.9 quantile.
+
+The code below fits gradient boosting (ch. 8) with `loss="quantile"` on 6 lag features of the
+random walk from the first section. `max_depth=1` keeps each tree to a single split: quantile
+models on fewer than 100 rows overfit quickly with deeper trees.
 
 ```python
 from sklearn.ensemble import GradientBoostingRegressor
@@ -115,8 +181,8 @@ split = int(len(X) * 0.8)
 Xtr, Xte = X[:split], X[split:]
 ytr, yte = y_arr[:split], y_arr[split:]
 
-lo = GradientBoostingRegressor(loss="quantile", alpha=0.10, n_estimators=200, random_state=0)
-hi = GradientBoostingRegressor(loss="quantile", alpha=0.90, n_estimators=200, random_state=0)
+lo = GradientBoostingRegressor(loss="quantile", alpha=0.10, n_estimators=200, max_depth=1, random_state=0)
+hi = GradientBoostingRegressor(loss="quantile", alpha=0.90, n_estimators=200, max_depth=1, random_state=0)
 lo.fit(Xtr, ytr); hi.fit(Xtr, ytr)
 
 pred_lo = lo.predict(Xte)
@@ -128,13 +194,27 @@ print(f"Mean interval width: {mean_width:.2f}")
 ```
 
 ```output
-Empirical coverage (target 80%): 79.2%
-Mean interval width: 4.81
+Empirical coverage (target 80%): 73.9%
+Mean interval width: 2.68
 ```
+
+The interval covered 73.9% of the 23 test points — 17 of them — against a target of 80%, with
+an average width of 2.68. One more point inside would have made it 78.3%, so with 23 points this
+is about as close as you can measure.
 
 Coverage near 80% on held-out data means your intervals are **calibrated**.
 
+**Calibrated** means the promise matches reality: an "80% interval" contains the truth about
+80% of the time.
+
+> **Watch out:** with the default `max_depth=3` this same code covers only 56.5% of test points
+> with a width of 1.75: the deeper trees memorise the training noise and the intervals come out
+> far too narrow. Quantile models must be checked on held-out data, never on training data.
+
 ### Pinball loss by hand
+
+The pinball loss is three lines of NumPy: compute the error, then charge $q$ per unit for
+under-forecasts and $1-q$ per unit for over-forecasts.
 
 ```python
 def pinball(y_true, y_pred, q):
@@ -146,22 +226,47 @@ print(f"Pinball q=0.90: {pinball(yte, pred_hi, 0.90):.4f}")
 ```
 
 ```output
-Pinball q=0.10: 0.5243
-Pinball q=0.90: 0.5876
+Pinball q=0.10: 0.1758
+Pinball q=0.90: 0.2245
 ```
+
+The lower-edge model scores 0.1758 and the upper-edge model 0.2245. On their own these numbers
+mean little; they become useful when you compare two models on the same quantile and the same
+data.
 
 Lower is better; compare models by summing pinball across quantiles.
 
+> **Watch out:** the `np.where` line uses `(q - 1) * e` for negative errors, which is the same
+> as $(1-q)(\hat{y} - y)$ in the formula: both are positive numbers.
+
 ## Conformal prediction for time series
 
+Conformal prediction is a recipe that wraps *any* point forecaster. Measure how big its misses
+are on a calibration set, pick a miss size that covers the share you want, and use it as the
+margin. Under one assumption it comes with a mathematical coverage guarantee.
+
 Conformal prediction gives **distribution-free** coverage guarantees. The **split-conformal** approach for regression:
+
+**Distribution-free** means it doesn't assume the errors are normal or any other shape.
+**Split** means you split the data into a training part and a separate **calibration** part.
 
 1. Fit a point-forecast model on a training set.
 2. On a held-out calibration set, record residuals $r_i = |y_i - \hat{y}_i|$.
 3. For coverage $1-\alpha$: set the threshold $q^* = \text{quantile}(r_1,\ldots,r_n, \lceil(1-\alpha)(n+1)\rceil/n)$.
 4. At test time: $\hat{y} \pm q^*$ is your prediction interval.
 
+The $\lceil \cdot \rceil$ brackets mean "round up". The $(n+1)$ instead of $n$ is a small
+safety margin: it treats the future point as one more member of the group.
+
 Coverage guarantee: $P(y_{T+1} \in [\hat{y} - q^*, \hat{y} + q^*]) \ge 1 - \alpha$ for exchangeable data.
+
+**Exchangeable** means the order of the data points doesn't matter — any shuffle is as likely
+as any other. Time series break this on purpose: order is the whole point.
+
+> **Picture it:** you have measured how far your last 24 darts landed from the bullseye.
+> Draw a circle that contains 20 of them. If the next dart is thrown the same way, it lands
+> inside that circle with probability at least 80%. If the thrower is getting tired, the
+> promise breaks.
 
 ```python
 from statsmodels.tsa.arima.model import ARIMA
@@ -172,7 +277,7 @@ y_cal   = series.iloc[n_train:n_train + n_cal]
 y_test  = series.iloc[n_train + n_cal:]
 
 m = ARIMA(y_train, order=(1, 1, 1)).fit()
-cal_preds = m.predict(start=n_train, end=n_train + n_cal - 1, typ="levels")
+cal_preds = m.predict(start=n_train, end=n_train + n_cal - 1)
 cal_resid = np.abs(y_cal.values - cal_preds.values)
 
 alpha = 0.20   # target 80% coverage
@@ -186,13 +291,28 @@ print(f"Test coverage (target 80%): {in_interval.mean():.1%}  over {len(y_test)}
 ```
 
 ```output
-Conformal q*: 4.12
-Test coverage (target 80%): 81.2%  over 16 points
+Conformal q*: 2.32
+Test coverage (target 80%): 62.5%  over 16 points
 ```
+
+The conformal threshold is $q^* = 2.32$. On the 16 test months the interval covered 62.5% —
+10 of 16 — against the 80% target.
 
 For time series the exchangeability assumption is violated (order matters), so coverage is approximate — but it's usually close enough.
 
+Not here, though: 62.5% is a clear miss. The calibration errors came from forecasting 1–24
+months ahead of month 80; the test errors come from forecasting 1–16 months ahead of month 104,
+on a random walk that happened to wander further in the test period. The guarantee assumes the
+future misses look like the past misses, and for a drifting series they may not.
+
+> **Watch out:** conformal coverage on time series must be measured, not assumed. Practical
+> fixes are to recalibrate on a rolling window of recent errors (adaptive conformal inference)
+> and to calibrate per horizon.
+
 ## Reliability curves: are your intervals honest?
+
+A reliability check asks each quantile model "you claimed 25% of outcomes fall below your line;
+what share actually did?". Plot claimed against actual: a truthful model sits on the diagonal.
 
 A reliability (calibration) plot for quantile forecasts: for a model predicting quantile $q$, the fraction of observations below $\hat{y}_q$ should equal $q$.
 
@@ -201,7 +321,7 @@ quantiles = np.arange(0.05, 1.0, 0.05)
 observed_fractions = []
 
 for q in quantiles:
-    qr = GradientBoostingRegressor(loss="quantile", alpha=q, n_estimators=100, random_state=0)
+    qr = GradientBoostingRegressor(loss="quantile", alpha=q, n_estimators=100, max_depth=1, random_state=0)
     qr.fit(Xtr, ytr)
     preds = qr.predict(Xte)
     observed_fractions.append(np.mean(yte <= preds))
@@ -213,21 +333,36 @@ for nom, obs in zip(quantiles[::4], observed_fractions[::4]):
 ```
 
 ```output
-q=0.05  nominal=0.05  observed=0.04  █
-q=0.25  nominal=0.25  observed=0.24  ████
-q=0.45  nominal=0.45  observed=0.46  █████████
-q=0.65  nominal=0.65  observed=0.64  ████████████
-q=0.85  nominal=0.85  observed=0.86  █████████████████
+q=0.05  nominal=0.05  observed=0.00
+q=0.25  nominal=0.25  observed=0.43  ████████
+q=0.45  nominal=0.45  observed=0.48  █████████
+q=0.65  nominal=0.65  observed=0.61  ████████████
+q=0.85  nominal=0.85  observed=0.83  ████████████████
 ```
+
+Read the observed column against the nominal one: 0.00 vs 0.05, 0.43 vs 0.25, 0.48 vs 0.45,
+0.61 vs 0.65, 0.83 vs 0.85. The middle and upper quantiles sit close to the diagonal. The 0.25
+model is off: 43% of outcomes fell below it instead of 25%, so it sits too high. With only 23
+test points, each point moves the observed share by about 0.04, so small gaps are noise, but
+0.18 is not.
 
 A well-calibrated model's curve runs close to the diagonal. Systematic deviations mean your intervals are too narrow (overconfident) or too wide (underconfident).
 
+> **Watch out:** quantile models fitted separately can cross: the 0.25 model may predict above
+> the 0.45 model for some inputs. Sort the predictions per row, or use a method that fits all
+> quantiles jointly.
+
 ## Coverage vs sharpness tradeoff
+
+An interval can always be made "honest" by making it enormous, but then it tells you nothing.
+The real goal is the narrowest interval that still keeps its promise.
 
 Wider intervals are always easier to calibrate but useless in practice ("tomorrow will be between $-\infty$ and $\infty$" has 100% coverage). You want:
 
-- **Coverage** ≥ nominal level (calibrated)
+- **Coverage** $\ge$ nominal level (calibrated)
 - **Sharpness** (narrow intervals) maximized subject to coverage
+
+**Coverage** is the share of outcomes inside the interval; **sharpness** is how narrow it is.
 
 ```python
 # Compare naive constant PI vs conformal PI on test set
@@ -243,11 +378,28 @@ print(f"Conformal | coverage={conf_cov:.1%} | width={2 * conf_half:.2f}")
 ```
 
 ```output
-Naive  | coverage=75.0% | width=6.84
-Conformal | coverage=81.2% | width=8.24
+Naive  | coverage=62.5% | width=4.44
+Conformal | coverage=62.5% | width=4.64
 ```
 
+Both methods cover 62.5% of the test months. The naive half-width (80th percentile of the
+calibration errors) gives a width of 4.44; the conformal half-width gives 4.64. Conformal is
+slightly wider, as expected — its $(n+1)$ correction picks a slightly higher quantile — but on
+this test period both fall short.
+
 Conformal gives guaranteed (approximate) coverage at the cost of slightly wider intervals.
+
+The guarantee holds when calibration and test errors are exchangeable; the example above shows
+how a drifting series can break it, and why you always check coverage on held-out data.
+
+## Recap in plain words
+
+- A confidence interval is about the average; a prediction interval is about the next actual value and is always wider.
+- ARIMA intervals widen with the horizon because each step adds an unknown shock.
+- Held-out errors give a model-free margin, but only for the horizon they were measured at.
+- Quantile regression with the pinball loss predicts interval edges directly.
+- Conformal prediction picks a margin from calibration errors and guarantees coverage when data is exchangeable — approximately, at best, for time series.
+- Check coverage and reliability on held-out data, then choose the sharpest interval that still keeps its promise.
 
 ## Try it Yourself
 
@@ -262,8 +414,8 @@ trend = np.linspace(0, 20, T)
 seasonal = 5 * np.sin(2 * np.pi * np.arange(T) / 12)
 noise = rng.normal(0, 2, T)
 y = trend + seasonal + noise
-idx = pd.date_range("2010-01", periods=T, freq="M")
-series = pd.Series(y, index=idx)
+idx = pd.date_range("2010-01", periods=T, freq="ME")
+series = pd.Series(y, index=idx).diff().dropna()   # model the monthly change
 
 def make_lags(s, nlags=12):
     df = pd.DataFrame({"y": s})
@@ -279,8 +431,8 @@ split = int(len(X) * 0.8)
 Xtr, Xte = X[:split], X[split:]
 ytr, yte = y_arr[:split], y_arr[split:]
 
-lo = GradientBoostingRegressor(loss="quantile", alpha=0.10, n_estimators=300, random_state=0)
-hi = GradientBoostingRegressor(loss="quantile", alpha=0.90, n_estimators=300, random_state=0)
+lo = GradientBoostingRegressor(loss="quantile", alpha=0.10, n_estimators=300, max_depth=1, random_state=0)
+hi = GradientBoostingRegressor(loss="quantile", alpha=0.90, n_estimators=300, max_depth=1, random_state=0)
 lo.fit(Xtr, ytr); hi.fit(Xtr, ytr)
 
 cov = np.mean((yte >= lo.predict(Xte)) & (yte <= hi.predict(Xte)))
@@ -289,16 +441,29 @@ print(f"Coverage: {cov:.1%}  |  Mean width: {wid:.2f}")
 ```
 
 ```output
-Coverage: 81.3%  |  Mean width: 6.14
+Coverage: 71.4%  |  Mean width: 6.23
 ```
 
+This series has a trend from 0 to 20, so the test period (the last 20%) sits above most of the
+training data. Trees cannot predict above what they have seen (ch. 8), so the code models the
+*monthly change* instead — the `.diff().dropna()` line. An interval for the change plus the
+known last value gives an interval for the level. The result: 71.4% coverage with a mean width
+of 6.23. Run on the raw levels instead, the same code covers only about 39% (and only 3.6%
+with the default depth-3 trees): much of the test period lies above the trees' reach.
+
 Try changing `alpha` values to 0.05/0.95 for a 90% interval and see how coverage and width change.
+
+Then remove `.diff().dropna()` and watch coverage collapse — a vivid demonstration of why
+trend handling comes before interval building.
 
 ## Exercise
 
 You have a monthly electricity demand series with 200 observations. You fit a gradient boosting model (lag features) on the first 150 points, use points 151–175 as a calibration set, and evaluate on points 176–200.
 
 Describe the full conformal prediction procedure: how do you compute $q^*$ from the calibration residuals, how do you construct the test-set intervals, and what coverage guarantee does the procedure provide?
+
+> **Hint:** the calibration set has $n = 25$ points. Plug $n$ and $\alpha = 0.20$ into
+> $\lceil(1-\alpha)(n+1)\rceil/n$ and think about which sorted residual that level points to.
 
 <details>
 <summary>Solution</summary>
@@ -327,12 +492,19 @@ print(f"Theoretical coverage guarantee: >= {(1-alpha):.0%}")
 ```
 
 ```output
-Quantile level used: 1.0400
-Quantile level used: 1.0400
+Quantile level used: 0.8400
 Interval: [forecast - q*, forecast + q*]
 Theoretical coverage guarantee: >= 80%
 ```
 
-The key insight: $\lceil(1-\alpha)(n+1)\rceil / n$ slightly exceeds $1-\alpha$, which is what gives the guarantee. When the level exceeds 1.0 (as with $n=25, \alpha=0.20$), you use the maximum residual — a conservative fallback that still satisfies coverage.
+The key insight: $\lceil(1-\alpha)(n+1)\rceil / n$ slightly exceeds $1-\alpha$, which is what gives the guarantee.
 
+Here $(1 - 0.2) \times 26 = 20.8$, rounded up to 21, so the level is $21/25 = 0.84$: $q^*$ is
+the 21st smallest of the 25 residuals. So with $n=25, \alpha=0.20$ the level stays below 1.0.
+The level only exceeds 1.0 when the calibration set is
+tiny — for $\alpha = 0.20$, when $n < 4$ — and then you use the maximum residual (or an infinite
+interval) as a conservative fallback. The guarantee is coverage $\ge 80\%$ on average over test
+points, and it holds only if calibration and test errors are exchangeable; for demand data
+with trends or regime changes, check the realised coverage on points 176–200 and recalibrate
+on recent errors if it drifts.
 </details>
