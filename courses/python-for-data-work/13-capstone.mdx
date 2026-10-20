@@ -7,16 +7,30 @@ order: 13
 
 ## The project
 
-Build a **columnar analytical engine from scratch using only NumPy**. It must handle
-multi-million-row data under a fixed time and memory budget. The goal is to prove that you
-understand what pandas and polars are doing internally — not just how to call them.
+You are going to build a tiny pandas of your own. It will answer questions like "total
+sales per city, for orders over 100, with each city's region attached" — on millions of
+rows, fast — using nothing but NumPy arrays. If you can build it, you understand what pandas
+and polars are really doing.
+
+Build a **columnar analytical engine from scratch using only NumPy**. **Columnar** means
+each column is stored as its own NumPy array (the way pandas blocks and Arrow store data),
+rather than storing rows. It must handle multi-million-row data under a fixed time and
+memory budget. The goal is to prove that you understand what pandas and polars are doing
+internally — not just how to call them.
 
 You will implement three operations that together cover the core of any groupby-based
 analytical query: a **hash groupby-aggregate**, a **hash join**, and a **vectorized filter**.
 Then you will run your engine against a messy real-world-style CSV and verify correctness
 against a pandas reference.
 
+> **Picture it:** pandas is a car you've learned to drive. This capstone is building a
+> go-kart engine from parts. It won't have every feature, but afterwards you'll know what
+> every noise under the hood means.
+
 ## Hard constraints (no vibe coding)
+
+"Vibe coding" means letting a tool write code you don't understand. The rules below make
+sure every line of the engine is something you can explain.
 
 - **No AI writes your logic or your design.** Use only the docs and these chapters.
 - **No `pandas.groupby`, `pandas.merge`, `DataFrame.join`, or `DataFrame.merge`** for the
@@ -28,7 +42,13 @@ against a pandas reference.
 
 ## What it must contain (and the chapter each tests)
 
+Four pieces, built in order. Each one reuses an idea from a specific chapter.
+
 ### 1. Vectorized filter (ch. 1–3)
+
+A filter answers "which rows pass this test?" with one True/False per row — the boolean
+mask from ch. 3 — computed for the whole column at once.
+
 A function `filter_rows(table, col_idx, condition)` that returns a boolean mask over a
 NumPy 2-D array using only ufuncs and boolean indexing. No Python loop per row.
 
@@ -36,6 +56,11 @@ Conditions to support: `>`, `<`, `==`, `!=`, `between(lo, hi)`. They must compos
 `&` and `|` (ch. 3).
 
 ### 2. Hash groupby-aggregate (ch. 1–3)
+
+A groupby turns each distinct key ("Dhaka", "Sylhet", …) into a small integer, then adds up
+the values that share an integer. Once keys are integers, NumPy can do the adding in one
+compiled pass.
+
 A function `groupby_agg(data, key_col, val_col, aggfunc)` that:
 1. Encodes the group key column into integer codes using `np.unique(..., return_inverse=True)`.
 2. Sorts by code using `np.argsort` (for cache-friendly access).
@@ -43,9 +68,19 @@ A function `groupby_agg(data, key_col, val_col, aggfunc)` that:
    NumPy: `np.add.reduceat` or `np.bincount` + fancy indexing are the right tools.
 4. Returns a structured result: `(unique_keys, agg_values)`.
 
+> **In plain words:** `np.unique(keys, return_inverse=True)` gives you the list of distinct
+> keys *and*, for every row, the position of its key in that list (its code).
+> `np.bincount(codes, weights=values)` then adds each row's value into the bucket numbered by
+> its code. `np.add.reduceat` does the same on sorted data by summing each run of equal codes.
+
 Benchmark: must be within 5× of `pandas.groupby.sum()` on 10 million rows.
 
 ### 3. Hash join (ch. 1–3, ch. 7)
+
+A join looks up each left-side row's key in the right-side table and returns *where* the
+match lives. Once you have the matching row numbers, fancy indexing (ch. 3) assembles the
+joined table in one step.
+
 A function `hash_join(left, right, left_key_col, right_key_col)` that:
 1. Builds a Python dict (or uses `np.searchsorted` on sorted keys) to map right-side keys
    to their row indices.
@@ -55,18 +90,34 @@ A function `hash_join(left, right, left_key_col, right_key_col)` that:
 Implement at least an **inner join**. A left join (NaN fill for non-matches) for extra
 credit.
 
-### 4. End-to-end pipeline (all chapters)
-Wire the three operations into a query:
+> **In plain words:** `np.searchsorted(sorted_right_keys, left_keys)` tells you, for every
+> left key, the position where it *would* sit in the sorted right keys. If the key at that
+> position is equal, you found a match; if not, there is none (the inner join drops the row,
+> the left join fills NaN). Remember the duplicate-key row explosion from ch. 7.
 
-```
-filter → groupby-aggregate → join with a lookup table → present result
-```
+### 4. End-to-end pipeline (all chapters)
+
+Wire the three operations into a query — filter → groupby-aggregate → join with a lookup
+table → present result:
+
+1. **Filter** the rows you care about (piece 1).
+2. **Group and aggregate** what's left (piece 2).
+3. **Join** the aggregated keys to a lookup table, such as city → region (piece 3).
+4. **Present** the result as a small, sorted table.
 
 Run it on a CSV with at least 5 million rows, 5 columns, and at least one messy column
 (mixed types, some nulls, encoding issues). Fix the mess in NumPy before the engine sees
-clean data. Time the full pipeline and report MB/s throughput.
+clean data. Time the full pipeline and report MB/s throughput (megabytes of input processed
+per second of wall time).
+
+> **Watch out:** messy columns are where the time goes. Decide early how you represent a
+> missing value in each column (NaN for floats, a sentinel such as `-1` for integer codes),
+> and convert text keys to integer codes once, up front — never inside the hot loop.
 
 ## Acceptance criteria
+
+These are the tests that decide "done". Each one is measurable — run it and record the
+number.
 
 - **Correctness:** your engine's output matches `pandas.groupby.sum()` and `pandas.merge()`
   to within float32 tolerance on the same data.
@@ -75,7 +126,9 @@ clean data. Time the full pipeline and report MB/s throughput.
 - **No leakage:** the engine uses zero pandas/polars for the core — confirmed by removing the
   imports and verifying it still runs.
 - **Explanation:** you can explain why `np.add.reduceat` is faster than a Python loop over
-  groups, and why the sort step improves cache performance.
+  groups, and why the sort step improves cache performance (ch. 1: after sorting, each
+  group's values sit next to each other in memory, so the CPU reads them in a few cache
+  lines instead of jumping around).
 
 ## Skills checklist (tick before you claim done)
 

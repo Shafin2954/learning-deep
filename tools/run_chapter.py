@@ -52,6 +52,21 @@ def render(outputs: list[dict]) -> tuple[str, list[str]]:
     return "".join(parts), kinds
 
 
+def is_rich(expected: str) -> bool:
+    """Output blocks that stand for an image/HTML result rather than literal stdout."""
+    s = expected.strip()
+    return "data:image" in s or "<table" in s or s.startswith(("[Figure", "[Interactive"))
+
+
+def rich_ok(expected: str, kinds: list[str]) -> bool:
+    s = expected.strip()
+    if "<table" in s:
+        return "html" in kinds
+    if s.startswith("[Interactive"):
+        return "html" in kinds or "image" in kinds
+    return "image" in kinds
+
+
 def norm(s: str) -> str:
     lines = [ln.rstrip() for ln in s.strip("\n").split("\n")]
     return "\n".join(lines).strip("\n")
@@ -76,9 +91,8 @@ def run_file(pool: KernelPool, path: Path, timeout: float):
             nxt = order[pos + 1] if pos + 1 < len(order) else None
             if nxt and fence_lang(fences[nxt - 1]) == "output":
                 expected = "\n".join(fences[nxt - 1].split("\n")[1:-1])
-                exp_rich = "data:image" in expected or "<table" in expected
-                if exp_rich:
-                    ok = ("image" in kinds and "data:image" in expected) or ("html" in kinds and "<table" in expected)
+                if is_rich(expected):
+                    ok = rich_ok(expected, kinds)
                 else:
                     ok = norm(expected) == norm(actual)
                 status = "ok" if ok else ("mismatch" if res["status"] == "ok" else res["status"])
@@ -101,7 +115,7 @@ def apply_fixes(path: Path, results, which: set[int] | None):
             continue
         if which is not None and out_idx not in which:
             continue
-        if "data:image" in expected or "<table" in expected:
+        if is_rich(expected):
             continue
         old = fences[out_idx - 1]
         new = "```output\n" + norm(actual) + "\n```"

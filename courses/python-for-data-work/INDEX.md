@@ -6,6 +6,13 @@ performance instincts, and the tools you reach for every day. No beginner filler
 
 Pitched at: strong Python, wants to stop writing loops, wants to know *why* NumPy is fast.
 
+**In plain words:** data work in Python means telling compiled code to process whole
+columns at once instead of looping over values one by one. This course teaches the mental
+model behind that — how numbers sit in memory (ch. 1), how operations spread over whole
+arrays (ch. 2–3), how pandas attaches labels to those arrays (ch. 4–9), and how to make it
+all fast (ch. 10–11) and visible (ch. 12). Every chapter starts each idea in everyday words,
+then gives the precise version, a real example with its real output, and a recap.
+
 ---
 
 ## Chapters

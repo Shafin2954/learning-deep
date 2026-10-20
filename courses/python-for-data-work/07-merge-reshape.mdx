@@ -7,6 +7,10 @@ order: 7
 
 ## Combining DataFrames — four operations
 
+Data rarely arrives in one table. You either glue tables together (stack them, or match
+them up by a shared ID), or you reshape one table between "wide" and "long". Four
+operations cover almost every case.
+
 | Operation | pandas function | SQL analogy |
 |-----------|----------------|-------------|
 | Stack rows | `pd.concat(axis=0)` | `UNION ALL` |
@@ -14,7 +18,14 @@ order: 7
 | Key-based join | `pd.merge(on=key)` | `JOIN` |
 | Reshape long↔wide | `pivot_table` / `melt` | `PIVOT` / `UNPIVOT` |
 
+> **Picture it:** `concat` is stacking sheets of paper (on top of each other, or side by
+> side). `merge` is matching two guest lists by name. `melt` and `pivot` are rewriting the
+> same sheet in a different layout.
+
 ## `pd.concat` — stacking DataFrames
+
+`concat` puts tables next to each other without looking at what's inside — it lines them
+up by column names (when stacking rows) or by row labels (when stacking columns).
 
 ```python
 import pandas as pd
@@ -34,6 +45,9 @@ print(pd.concat([df1, df2], ignore_index=True))
 3  6  8
 ```
 
+The rows of `df2` were placed under `df1`'s rows, and `ignore_index=True` renumbered them
+0–3 instead of keeping the duplicate labels 0, 1, 0, 1.
+
 ```python
 import pandas as pd
 
@@ -50,10 +64,21 @@ print(pd.concat([df1, df2], axis=1))
 1  2  4
 ```
 
+With `axis=1`, the tables sit side by side, matched on their row labels (both have 0 and
+1, so they line up neatly).
+
 Use `ignore_index=True` when row indices are meaningless after stacking.
 Without it, the original indices are preserved (including duplicates from multiple files).
 
+> **Watch out:** if the column names differ even slightly (`'Amount'` vs `'amount'`),
+> `concat` along rows keeps both columns and fills the gaps with `NaN` instead of raising
+> an error. Check `df.columns` after every concat of files from different sources.
+
 ## `pd.merge` — SQL-style joins
+
+A **join** (or **merge**) matches rows from two tables that share a **key** — an ID column
+like `customer_id` — and combines their columns into one row. The `how` argument decides
+what to do with rows that have no partner.
 
 The default is an inner join on the common column name. Always specify `how` explicitly.
 
@@ -80,9 +105,14 @@ print("inner:\n", inner)
 inner:
     order_id  customer_id  amount   name        city
 0         1          101     500  alice       Dhaka
-1         3          101     750  alice       Dhaka
-2         2          102     300    bob  Chittagong
+1         2          102     300    bob  Chittagong
+2         3          101     750  alice       Dhaka
 ```
+
+An **inner join** keeps only rows whose key exists in *both* tables. Order 4 vanished
+(customer 103 isn't in `customers`), and so did carol (customer 104 placed no orders).
+Alice appears twice because customer 101 placed two orders — orders 1 and 3 — and each
+order row picks up its own copy of her name and city.
 
 ```python
 import pandas as pd
@@ -112,15 +142,32 @@ left:
 3         4          103     200    NaN         NaN
 ```
 
+A **left join** keeps every row of the left table (`orders`) and fills in what it can from
+the right. Order 4 survives, but there is no customer 103 to copy from, so `name` and `city`
+are `NaN`.
+
 Order 4 has `customer_id=103` which doesn't appear in the customers table → NaN.
-Order 3 appears twice because customer 101 placed two orders, and the join expands it.
+A key that appears several times on one side (customer 101, with two orders) is matched
+once per occurrence, so the join can produce *more* rows than either input when both sides
+repeat a key.
+
+> **Picture it:** an inner join is the guests on *both* lists. A left join is everyone on
+> the left list, with blanks where the right list has nothing about them. A `how='outer'`
+> join is everyone on either list.
 
 ### Left vs inner: when it matters
 
 If your downstream analysis drops NaN rows, a left join looks like an inner join.
 Make the join type explicit based on your *intent*, not what "happens to work."
 
+> **Watch out:** duplicate keys on *both* sides multiply rows: 3 rows for a key on the left
+> and 4 on the right become 12. A silent row explosion after a merge is almost always this.
+> `pd.merge(..., validate='many_to_one')` makes pandas raise an error instead.
+
 ## `melt` — wide to long
+
+**Wide** format puts one measurement type per column (`jan`, `feb`, `mar`). **Long** format
+uses one row per single observation: (product, month, sales). Same data, different shape.
 
 A "wide" table has one column per time period or category. Analysis prefers "long" (tidy)
 format: one observation per row.
@@ -156,6 +203,14 @@ long:
 5    beta   mar    210
 ```
 
+Two rows × three month columns became six rows: each (product, month) pair now has its own
+row. `id_vars='product'` said "keep this as an identifier"; every other column was melted
+into `month` (its old name) and `sales` (its value).
+
+> **Watch out:** the months sort as `feb, jan, mar` because `sort_values` on text is
+> alphabetical. For calendar order, make the column an ordered category:
+> `pd.Categorical(long['month'], ['jan', 'feb', 'mar'], ordered=True)`.
+
 ## `pivot_table` — long to wide with aggregation
 
 `pivot_table` is the inverse: it takes a long table and spreads values into columns.
@@ -178,11 +233,15 @@ print(wide)
 ```
 
 ```output
-month   feb  jan  mar
+month    feb  jan  mar
 product
-alpha   110  100  120
-beta    190  200  210
+alpha    110  100  120
+beta     190  200  210
 ```
+
+Each product became a row, each month became a column, and each cell holds the `sales`
+value for that (product, month). The word `month` above the columns is the *name* of the
+column index, and `product` is the name of the row index.
 
 ```python
 import pandas as pd
@@ -206,7 +265,16 @@ print(wide)
 1    beta  190  200  210
 ```
 
+Clearing `wide.columns.name` removed the floating `month` label, and `reset_index()` turned
+`product` back into an ordinary column — a plain flat table again.
+
+> **In plain words:** `melt` takes column names and turns them into values in a column;
+> `pivot_table` takes values in a column and turns them into column names.
+
 ## `stack` and `unstack` — index-level reshaping
+
+`stack` folds columns down into the row labels, making the table taller and thinner.
+`unstack` unfolds a row-label level back out into columns.
 
 `stack` moves a column level into the row index. `unstack` does the reverse. Use these
 when you already have a MultiIndex and want to reshape it — they are faster than
@@ -231,6 +299,18 @@ beta   jan    200
        feb    190
 dtype: int64
 ```
+
+The 2×2 table became a 4-element Series whose label has two parts: (product, month). Each
+original cell is now one row. `stacked.unstack()` would give you the 2×2 table back.
+
+## Recap in plain words
+
+- `concat` stacks tables by position/labels; use `ignore_index=True` to renumber rows.
+- `merge` matches rows by a key; `how` decides what happens to rows without a partner
+  (inner = both, left = all left rows, outer = everyone).
+- A repeated key is matched once per occurrence — watch for row explosions.
+- `melt` goes wide → long; `pivot_table` goes long → wide and aggregates duplicates.
+- `stack`/`unstack` move levels between the columns and a MultiIndex.
 
 ## Try it Yourself
 
@@ -268,19 +348,24 @@ print(merged.head(4))
 
 ```output
 Pivot:
- month   feb    jan    mar
+ month    feb    jan    mar
 store
-S1      211.0  241.0  339.0
-S2      354.0  302.0  283.0
-S3      247.0  176.0  371.0
+S1     364.0  369.0  292.0
+S2     132.0  167.0  287.0
+S3     159.0  374.0  443.0
 
 Melted shape: (9, 3)
   store month  avg_rev region
-0    S1   feb    211.0  north
-1    S2   feb    354.0  south
-2    S3   feb    247.0   east
-3    S1   jan    241.0  north
+0    S1   feb    364.0  north
+1    S2   feb    132.0  south
+2    S3   feb    159.0   east
+3    S1   jan    369.0  north
 ```
+
+Read the pivot as a grid of averages: each cell is the mean revenue for that (store,
+month), with `fill_value=0` standing in if a combination never occurred. Melting it back gave
+3 stores × 3 months = 9 rows, and the left merge attached each store's region. Try
+`aggfunc='count'` to see how many sales went into each average.
 
 ## Exercise
 
@@ -290,6 +375,9 @@ Start with a wide DataFrame of student scores (rows = students, columns = subjec
 2. Compute the mean and max score per subject using groupby on the long frame.
 3. Pivot back to wide format (one row per student, one col per subject) — verify you recover
    the original shape.
+
+> **Hint:** `melt(id_vars='student', ...)` keeps the student name on every row. To pivot
+> back, the student is the row index and the subject is the column.
 
 <details>
 <summary>Solution</summary>
@@ -317,4 +405,8 @@ back.columns.name = None
 back = back.reset_index()
 print("\nRecovered shape:", back.shape, "  original:", wide.shape)
 ```
+
+The round trip works because each (student, subject) pair occurs exactly once, so
+`pivot_table`'s default mean just returns the single value. The column order may differ
+(subjects come back alphabetically), but the shape matches.
 </details>

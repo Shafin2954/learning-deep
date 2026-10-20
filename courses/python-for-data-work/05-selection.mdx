@@ -7,6 +7,10 @@ order: 5
 
 ## The selection landscape
 
+**Selection** is how you point at the rows and columns you want. pandas lets you point by
+name, by position, or by a rule ("rows where sales > 100"), and each way has its own
+accessor.
+
 pandas has more selection syntax than any other library in the ecosystem. Knowing exactly
 which accessor to reach for — and why — prevents a whole class of subtle bugs.
 
@@ -22,7 +26,13 @@ which accessor to reach for — and why — prevents a whole class of subtle bug
 The root confusion: `df[...]` means different things depending on what you pass. Use `.loc`
 and `.iloc` for explicit, unambiguous selection.
 
+> **Picture it:** `.loc` is asking for someone by name ("where's Carol?"). `.iloc` is asking
+> by seat number ("who's in seat 3?"). If people change seats, names still work but seat
+> numbers point at someone else.
+
 ## `loc` — label-based
+
+`.loc` finds things by their labels — the names in the index and the column header.
 
 `.loc[row_selector, col_selector]`. Both selectors use labels. Slices are **inclusive** at
 both ends (unlike Python slices).
@@ -56,7 +66,18 @@ alice     88     B
 dave      60     D
 ```
 
+Three shapes of answer from one accessor. `df.loc['alice']` asked for one row and got a
+Series whose labels are the column names (its dtype is `object` because the row mixes a
+number and a letter). `'bob':'carol'` included *both* ends — Carol is in the result.
+A list of labels returned a smaller DataFrame.
+
+> **In plain words:** with labels there is no obvious "one past the end", so `.loc` slices
+> stop *at* the last label you name, not before it.
+
 ## `iloc` — position-based
+
+`.iloc` ignores labels completely and counts rows and columns from 0, exactly like a
+Python list.
 
 `.iloc[row_int, col_int]`. Uses integer positions. Slices are **exclusive** at the end
 (standard Python). Use this when you care about order, not labels — e.g. "the first 10 rows".
@@ -82,12 +103,16 @@ print(df.iloc[-1, -1])                # last row, last col
 1  20  2.2  x
 2  30  3.3  y
 
-      b  c
-0   1.1  w
-3   4.4  z
+     b  c
+0  1.1  w
+3  4.4  z
 
 z
 ```
+
+`1:3` gave positions 1 and 2 but not 3 — the usual Python rule. `[[0, 3], 1:]` picked rows 0
+and 3 and every column from position 1 on (`b` and `c`). Negative positions count from the
+end, so `[-1, -1]` is the bottom-right cell, `'z'`.
 
 ### Mixing loc and iloc — don't
 
@@ -95,7 +120,15 @@ Never mix `.loc` and `.iloc` in one call. `df.loc[0, 'a']` is label-based (row l
 column label `'a'`). If the index happens to be a RangeIndex, labels and positions coincide,
 which hides bugs until you reset the index.
 
+> **Watch out:** after sorting or filtering, row labels stop matching positions. On a
+> filtered frame whose labels are `[2, 5, 9]`, `df.loc[0]` raises a `KeyError` while
+> `df.iloc[0]` returns the row labelled 2. Code that "worked" on the unfiltered data breaks
+> silently or loudly.
+
 ## Boolean selection — filter rows with a mask
+
+A boolean mask is a column of True/False answers to a question, one per row. Passing it in
+brackets keeps the rows that answered True.
 
 The most common selection in data work: keep rows satisfying a condition.
 
@@ -119,6 +152,10 @@ print(df[df['sales'] > 100])
 3       Dhaka    200  2023
 ```
 
+`df['sales'] > 100` produced one True/False per row; only rows 0, 2, and 3 (sales 120,
+150, 200) said True. Note the row labels kept their original values — the surviving rows
+are not renumbered (and, as with NumPy masks, the result is a new copy).
+
 ```python
 import pandas as pd
 
@@ -137,6 +174,10 @@ print(high_dhaka_2023)
     city  sales  year
 3  Dhaka    200  2023
 ```
+
+Only one row passes all three tests at once — Dhaka, 2023, and more than 100 sales. Each
+condition must be in its own parentheses because `&` binds tighter than `==` and `>` (the
+same trap as in ch. 3).
 
 Use `.isin()` to replace a chain of `|` conditions:
 
@@ -160,7 +201,14 @@ Chittagong    1
 Name: count, dtype: int64
 ```
 
+`.isin([...])` asks "is this value one of these?" for every row — the same as writing
+`(df['city'] == 'Dhaka') | (df['city'] == 'Chittagong')`, but readable. `value_counts()`
+then confirms 3 Dhaka rows and 1 Chittagong row survived; Sylhet was dropped.
+
 ## `.query()` — readable string expressions
+
+`.query` lets you write the filter as a sentence-like string, using column names directly
+as if they were variables.
 
 `.query(expr)` evaluates a string expression against column names. Good for long chains of
 conditions; bad for computed values or column names with special characters.
@@ -191,13 +239,24 @@ print(result2)
 3  Dhaka    200  2023
 ```
 
+Both calls returned the same single row as the boolean version above. Inside the string you
+write `and`/`or` instead of `&`/`|`, and `@threshold` reaches out to a normal Python
+variable.
+
 `.query()` is cleaner to read but slower for small DataFrames (it parses the string). For
 DataFrames with millions of rows it can be faster because it uses numexpr internally.
+(**numexpr** is a small compiler for array expressions; pandas uses it when it's installed.)
 
 ## Assignment to selections — `loc` only
 
+To *change* values in place, select and assign in one `.loc` step. Splitting the selection
+into two bracket steps can end up writing into a temporary copy that is thrown away.
+
 Always use `.loc` for assignment. Never use chained indexing (`df[...][...] = value`) — it
 may or may not modify the original DataFrame depending on whether the intermediate is a copy.
+In pandas 3 (what this kernel runs) **Copy-on-Write** is always on, which makes the answer
+definite: chained assignment *never* modifies `df`, and pandas warns with a
+`ChainedAssignmentError`.
 
 ```python
 import pandas as pd
@@ -221,6 +280,23 @@ print(df)
 1       Dhaka      0
 2  Chittagong    150
 ```
+
+Only Dhaka's 90 was below 100, so only that cell became 0. `.loc[mask, 'sales']` reads as
+"in the rows where the mask is True, the `sales` column" — one selection, one write, straight
+into `df`.
+
+> **Picture it:** chained indexing is photocopying a page, correcting the photocopy, and
+> throwing it in the bin. The original page never changes. `.loc` edits the original page.
+
+## Recap in plain words
+
+- `.loc` selects by label and its slices include both ends; `.iloc` selects by position and
+  its slices exclude the end.
+- Don't mix them; labels and positions only agree on a fresh RangeIndex.
+- Boolean masks keep the True rows; combine conditions with `&`, `|`, `~` in parentheses.
+- `.isin` replaces long chains of `==` … `|`; `.query` gives readable string filters and can
+  use `@variables`.
+- Assign with `df.loc[mask, col] = value`, never with chained brackets.
 
 ## Try it Yourself
 
@@ -249,15 +325,21 @@ print(df.iloc[-5:][['value']])
 ```
 
 ```output
-A-and-flag fraction: 0.175
+A-and-flag fraction: 0.140
 max after cap: 70.0
-   value
-195   49.4
-196   42.2
-197   50.7
-198   63.1
-199   44.8
+     value
+195   64.6
+196   49.4
+197   49.1
+198   55.7
+199   51.8
 ```
+
+Three different jobs, three accessors. The fraction comes from taking the mean of a
+True/False mask (True = 1). The cap uses `.loc` assignment, and the max confirms nothing
+above 70 is left. `iloc[-5:]` grabs the last five rows by *position*; their labels (195–199)
+happen to match because the index was never reordered. Try sorting `df` by `value` first and
+compare `df.iloc[-5:]` with `df.loc[195:199]`.
 
 ## Exercise
 
@@ -267,6 +349,9 @@ products and regions). Then answer three questions using `.loc`, boolean masks, 
 1. Which rows have revenue per unit above 50?
 2. Which products appear in all regions?
 3. Set revenues below 100 to 0 using `.loc` assignment.
+
+> **Hint:** for question 2, collect the set of regions each product appears in, and compare
+> it with the set of all regions.
 
 <details>
 <summary>Solution</summary>
@@ -296,5 +381,6 @@ print(df)
 ```
 
 Always use `.loc` for assignment — chained indexing (`df[mask]['col'] = v`) silently
-fails with newer pandas, raising `SettingWithCopyWarning` or doing nothing.
+fails with newer pandas, raising `SettingWithCopyWarning` or doing nothing. (In pandas 3
+the warning is called `ChainedAssignmentError`, and the write never lands.)
 </details>

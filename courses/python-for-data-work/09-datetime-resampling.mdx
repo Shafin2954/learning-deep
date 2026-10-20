@@ -7,6 +7,10 @@ order: 9
 
 ## Datetime in pandas: three objects
 
+Time data has three flavours: a moment ("15 Jan 2023, 9 am"), a list of moments (one per
+row), and a length of time ("3 days"). pandas has one object for each, and they work
+together the way you'd expect: moment minus moment = length of time.
+
 | Object | What it is | Created from |
 |--------|------------|-------------|
 | `pd.Timestamp` | a single point in time | string, Python datetime |
@@ -16,7 +20,14 @@ order: 9
 Arithmetic between Timestamps gives Timedeltas. Indexing a Series on a DatetimeIndex
 gives you partial-string selection ("2023" selects all of 2023).
 
+> **Picture it:** a Timestamp is a pin on a timeline, a Timedelta is a ruler length, and a
+> DatetimeIndex is a row of pins. Two pins give you a ruler length; a pin plus a ruler
+> length gives you a new pin.
+
 ## Parsing datetimes
+
+**Parsing** means reading text like `'2023-01-15'` and turning it into a real date the
+computer can do arithmetic with. Until you parse, a date is just a string of characters.
 
 ```python
 import pandas as pd
@@ -29,9 +40,14 @@ print("dtype:", idx.dtype)
 ```
 
 ```output
-DatetimeIndex(['2023-01-15', '2023-02-28', '2023-03-31'], dtype='datetime64[ns]', freq=None)
-dtype: datetime64[ns]
+DatetimeIndex(['2023-01-15', '2023-02-28', '2023-03-31'], dtype='datetime64[us]', freq=None)
+dtype: datetime64[us]
 ```
+
+The strings became a `DatetimeIndex` with dtype `datetime64[us]`: every date is stored as one
+64-bit integer counting **microseconds** (`us`) since 1 January 1970. pandas 3 (this kernel)
+defaults to microsecond resolution; older versions printed `datetime64[ns]` (nanoseconds).
+Storing dates as integers is what makes date maths and sorting fast.
 
 ```python
 import pandas as pd
@@ -46,13 +62,20 @@ print(parsed)
 0   2023-01-15
 1   2023-02-28
 2   2023-03-31
-dtype: datetime64[ns]
+dtype: datetime64[us]
 ```
 
 Always pass `format=` when the format is known — auto-detection is slow on large Series and
 can silently mis-parse ambiguous dates like `01/02/03`.
 
+> **Watch out:** `01/02/03` is 1 February 2003 in Europe, January 2 2003 in the US, and
+> 3 February 2001 in ISO-ish year-first order. Only `format=` (here `'%d/%m/%Y'`: day,
+> month, 4-digit year) removes the guesswork.
+
 ## The `.dt` accessor
+
+Once a column holds real dates, `.dt` lets you pull out any part of each date — the year,
+the weekday, the quarter — for the whole column at once.
 
 Once a column is `datetime64`, the `.dt` accessor exposes all components without a loop:
 
@@ -76,12 +99,19 @@ print(df)
         date  value  year  month  day_of_week  quarter  is_weekend
 0 2023-01-15    100  2023      1            6        1        True
 1 2023-06-28    200  2023      6            2        2       False
-2 2023-12-31    300  2023     12            0        4       False
+2 2023-12-31    300  2023     12            6        4        True
 ```
+
+15 January and 31 December 2023 were Sundays, so `day_of_week` is 6 and `is_weekend` is
+True for them; 28 June was a Wednesday (2). Each new column is a ready-made feature for a
+model: models can't read dates, but they can read "month = 6" and "weekend = True".
 
 These are vectorized operations — no `.apply()` needed.
 
 ## `date_range` — generating regular time series
+
+`date_range` makes an evenly spaced list of dates for you — every day, every hour, the start
+of every month — so you never build calendars by hand.
 
 ```python
 import pandas as pd
@@ -98,11 +128,18 @@ print(idx2)
 ```output
 DatetimeIndex(['2023-01-01', '2023-01-02', '2023-01-03', '2023-01-04',
                '2023-01-05', '2023-01-06', '2023-01-07'],
-              dtype='datetime64[ns]', freq='D')
-DatetimeIndex(['2023-01-01', '2023-02-01', '2023-03-01', '2023-04-01'], dtype='datetime64[ns]', freq='MS')
+              dtype='datetime64[us]', freq='D')
+DatetimeIndex(['2023-01-01', '2023-02-01', '2023-03-01', '2023-04-01'], dtype='datetime64[us]', freq='MS')
 ```
 
+The first index has 7 consecutive days (`freq='D'`); the second has 4 month starts
+(`freq='MS'`). The `freq` shown in the output is pandas remembering the spacing, which later
+operations (like resampling and shifting) can use.
+
 ## Resampling — aggregating by time bucket
+
+**Resampling** groups rows into time buckets (every week, every month) and summarizes each
+bucket — like groupby, but the groups are slices of the calendar.
 
 `resample` is `groupby` for time series. It takes a frequency string and aggregates values
 within each time bucket. The Series/DataFrame must have a `DatetimeIndex`.
@@ -121,12 +158,18 @@ print(weekly.head(4))
 ```
 
 ```output
-2023-01-02     97
-2023-01-09    620
-2023-01-16    671
-2023-01-23    728
-Freq: W-MON, Name: sales, dtype: int64
+2023-01-01    139
+2023-01-08    627
+2023-01-15    533
+2023-01-22    864
+Freq: W-SUN, Name: sales, dtype: int64
 ```
+
+Look at the `Freq` line: `'W'` is shorthand for `'W-SUN'` — weeks that **end on Sunday** —
+and each bucket is labelled by its last day. (The code comment's `W-MON` would be weeks
+ending on Monday; you'd write `resample('W-MON')` for that.) 1 January 2023 was a Sunday, so
+the first bucket contains only that one day, which is why its total (139) is so much smaller
+than the full 7-day weeks after it.
 
 ```python
 import pandas as pd
@@ -142,19 +185,32 @@ print(monthly)
 ```
 
 ```output
-2023-01-31    102.0
-2023-02-28    103.6
-2023-03-31     96.3
+2023-01-31     94.5
+2023-02-28    102.1
+2023-03-31     91.1
 Freq: ME, Name: sales, dtype: float64
 ```
+
+Three month-end labels, each the average daily sales for that month. The label is the last
+day of the bucket because `'ME'` means "month end".
 
 Common frequency strings: `'D'` (day), `'W'` (week), `'ME'` (month end), `'MS'` (month
 start), `'QE'` (quarter end), `'YE'` (year end), `'h'` (hour), `'min'` (minute).
 
+> **Watch out:** a partial first or last bucket (like the 1-day week above) looks like a
+> sudden drop when you plot sums. Compare means, or drop incomplete buckets, before you
+> conclude anything.
+
 ## Rolling windows
+
+A **rolling window** is a sliding frame of the last `n` values: at each row, look back `n`
+steps, compute something (a mean, a std), write it down, slide one step forward.
 
 `rolling(n)` computes a statistic over the last `n` periods at each point. It's not a
 resample (it doesn't change the index frequency) — every row gets a value.
+
+> **Picture it:** a 7-day moving average is a little window of 7 seats sliding along a
+> train. At every stop you average the 7 passengers currently in the window.
 
 ```python
 import pandas as pd
@@ -174,22 +230,34 @@ print(df)
 
 ```output
             sales  roll7  roll3_std
-2023-01-01     97    NaN        NaN
-2023-01-02     86    NaN        NaN
-2023-01-03    120    NaN        9.0  ← 3 values (window fills at position 3)
-2023-01-04    134    NaN       24.7
-2023-01-05    100    NaN       17.6
-2023-01-06    116    NaN       17.6
-2023-01-07     78   104.4      19.1  ← 7-day MA fills at position 7
-2023-01-08    143   111.0      34.1
-2023-01-09     63   107.7      41.0
-2023-01-10    109   106.1      40.3
+2023-01-01    139    NaN        NaN
+2023-01-02     78    NaN        NaN
+2023-01-03     76    NaN       35.8
+2023-01-04     96    NaN       11.0
+2023-01-05    139    NaN       32.2
+2023-01-06     62    NaN       38.6
+2023-01-07     74   94.9       41.4
+2023-01-08    102   89.6       20.5
+2023-01-09     74   89.0       16.2
+2023-01-10     90   91.0       14.0
 ```
+
+The table keeps all 10 days. `roll3_std` first appears on day 3, when three values exist —
+it is the standard deviation of 139, 78, and 76. `roll7` first appears on day 7, and on
+2023-01-07 it equals the mean of the first seven sales values.
 
 The first `n-1` values are NaN because the window isn't full yet. Use `min_periods=1` to
 start computing with partial windows instead.
 
+> **Watch out:** by default the window ends *at* the current row, so it includes today's
+> value. If you're building features to predict today, use `s.shift(1).rolling(7)` so the
+> feature only sees the past. Using the future by accident is called **leakage** (Data
+> Wrangling & EDA, ch. 12).
+
 ## Time-based indexing and slicing
+
+With a DatetimeIndex you can select by writing dates as plain strings — `'2023-02'` means
+"all of February 2023".
 
 With a DatetimeIndex, `.loc` accepts partial date strings for natural-language slicing:
 
@@ -211,9 +279,22 @@ print(f"Jan-10 to Feb-05: {len(span)} days")
 ```
 
 ```output
-February: 28 days, total=2901
+February: 28 days, total=2858
 Jan-10 to Feb-05: 27 days
 ```
+
+`'2023-02'` matched all 28 February days without you computing where February starts. The
+range `'2023-01-10':'2023-02-05'` gave 27 days: 22 in January (10th–31st) plus 5 in
+February. Like all label-based slicing, both ends are included.
+
+## Recap in plain words
+
+- Timestamp = a moment, DatetimeIndex = a column of moments, Timedelta = a duration.
+- Parse with `pd.to_datetime(..., format=...)` so ambiguous dates aren't guessed.
+- `.dt.year`, `.dt.dayofweek`, `.dt.quarter` … extract calendar features without loops.
+- `resample('W'/'ME'/…)` is groupby by calendar buckets; labels are the bucket edges.
+- `rolling(n)` slides a window and keeps every row; the first `n-1` are NaN.
+- Partial strings (`'2023-02'`) select whole periods, ends included.
 
 ## Try it Yourself
 
@@ -248,17 +329,22 @@ print("\nPeak hour:", avg_by_hour.idxmax(), "  avg demand:", avg_by_hour.max())
 
 ```output
 Daily peak (first 5):
-2023-03-01    279.9
-2023-03-02    280.2
-2023-03-03    280.1
-2023-03-04    280.3
-2023-03-05    280.1
+2023-03-01    289.8
+2023-03-02    298.4
+2023-03-03    286.3
+2023-03-04    284.1
+2023-03-05    285.8
 Freq: D, Name: demand_kw, dtype: float64
 
-Hourly smooth (2023-03-03 12:00): 199.74
+Hourly smooth (2023-03-03 noon): 203.16
 
-Peak hour: 18   avg demand: 269.8
+Peak hour: 6   avg demand: 278.5
 ```
+
+The fake demand follows a sine wave with one full cycle per day that starts at midnight, so
+it peaks a quarter of the way through each day — hour 6 — and the groupby-by-hour finds
+exactly that. The daily peaks sit around 285–300 kW: the 280 kW top of the wave plus noise.
+Try changing the phase (add a shift inside `np.sin`) and check that the peak hour moves.
 
 ## Exercise
 
@@ -268,6 +354,9 @@ Then compute:
 1. Monthly average temperature.
 2. A 30-day rolling max (to track warm spells).
 3. The day of the year with the highest temperature.
+
+> **Hint:** a sine wave with period 365 days, shifted so its peak falls in summer, gives a
+> believable yearly cycle; `idxmax()` returns the *date* of the maximum.
 
 <details>
 <summary>Solution</summary>
@@ -293,4 +382,8 @@ print("\nPeak rolling 30-day max:", roll30.max().round(1), "on", roll30.idxmax()
 # 3) Hottest single day
 print("Hottest day:", s.idxmax().date(), "  temp:", s.max())
 ```
+
+The shift of 80 days in $\sin\big(2\pi(\text{day} - 80)/365\big)$ puts the zero crossing
+near late March, so the peak lands a quarter-year later, in late June/July. `resample('ME')`,
+`rolling(30)`, and `idxmax()` each answer one question in one line.
 </details>

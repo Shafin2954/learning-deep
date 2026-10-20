@@ -7,16 +7,25 @@ order: 6
 
 ## The split-apply-combine pattern
 
+"What's the total sales per city?" is a groupby question. You sort the rows into piles (one
+pile per city), work out a number for each pile, and write the answers in a small table.
+pandas does all three moves in one call.
+
 Nearly every aggregation you do in data work follows the same three steps:
 
 1. **Split** the DataFrame into groups based on one or more columns.
 2. **Apply** a function to each group independently.
 3. **Combine** the results back into a single DataFrame or Series.
 
+> **Picture it:** you dump a jar of coins on the table, sort them into piles by type
+> (split), count each pile (apply), and write "pennies: 40, dimes: 12" on a card (combine).
+
 pandas `.groupby()` implements this pattern. It is not a loop — it dispatches to compiled
 aggregation functions that operate on each group's underlying NumPy arrays.
 
 ## Basic aggregation
+
+An **aggregation** reduces each group to a single number: a sum, a mean, a count.
 
 ```python
 import pandas as pd
@@ -39,6 +48,9 @@ B    350
 Name: sales, dtype: int64
 ```
 
+City A's rows are 100, 200, and 90, which sum to 390; city B's are 150, 80, and 120, which
+sum to 350. The group keys (`A`, `B`) became the index of the result.
+
 ```python
 import pandas as pd
 
@@ -59,17 +71,26 @@ print(result)
 ```
 
 ```output
-       total_sales  mean_sales  n
+      total_sales  mean_sales  n
 city
-A              390       130.0  3
-B              350       116.7  3
+A             390  130.000000  3
+B             350  116.666667  3
 ```
+
+`agg` computed three statistics per city in one pass and named each output column for you.
+Check row A: total 390, mean $390 / 3 = 130$, count 3.
 
 The named-aggregation syntax `agg(new_col=(col, func))` is the clearest way to rename
 columns during aggregation. Avoid the dict-of-lists form — it creates a MultiIndex that
 you immediately flatten.
 
+> **In plain words:** `total_sales=('sales', 'sum')` reads as "make a column called
+> `total_sales` by taking `sales` and summing it within each group".
+
 ## Multi-key groupby
+
+Grouping by two columns makes one pile per *combination* — city A with product x, city A
+with product y, and so on.
 
 ```python
 import pandas as pd
@@ -105,10 +126,18 @@ Name: sales, dtype: int64
 3    B       y     80
 ```
 
+The first print is a Series with a two-level **MultiIndex** (a row label made of two parts:
+`city` and `product`; ch. 8 covers it). The blank under `A` means "still A". After
+`reset_index()`, both levels became ordinary columns and the rows got plain numbers — a flat
+table you can merge, plot, or save without surprises.
+
 Always call `.reset_index()` after a groupby unless you explicitly need the MultiIndex.
 The MultiIndex looks impressive and causes bugs immediately.
 
 ## `transform` — broadcast group statistics back to original shape
+
+`transform` computes a group statistic but hands it back to *every row* of that group,
+so the answer lines up with the original table instead of shrinking it.
 
 `agg` collapses each group to one row. `transform` maps each group's result back to the
 **original shape**. Use it to add a group-level statistic as a new column:
@@ -127,19 +156,29 @@ print(df)
 ```
 
 ```output
-  city  sales  city_mean  sales_vs_mean
-0    A    100      150.0          -50.0
-1    A    200      150.0           50.0
-2    B    150      116.7           33.3
-3    B     80      116.7          -36.7
-4    B    120      116.7            3.3
+  city  sales   city_mean  sales_vs_mean
+0    A    100  150.000000     -50.000000
+1    A    200  150.000000      50.000000
+2    B    150  116.666667      33.333333
+3    B     80  116.666667     -36.666667
+4    B    120  116.666667       3.333333
 ```
+
+Every A row got A's mean (150) and every B row got B's mean (116.67), so the result has 5
+rows, the same as `df`. The last column then says how far each sale is above or below its
+own city's average.
 
 `transform('mean')` returns a Series with the same index as `df`, so it assigns cleanly.
 This pattern — subtract the group mean — is how you remove group-level effects from a
 feature before training.
 
+> **Picture it:** `agg` writes one summary card per pile. `transform` writes the pile's
+> summary on a sticky note and sticks a copy on every coin in that pile.
+
 ## `apply` — when agg and transform are not enough
+
+`apply` hands your own function each group as a mini-table and lets it return anything:
+a number, a row, or a filtered set of rows.
 
 `apply` gives you a function that receives each group as a full DataFrame. It's flexible
 but slower. Use it only when built-in aggregations can't express what you need.
@@ -162,14 +201,27 @@ print(top)
 ```
 
 ```output
-   city  sales
-1     A    200
-2     B    150
-4     B    120
+   sales
+1    200
+2    150
+4    120
 ```
+
+City A's median is 150, so only its 200 survives; city B's median is 120, so 150 and 120
+survive. The row labels 1, 2, 4 point back to the original rows.
+
+Notice the `city` column is gone. Since pandas 3 the function no longer receives the
+grouping column (asking for it with `include_groups=True` raises an error). If you need it in
+the result, use `transform` with a mask instead — which is also faster:
+`df[df['sales'] >= df.groupby('city')['sales'].transform('median')]` returns the same rows
+*with* `city`.
 
 `group_keys=False` prevents the group key from becoming an extra level in the index.
 Without it you'd get a MultiIndex that needs immediate resetting.
+
+> **Watch out:** `apply` calls your Python function once per group. With 100,000 groups
+> that is 100,000 Python calls — the slow loop from ch. 2 is back. Reach for `agg` and
+> `transform` with built-in names (`'mean'`, `'sum'`, …) first.
 
 ## Aggregating with custom functions
 
@@ -193,11 +245,30 @@ print(result.round(1))
 ```
 
 ```output
-       p90   iqr
+        p90    iqr
 city
-A     195.0  50.0
-B     276.0 110.0
+A     190.0   50.0
+B     264.0  110.0
 ```
+
+A **percentile** is the value below which that percentage of the data falls: the 90th
+percentile of A's `[100, 150, 200]` is 190 (with NumPy's default linear interpolation
+between data points). The **IQR** (interquartile range) is the 75th percentile minus the
+25th — the width of the middle half of the data: $175 - 125 = 50$ for A.
+
+> **Watch out:** a lambda runs as Python code per group, like `apply`. Fine for a report;
+> slow inside a loop over millions of groups. `groupby(...).quantile(0.9)` is the compiled
+> equivalent for percentiles.
+
+## Recap in plain words
+
+- groupby = split rows into piles, compute per pile, combine into a small table.
+- `agg(name=(col, func))` makes several named summary columns in one pass.
+- Grouping by several keys gives a MultiIndex; `reset_index()` flattens it.
+- `transform` returns one value per original row — perfect for "compare each row to its
+  group".
+- `apply` is the flexible escape hatch, but it runs Python per group and (in pandas 3)
+  doesn't see the grouping column.
 
 ## Try it Yourself
 
@@ -232,19 +303,25 @@ print(frac)
 ```
 
 ```output
-          total_revenue  mean_margin     n
+          total_revenue  mean_margin    n
 category
-bird           17098.65        40.07   170
-cat            16480.57        41.16   163
-dog            16784.42        38.89   167
+bird           14779.07        32.20  156
+cat            15881.37        27.90  167
+dog            17136.82        38.71  177
 
 Fraction of high-revenue months:
 category
-bird    0.083
-cat     0.083
-dog     0.167
-dtype: float64
+bird    0.667
+cat     0.917
+dog     0.750
+Name: high, dtype: float64
 ```
+
+The first table is one row per category: total revenue, the average margin, and how many
+rows fell into each category (the three counts add to 500). The second part is a groupby
+*of a groupby*: first total revenue per (category, month), then the share of months above
+1000 per category. A mean of True/False values is a fraction. Try changing the 1000
+threshold, or group by `month` alone to see seasonality.
 
 ## Exercise
 
@@ -254,6 +331,10 @@ Given a DataFrame with columns `team`, `player`, `score` (simulate 3 teams × 5 
 1. The highest-scoring player in each team.
 2. Each player's score as a fraction of their team's total score (use `transform`).
 3. The team with the most consistent scores (lowest CV = std/mean).
+
+> **Hint:** for 1, sum per (team, player) first, then use `idxmax` within each team. For
+> 3, the **CV** (coefficient of variation) is spread relative to size, so teams with
+> different averages can be compared fairly.
 
 <details>
 <summary>Solution</summary>
@@ -292,4 +373,8 @@ print("\nCV per team:")
 print(cv.round(4))
 print("Most consistent:", cv.idxmin())
 ```
+
+The key moves: `idxmax` returns the *row label* of each team's best total, which `.loc`
+uses to pull the whole row; `transform('sum')` puts each team's total on every one of its
+rows, so the division lines up row by row.
 </details>

@@ -7,10 +7,15 @@ order: 11
 
 ## The profiling-first rule
 
+Before you make code faster, find out *where* it is slow. Guessing wastes time: the slow
+part is rarely where you think. Measure first, then fix the biggest problem, then measure
+again.
+
 Never optimize before measuring. Two tools:
 
 - **`df.info(memory_usage='deep')`** — shows dtype and memory per column.
-- **`%timeit` / `time.perf_counter`** — measures wall time.
+- **`%timeit` / `time.perf_counter`** — measures wall time (real elapsed time, as a clock on
+  the wall would show it).
 
 Most pandas performance problems fall into four buckets:
 
@@ -19,11 +24,18 @@ Most pandas performance problems fall into four buckets:
 3. **Unnecessary copies** — chained operations materializing intermediate DataFrames.
 4. **Missing `numexpr`** — complex arithmetic that could use compiled expressions.
 
+> **Picture it:** a slow program is a traffic jam. Widening a road that isn't jammed does
+> nothing; profiling is the traffic report that tells you which junction to fix.
+
 ## Dtype optimization: the biggest win
 
+The cheapest speed-up is storing each column in the smallest type that holds its values.
+Text that repeats a handful of values ("alpha", "beta", …) is the biggest offender.
+
 The `object` dtype is a column of Python strings (or mixed types) — each element is a
-heap-allocated object. It is typically 5–10× more memory than the semantic data requires
-and 20–100× slower to process.
+heap-allocated object (a separate Python object somewhere in memory, reached by a pointer).
+It is typically 5–10× more memory than the semantic data requires and 20–100× slower to
+process.
 
 ```python
 import pandas as pd
@@ -48,21 +60,38 @@ print(f"  categories: {df['category_cat'].cat.categories.tolist()}")
 
 ```output
 object dtype:
-  memory: 65.9 MB
+  memory: 12.7 MB
 category dtype:
   memory: 1.0 MB
-  categories: ['alpha', 'beta', 'gamma', 'delta']
+  categories: ['alpha', 'beta', 'delta', 'gamma']
 ```
 
-A 65× reduction. The `category` dtype stores only the unique category codes as integers
-internally; the string labels appear once. GroupBy on a `category` column is also faster.
+A ~13× reduction here: 12.7 MB down to 1.0 MB. The `category` dtype stores only the unique
+category codes as integers internally; the string labels appear once. GroupBy on a
+`category` column is also faster.
+
+The code comment says "object dtype", but in pandas 3 (this kernel) the column is actually
+the new Arrow-backed `str` dtype, which packs the text into one buffer and is already far
+leaner than `object`. Under pandas 2, the same column as real `object` dtype measures about
+54 MB — there, `category` was a ~50× win. Either way, the category column is a 1-byte code
+per row plus a 4-entry lookup table.
+
+> **Picture it:** an `object` column writes the word "gamma" out in full on a separate
+> card for every row. A `category` column writes the four words once on a legend and then
+> stores just a number (0–3) per row — like a map key.
 
 ### When NOT to use category
 
 If a column has more than ~1,000 unique values, the overhead of the category map
 outweighs the savings. Rule of thumb: `nunique / len(df) < 0.01` → use category.
 
+> **In plain words:** category pays off when values *repeat a lot*. If almost every row
+> is different (user IDs, free text), the legend would be as long as the data itself.
+
 ## Downcasting numerics
+
+**Downcasting** means switching a column to a smaller number type — 64-bit to 32-bit —
+when the values fit. Half the bytes per number means half the memory.
 
 If you're certain values fit in float32 or int32, downcast to halve memory:
 
@@ -88,11 +117,20 @@ print(f"Before: {before:.1f} MB  After: {after:.1f} MB  ratio: {before/after:.1f
 Before: 16.0 MB  After: 8.0 MB  ratio: 2.0×
 ```
 
+Exactly 2×: two columns of 1 million 8-byte numbers (16 MB) became two columns of 4-byte
+numbers (8 MB). Integers 0–999 fit easily in int32 (which reaches about 2.1 billion).
+
 Downcast when: integers are counts or codes (int16/int32 suffice), values are ML features
 not requiring float64 precision. Don't downcast aggregated statistics or intermediate
 computations — accumulate in float64, then downcast the final result.
 
+> **Watch out:** `astype(np.int16)` on a value outside $-32768$ to $32767$ wraps around
+> silently, as in ch. 1. Check `col.min()` and `col.max()` before you downcast integers.
+
 ## `.apply()` is a loop — never use it on large DataFrames
+
+`.apply` with `axis=1` calls your Python function once for every row. That is the slow
+Python loop from ch. 2 wearing a pandas costume.
 
 `.apply(func, axis=1)` passes each row as a Series to `func`. Python function call per row.
 For 1 million rows, that's 1 million Python-level function calls.
@@ -121,9 +159,13 @@ print("results equal:", np.allclose(slow.values, fast.values))
 ```
 
 ```output
-apply: 1284 ms   vec: 2.3 ms   ratio: 558×
+apply: 2058 ms   vec: 3.1 ms   ratio: 662×
 results equal: True
 ```
+
+Same answer (`results equal: True`), but hundreds of times slower with `apply`. Each of the
+500,000 rows was wrapped in a new Series object and passed through the Python interpreter;
+the vectorized line did three whole-column operations in compiled code.
 
 **Vectorized pandas/NumPy is ~500× faster than `.apply(axis=1)`.** If you think you need
 `apply`, first ask: can I express this as arithmetic on columns, NumPy ufuncs, or a
@@ -135,7 +177,14 @@ Column-level `apply(func, axis=0)` is fine (one call per column, not per row).
 Row-level apply is justified only for calls to external services or for complex logic
 that truly cannot be vectorized (and then the bottleneck is likely the external call, not Python).
 
+> **In plain words:** if/else per row → `np.where`; several cases → `np.select`; lookup
+> per row → `map` or a merge; per-group maths → `groupby().transform`. Row-level `apply`
+> is the last resort, not the first tool.
+
 ## `numexpr` — fast multi-threaded arithmetic
+
+**numexpr** takes a formula written as a string, compiles it, and evaluates it in chunks
+on several threads at once, without building the in-between arrays NumPy would create.
 
 For large float64 arrays with multi-step arithmetic, `numexpr` compiles the expression
 to native code and uses multiple threads:
@@ -168,15 +217,27 @@ print("equal:", np.allclose(result_np, result_ne))
 ```
 
 ```output
-numpy:   213 ms
-numexpr: 41 ms  ratio: 5.2×
+numpy:   1028 ms
+numexpr: 61 ms  ratio: 16.8×
+equal: True
 ```
+
+Same result, many times faster. With 10 million elements, NumPy builds a temporary 80 MB
+array for every step (`a**2`, `b**2`, their sum, `2*a`, `2*a*c`) and walks memory once per
+step; numexpr walks it once, in cache-sized chunks, on every core.
 
 `numexpr` also avoids creating intermediate arrays (`a**2`, `b**2` each allocate a new
 array in NumPy; numexpr fuses them into one pass). pandas `.query()` uses numexpr
 internally when the query is a pure arithmetic/comparison expression.
 
+> **Picture it:** NumPy cooks a recipe one ingredient at a time, putting each half-done
+> step in its own bowl. numexpr does all the steps to one spoonful at a time, with no extra
+> bowls — and several cooks share the work.
+
 ## Reading memory with `info()`
+
+`info()` is a one-screen health check: every column's type, how many values are missing,
+and how much memory the whole table uses.
 
 ```python
 import pandas as pd
@@ -194,21 +255,38 @@ df.info(memory_usage='deep')
 ```
 
 ```output
-<class 'pandas.core.frame.DataFrame'>
+<class 'pandas.DataFrame'>
 RangeIndex: 10000 entries, 0 to 9999
 Data columns (total 4 columns):
  #   Column    Non-Null Count  Dtype
 ---  ------    --------------  -----
  0   id        10000 non-null  int64
- 1   category  10000 non-null  object
+ 1   category  10000 non-null  str
  2   value     10000 non-null  float64
  3   flag      10000 non-null  bool
-dtypes: bool(1), float64(1), int64(1), object(1)
-memory usage: 735.4 KB
+dtypes: bool(1), float64(1), int64(1), str(1)
+memory usage: 254.0 KB
 ```
 
+The `Non-Null Count` column says no values are missing. The `Dtype` column is the important
+one: `category` shows as `str` (pandas 3's text dtype), `flag` is `bool` (1 byte per row).
+Only `memory_usage='deep'` measures the real size of text columns; without it pandas
+reports just the pointers.
+
 The `object` column (category) uses most memory despite having only 3 unique values.
-Converting it to `category` drops total memory to ~395 KB.
+Converting it to `category` drops total memory to ~395 KB. (With pandas 3's `str` dtype the
+text column is about 90 KB of the 254 KB total; converting it to `category` brings the
+total down to about 176 KB.)
+
+## Recap in plain words
+
+- Measure first: `info(memory_usage='deep')` for memory, `perf_counter`/`%timeit` for time.
+- Repeated text → `category` (codes + a small lookup table).
+- Downcast numbers that fit (int64 → int32/int16, float64 → float32) — but accumulate
+  statistics in float64.
+- Row-wise `.apply` is a Python loop; rewrite it as column arithmetic, `np.where`,
+  `np.select`, `map`, or `transform`.
+- `numexpr` fuses multi-step arithmetic into one multi-threaded pass.
 
 ## Try it Yourself
 
@@ -256,29 +334,26 @@ print(f"\ngroupby object: {obj_ms:.1f} ms   category: {cat_ms:.1f} ms   ratio: {
 
 ```output
 Before optimization:
-  memory: 149.7 MB
+  memory: 68.0 MB
 After optimization:
-  memory: 18.2 MB
-groupby object: 148.3 ms   category: 41.2 ms   ratio: 3.6×
+  memory: 22.0 MB
+
+groupby object: 60.8 ms   category: 24.2 ms   ratio: 2.5×
 ```
 
-## Under the Trench
-
-Rare and advanced topics you should at least know the name of. You won't need them daily,
-but you'll stop being surprised when you meet them.
-
-- **NumPy strides & `as_strided`** — make sliding windows with zero copies by manipulating stride metadata directly; the array doesn't move, only the view shape changes. Extremely sharp edges: wrong strides read garbage memory.
-- **Structured/record arrays (`np.dtype([('x', float), ('y', int)])`)** — C-struct-like typed arrays where each element has named fields; rare outside reading binary file formats or interfacing with C code.
-- **Memory-mapping (`np.memmap`, `np.load(..., mmap_mode='r')`)** — treat a file on disk as an ndarray; only the pages you access are loaded into RAM. Essential for arrays larger than available memory.
-- **Copy-on-write (CoW) & SettingWithCopy** — pandas 2.0+ defaults to CoW: a slice is a view until you write to it, then it copies. The old warning was about chained indexing returning unexpected copies; CoW removes the ambiguity but changes mutation semantics.
-- **Broadcasting tricks for pairwise ops** — outer subtraction `a[:, np.newaxis] - b[np.newaxis, :]` computes all pairwise differences without a loop; used for distance matrices, kernel matrices, attention logits.
-- **Arrow-backed pandas & zero-copy interchange** — pandas 2+ supports `ArrowDtype` columns backed by PyArrow memory; operations on Arrow-backed data can be zero-copy passed to polars/DuckDB/other Arrow-native tools.
+Two wins in one run: memory fell to about a third, and grouping on the `category` column
+was faster than on plain text, because pandas groups small integer codes instead of
+comparing strings. Try leaving `score` and `weight` as float64 and see how much of the
+saving was from downcasting versus from the category.
 
 ## Exercise
 
 Take a DataFrame with 3 million rows: one `object` column (10 unique values), one float64,
 one int64. Measure memory before and after dtype optimization (category + float32 + int32).
 Then verify that `groupby('cat').mean()` gives identical results before and after.
+
+> **Hint:** compute the reference groupby *before* converting anything, and compare with
+> `np.allclose` and a small tolerance — float32 can't match float64 to the last digit.
 
 <details>
 <summary>Solution</summary>
@@ -310,4 +385,8 @@ print(f"Memory: {before_mb:.1f} MB → {after_mb:.1f} MB  ({before_mb/after_mb:.
 print("Results close:", np.allclose(ref.values, opt.values, atol=1e-4))
 # float32 has ~1e-7 relative error vs float64, so results may differ slightly
 ```
+
+The optimized frame gives the same group means to about 4 decimal places — the expected
+float32 rounding — while using a fraction of the memory. Category conversion changes how
+the labels are stored, never which rows belong to which group.
 </details>

@@ -7,6 +7,10 @@ order: 10
 
 ## Why polars exists
 
+polars is a newer DataFrame library that does the same jobs as pandas, but uses all of your
+CPU cores and can plan a whole chain of steps before running any of them. On big data that
+makes it much faster.
+
 pandas has a 15-year-old design: it was built around NumPy arrays and Python loops.
 Two fundamental problems follow:
 
@@ -16,9 +20,20 @@ Two fundamental problems follow:
 
 polars was built around these two goals: multi-core execution via Apache Arrow + Rust, and
 a **lazy evaluation** engine that optimizes the full query plan before touching disk.
+**Apache Arrow** is a standard column-by-column memory format that many tools share;
+**Rust** is a fast compiled language. **Lazy evaluation** means "write down the recipe now,
+cook later" — nothing runs until you ask for the result.
 For large files and multi-step pipelines it is typically 5–50× faster than pandas.
 
+> **Picture it:** eager pandas is a cook who chops every vegetable in the fridge the moment
+> you mention soup, then throws half away when you say "no onions". Lazy polars reads the
+> whole recipe first, then chops only what the soup needs — with four cooks at once.
+
 ## The two modes: eager vs lazy
+
+**Eager** mode runs each line immediately and shows you the result — handy for poking at
+small data. **Lazy** mode collects your steps into a plan and runs the whole plan only when
+you call `.collect()`.
 
 ```python
 import polars as pl
@@ -41,8 +56,18 @@ shape: (3, 2)
 └─────┴─────┘
 ```
 
+polars prints the shape, the column names, and each column's type (`i64` = 64-bit integer,
+`f64` = 64-bit float) above the data. There is no row index: in polars, rows are just
+numbered positions.
+
 ```python
 import polars as pl
+
+# Write a small CSV so the example is self-contained
+pl.DataFrame({
+    'city':  ['Dhaka', 'Dhaka', 'Chittagong', 'Chittagong', 'Sylhet', 'Dhaka'],
+    'sales': [900, 1000, 1200, 1250, 680, 80],
+}).write_csv('data.csv')
 
 # Lazy — builds a query plan, collects at the end
 lf = pl.scan_csv('data.csv')          # does NOT read the file yet
@@ -66,15 +91,27 @@ shape: (3, 2)
 ╞════════════╪═══════╡
 │ Chittagong ┆ 2450  │
 │ Dhaka      ┆ 1900  │
-│ Sylhet     ┆  680  │
+│ Sylhet     ┆ 680   │
 └────────────┴───────┘
 ```
 
+The plan filtered out Dhaka's 80-unit row (not > 100), summed what was left per city, and
+sorted biggest first: Chittagong 1200 + 1250 = 2450, Dhaka 900 + 1000 = 1900, Sylhet 680.
+None of it happened until `.collect()`.
+
 The lazy path is why polars is fast on large CSVs: `scan_csv` + `filter` tells the engine
 "I only want rows where sales > 100" — it can push that filter down to the CSV reader and
-skip blocks of rows entirely (predicate pushdown).
+skip blocks of rows entirely (predicate pushdown). A **predicate** is a true/false test on
+a row; **pushdown** means moving that test as early as possible, into the file reader
+itself, so unwanted rows never reach memory.
+
+> **In plain words:** in lazy mode you describe *what* you want; polars works out the
+> cheapest *how*. Call `lf.explain()` to see the plan it chose.
 
 ## The expression API
+
+An **expression** like `pl.col('value') * 2` is a description of a column calculation, not
+the calculation itself. polars collects expressions and runs them together, in parallel.
 
 polars uses `pl.col('name')` expressions rather than pandas-style string column access.
 Expressions compose and parallelize — polars can evaluate multiple `pl.col` expressions
@@ -107,14 +144,21 @@ shape: (4, 3)
 │ ---      ┆ ---         ┆ ---      │
 │ str      ┆ f64         ┆ f64      │
 ╞══════════╪═════════════╪══════════╡
-│ B        ┆ 53.0        ┆ 210.9   │
-│ A        ┆ 37.0        ┆  73.2   │
-│ C        ┆ 47.0        ┆ 421.2   │
-│ A        ┆ 68.0        ┆ 136.6   │
+│ C        ┆ 57.0        ┆ 171.9    │
+│ B        ┆ 55.0        ┆ 277.0    │
+│ C        ┆ 52.0        ┆ 206.4    │
+│ C        ┆ 36.0        ┆ 108.0    │
 └──────────┴─────────────┴──────────┘
 ```
 
+Each expression became one output column, named with `.alias(...)`: the category passed
+through unchanged, the value was rounded, and `weighted` multiplied two columns row by row.
+`select` returns *only* the columns you list.
+
 ## `filter`, `group_by`, `agg`
+
+These are polars' names for keeping rows by a rule, splitting into groups, and summarizing
+each group — the same split-apply-combine idea as pandas' `groupby` (ch. 6).
 
 ```python
 import polars as pl
@@ -145,20 +189,31 @@ print(summary)
 ```
 
 ```output
-rows with value > 50: 9
+rows with value > 50: 7
 shape: (3, 4)
 ┌──────────┬──────────┬─────────┬─────┐
 │ category ┆ mean_val ┆ std_val ┆ n   │
 │ ---      ┆ ---      ┆ ---     ┆ --- │
 │ str      ┆ f64      ┆ f64     ┆ u32 │
 ╞══════════╪══════════╪═════════╪═════╡
-│ A        ┆ 48.83    ┆ 13.93   ┆ 6   │
-│ B        ┆ 51.71    ┆ 16.75   ┆ 7   │
-│ C        ┆ 48.57    ┆ 17.43   ┆ 7   │
+│ A        ┆ 33.33    ┆ 15.78   ┆ 7   │
+│ B        ┆ 52.28    ┆ 2.4     ┆ 4   │
+│ C        ┆ 44.63    ┆ 10.93   ┆ 9   │
 └──────────┴──────────┴─────────┴─────┘
 ```
 
+7 of the 20 random values exceed 50. In the summary, the three `n` values add to 20, each
+group got its mean and standard deviation in one pass, and `pl.len()` counted rows per group
+(its type `u32` is an unsigned 32-bit integer — counts can't be negative). The `.sort` at
+the end matters: polars' `group_by` does not promise any output order.
+
+> **Watch out:** without `.sort(...)` (or `group_by(..., maintain_order=True)`), the group
+> order can change from run to run because groups are processed on several threads.
+
 ## `with_columns` — add or update columns
+
+`with_columns` gives you back the table with extra (or replaced) columns. The original
+table is left exactly as it was.
 
 ```python
 import polars as pl
@@ -186,11 +241,21 @@ shape: (3, 4)
 └─────┴──────┴─────┴───────┘
 ```
 
+`df2` has the two new columns `a2` and `ratio` next to the originals; `df` still has only
+`a` and `b`.
+
 polars DataFrames are **immutable** — `with_columns` returns a new DataFrame. This is
 different from pandas, where `df['c'] = ...` mutates in-place (and can trigger CoW
-warnings with newer pandas).
+warnings with newer pandas). **CoW** is Copy-on-Write, the pandas 3 rule from ch. 5.
+
+> **Picture it:** pandas lets you write on the page in pen. polars hands you a fresh
+> photocopy with your additions every time, and the original stays clean — which is what
+> makes the parallel, lazy tricks safe.
 
 ## pandas interop
+
+**Interop** (interoperability) means passing data back and forth between the two
+libraries, so you can use polars for the heavy lifting and pandas for tools that need it.
 
 ```python
 import polars as pl
@@ -207,12 +272,16 @@ print(df_pl2.dtypes)
 ```
 
 ```output
-<class 'pandas.core.frame.DataFrame'> {'x': dtype('int64'), 'y': dtype('float64')}
+<class 'pandas.DataFrame'> {'x': dtype('int64'), 'y': dtype('float64')}
 [Int64, Float64]
 ```
 
+The round trip kept the types: polars `Int64`/`Float64` became NumPy `int64`/`float64` in
+pandas and back again.
+
 Zero-copy exchange is possible when both sides use Arrow memory (e.g., pandas 2+ with
 the `ArrowDtype` backend or via `pyarrow` directly), but the common path copies.
+**Zero-copy** means both libraries read the same bytes in memory instead of duplicating them.
 
 ## When to use polars vs pandas
 
@@ -225,6 +294,21 @@ the `ArrowDtype` backend or via `pyarrow` directly), but the common path copies.
 | Streaming/out-of-core data | polars lazy or dask |
 | Existing pandas codebase | pandas (switching cost) |
 | You want multi-core groupby | polars |
+
+**Out-of-core** means data larger than your RAM, processed in pieces from disk. The short
+version: polars when data is big or the pipeline is long; pandas when you're exploring or
+handing the data to a library that expects pandas.
+
+## Recap in plain words
+
+- polars uses all CPU cores (Rust + Arrow) and can plan a whole query lazily.
+- Lazy = describe the steps, then `.collect()`; polars optimizes the plan (e.g., predicate
+  pushdown into the CSV reader).
+- Work through expressions: `pl.col(...)` + `.alias(...)` inside `select`, `filter`,
+  `with_columns`, `group_by(...).agg(...)`.
+- polars frames are immutable and have no row index; group order is not guaranteed unless
+  you sort.
+- Convert with `to_pandas()` / `pl.from_pandas()` at the boundary with pandas-only tools.
 
 ## Try it Yourself
 
@@ -264,22 +348,29 @@ shape: (6, 4)
 │ ---    ┆ ---     ┆ ---       ┆ ---         │
 │ str    ┆ str     ┆ f64       ┆ i64         │
 ╞════════╪═════════╪═══════════╪═════════════╡
-│ BD     ┆ A       ┆ 85420.0   ┆ 3580        │
-│ BD     ┆ B       ┆ 78920.0   ┆ 3240        │
-│ BD     ┆ C       ┆ 82680.0   ┆ 3420        │
-│ IN     ┆ A       ┆ 79450.0   ┆ 3310        │
-│ IN     ┆ B       ┆ 87340.0   ┆ 3600        │
-│ IN     ┆ C       ┆ 83790.0   ┆ 3480        │
+│ BD     ┆ A       ┆ 143398.0  ┆ 5083        │
+│ BD     ┆ B       ┆ 148936.0  ┆ 5324        │
+│ BD     ┆ C       ┆ 157170.0  ┆ 5419        │
+│ IN     ┆ A       ┆ 153955.0  ┆ 5361        │
+│ IN     ┆ B       ┆ 155972.0  ┆ 5376        │
+│ IN     ┆ C       ┆ 146476.0  ┆ 5029        │
 └────────┴─────────┴───────────┴─────────────┘
 
 Total rows: 12
 ```
+
+`df.lazy()` turned an in-memory frame into a plan, so the filter, groupby, and sort were
+optimized together. 4 regions × 3 products = 12 groups, matching "Total rows: 12". Try
+removing `.sort(...)`, run it twice, and watch the row order change.
 
 ## Exercise
 
 Compare pandas vs polars on a large aggregation: generate a DataFrame with 5 million rows
 and 3 columns (`cat` with 100 categories, `val1`, `val2`). Run `groupby('cat').mean()` on
 both, time each with `time.perf_counter`, and report the ratio.
+
+> **Hint:** build the data once with NumPy, then construct both frames from the same arrays
+> so the comparison is fair. Time only the groupby, not the construction.
 
 <details>
 <summary>Solution</summary>
