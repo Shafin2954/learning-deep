@@ -7,7 +7,16 @@ order: 11
 
 ## Why ensembles?
 
+One expert can be badly wrong; the average of many independent experts usually isn't. An
+**ensemble** — a group of models whose predictions are combined — uses this to turn jumpy
+individual models into a steady team.
+
 A single deep tree has low bias but high variance — small changes in data give very different trees. Ensembles reduce variance by averaging many models.
+
+> **Picture it:** guessing the number of sweets in a jar at a fair. Individual guesses are all
+> over the place, but the average of a hundred guesses is often eerily close. That only works
+> if people guess independently: if everyone copies the loudest person, averaging adds
+> nothing.
 
 The key insight: if $B$ predictions each have variance $\sigma^2$ and pairwise correlation $\rho$, the variance of their average is:
 
@@ -15,16 +24,37 @@ $$
 \text{Var}\!\left(\frac{1}{B}\sum_b f_b(x)\right) = \rho\sigma^2 + \frac{1-\rho}{B}\sigma^2
 $$
 
+> **In plain words:**
+> - $B$ is the number of models averaged; $f_b(x)$ is model $b$'s prediction.
+> - $\sigma^2$ is how much one model's prediction wobbles across training sets.
+> - $\rho$ ("rho") is how alike two models' wobbles are: 0 means independent, 1 means identical.
+>
+> The second term shrinks as you add models. The first term, $\rho\sigma^2$, doesn't depend
+> on $B$ at all: correlated models share mistakes that no amount of averaging removes.
+
 As $B\to\infty$, the second term vanishes. The first term $\rho\sigma^2$ remains — **decorrelating the trees** is the key to further variance reduction.
+
+For example, with $\rho = 0.5$, even infinitely many trees only halve the variance. Cut
+$\rho$ to 0.1 and the floor drops to a tenth.
 
 ## Bootstrap aggregation (Bagging)
 
-**Algorithm:**
+**Bagging** builds many models, each trained on a slightly different random version of the
+training set, and averages them. The random versions come from resampling your own data.
+
+The **algorithm** has three steps:
 1. Draw $B$ bootstrap samples (sample $n$ points with replacement from training set).
 2. Fit a model (typically a deep tree) on each bootstrap sample.
 3. Predict: majority vote (classification) or mean (regression).
 
+A **bootstrap sample** is drawn by picking $n$ rows at random *with replacement* — the same
+row can be picked twice, and some rows not at all. Each sample is the same size as the
+original but has a different mix of rows.
+
 On average, each bootstrap sample contains ~63.2% of unique training points. The ~36.8% not in a sample are **out-of-bag (OOB)** for that tree.
+
+(Where 36.8% comes from: a given row is missed by one draw with probability $1 - 1/n$, and by
+all $n$ draws with probability $(1 - 1/n)^n$, which approaches $e^{-1} \approx 0.368$.)
 
 ```python
 import numpy as np
@@ -32,7 +62,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.datasets import make_moons
 from sklearn.model_selection import train_test_split
 
-X, y = make_moons(n_samples=600, noise=0.3, random_state=0)
+X, y = make_moons(n_samples=600, noise=0.3, random_state=2)
 X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0)
 
 rng = np.random.default_rng(0)
@@ -55,13 +85,28 @@ print(f"Bagging 100: {acc:.3f}")
 ```
 
 ```output
-Single tree: 0.875
-Bagging 100: 0.917
+Single tree: 0.883
+Bagging 100: 0.908
 ```
+
+On these 120 test points the single deep tree scores 0.883 and the bag of 100 trees 0.908 —
+3 more correct. Each bootstrapped tree is as overfit as the single tree, but they overfit
+*differently*, and the vote cancels much of that noise.
+
+> **Watch out:** bagging helps high-variance models like deep trees. Bagging a stable,
+> high-bias model (say, a linear regression) changes almost nothing, because every bootstrap
+> copy learns nearly the same thing.
 
 ## Out-of-bag error estimation
 
+Every tree in a bag never saw about a third of the training rows. Those rows are a free test
+set for that tree — no need to hold out separate data.
+
 Each tree can evaluate itself on the OOB samples — a free, unbiased estimate of generalisation error without holding out data.
+
+More precisely: for each training row, collect the votes of only the trees that did *not*
+train on it, and compare their majority vote with the true label. Averaged over all rows,
+that gives the **OOB score**.
 
 ```python
 from sklearn.ensemble import BaggingClassifier
@@ -78,17 +123,29 @@ print(f"Test score: {bag.score(X_te, y_te):.3f}")
 ```
 
 ```output
-OOB score: 0.912
-Test score: 0.917
+OOB score: 0.906
+Test score: 0.900
 ```
+
+OOB says 0.906, the held-out test set says 0.900 — less than one test point apart.
 
 OOB score tracks test score closely — a reliable free validation metric.
 
 ## Random Forests: decorrelating trees
 
+Bagged trees still look alike, because every tree grabs the same strongest feature for its
+first question. A **random forest** forces variety: at each split, a tree may only choose
+from a random handful of features.
+
 In Bagging, trees are still correlated because they all use the same strong features. Random Forests add **random feature subsampling**: at each split, consider only $m = \sqrt{p}$ features (classification) or $p/3$ (regression) chosen at random.
 
 This decorrelates trees: if one feature dominates, not every tree can use it, so different trees learn different patterns.
+
+> **Picture it:** a quiz team where each member may only consult a random few pages of the
+> encyclopedia for each question. Each one is a little worse alone, but they stop all making
+> the same mistake, so the team's vote gets better — the $\rho$ in the formula above falls.
+
+The breast-cancer dataset has 30 features, so each split looks at $\sqrt{30} \approx 5$ of them.
 
 ```python
 from sklearn.ensemble import RandomForestClassifier
@@ -102,16 +159,23 @@ rf = RandomForestClassifier(n_estimators=200, oob_score=True, random_state=0)
 rf.fit(X_tr, y_tr)
 print(f"Test accuracy: {rf.score(X_te, y_te):.4f}")
 print(f"OOB accuracy:  {rf.oob_score_:.4f}")
-print(f"n_features_per_split: {rf.max_features_}")
+print(f"n_features_per_split: {rf.max_features}")
 ```
 
 ```output
 Test accuracy: 0.9649
-OOB accuracy:  0.9582
+OOB accuracy:  0.9626
 n_features_per_split: sqrt
 ```
 
+The forest classifies 96.49% of the 114 test patients correctly, and OOB (96.26%) agrees
+within a quarter of a point. The last line shows the setting in use: `max_features='sqrt'`,
+the default for classification.
+
 ## Feature importance
+
+A forest can tell you which features it relied on most: add up how much each feature's
+splits cleaned up the labels, across every tree.
 
 Each split improves impurity. Feature importance is the total impurity decrease (weighted by samples) across all splits for that feature, averaged across trees.
 
@@ -130,16 +194,31 @@ for i in top5_idx:
 
 ```output
 Top 5 features by impurity importance:
-  worst concave points                  0.1534
-  worst perimeter                       0.1247
-  mean concave points                   0.1038
-  worst radius                          0.0934
-  worst area                            0.0873
+  worst concave points                0.1498
+  worst perimeter                     0.1209
+  worst radius                        0.1096
+  mean concave points                 0.0999
+  worst area                          0.0970
 ```
+
+The top five are all size and shape measurements of the cell nuclei, led by
+"worst concave points" (0.1498). The importances sum to 1 over all 30 features, so these five
+carry about 58% of the total.
 
 **Caveat:** impurity importance is biased toward high-cardinality numeric features. Permutation importance (`sklearn.inspection.permutation_importance`) is more reliable.
 
+**High-cardinality** features have many distinct values, which gives them many candidate
+thresholds and so more chances to win a split by luck. **Permutation importance** shuffles one
+feature's column on held-out data and measures how much the score drops.
+
+> **Watch out:** "worst radius", "worst perimeter", and "worst area" are almost the same
+> measurement. Correlated features split the credit between them, so each looks less
+> important than the group really is — and dropping one may cost nothing at all.
+
 ## Convergence: how many trees?
+
+More trees never make a forest overfit; they only make its vote steadier. The question is
+when extra trees stop paying for their compute time.
 
 ```python
 from sklearn.ensemble import RandomForestClassifier
@@ -160,17 +239,35 @@ for n in n_estimators_range:
 
 ```output
  n_trees |    oob |   test
-       1 | 0.9055 | 0.9123
-       5 | 0.9385 | 0.9561
-      10 | 0.9473 | 0.9561
-      25 | 0.9538 | 0.9649
-      50 | 0.9560 | 0.9561
+       1 | 0.5341 | 0.9386
+       5 | 0.8462 | 0.9474
+      10 | 0.9077 | 0.9649
+      25 | 0.9429 | 0.9561
+      50 | 0.9473 | 0.9561
      100 | 0.9582 | 0.9649
-     200 | 0.9582 | 0.9649
-     500 | 0.9593 | 0.9649
+     200 | 0.9626 | 0.9649
+     500 | 0.9626 | 0.9649
 ```
 
+Test accuracy hardly moves: 0.9386 with one tree and between 0.9561 and 0.9649 from 10 trees
+on. The OOB column climbs much more — 0.5341 at 1 tree to 0.9626 at 200. With very few
+trees, many training rows were in every tree's bootstrap sample and have no OOB vote at all;
+they count as errors, and the trees that do vote are few. OOB is pessimistic until there are
+enough trees, then it settles at 200 and 500 trees.
+
 Test accuracy converges around 100–200 trees. Adding more trees doesn't hurt but gives diminishing returns.
+
+> **Watch out:** a one-tree "forest" with `oob_score=True` triggers a warning that some rows
+> have no OOB prediction. Don't read OOB numbers from forests with fewer than about 25 trees.
+
+## Recap in plain words
+
+- Averaging many models shrinks variance, but only down to a floor set by how correlated they are.
+- Bagging trains each tree on a bootstrap resample and votes; it helps jumpy models such as deep trees.
+- Each tree leaves out about 36.8% of rows, and their votes give a free out-of-bag estimate of test accuracy.
+- Random forests also limit each split to a random subset of features, which decorrelates the trees.
+- Impurity importance is quick but biased; permutation importance is more trustworthy.
+- More trees never hurt accuracy; returns flatten after a few hundred.
 
 ## Try it Yourself
 
@@ -196,14 +293,26 @@ for name, clf in [("Single Tree", dt), ("Bagging", bag), ("Random Forest", rf)]:
 ```
 
 ```output
-Single Tree    : test=0.850, oob=-
-Bagging        : test=0.905, oob=0.899
-Random Forest  : test=0.920, oob=0.912
+Single Tree    : test=0.770, oob=-
+Bagging        : test=0.895, oob=0.87375
+Random Forest  : test=0.880, oob=0.85125
 ```
+
+Both ensembles beat the single tree by a wide margin: 0.770 for one tree against 0.895 for
+bagging and 0.880 for the random forest. Here plain bagging edges out the forest on both test
+and OOB (0.874 against 0.851). With 10 of 20 features informative, many features carry
+signal, so the trees were not very correlated to begin with, and forcing each split to look
+at only $\sqrt{20} \approx 4$ features costs more accuracy per tree than it gains in variety.
+
+Try `RandomForestClassifier(n_estimators=100, max_features=0.5, ...)` so each split sees 10
+features. Then try `max_features=None`, which is exactly bagging.
 
 ## Exercise
 
 Compare a single DecisionTree vs RandomForest on `make_classification` with 50 features (10 informative). Sweep `n_estimators` from 1 to 300. Plot OOB error and test error vs n_estimators. At what point does OOB error stop improving?
+
+> **Hint:** store `1 - rf.oob_score_` and `1 - rf.score(X_te, y_te)` in two lists inside the
+> loop, then `plt.plot(ns, oob_errs)` and `plt.plot(ns, test_errs)` on the same axes.
 
 <details>
 <summary>Solution</summary>
@@ -226,4 +335,10 @@ for n in ns:
     test_errs.append(1 - rf.score(X_te, y_te))
     print(f"n={n:3}: oob_err={oob_errs[-1]:.3f}, test_err={test_errs[-1]:.3f}")
 ```
+
+Running it, test error drops fast — from 0.405 with one tree to 0.135 at 50 trees — and then
+wanders between 0.125 and 0.16. OOB error keeps falling more slowly the whole way, from 0.423
+to 0.183 at 100 trees and 0.155 at 300, because OOB needs many trees before every row gets
+enough out-of-bag votes. So the honest answer is: test error stops improving around 50 to 150
+trees; OOB is still creeping down at 300, but by less than a point per 100 extra trees.
 </details>

@@ -7,16 +7,38 @@ order: 10
 
 ## When variance is the signal
 
+Sometimes you can't predict whether tomorrow goes up or down, but you *can* predict how wild
+it will be. Stock returns are like that: the direction is close to a coin flip, but calm weeks
+follow calm weeks and stormy weeks follow stormy weeks.
+
 Most forecasting models target the conditional mean $E[y_t | \mathcal{F}_{t-1}]$. In
 finance and risk management, the target is often the **conditional variance**
 $\text{Var}(y_t | \mathcal{F}_{t-1})$ — the volatility. High volatility means wide
 prediction intervals and high risk.
 
+$\mathcal{F}_{t-1}$ stands for "everything known up to yesterday". **Conditional** means "given
+that information". So the conditional variance is "how spread out tomorrow's value is likely
+to be, given what you know today". **Volatility** is its square root, the conditional standard
+deviation.
+
 **Volatility clustering**: large swings tend to cluster together. After a turbulent day,
 the next day is likely to be turbulent too. This violates the i.i.d. residual assumption
 of ARIMA — the variance is itself time-varying.
 
+**i.i.d.** means "independent and identically distributed": every shock drawn from the same
+distribution, unaffected by the others. ARIMA (ch. 5) assumes its shocks have one fixed
+variance forever.
+
+> **Picture it:** weather at sea. You can't say which way the next wave will roll, but if the
+> last hour brought big waves, the next hour probably will too. Storms come in spells.
+
 ## ARCH(q): autoregressive conditional heteroskedasticity
+
+ARCH says: today's risk depends on how big yesterday's surprises were. A big shock yesterday —
+up or down, the sign doesn't matter — raises today's variance.
+
+**Heteroskedasticity** means "the variance changes" (the opposite, *homo*skedastic, is
+"constant variance").
 
 Engle (1982) modeled the conditional variance as a linear function of past squared
 residuals:
@@ -24,13 +46,27 @@ residuals:
 $$
 \varepsilon_t = \sigma_t z_t, \quad z_t \sim \mathcal{N}(0,1)
 $$
+
+> **In plain words:** each shock $\varepsilon_t$ is a standard normal draw $z_t$ (mean 0, std 1)
+> stretched by today's volatility $\sigma_t$. On a calm day $\sigma_t$ is small, so the
+> shock is small; on a stormy day the same draw becomes a big move.
+
 $$
 \sigma_t^2 = \omega + \alpha_1 \varepsilon_{t-1}^2 + \cdots + \alpha_q \varepsilon_{t-q}^2
 $$
 
+> **In plain words:** today's variance = a baseline $\omega$ (omega) + weights $\alpha_i$ times
+> the *squared* recent shocks. Squaring makes a drop of 3 and a jump of 3 count the same: 9.
+
 $\omega > 0$, $\alpha_i \ge 0$. A large squared shock at $t-1$ increases $\sigma_t$.
 
+The signs keep the variance positive: a variance can never be negative.
+
 ## GARCH(1,1): the workhorse
+
+GARCH adds memory of the variance itself: today's risk is a mix of a baseline, yesterday's
+surprise, and yesterday's risk level. That one extra term lets a single model keep storms going
+for weeks.
 
 Bollerslev (1986) added a lagged variance term:
 
@@ -38,8 +74,21 @@ $$
 \sigma_t^2 = \omega + \alpha\, \varepsilon_{t-1}^2 + \beta\, \sigma_{t-1}^2
 $$
 
+- $\omega$: the baseline variance that is always there.
+- $\alpha\, \varepsilon_{t-1}^2$: the reaction to yesterday's surprise.
+- $\beta\, \sigma_{t-1}^2$: the carry-over of yesterday's variance.
+
 This is the most common model. The persistence $\alpha + \beta < 1$ ensures stationarity;
 typical values: $\alpha \approx 0.1$, $\beta \approx 0.85$ (high persistence).
+
+**Persistence** is the share of today's extra variance that survives into tomorrow. When it is
+below 1, every storm eventually calms down to the **unconditional variance**
+$\omega / (1 - \alpha - \beta)$, the long-run average level. With the values below that is
+$0.02 / 0.05 = 0.4$, so the long-run std is about 0.632.
+
+> **Picture it:** a thermostat with a slow heater. A cold blast ($\varepsilon^2$) knocks the
+> room temperature away, and because the heater is slow ($\beta$ near 1), the room takes a long
+> time to drift back to its set point ($\omega/(1-\alpha-\beta)$).
 
 ```python
 import numpy as np
@@ -67,15 +116,34 @@ print(f"  Kurtosis: {float(np.mean((eps - eps.mean())**4) / eps.std()**4):.2f}  
 
 ```output
 Simulated returns statistics:
-  Mean:     -0.0074
-  Std:      0.2035
-  Kurtosis: 5.17  (>3 = fat tails)
+  Mean:     -0.0091
+  Std:      0.5629
+  Kurtosis: 3.79  (>3 = fat tails)
 ```
 
-Excess kurtosis (> 3) is the fingerprint of GARCH: the unconditional distribution has
+The mean is $-0.0091$, essentially 0, and the std is 0.5629, a little under the theoretical
+0.632 (500 points is a short sample for such a persistent process). The interesting number is
+the kurtosis, 3.79. **Kurtosis** measures how heavy the tails are; a normal distribution has
+exactly 3.
+
+Excess kurtosis (kurtosis > 3) is the fingerprint of GARCH: the unconditional distribution has
 fatter tails than Normal because periods of high variance generate extreme observations.
 
+Every single shock here *is* normal, yet the mixture of calm and stormy days produces more
+extreme values than one normal distribution would.
+
+> **Watch out:** "kurtosis" and "excess kurtosis" are different numbers. Excess kurtosis is
+> kurtosis minus 3, so a normal distribution has excess 0. `scipy.stats.kurtosis` returns the
+> excess version by default.
+
 ## Fitting GARCH with the `arch` library
+
+Fitting reverses the simulation: given the returns, find the $\omega$, $\alpha$, $\beta$
+that make the observed sequence of calm and stormy days most likely.
+
+The `arch` library does this by **maximum likelihood** — it searches for the parameters under
+which the data would have been most probable. The code multiplies returns by 100 (percent
+returns) because the optimiser works better when numbers are not tiny.
 
 ```python
 import numpy as np
@@ -101,21 +169,42 @@ print(f"Log-likelihood: {result.loglikelihood:.1f}")
 ```
 
 ```output
-omega      0.2142
-alpha[1]   0.0957
-beta[1]    0.8618
+omega       493.2507
+alpha[1]      0.1695
+beta[1]       0.6766
 
 True:  omega=0.0200  alpha=0.1000  beta=0.8500
-Log-likelihood: -832.4
+Log-likelihood: -2705.7
 ```
 
-Estimated $\hat\alpha \approx 0.096$ (true 0.10) and $\hat\beta \approx 0.862$ (true 0.85).
-`omega` is scaled by 100² because we multiplied returns by 100.
+The estimates are rough: $\hat\alpha = 0.1695$ (true 0.10) and $\hat\beta = 0.6766$ (true 0.85),
+so the fitted persistence is 0.85 instead of 0.95. You might hope for estimates like
+$\hat\alpha \approx 0.096$ and $\hat\beta \approx 0.862$, within a hair of the truth; 500 points
+do not deliver that.
+`omega` is scaled by $100^2$ because we multiplied returns by 100: the true value on this scale is
+$0.02 \times 100^2 = 200$, and the estimate is 493.
+
+This is not a scaling problem. Fitting the same data unscaled or times 10 gives the same
+$\hat\alpha$ and $\hat\beta$. It is sample size: re-running the simulation with 5000 points
+recovers $\hat\alpha \approx 0.097$ and $\hat\beta \approx 0.83$. Persistence is hard to pin
+down because a few big storms carry most of the information.
+
+> **Watch out:** GARCH parameters are noisy with a few hundred observations. Use thousands of
+> daily points where you can, and look at the standard errors in `result.summary()` before
+> trusting a single estimate.
 
 ## Conditional volatility and VaR
 
+Once fitted, the model gives a volatility estimate for every day. Turn that into a risk number:
+"on 95% of days you will not lose more than this".
+
 The key output is the **conditional standard deviation** $\hat\sigma_t$ — the model's
 estimate of the current volatility.
+
+**VaR** (Value at Risk) at 95% is the loss you exceed on only 5% of days. If returns are normal
+with std $\hat\sigma_t$, that threshold is $-1.645\,\hat\sigma_t$, because 5% of a normal
+distribution lies below $-1.645$ standard deviations. A **violation** is a day when the real
+return falls below the VaR line.
 
 ```python
 import numpy as np
@@ -143,12 +232,32 @@ print(f"VaR 95% violations: {violations:.3f}  (target: 0.050)")
 ```
 
 ```output
-Conditional vol — mean: 20.218  max: 76.491
-True vol        — mean: 20.355  max: 65.392
+Conditional vol — mean: 55.186  max: 132.715
+True vol        — mean: 57.733  max: 116.411
 VaR 95% violations: 0.052  (target: 0.050)
 ```
 
-VaR violation rate ≈ 5.2%, close to the nominal 5% — the model is reasonably calibrated.
+The model's volatility averages 55.186 against a true 57.733, and its peak is 132.715 against
+a true 116.411: the low $\hat\beta$ makes it react harder to single shocks. The violation rate
+is 0.052, i.e. 26 days out of 500 dipped below the VaR line, against 25 expected.
+
+VaR violation rate $\approx$ 5.2%, close to the nominal 5% — the model is reasonably calibrated.
+
+So even with imperfect parameters, the *volatility path* is good enough for honest risk bands.
+
+> **Watch out:** this check is in-sample: the model was fitted on the same days it is scored
+> on. A real VaR backtest refits on past data only and scores the next day (ch. 6). And with
+> fat-tailed real data, normal quantiles understate extreme losses; `dist='t'` (Student's t) is
+> a common fix.
+
+## Recap in plain words
+
+- Volatility is the predictable part of risk: big moves cluster, so variance changes over time.
+- ARCH makes today's variance depend on recent squared shocks.
+- GARCH(1,1) adds yesterday's variance; $\alpha + \beta$ is the persistence and must be below 1.
+- GARCH processes have fat tails (kurtosis above 3) even when every shock is normal.
+- Parameter estimates are noisy on a few hundred points, but the fitted volatility path is still useful.
+- VaR turns the volatility into a loss threshold; check that violations happen at the promised rate.
 
 ## Try it Yourself
 
@@ -174,14 +283,26 @@ print(f"Half-life of volatility shock: {-np.log(2)/np.log(params['alpha[1]']+par
 ```
 
 ```output
-alpha+beta = 0.9783  (true: 0.98)
-Half-life of volatility shock: 31.2 days
+alpha+beta = 0.8402  (true: 0.98)
+Half-life of volatility shock: 4.0 days
 ```
+
+The fit badly underestimates persistence: 0.8402 instead of 0.98. The **half-life** is how many
+days a volatility shock takes to shrink by half, $-\ln 2 / \ln(\alpha + \beta)$. The model says
+4.0 days; the truth is $-\ln 2 / \ln 0.98 \approx 34$ days. With $\alpha + \beta$ this close to
+1, 400 points contain only a handful of storms, and the model can't tell "very slow decay" from
+"medium decay".
+
+Raise `n` to 4000 and re-run: the estimate should move much closer to 0.98 and the half-life
+should grow accordingly. Then try `alpha_h = 0.02; beta_h = 0.97` to see an even harder case.
 
 ## Exercise
 
 Simulate GARCH(1,1) with `alpha=0.15, beta=0.80`. Fit the model and compute the 99% VaR
 ($z_{0.01} = -2.326$). Report the empirical violation rate and check whether it's near 1%.
+
+> **Hint:** reuse the VaR block. Only two things change: the simulation parameters and the
+> multiplier, $-2.326$ instead of $-1.645$.
 
 <details>
 <summary>Solution</summary>
@@ -206,4 +327,10 @@ viols   = (returns < var_99).mean()
 print(f"99% VaR violations: {viols:.3f}  (target: 0.010)")
 print(f"alpha: {result.params['alpha[1]']:.3f}  beta: {result.params['beta[1]']:.3f}")
 ```
+
+Running it prints a violation rate of 0.012 (7 of 600 days) against a target of 0.010, and
+estimates $\hat\alpha = 0.164$, $\hat\beta = 0.783$ — close to the true 0.15 and 0.80 this
+time. At 99% you expect only 6 violations in 600 days, so 7 is well within luck. Testing VaR
+at extreme levels needs long histories: one extra violation moves the rate by 0.17 percentage
+points.
 </details>

@@ -7,9 +7,23 @@ order: 12
 
 ## The two ways competitions are lost after the modelling is done
 
+Good models still lose competitions in the last mile: you trust a gain that was luck, or you
+upload a file with the answers in the wrong rows. Both are bookkeeping problems with bookkeeping
+fixes.
+
 The first is believing a gain that was seed noise. The second is uploading a file whose rows are
 in the wrong order. Neither has anything to do with machine learning, and both are entirely
 preventable with about forty lines of code.
+
+A **seed** is the starting number for a random number generator. Same seed, same "random" choices;
+different seed, different ones. **Reproducible** means running the same code again gives the same
+numbers.
+
+> **Picture it:** a pilot's pre-flight checklist. Nobody thinks the pilot cannot fly; the checklist
+> exists because skilled people still forget the fuel cap. This chapter is that checklist for the
+> moment you press "submit".
+
+The setup: 8,000 training rows and a 3,000-row test set with ids from 100,000 to 102,999.
 
 ```python
 import numpy as np
@@ -34,6 +48,13 @@ train (8000, 20) | test (3000, 20)
 ```
 
 ## How much of your "improvement" is the seed?
+
+Run the same model with a different seed and the score moves a little. If your "improvement" is
+smaller than that wobble, it is not an improvement. Measure the wobble first.
+
+There are two seeds to vary: the **model seed** (which trees a forest grows) and the **fold seed**
+(which rows land in which CV fold). The experiment uses 1,200 rows, so each of the 4 folds
+validates on only 300.
 
 ```python
 # a realistic competition size: noise is invisible on 8,000 easy rows
@@ -70,6 +91,9 @@ varying the FOLD seed (model fixed) : mean 0.9517 | range 0.0047
   [0.9499, 0.9522, 0.9546, 0.9528, 0.95, 0.9506]
 ```
 
+Changing only the model seed moves the CV score within a range of 0.0011 (0.9499 to 0.9510).
+Changing only the fold seed moves it within 0.0047 (0.9499 to 0.9546).
+
 Two different noise sources, and they are **not** the same size: the fold seed moves the score four
 times as much as the model seed. That ordering is typical and it has a cause — changing the model
 seed re-randomises 120 trees whose average is stable, while changing the fold seed changes *which
@@ -78,7 +102,13 @@ rows are being scored*, and 300 validation rows are a small sample.
 Before you believe any improvement, compare it against both ranges, and against the larger one in
 particular: a change under 0.005 on this data is not a change at all (eval-tuning ch. 12).
 
+> **Watch out:** comparing model A on fold seed 0 with model B on fold seed 1 mixes the fold noise
+> into the comparison. Always compare candidates on the *same* folds.
+
 ### Seed averaging is a technique; seed hunting is not
+
+Training the same model with several seeds and averaging the predictions is honest: it removes
+wobble. Trying many seeds and keeping the luckiest is dishonest to yourself: it keeps wobble.
 
 ```python
 def oof_predictions(seed, k=4, cv_seed=0):
@@ -110,6 +140,9 @@ print(f"\nbest individual seed ({best_seed}): "
 best individual seed (1): 0.9740  <- do NOT submit this one
 ```
 
+One seed scores 0.9733 out-of-fold; the average of five seeds scores 0.9741. The single best seed
+(seed 1, 0.9740) sits right next to the five-seed average.
+
 Averaging over seeds reduces variance and is a legitimate free gain — small here (+0.0008 from one
 seed to five) because a 120-tree forest is already an average, and much larger for models that are
 not, such as a single neural net or a boosted tree with aggressive subsampling.
@@ -119,7 +152,16 @@ ch. 8's weight fitting in its purest form. Note that the best individual seed (0
 even beat the five-seed average (0.9741) in-sample, and on the test set it has no reason to lead
 at all. If you find yourself with a "best seed", you have found noise.
 
+> **Picture it:** flipping five coins and keeping the one that landed heads does not give you a
+> coin that lands heads more often. The "best seed" is that coin.
+
 ## Everything else that makes a run irreproducible
+
+Fixing `random_state` is not the whole story. Thread counts, row order, library versions and
+hashing can all change a result while the seed stays the same.
+
+The code seeds the three random sources a NumPy and scikit-learn stack uses, then runs two tests:
+the same forest on 1 versus 4 threads, and the same forest on shuffled rows.
 
 ```python
 def set_all_seeds(seed=0):
@@ -150,6 +192,10 @@ same seed, 1 thread vs 4 threads, identical predictions: True
 same seed, rows shuffled before fitting, identical predictions: False
 ```
 
+Threads did not matter here (`True`): scikit-learn's forest assigns each tree its own seed, so the
+trees come out the same however they are split across threads. Shuffling the rows did matter
+(`False`).
+
 Row order changes the result even with the seed fixed, because the RNG stream is consumed against
 whatever order the data arrives in. That is the mechanism behind most "it worked yesterday"
 reports. The checklist:
@@ -164,9 +210,22 @@ reports. The checklist:
 | thread count | fix it if you need bit-identical output; expect tiny drift otherwise |
 | GPU kernels | deterministic mode where the framework offers one, at a speed cost |
 
+The less familiar rows, in plain words: **`PYTHONHASHSEED`** controls how Python orders the items
+of a `set` of strings, which changes between runs unless you fix it. To **pin** a library version
+means to write down the exact version (for example `pandas==3.0.6`) and install exactly that.
+
+> **Watch out:** a `pd.concat` or `merge` can silently change row order. If a run differs from
+> yesterday's with the same seed, check the row order before anything else.
+
 ## Building the submission
 
+The model is done; now you must write its predictions into the organiser's file format. Every
+prediction must land next to the id it belongs to.
+
 The modelling is over. Everything from here is data handling, and it is where files get ruined.
+
+The **sample submission** is the organiser's template file: the ids in the order they expect, and
+a placeholder target. Here its ids are shuffled, as they often are in real competitions.
 
 ```python
 model = HistGradientBoostingClassifier(max_depth=5, random_state=0).fit(X, y)
@@ -191,11 +250,21 @@ sample submission id order matches test order: False
 correlation between the two submissions: 0.0167
 ```
 
+The sample's id order does not match the test order (`False`). The positional file and the
+key-aligned file correlate at only 0.0167 — the positional file is essentially random.
+
 Both files have the right ids, the right number of rows, and a plausible distribution of values.
 One of them is a random permutation of the correct answer. **Always merge on the key; never assign
 a column by position.**
 
+> **Picture it:** handing back exam papers in the order you marked them, instead of reading the
+> name on each. Every student gets a real grade — someone else's.
+
 ## A submission validator
+
+Before uploading, run a function that checks everything that can go wrong with the file itself:
+columns, row count, duplicates, missing ids, order, NaNs, range — and similarity to your last good
+file.
 
 ```python
 def validate_submission(sub, sample, id_col="id", target_col="target",
@@ -237,7 +306,7 @@ def validate_submission(sub, sample, id_col="id", target_col="target",
 print("correct submission:")
 validate_submission(sub_right, sample_submission)
 print("\npositionally-assigned submission:")
-validate_submission(sub_wrong, sample_submission, previous=sub_right)
+_ = validate_submission(sub_wrong, sample_submission, previous=sub_right)
 ```
 
 ```output
@@ -252,9 +321,15 @@ positionally-assigned submission:
   => 1 problem(s)
 ```
 
+The correct file passes (`=> OK`). The positional file has the same mean, spread, minimum and
+maximum to four decimals, so every value check passes. Only the last check fires: its
+correlation with the known-good file is 0.0167.
+
 The positional file passes every structural check — the only thing that catches it is the
 correlation against a known-good submission. That is why the last check exists, and why you keep
 your previous best on disk.
+
+Now a file broken in five ways at once — NaNs, out-of-range values, an extra duplicated row:
 
 ```python
 broken = sub_right.copy()
@@ -262,7 +337,7 @@ broken.loc[broken.index[:5], "target"] = np.nan
 broken.loc[broken.index[5:10], "target"] = 1.7
 broken = pd.concat([broken, broken.iloc[[0]]], ignore_index=True)
 print("deliberately broken submission:")
-validate_submission(broken, sample_submission)
+_ = validate_submission(broken, sample_submission)
 ```
 
 ```output
@@ -276,7 +351,26 @@ deliberately broken submission:
   => 5 problem(s)
 ```
 
+All five problems are reported in one pass: 3,001 rows, 1 duplicate id, wrong order (the extra
+row shifts everything after it), 6 NaNs (the 5 planted plus the duplicated first row), and a
+maximum of 1.7000.
+
+> **Watch out:** the validator *reports*; it does not stop you. Make your upload script refuse to
+> continue when it returns `False` — that is the exercise below.
+
+## Recap in plain words
+
+- On 1,200 rows, the fold seed moved the score 0.0047 and the model seed 0.0011; smaller "gains"
+  are noise.
+- Averaging several seeds is a real, small gain; keeping the best seed is self-deception.
+- Row order changes results even with a fixed seed; sort by a stable key.
+- Always merge predictions onto the sample submission by id, never by position.
+- Validate every file before upload, including a correlation check against your previous best.
+
 ## Try it Yourself
+
+`submission_manifest` writes a small record of what a file is: model, config, CV score, seeds,
+library versions, and a short **hash** — a fingerprint computed from the prediction values.
 
 ```python
 def submission_manifest(sub, model_name, config, cv_score, seeds, target_col="target"):
@@ -315,24 +409,34 @@ print(f"\nre-built file has the same hash: "
  "pred_hash": "e4b74cdf5114",
  "pred_mean": 0.531283,
  "libs": {
-  "numpy": "2.4.6",
-  "pandas": "3.0.5"
+  "numpy": "2.5.2",
+  "pandas": "3.0.6"
  }
 }
 
 re-built file has the same hash: True
 ```
 
+The 12-character `pred_hash` is `e4b74cdf5114`. Rebuilding the same file gives the same hash
+(`True`); change one prediction in the eighth decimal and the hash changes completely.
+
 The prediction hash is the cheapest anti-mistake device in a competition: two submissions with the
 same hash are the same file, whatever you named them, and a "new" model whose hash matches
 yesterday's means you submitted the wrong thing. Add fields you find yourself wanting — the git
 commit, the feature-set name, the blend weights (ch. 8).
+
+Variation to try: build the manifest for `sub_wrong` and compare its hash and `pred_mean` with
+`m1`. The means match exactly; only the hash tells the two files apart.
 
 ## Exercise
 
 Build the last mile: a function that takes a set of candidate submissions with their CV scores,
 picks the final two (one best, one diverse hedge), validates both, writes their manifests, and
 refuses to proceed if anything fails. Test it on a set that includes one deliberately broken file.
+
+> **Hint:** validate *first*, then choose among the files that passed. For the hedge, take the
+> candidate least correlated with the champion among those whose CV is within a small tolerance of
+> the champion's.
 
 <details>
 <summary>Solution</summary>
@@ -439,6 +543,10 @@ The broken candidate is rejected before it can be chosen, which matters because 
 **highest CV score in the set** — exactly the shape of the real accident, where the file you most
 want to submit is the one with something wrong in it. Validation runs before selection, never
 after.
+
+Here `broken` (CV 0.8200) fails on 65 NaN predictions. Among the four usable files, `blend` wins on
+CV (0.8150), and `forest` becomes the hedge: its CV (0.8065) is within 0.01 of the champion and its
+correlation with it (0.8269) is the lowest of the three.
 
 The hedge rule is the other piece worth keeping. Picking the top two by CV score usually gives you
 two nearly identical files, which wastes a submission slot: if the champion is wrong about the
