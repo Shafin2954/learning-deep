@@ -7,6 +7,11 @@ order: 6
 
 ## EDA is hypothesis generation
 
+**Exploratory Data Analysis (EDA)** is getting to know a dataset before you model it: how
+big it is, what is missing, what each column looks like, and which columns move together.
+The goal is not pretty charts. The goal is a list of facts and hunches that tell you what to
+clean, what to transform, and what to test.
+
 Exploratory Data Analysis is not about making charts — it's about building a mental model of
 the data that informs every modelling decision. Work through these five steps in order, and
 document what you find at each step. Undocumented EDA is wasted EDA.
@@ -17,7 +22,19 @@ document what you find at each step. Undocumented EDA is wasted EDA.
 4. **Bivariate relationships** — numeric×numeric, numeric×categorical, categorical×categorical.
 5. **Multivariate** — pairplot, heatmap, conditional patterns.
 
+**Univariate** means one column at a time, **bivariate** two at a time, and
+**multivariate** many at once. **Cardinality** is the number of distinct values a column
+has.
+
+> **Picture it:** a doctor's check-up. First height and weight (shape), then what is missing
+> from your file, then each vital sign on its own, then how pairs relate ("blood pressure
+> rises with age"), and only then the whole picture. Skipping to the whole picture first is
+> how things get missed.
+
 ## Step 1: Shape and dtypes
+
+Count the rows and columns and check each column's type. Wrong types (numbers stored as
+text, IDs stored as numbers) are the first thing to fix.
 
 ```python
 import pandas as pd
@@ -45,18 +62,25 @@ print(f"\nMemory: {df.memory_usage(deep=True).sum() / 1024:.1f} KB")
 
 ```output
 (500, 6)
-age         int32
-income    float64
-score     float64
-region     object
-product    object
-churned      int8
+age          int32
+income     float64
+score      float64
+region         str
+product        str
+churned       int8
 dtype: object
 
-Memory: 98.8 KB
+Memory: 22.9 KB
 ```
 
+500 rows and 6 columns. `region` and `product` are text (`str`), `churned` is a small
+`int8` (it only holds 0 or 1), and the whole table uses about 23 KB. Already you know
+`churned` is the likely target and two columns will need encoding (ch. 9).
+
 ## Step 2: Missing values
+
+Next, count the blanks per column and turn them into percentages, so "19 missing" becomes
+"3.8% missing" — a number you can compare across columns.
 
 ```python
 import pandas as pd
@@ -80,11 +104,21 @@ print(summary[summary['missing'] > 0])
 
 ```output
         missing  pct
-income       25  5.0
-score        35  7.0
+income       19  3.8
+score        43  8.6
 ```
 
+Only two columns have gaps: `income` with 19 (3.8%) and `score` with 43 (8.6%) — close to
+the 5% and 8% planted. The summary shows only columns with at least one blank, so a wide
+table stays readable. Next you would check *why* they are missing (ch. 4).
+
 ## Step 3: Univariate distributions
+
+Look at each column by itself. For numbers: where is the middle, how wide is the spread,
+is it lopsided, are there extremes? For categories: how many of each?
+
+A **distribution** is the pattern of how often each value occurs. **Skew** measures how
+lopsided it is: 0 for symmetric, positive when a long tail stretches to the right.
 
 ```python
 import pandas as pd
@@ -122,22 +156,36 @@ print(f"product counts:\n{pd.Series(product).value_counts()}")
 ```
 
 ```output
-income skew: 2.04
+income skew: 2.22
 product counts:
-Basic         253
-Pro           176
-Enterprise     71
-dtype: int64
-[Figure: histogram, box plot, and bar chart for income and product columns]
+Basic         243
+Pro           168
+Enterprise     89
+Name: count, dtype: int64
 ```
 
+The skew of 2.22 says income has a long right tail — a few people earn far more than the
+rest (an exponential distribution has skew 2 in theory). In the product counts, Basic
+leads with 243, then Pro with 168, and Enterprise trails with 89.
+
 Right-skewed income ($\text{skew} > 1$) is a signal to consider log-transforming before
-feeding to linear models. Enterprise customers are rare (14%) — flag for class-imbalance
-consideration.
+feeding to linear models. Enterprise customers are rare (89 of 500, about 18%) — flag for
+class-imbalance consideration.
+
+> **Picture it:** a right-skewed income histogram is a playground slide seen from the side:
+> a tall ladder of ordinary incomes on the left, and a long slope trailing off to the right
+> where the few very high earners sit.
 
 ## Step 4: Bivariate relationships
 
+Now look at pairs of columns. The right tool depends on the pair's types: a scatter plot
+and correlation for two numbers, grouped box plots for a number and a category, and a
+contingency table for two categories.
+
 ### Numeric × numeric
+
+The **correlation** (Pearson's $r$, ch. 7) is a number from -1 to 1 that says how close two
+columns are to lying on a straight line together: 1 is a perfect rising line, 0 is no line.
 
 ```python
 import pandas as pd
@@ -159,7 +207,7 @@ axes[0].set_title('age vs income (positive trend)')
 
 axes[1].scatter(df['income'], df['score'], alpha=0.3, s=15, color='tomato')
 axes[1].set_xlabel('income'); axes[1].set_ylabel('score')
-axes[1].set_title('income vs score (weak negative)')
+axes[1].set_title('income vs score (weak)')
 
 fig.tight_layout()
 plt.show()
@@ -167,14 +215,26 @@ print(df.corr().round(2))
 ```
 
 ```output
-           age  income  score
-age       1.00    0.93  -0.03
-income    0.93    1.00  -0.26
-score    -0.03   -0.26   1.00
-[Figure: two scatter plots showing age-income and income-score relationships]
+         age  income  score
+age     1.00    0.79   0.12
+income  0.79    1.00   0.07
+score   0.12    0.07   1.00
 ```
 
+`age` and `income` correlate at 0.79 — a strong rising trend, as the formula built in
+(`800 * age`). `score` barely relates to either: 0.12 with age and 0.07 with income. The
+formula gives score a *negative* direct link to income (`- 0.0001 * income`), yet the
+correlation is positive: income rides along with age, and age pushes score up. That
+indirect path outweighs the small direct one.
+
+> **Watch out:** a correlation between two columns mixes direct and indirect effects. To
+> isolate one effect, you need a model that holds the other columns fixed — not a
+> correlation table.
+
 ### Numeric × categorical
+
+To compare a number across groups, compute summary statistics per group and draw one box
+plot per group side by side.
 
 ```python
 import pandas as pd
@@ -193,7 +253,7 @@ df = pd.DataFrame({'product': product, 'income': income})
 
 fig, ax = plt.subplots(figsize=(6, 4))
 groups = [df[df['product'] == p]['income'].dropna().values for p in ['Basic', 'Pro', 'Enterprise']]
-ax.boxplot(groups, labels=['Basic', 'Pro', 'Enterprise'])
+ax.boxplot(groups, tick_labels=['Basic', 'Pro', 'Enterprise'])
 ax.set_ylabel('income')
 ax.set_title('Income by product tier')
 plt.show()
@@ -202,15 +262,23 @@ print(df.groupby('product')['income'].agg(['mean', 'median', 'std']).round(0))
 ```
 
 ```output
-            mean  median    std
+               mean   median      std
 product
-Basic      35052   35104  10074
-Enterprise 89863   89752  19791
-Pro        55072   55228  15249
-[Figure: box plot showing income distributions across Basic, Pro, Enterprise tiers]
+Basic       35785.0  34782.0  10145.0
+Enterprise  91137.0  92319.0  18079.0
+Pro         53015.0  53471.0  14049.0
 ```
 
+The groups are clearly separated: Basic averages about 35,800, Pro about 53,000, and
+Enterprise about 91,100. In each tier the mean and median are close, so the groups are
+roughly symmetric. Enterprise's standard deviation (18,079) is the widest, a sign of more
+varied customers in that tier.
+
 ## Step 5: Contingency tables for categorical × categorical
+
+A **contingency table** (or **crosstab**) counts how many rows fall in each combination of
+two categories — region by product here. Dividing each row by its total turns counts into
+shares you can compare.
 
 ```python
 import pandas as pd
@@ -235,26 +303,45 @@ print(ct_norm)
 
 ```output
 Raw counts:
-product    Basic  Enterprise  Pro
+product  Basic  Enterprise  Pro
 region
-East          67          18   44
-North         72          13   40
-South         60          18   46
-West          52          17   53
+East        54          26   45
+North       59          18   43
+South       56          19   45
+West        73          12   50
 
 Row-normalised (proportion within region):
-product    Basic  Enterprise   Pro
+product  Basic  Enterprise    Pro
 region
-East       0.518       0.140  0.341
-North      0.587       0.106  0.326
-South      0.484       0.145  0.371
-West       0.402       0.131  0.467
+East     0.432       0.208  0.360
+North    0.492       0.150  0.358
+South    0.467       0.158  0.375
+West     0.541       0.089  0.370
 ```
 
-Row-normalised tables reveal differences in distribution across groups. West has notably more
-Pro customers (46.7%) and fewer Basic customers (40.2%) than North (32.6% Pro, 58.7% Basic).
+Row-normalised tables reveal differences in distribution across groups. Here the
+differences look striking at first: East has 20.8% Enterprise customers and West only
+8.9%. But this data was generated with region and product *independent* — the gaps are
+pure sampling noise. A chi-square test of independence on these counts gives $p \approx
+0.24$, far from significant (see the Probability & Statistics course for the test).
+
+> **Watch out:** with a few hundred rows split into 12 cells, some cells hold only 12 to 26
+> rows, and percentages jump by several points on a handful of customers. Before you report
+> "West buys less Enterprise", test it.
+
+## Recap in plain words
+
+- EDA builds a written list of facts and hunches about the data before any model.
+- Go in order: shape and types, missing values, one column at a time, pairs, then many.
+- Skew above 1 suggests a log transform; rare categories suggest class imbalance.
+- Pick the pair tool by type: correlation for number-number, grouped box plots for
+  number-category, crosstabs for category-category.
+- Differences in small groups can be noise — check them with a test before believing them.
 
 ## Try it Yourself
+
+This runs all five steps on a small customer table where churn is defined as spending
+under 40.
 
 ```python
 import pandas as pd
@@ -299,15 +386,23 @@ spend      0
 segment    0
 churned    0
 dtype: int64
-Correlation spend vs tenure: 0.474
+
+Correlation spend vs tenure: 0.436
+
 Churn by segment:
-         churned    0    1
+churned      0      1
 segment
-A               0.806  0.194
-B               0.788  0.212
-C               0.848  0.152
-[Figure: histograms of tenure and spend]
+A        0.904  0.096
+B        0.966  0.034
+C        0.923  0.077
 ```
+
+No missing values, and spend correlates with tenure at 0.436 — positive, as the formula
+`0.5 * tenure` built in. The churn table shows 9.6%, 3.4%, and 7.7% churn across segments
+A, B, C, but segment was assigned at random, so this spread is noise again (a chi-square
+test gives $p \approx 0.09$). The real churn driver is spend, which you would find by
+comparing spend across `churned` values. Try `df.groupby('churned')['spend'].mean()` and
+see how far apart the two groups are.
 
 ## Exercise
 
@@ -315,6 +410,9 @@ Simulate a DataFrame: 600 rows, columns `temperature` (Normal 20, 5), `humidity`
 `city` (choice of 4 cities), `demand` (positive linear function of temperature + noise).
 Produce: (1) a printed missing-value summary, (2) a histogram of `demand`, (3) a box plot of
 `demand` by `city`, (4) a correlation table for the numeric columns.
+
+> **Hint:** build `temperature` first as its own array so `demand` can use it, then put
+> everything in one `DataFrame`. For the box plot, collect one array per city in a list.
 
 <details>
 <summary>Solution</summary>
@@ -345,7 +443,7 @@ axes[0].set_title('Demand distribution')
 
 # 3) Box plot by city
 city_groups = [df[df['city'] == c]['demand'].values for c in cities]
-axes[1].boxplot(city_groups, labels=cities)
+axes[1].boxplot(city_groups, tick_labels=cities)
 axes[1].set_title('Demand by city')
 
 plt.tight_layout()
@@ -358,5 +456,7 @@ print(df[['temperature', 'humidity', 'demand']].corr().round(3))
 
 Temperature and demand should show strong positive correlation (~0.89); humidity and demand
 near zero. City box plots should show similar medians (city was random here) — a real dataset
-would show geographic differences.
+would show geographic differences. Running it confirms this: temperature and demand
+correlate at 0.894, humidity and demand at -0.003. The strength comes from the signal-to-noise
+ratio: `8 * temp` has a spread of 40 against noise of 20.
 </details>

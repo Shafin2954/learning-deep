@@ -7,13 +7,27 @@ order: 4
 
 ## From regression to classification
 
+For a yes/no question you want an answer like "73% chance of yes", not "4.2". Logistic
+regression computes the same weighted sum as linear regression, then squashes it into the
+range 0 to 1 so it can be read as a probability.
+
 Linear regression predicts a real value. For binary classification, you need a probability in $(0,1)$. Apply the **sigmoid** function to the linear output:
 
 $$
 \sigma(z) = \frac{1}{1 + e^{-z}}, \quad z = w^Tx + b
 $$
 
+> **In plain words:** first compute the score $z$ — a weighted sum of the features, exactly
+> as in ch. 2. Then feed it through $\sigma$. A big positive score gives a probability near
+> 1, a big negative score gives one near 0, and a score of 0 gives exactly one half.
+
 $\sigma$ maps any real number to $(0,1)$: $\sigma(0)=0.5$, $\sigma(\infty)=1$, $\sigma(-\infty)=0$. The predicted probability that $y=1$ is $\hat{p} = \sigma(w^Tx)$.
+
+(As in ch. 2, $b$ has been folded into $w$ with a column of ones, so $w^Tx$ includes it.)
+
+> **Picture it:** a dimmer switch with soft ends. Turning the knob (the score $z$) through
+> the middle changes the light a lot; near either end the light is already almost fully off
+> or on, and extra turning barely changes it.
 
 ```python
 import numpy as np
@@ -37,15 +51,35 @@ plt.show()
 [Figure: sigmoid S-curve from 0 to 1 over z in [-6, 6], crossing 0.5 at z=0]
 ```
 
+The curve is flat near 0 on the far left, flat near 1 on the far right, and steepest in the
+middle, where it crosses the dashed 0.5 line at exactly $z = 0$.
+
 ## Binary cross-entropy loss
 
+The loss should punish a model that is confidently wrong much more than one that was
+unsure. Cross-entropy does this by charging the *log* of the probability the model gave to
+the right answer.
+
 Using MSE $\|y - \hat{p}\|^2$ with sigmoid leads to a non-convex loss. The correct loss is **binary cross-entropy**, which comes from maximum likelihood estimation of a Bernoulli distribution:
+
+A **non-convex** loss has several dips, so gradient descent can get stuck in the wrong one.
+**Maximum likelihood estimation** means choosing the weights that make the observed labels
+as probable as possible. A **Bernoulli distribution** is a single weighted coin flip: 1 with
+probability $p$, 0 otherwise.
 
 $$
 L(w) = -\frac{1}{n}\sum_{i=1}^n \left[y_i \log \hat{p}_i + (1 - y_i)\log(1 - \hat{p}_i)\right]
 $$
 
+> **In plain words:** for each example, only one of the two terms is switched on. If the
+> true label is 1, the cost is $-\log \hat{p}_i$. If the label is 0, the cost is
+> $-\log(1-\hat{p}_i)$. Either way, the cost is minus the log of the probability you gave to
+> what actually happened. Average over all $n$ examples.
+
 When $y_i=1$ and $\hat{p}_i\to 0$, the loss $\to\infty$ — a heavy penalty for confident wrong predictions. When $\hat{p}_i\to 1$, the loss $\to 0$.
+
+For example, with true label 1: predicting 0.9 costs $-\log 0.9 \approx 0.105$, predicting
+0.5 costs $0.693$, and predicting 0.01 costs $4.6$.
 
 ### Gradient derivation
 
@@ -55,9 +89,22 @@ $$
 \frac{\partial L}{\partial w} = \frac{1}{n}\sum_{i=1}^n (\hat{p}_i - y_i)x_i = \frac{1}{n}X^T(\hat{p} - y)
 $$
 
+> **In plain words:** for each example, take the miss $\hat{p}_i - y_i$ (predicted
+> probability minus the true 0 or 1), multiply by that example's features, and average.
+> The derivation works because the sigmoid's own slope is $\sigma(z)(1-\sigma(z))$, and that
+> factor cancels neatly against the derivatives of the two log terms.
+
 This is the same form as linear regression — the error times the features — but $\hat{p}=\sigma(Xw)$ instead of $Xw$.
 
+> **Watch out:** unlike linear regression, setting this gradient to zero has no formula
+> solution, because $w$ is trapped inside $\sigma$. You must iterate — gradient descent or a
+> smarter optimizer.
+
 ## Implementing from scratch
+
+The from-scratch version is ch. 2's gradient-descent loop with two changes: predictions pass
+through `sigmoid`, and the printed loss is cross-entropy. The `1e-15` inside each log stops
+$\log 0$ from becoming minus infinity.
 
 ```python
 import numpy as np
@@ -95,10 +142,18 @@ print(f"Scratch accuracy: {acc:.3f}, final loss: {losses[-1]:.4f}")
 ```
 
 ```output
-Scratch accuracy: 0.933, final loss: 0.1782
+Scratch accuracy: 0.917, final loss: 0.1851
 ```
 
+The from-scratch model classifies 91.7% of the 60 test points correctly (55 of 60), and the
+training cross-entropy has fallen to 0.1851 from its starting value of $\log 2 \approx 0.693$
+(where every prediction was 0.5).
+
 ## Verifying against sklearn
+
+A good habit: whenever you write a model by hand, fit the library version on the same data
+and compare. `C=1e6` turns sklearn's built-in penalty almost off (sklearn's `C` is the
+*inverse* of the penalty strength), so both models solve the same unregularized problem.
 
 ```python
 from sklearn.linear_model import LogisticRegression
@@ -110,20 +165,46 @@ print(f"Sklearn  w: {sk.coef_[0].round(3)}, b: {sk.intercept_[0]:.3f}")
 ```
 
 ```output
-Sklearn accuracy: 0.933
-Scratch  w: [ 1.824 -1.406], b: -0.114
-Sklearn  w: [ 1.837 -1.421], b: -0.116
+Sklearn accuracy: 0.917
+Scratch  w: [0.405 3.58 ], b: -0.009
+Sklearn  w: [0.821 5.54 ], b: -0.092
 ```
+
+The accuracies agree (0.917), but the weights do not: scratch gives `[0.405 3.58 ]`,
+sklearn gives `[0.821 5.54 ]`, roughly 1.5 to 2 times larger. The scratch loop simply
+stopped early. On this nearly separable data the loss keeps decreasing slowly as the
+weights grow, and 500 steps at learning rate 0.1 are not enough to get there. Rerun
+`logistic_fit` with `epochs=50000` and the scratch weights become `[0.82 5.539]` with
+$b = -0.094$ — a match to sklearn's to two decimals.
 
 The coefficients match closely (sklearn uses a more sophisticated optimizer; with enough epochs GD converges to the same solution).
 
+The sentence above is true only "with enough epochs": sklearn's **L-BFGS** optimizer uses
+curvature information and reaches the minimum in a few dozen steps, while plain GD needs
+tens of thousands here.
+
+> **Watch out:** sklearn's `LogisticRegression` is **regularized by default** (`C=1.0`).
+> Without `C=1e6` the sklearn weights on this data are about `[0.50 3.91]`, and you would be
+> comparing two different models.
+
 ## Softmax for multiclass
+
+For more than two classes, give each class its own score, then turn all the scores into
+probabilities that add up to 1. The class with the highest score gets the largest share.
 
 For $K$ classes, replace sigmoid with softmax:
 
 $$
 p_k = \frac{e^{z_k}}{\sum_{j=1}^K e^{z_j}}, \quad z_k = w_k^T x + b_k
 $$
+
+> **In plain words:** each class $k$ has its own weights $w_k$ and offset $b_k$, giving a
+> score $z_k$. Raise $e$ to each score (making them all positive), then divide by the total
+> so the $K$ results sum to 1. That's the **softmax** function.
+
+> **Picture it:** a vote where each class shouts its score. Exponentiating turns the shouts
+> into shares of a pie: a class whose score is 1 unit higher gets about 2.7 times as large a
+> slice.
 
 The loss is categorical cross-entropy: $L = -\frac{1}{n}\sum_i \log p_{y_i}$. Logistic regression is the special case $K=2$.
 
@@ -135,15 +216,29 @@ X_iris, y_iris = load_iris(return_X_y=True)
 X_iris = StandardScaler().fit_transform(X_iris)
 X_tr2, X_te2, y_tr2, y_te2 = train_test_split(X_iris, y_iris, test_size=0.2, random_state=0)
 
-sk3 = LogisticRegression(multi_class='multinomial', max_iter=500).fit(X_tr2, y_tr2)
+sk3 = LogisticRegression(max_iter=500).fit(X_tr2, y_tr2)
 print(f"3-class accuracy: {sk3.score(X_te2, y_te2):.3f}")
 print(f"Classes: {sk3.classes_}, coef shape: {sk3.coef_.shape}")
 ```
 
 ```output
-3-class accuracy: 0.967
+3-class accuracy: 1.000
 Classes: [0 1 2], coef shape: (3, 4)
 ```
+
+On the 30 iris test flowers the 3-class model is right every time (accuracy 1.000). The
+coefficient matrix has shape `(3, 4)`: one row of 4 weights for each of the 3 classes. Recent
+sklearn versions use the multinomial (softmax) loss automatically when there are more than
+two classes.
+
+## Recap in plain words
+
+- Logistic regression is linear regression's weighted sum passed through a sigmoid, giving a probability between 0 and 1.
+- It is trained with cross-entropy, which charges minus the log of the probability given to the true label.
+- The gradient is "error times features", the same shape as linear regression, but there is no closed-form solution.
+- Plain gradient descent can be slow to converge; sklearn's optimizer gets there far faster.
+- sklearn regularizes by default; set `C` large to switch that off.
+- Softmax generalizes the sigmoid to $K$ classes by exponentiating the scores and normalizing them.
 
 ## Try it Yourself
 
@@ -175,14 +270,26 @@ print(f"Final loss: {losses[-1]:.4f}")
 ```
 
 ```output
-w=4.127, b=-0.083
-Decision boundary at x = 0.020  (expected ≈ 0)
-Final loss: 0.1034
+w=6.526, b=0.370
+Decision boundary at x = -0.057  (expected ≈ 0)
+Final loss: 0.0198
 ```
+
+The two classes are centred at -1 and +1 with the same spread, so the boundary should land
+halfway, at 0. The fit puts it at $-b/w = -0.057$, close to 0. The **decision boundary** is
+the $x$ where $wx + b = 0$, so $\sigma = 0.5$. A large slope ($w = 6.526$) means the
+predicted probability switches sharply from 0 to 1 near the boundary; the final loss of
+0.0198 says almost every point is classified confidently and correctly.
+
+Try moving the second cluster's mean from `1` to `2`. The boundary should shift right,
+toward the new midpoint of 0.5.
 
 ## Exercise
 
 Implement logistic regression with L2 regularisation: add $\lambda\|w\|_2^2/2$ to the loss and $\lambda w$ to the gradient. Use make_classification with n_features=20, n_informative=5. Compare the test accuracy of unregularised vs regularised ($\lambda=0.1, 1, 10$). Which $\lambda$ works best?
+
+> **Hint:** only `dw` changes — add `lam * w` to it. Do not add anything to `db`; the
+> intercept is normally left unpenalized.
 
 <details>
 <summary>Solution</summary>
@@ -216,4 +323,10 @@ for lam in [0, 0.1, 1, 10]:
 ```
 
 The best lambda is typically 0.1 or 1 — enough regularisation to handle the 15 noise features without over-shrinking the 5 informative ones.
+
+On this exact split, the run prints test accuracy 0.875 for $\lambda = 0$, 0.887 for 0.1,
+0.812 for 1, and 0.550 for 10. So 0.1 is the winner, and 1 already shrinks too hard. At
+$\lambda = 10$ the penalty step `lr * lam * w` cancels the whole weight vector every
+iteration, so the model is close to a coin flip. The lesson: useful regularization lives in
+a narrow band, which is why you tune it by cross-validation (ch. 3).
 </details>

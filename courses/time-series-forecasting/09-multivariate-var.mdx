@@ -7,12 +7,27 @@ order: 9
 
 ## When you have multiple related series
 
+Sometimes one series gives early warning about another: advertising spend this month hints at
+sales next month. A model that looks only at sales throws that warning away. VAR looks at all
+the series together.
+
 Univariate models treat each series in isolation. If series $X$ causally influences $Y$,
 ignoring $X$ discards useful information. **Vector Autoregression (VAR)** models all series
 jointly: each variable is a linear function of its own lags and the lags of every other
 variable.
 
+**Univariate** means "one variable at a time" — every model so far (ch. 4–5). A **vector** here
+is a short list of numbers measured at the same moment, like (temperature, electricity demand)
+for one day.
+
+> **Picture it:** two friends walking side by side. Where friend A is now depends on where A
+> was a second ago — and a little on where B was, because they nudge each other. VAR writes
+> one AR equation per friend, each allowed to look at both friends' past positions.
+
 ## VAR(p) model
+
+A VAR is an AR model (ch. 5) where every number becomes a list and every coefficient becomes a
+table. Each table says how much each series' past pushes each series' present.
 
 For a $K$-dimensional vector $\mathbf{y}_t = (y_{1,t}, \ldots, y_{K,t})^T$:
 
@@ -20,14 +35,32 @@ $$
 \mathbf{y}_t = \mathbf{c} + A_1 \mathbf{y}_{t-1} + A_2 \mathbf{y}_{t-2} + \cdots + A_p \mathbf{y}_{t-p} + \boldsymbol{\varepsilon}_t
 $$
 
+- $\mathbf{y}_t$ is the list of all $K$ series at time $t$; $\mathbf{c}$ is a list of constants.
+- $A_i$ is a $K \times K$ table of coefficients for lag $i$: row $j$, column $k$ says how much
+  series $k$ at lag $i$ pushes series $j$ today.
+- $\boldsymbol{\varepsilon}_t$ is a list of shocks, one per series (they may be correlated
+  with each other).
+- $p$ is the number of lags, the same for every series.
+
 Each $A_i$ is a $K\times K$ coefficient matrix. The model reduces to $K$ separate AR(p)
 regressions when the off-diagonal elements of all $A_i$ are zero. VAR captures the full
 cross-series dynamics.
 
+The **off-diagonal** entries are the cross-effects ("series 2's past moves series 1"); the
+**diagonal** entries are each series' own memory. The cost: a VAR with $K$ series and $p$ lags
+has $K^2 p$ coefficients, so 5 series and 4 lags already means 100 numbers to estimate.
+
 **Stationarity requirement**: all series in $\mathbf{y}_t$ must be stationary (difference
 if needed). If they're cointegrated, use VECM instead.
 
+**Cointegrated** series wander individually but are tied together in the long run, like the
+price of the same stock on two exchanges. Differencing them would throw away that tie; a
+**VECM** (vector error-correction model) keeps it.
+
 **Lag order selection**: minimize AIC or BIC over candidate orders $p=1,2,\ldots$
+
+**BIC** is like AIC (ch. 4) but penalises extra parameters harder, so it tends to pick smaller
+models.
 
 ```python
 import numpy as np
@@ -59,32 +92,61 @@ lag_order = model.select_order(maxlags=5)
 print(f"\nSelected lag order (AIC): {lag_order.aic}")
 
 fitted = model.fit(lag_order.aic)
-print(fitted.summary().tables[1])
+eq_x = pd.DataFrame({'coefficient': fitted.params['x'], 'std error': fitted.stderr['x'],
+                     't-stat': fitted.tvalues['x'], 'prob': fitted.pvalues['x']})
+print("\nResults for equation x")
+print(eq_x.round(3))
 ```
 
 ```output
 ADF p-value for x: 0.0000  (stationary)
 ADF p-value for y: 0.0000  (stationary)
 
-Selected lag order (AIC): 1
+Selected lag order (AIC): 2
 
 Results for equation x
-========================================
-      coefficient  std error  t-stat  prob
-----------------------------------------
-const       0.005      0.073   0.072  0.943
-L1.x        0.602      0.067   9.008  0.000
-L1.y       -0.010      0.058  -0.174  0.862
+       coefficient  std error  t-stat   prob
+const       -0.033      0.062  -0.527  0.598
+L1.x         0.731      0.070  10.421  0.000
+L1.y         0.107      0.061   1.762  0.078
+L2.x        -0.209      0.074  -2.824  0.005
+L2.y        -0.086      0.058  -1.488  0.137
 ```
 
+Both ADF p-values are 0.0000, so both series are stationary and VAR can be applied directly. AIC
+selects lag order 2, even though the simulation uses only lag 1. In the $x$ equation, the true
+model is $x_t = 0.6 x_{t-1} + \text{noise}$. The fit gives `L1.x` 0.731 and `L2.x` $-0.209$,
+the second one significant (prob 0.005). Their sum, 0.52, is close to the true 0.6 — this
+particular sample happens to look like a slightly more complex process. The $y$ lags in the
+$x$ equation (`L1.y` p = 0.078, `L2.y` p = 0.137) are not significant at 5%, which is correct:
+$y$ does not drive $x$.
+
+> **Watch out:** AIC tends to overfit lag order, especially in small samples; BIC picks
+> smaller orders. When the two disagree, compare the candidate VARs by backtested forecast error
+> (ch. 6).
+
 ## Granger causality test
+
+The question "does $X$ help forecast $Y$?" can be tested: fit $Y$'s equation with and without
+$X$'s past, and check whether including it cuts the error by more than chance would.
 
 $X$ **Granger-causes** $Y$ if adding lagged values of $X$ significantly improves the
 forecast of $Y$ beyond what lagged $Y$ alone provides. It's a predictive (not structural)
 notion of causality.
 
+**Predictive, not structural** means it tells you "$X$'s past carries information about $Y$'s
+future", not "$X$ makes $Y$ happen". A third hidden series driving both, with $X$ reacting
+faster, would also produce Granger causality.
+
 The test: fit two VAR models (unrestricted: includes $X$; restricted: excludes $X$) and
-compare via an F-test. Low p-value → $X$ Granger-causes $Y$.
+compare via an F-test. A low p-value means $X$ Granger-causes $Y$.
+
+The **F-test** compares how much smaller the error gets with the extra lags against how much it
+would shrink from adding random noise columns.
+
+> **Picture it:** rooster crows reliably come before sunrise. The rooster Granger-causes the
+> sunrise — knowing he crowed helps you predict dawn — but shooting the rooster will not stop
+> the sun.
 
 ```python
 import numpy as np
@@ -112,17 +174,33 @@ print(f"z → y: F={gc_z_to_y.test_statistic:.2f}  p={gc_z_to_y.pvalue:.4f}")
 ```
 
 ```output
-x → y: F=14.83  p=0.0002
-z → y: F=0.47   p=0.4943
+x → y: F=36.12  p=0.0000
+z → y: F=0.41  p=0.5222
 ```
 
-$x \to y$: p = 0.0002 — strong evidence that $x$ Granger-causes $y$ (as designed).
-$z \to y$: p = 0.49 — no evidence (correct: $z$ is independent).
+$x \to y$ has $F = 36.12$ with a p-value that rounds to 0.0000: decisive. $z \to y$ has
+$F = 0.41$ and $p = 0.5222$: no evidence at all.
+
+$x \to y$: p $\approx$ 0.0000 — strong evidence that $x$ Granger-causes $y$ (as designed).
+$z \to y$: p = 0.52 — no evidence (correct: $z$ is independent).
+
+> **Watch out:** with many series you run many tests, and about 1 in 20 unrelated pairs will
+> show p < 0.05 by luck. Correct for multiple testing, or use Granger results as hints rather
+> than proof.
 
 ## Impulse response functions
 
+An impulse response answers "if I kick series $i$ once today, how does series $j$ move over the
+next few days?". It traces the ripple of a single shock through the whole system.
+
 An IRF traces the dynamic effect of a one-standard-deviation shock in variable $i$ on
 variable $j$ over $h$ periods ahead.
+
+Strictly, `irf.irfs` used below is the *unit* version: a shock of size exactly 1 in $x$'s
+equation, holding the other shocks at zero. The one-standard-deviation version, which also
+accounts for shocks hitting both series together, lives in `irf.orth_irfs` (orthogonalised
+IRFs). Both trace the same shape; only the scaling and the treatment of correlated shocks
+differ.
 
 ```python
 import numpy as np
@@ -150,17 +228,32 @@ for h, r in enumerate(response):
 ```output
 Effect of x-shock on y over 8 periods:
   h=0: 0.0000
-  h=1: 0.4973
-  h=2: 0.4964
-  h=3: 0.3971
-  h=4: 0.3176
-  h=5: 0.2541
-  h=6: 0.2033
-  h=7: 0.1627
+  h=1: 0.5544
+  h=2: 0.5072
+  h=3: 0.3535
+  h=4: 0.2222
+  h=5: 0.1328
+  h=6: 0.0772
+  h=7: 0.0441
+  h=8: 0.0250
 ```
+
+The response is 0 at $h = 0$, jumps to 0.5544 at $h = 1$ — close to the true coefficient 0.5 on
+$x_{t-1}$ in $y$'s equation — and then fades: 0.5072, 0.3535, …, 0.0250 at $h = 8$. The $h = 2$
+value stays high because the shock keeps arriving twice: $x$ remembers 60% of it, and $y$ remembers
+40% of what it already received.
 
 The shock in $x$ reaches $y$ with a one-period delay (h=0 effect is 0 — by construction
 $y$ responds to lagged $x$) then decays geometrically as both autoregressive processes damp.
+
+## Recap in plain words
+
+- VAR models several series together: each one depends on its own past and on the others' past.
+- Each lag has a $K \times K$ coefficient table, so the parameter count grows as $K^2 p$.
+- All series must be stationary; cointegrated series call for a VECM.
+- Choose $p$ with AIC or BIC; AIC tends to pick more lags.
+- Granger causality tests whether one series' past improves forecasts of another — prediction, not proof of cause.
+- Impulse response functions show how a single shock ripples through the system over time.
 
 ## Try it Yourself
 
@@ -191,19 +284,33 @@ print(fitted.forecast(df.values[-1:], steps=5).round(3))
 
 ```output
 x → y: p=0.0000
-y → x: p=0.0000
+y → x: p=0.0026
 Forecast 5 steps ahead:
-[[-0.058  0.113]
- [-0.037  0.075]
- [-0.024  0.048]
- [-0.016  0.031]
- [-0.010  0.020]]
+[[1.787 2.14 ]
+ [1.309 1.782]
+ [1.001 1.442]
+ [0.784 1.164]
+ [0.626 0.948]]
 ```
+
+Here both directions are real: $x$ uses $0.2\,y_{t-1}$ and $y$ uses $0.3\,x_{t-1}$. The tests
+find both: p = 0.0000 for $x \to y$ and p = 0.0026 for $y \to x$. The weaker link (0.2) gets the
+larger p-value, but it is still well below 0.05. The 5-step forecast starts at (1.787, 2.14)
+and shrinks toward (0, 0) step by step: a stationary VAR forecast always decays toward the
+series' mean, here about 0.
+
+Try setting the $0.2$ to $0.05$ and re-run: the $y \to x$ p-value should climb, and with
+250 points it may no longer be significant. That shows how sample size limits what Granger
+tests can detect.
 
 ## Exercise
 
 Simulate two series where $A$ causes $B$ but $B$ does NOT cause $A$. Fit VAR(1), run
 Granger causality tests in both directions, and verify the correct direction is detected.
+
+> **Hint:** copy the simulation loop from the Granger section with two series: let $b_t$ depend
+> on $a_{t-1}$, but let $a_t$ depend only on $a_{t-1}$. Then call `test_causality` twice with the
+> roles swapped.
 
 <details>
 <summary>Solution</summary>
@@ -226,4 +333,8 @@ fitted = VAR(df).fit(1)
 print(f"a → b: p={fitted.test_causality('b', ['a'], kind='f').pvalue:.4f}  (should be low)")
 print(f"b → a: p={fitted.test_causality('a', ['b'], kind='f').pvalue:.4f}  (should be high)")
 ```
+
+Running it prints p = 0.0000 for $a \to b$ and p = 0.4107 for $b \to a$: the test finds the real
+link and correctly finds no evidence for the reverse one. A large p-value is "no evidence",
+not "proof of no effect" — with a short series a weak true link could also produce p = 0.41.
 </details>

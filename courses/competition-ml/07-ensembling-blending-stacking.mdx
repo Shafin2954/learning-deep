@@ -7,6 +7,13 @@ order: 7
 
 ## Why averaging works, in one formula
 
+Ask several people to guess the weight of a cow and average their guesses: the average usually
+beats most of the individuals. It works because their mistakes partly cancel — but only if they
+do not all make the same mistake.
+
+An **ensemble** is a prediction made by combining several models. The simplest combination is
+the average.
+
 Average $k$ predictors whose errors have variance $\sigma^2$ and average pairwise correlation
 $\rho$, and the variance of the average is
 
@@ -16,10 +23,25 @@ $$
 \;\xrightarrow[k \to \infty]{}\; \rho\,\sigma^2
 $$
 
+> **In plain words:**
+> - $k$ is the number of models you average, and $f_i$ is model $i$'s prediction.
+> - $\sigma^2$ is how much one model's error wobbles; $\rho$ is how similar two models' errors are
+>   (0 = unrelated, 1 = identical).
+> - The first term, $1/k$, shrinks as you add models. The second term does not shrink: with
+>   infinitely many models you are left with $\rho\,\sigma^2$, the part of the error they all
+>   share.
+
 Two consequences run this entire chapter. Adding models has **diminishing returns**, and the floor
 is set by $\rho$ — the correlation between your models' mistakes. **Diversity beats individual
 quality**, which is why a mediocre model with different errors can improve an ensemble that a
 better but correlated model cannot.
+
+> **Picture it:** ten weather forecasters who all copy the same app give you one forecast, ten
+> times. Ten forecasters using different methods give you something closer to ten opinions. The
+> second group is worth more even if each member is a bit worse.
+
+The table evaluates the formula (as a standard deviation, so the square root of the variance) for
+several $k$ and $\rho$:
 
 ```python
 import numpy as np
@@ -46,7 +68,19 @@ print("\n(values are the sd of the averaged error, relative to a single model)")
 At $\rho = 0.99$ — two versions of the same gradient booster with different seeds — a hundred
 models buy you a 0.5% reduction. At $\rho = 0.5$, five models buy 22%.
 
+Read the $\rho = 0.0$ column too: errors that are truly independent shrink as $1/\sqrt{k}$, so 100
+models cut the error to 0.1000 of one model. Real models are never that independent.
+
 ## Four models, and how correlated they actually are
+
+Before combining models, measure how similar their mistakes are. Four quite different model
+families are trained on the same folds, and their errors are compared.
+
+The four: **logistic regression** (a straight-line boundary), **k-nearest neighbours** (predict
+from the 45 most similar training rows), a **random forest** (many deep trees on random subsets,
+averaged), and **gradient boosting** (`hgb`, shallow trees added one after another). Every model
+produces **out-of-fold** (OOF) predictions: each row is predicted by a model that did not see it
+in training.
 
 ```python
 from sklearn.datasets import make_classification
@@ -102,11 +136,21 @@ forest   0.868  0.945   1.000  0.923
 hgb      0.747  0.862   0.923  1.000
 ```
 
+Three models sit between 0.9470 and 0.9643; `logreg` trails far behind at 0.7685 (the data has
+non-linear structure a straight line cannot fit). In the error matrix, the most different pair is
+`logreg` and `hgb` (0.747); the most similar is `knn` and `forest` (0.945).
+
 Read the error-correlation matrix, not the prediction-correlation matrix. Predictions correlate
 because they all track the target; only the *errors* tell you whether two models are making the
 same mistakes.
 
+> **Watch out:** OOF predictions must come from the **same folds** for every model. If each model
+> uses its own split, the later combination steps leak information across folds.
+
 ## Rung 1: the simple average
+
+The cheapest ensemble is "add the predictions and divide by the count". Try it before anything
+fancier, and compare it with the best single model.
 
 ```python
 def report(name, pred):
@@ -117,7 +161,7 @@ best_single = max(roc_auc_score(y, oof[c]) for c in oof)
 print(f"{'best single model':34} AUC {best_single:.4f}")
 simple = report("simple average of 4", oof.mean(axis=1).values)
 top2 = oof[["hgb", "forest"]].mean(axis=1).values
-report("average of the two best", top2)
+_ = report("average of the two best", top2)
 ```
 
 ```output
@@ -131,11 +175,20 @@ The four-model average is *worse* than the best single model. That is the formul
 model a full quarter of the vote. Averaging only helps when the members are comparable in quality
 — or when the weights account for the difference, which is rung 3.
 
+The two strong tree models, averaged on their own, do beat the best single model: 0.9650 against
+0.9643.
+
 ## Rung 2: rank averaging
+
+Different models speak on different scales: one says 0.9 when sure, another says 0.6. Converting
+each model's predictions to ranks puts them on the same scale before averaging.
 
 When the metric is rank-based, average the *ranks* rather than the probabilities. It makes the
 blend immune to models being on different scales — a badly calibrated model no longer drags the
 average around (ch. 1, ch. 8).
+
+`rankdata(c) / len(c)` turns each prediction into its **percentile**: the lowest prediction
+becomes about 0, the highest becomes 1.
 
 ```python
 from scipy.stats import rankdata
@@ -146,8 +199,8 @@ report("rank average of 4", ranks.mean(axis=1).values)
 skewed = oof.copy()
 skewed["knn"] = skewed["knn"] ** 3                        # same ranking, very different scale
 report("probability average, one model rescaled", skewed.mean(axis=1).values)
-report("rank average, one model rescaled",
-       skewed.apply(lambda c: rankdata(c) / len(c)).mean(axis=1).values)
+_ = report("rank average, one model rescaled",
+           skewed.apply(lambda c: rankdata(c) / len(c)).mean(axis=1).values)
 ```
 
 ```output
@@ -165,10 +218,20 @@ probability average, because converting to ranks throws away the information tha
 usually confident and wrong while the others are confident and right. Rank averaging protects you
 from scale mismatches; only weights protect you from quality mismatches.
 
+> **Picture it:** rank averaging is like a talent show where each judge ranks the acts instead of
+> scoring them out of 10. A judge who gives everyone 9s and 10s can no longer swamp the others —
+> but a judge with terrible taste still gets a full vote.
+
 ## Rung 3: weighted blending
+
+Give better models a bigger say. Instead of guessing the weights, let an optimiser find the
+weights that score best on the OOF predictions.
 
 Fit the weights instead of assuming they are equal. Constrain them to be non-negative and sum to
 one, and fit them on out-of-fold predictions only.
+
+The code uses **Nelder-Mead**, a search method that needs only the score, not its slope. The
+`np.abs(w) / sum` step forces every candidate weight vector to be non-negative and sum to one.
 
 ```python
 from scipy.optimize import minimize
@@ -199,15 +262,26 @@ hgb       0.2845
 weighted blend                    AUC 0.9655
 ```
 
+The optimiser sets `logreg` to exactly 0.0000 and splits the rest roughly evenly between `knn`
+(0.3592), `forest` (0.3563) and `hgb` (0.2845). The blend reaches 0.9655 — above the best single
+model (0.9643) and above the simple average (0.9574).
+
 The optimiser is allowed to zero out a model, which is how weight fitting doubles as model
 selection. Watch for weights that look extreme — they are fitted on a finite sample and inherit
 the selection bias of any optimisation (eval-tuning ch. 5).
 
 ## Rung 4: stacking
 
+Instead of fixed weights, train a second model whose inputs are the first models' predictions.
+It can learn rules like "trust model A more when this feature is high".
+
 A blend is a linear function of the base predictions with weights you fit. **Stacking** replaces
 that with a model, so the combination can be non-linear and conditional: *trust the forest when
 `f3` is large, trust the linear model otherwise.*
+
+The second model is the **meta-learner**; the original four are the **base models**. A
+**restack** also gives the meta-learner some raw features, so it can learn those conditional
+rules.
 
 ```python
 def stack(oof_frame, y, folds, meta=None, extra_features=None):
@@ -236,6 +310,10 @@ stacked (gbm meta)                 AUC 0.9669
 restacked (meta sees 5 raw features) AUC 0.9670
 ```
 
+All three stacks land at 0.9669–0.9670, the best scores so far (+0.0027 over the best single
+model). The logistic meta-learner is as good as the GBM one, and giving it five raw features adds
+nothing here: with these base models there is no "trust A when f3 is large" rule to find.
+
 Three notes on the discipline that makes stacking safe:
 
 - The meta-learner is trained on **out-of-fold** base predictions. Train it on in-fold predictions
@@ -246,6 +324,9 @@ Three notes on the discipline that makes stacking safe:
   averaging the fold models. Pick one and be consistent.
 
 ## What happens if you break the discipline
+
+Here is what goes wrong if the meta-learner sees predictions the base models made on their own
+training rows. **In-fold** predictions are those made on rows the model was trained on.
 
 ```python
 in_fold = {}
@@ -273,11 +354,21 @@ stack on in-fold predictions : AUC 0.9997  <- fiction
 stack on out-of-fold preds   : AUC 0.9670
 ```
 
+The forest's in-fold AUC is 0.9980 against an OOF of 0.9643 — it has memorised its training rows.
+A meta-learner trained on these predictions scores 0.9997, a number that no real test set will
+ever give back.
+
 The leaky stack looks better and is worthless: it learned to lean on the random forest, whose
 in-fold predictions are nearly perfect memorisation. On the leaderboard that weight goes to a
 model that is no better than the others.
 
+> **Watch out:** a stacked CV score far above every base model's OOF score is not a triumph. It
+> is almost always this bug.
+
 ## Blending versus stacking
+
+The two words are often mixed up. **Blending** fits the combination on one held-out slice of the
+training data; **stacking** fits it on out-of-fold predictions for every row.
 
 | | Blending (holdout) | Stacking (out-of-fold) |
 |---|---|---|
@@ -286,6 +377,9 @@ model that is no better than the others.
 | Risk | overfits a small holdout; wastes rows | folds must be identical across models |
 | Non-linear combination | awkward | natural |
 | Use it when | models are expensive, data is plentiful | data is limited, folds are cheap |
+
+The code fits the same weight optimiser on a 15% holdout and compares the weights with the OOF
+ones:
 
 ```python
 from sklearn.model_selection import train_test_split
@@ -320,11 +414,28 @@ hgb       0.2845
 L1 distance between the two weight vectors: 0.2814
 ```
 
+On the holdout the forest gets almost half the vote (0.4938) and `knn` drops to 0.2185; on the
+OOF predictions they are nearly equal. The total disagreement (L1 distance, the sum of absolute
+differences) is 0.2814 out of a possible 2.
+
 The two weight vectors disagree, and the holdout version is the less trustworthy of the two: it
 was fitted on 1,350 rows instead of 9,000. Blending is a compute-saving compromise, not a
 different theory.
 
+## Recap in plain words
+
+- Averaging cancels errors only as far as the models' errors differ; the shared part $\rho\,\sigma^2$
+  never goes away.
+- Measure the correlation of errors, not of predictions.
+- An unweighted average with one weak member can be worse than the best single model.
+- Rank averaging fixes scale mismatches, not quality mismatches.
+- Fitted weights and stacking handle quality differences; both must use out-of-fold predictions.
+- A meta-learner trained on in-fold predictions gives a fiction score (0.9997 here).
+
 ## Try it Yourself
+
+`ensemble_ladder` takes a subset of the OOF predictions and prints three things: their average
+error correlation, the best single member, and whether a plain average beats it.
 
 ```python
 def ensemble_ladder(frame, y, subset):
@@ -354,7 +465,7 @@ hgb+forest+logreg+knn        rho 0.872 | best single 0.9643 | average 0.9574 | g
 
 This table is the chapter's caveat in five lines. `hgb+logreg` has the lowest error correlation of
 any pair (0.747) and the *worst* result (-0.0221): diversity is necessary but not sufficient, and
-a member two hundred basis points behind the rest destroys an unweighted average no matter how
+a member almost 0.20 AUC behind the rest destroys an unweighted average no matter how
 uncorrelated its mistakes are. `hgb+forest`, at rho 0.923, is the only unweighted combination that
 beats its best member — barely, by 0.0007.
 
@@ -363,6 +474,9 @@ quality. When quality differs, move up a rung and fit weights, which is exactly 
 blend does when it assigns `logreg` a weight of zero. Add a fifth model of your own — an
 extra-trees, a differently-seeded booster — and watch where it lands on both axes.
 
+Variation to try: `ensemble_ladder(oof, y, ("hgb", "forest", "knn"))` — three strong members
+without `logreg` — and check whether the gain turns positive.
+
 ## Exercise
 
 Build the ensembling harness you will reuse: it takes a dictionary of models, produces out-of-fold
@@ -370,6 +484,9 @@ predictions on shared folds, and reports every combination rule — best single,
 rank average, weighted, and stacked — with an honest estimate of each. Then demonstrate the two
 failure modes on the same data: weights fitted and evaluated on the same rows, and a meta-learner
 trained on in-fold predictions.
+
+> **Hint:** to make the weighted blend honest, fit the weights on the training part of each fold
+> and apply them to that fold's held-out part — the same pattern as any other fitted step.
 
 <details>
 <summary>Solution</summary>
@@ -437,7 +554,10 @@ forest", and at test time that forest will be an ordinary 0.9643 model. The stac
 for a base model that does not exist.
 
 The honest table is the one to act on. Note what it says about effort: the gap between the best
-single model and the best ensemble is real but small, and simple averaging captures most of it.
+single model and the best ensemble is real but small (+0.0027 for the stack, +0.0014 for the
+per-fold weighted blend). Simple averaging does *not* capture it on this data: with `logreg` in
+the mix it loses 0.0069, and rank averaging loses 0.0151. Here the gain only appears once the
+combination can down-weight the weak member.
 Stacking earns its extra complexity when the base models are genuinely complementary — different
 algorithm families, different feature sets, different target transformations — and returns almost
 nothing when they are four variations of the same tree.

@@ -7,6 +7,10 @@ order: 4
 
 ## Three mechanisms of missingness
 
+A blank cell is not only "no data" — *why* it is blank matters. If blanks happen by pure
+luck, you can ignore them. If they happen for a reason, ignoring them quietly skews your
+results.
+
 The mechanism that caused the missing value determines what you can safely do about it.
 
 **MCAR — Missing Completely At Random.** Missingness is unrelated to any variable, observed or
@@ -23,6 +27,15 @@ condition on the observed variables.
 don't report income; very sick patients drop out of trials. No imputation method solves MNAR
 without additional assumptions or external data. You can only model the missingness explicitly
 or collect more data.
+
+Here **imputation** means filling a blank with a best guess, and **bias** means a result
+that is wrong in a consistent direction, not by random chance.
+
+> **Picture it:** a teacher collecting homework. MCAR: a gust of wind blew a random few
+> sheets away. MAR: students in the back row hand in less often — you can see who sits
+> where, so you can adjust. MNAR: students who did badly "forgot" to hand it in — the
+> missing sheets are missing *because* of what is written on them, and nothing on the
+> sheets you do have tells you that.
 
 ```python
 import pandas as pd
@@ -52,19 +65,31 @@ print(f"Income missing rate age>50: {df[df['age']>50]['income'].isnull().mean():
 ```
 
 ```output
-age       0
-income    49
-score     44
+age        0
+income    63
+score     45
 dtype: int64
 
 MCAR fraction: 0.15
 Income missing rate age≤50: 0.00
-Income missing rate age>50: 0.38
+Income missing rate age>50: 0.48
 ```
+
+The counts show 45 missing `score` values (15% of 300, as planted) and 63 missing
+`income` values. The last two lines prove the mechanism: income is never missing for
+people aged 50 or under (0.00), but missing for 48% of people over 50.
 
 The income missingness is clearly higher for older respondents — that's MAR in action.
 
+> **Watch out:** you can never *prove* data is MAR rather than MNAR from the data alone —
+> the deciding information is exactly the values you don't have. Comparing missing rates
+> across observed groups (as above) rules out MCAR; telling MAR from MNAR needs domain
+> knowledge.
+
 ## Visualising missingness
+
+Before you fix blanks, look at where they are. A picture shows in seconds whether blanks
+are scattered, packed into one column, or lined up in the same rows.
 
 A missingness heatmap is the fastest way to see patterns:
 
@@ -104,17 +129,28 @@ print(df.isnull().sum())
 ```
 
 ```output
-A    21
-B    55
+A    18
+B    58
 C     0
-D    11
+D     8
 dtype: int64
-[Figure: missingness matrix heatmap and bar chart of missing rates per column]
 ```
+
+The printed counts match the planted rates: column `B` is missing 58 of 200 values (about
+30%), `A` 18 (about 10%), `D` 8 (about 5%), and `C` none. In the matrix plot, look for red
+streaks that line up vertically across columns — rows that are missing several fields at
+once usually share one cause.
 
 ## Imputation strategies
 
+Filling blanks has two parts: learn the fill value from the training data, then apply it
+everywhere. scikit-learn's imputers split these into `fit` (learn) and `transform`
+(apply).
+
 ### SimpleImputer — fill with a statistic
+
+**`SimpleImputer`** replaces every blank in a column with one number computed from that
+column: the mean, the median, or the most frequent value.
 
 ```python
 import pandas as pd
@@ -146,12 +182,27 @@ print(f"Any NaN after imputation: {np.isnan(X_train_imp).any()}")
 ```
 
 ```output
-Imputed median (from train): 10.001
-True train median: 10.001
+Imputed median (from train): 9.814
+True train median: 9.814
 Any NaN after imputation: False
 ```
 
+The imputer learned 9.814 — exactly the median of the training column — and stored it in
+`statistics_`. After `transform`, no `NaN` remains. The test set is filled with the same
+9.814, learned from train only.
+
+> **Watch out:** a single fill value shrinks the spread. If 20% of a column becomes the
+> same number, the standard deviation drops and correlations with other columns weaken.
+> Adding a "was missing" 0/1 indicator column (`add_indicator=True`) keeps that
+> information for the model.
+
 ### KNNImputer — uses neighbour values
+
+**`KNNImputer`** fills a blank by finding the $k$ rows most similar on the *other* columns
+(the **nearest neighbours**) and averaging their values for the missing one.
+
+> **Picture it:** you don't know a house's price, so you look up the 5 houses on the same
+> street with the most similar size and age and take their average.
 
 ```python
 import pandas as pd
@@ -185,16 +236,26 @@ print(f"True num1 mean:    {X_train['num1'].mean():.3f}")
 ```
 
 ```output
-Missing before: 49
+Missing before: 34
 Missing after:  0
-Imputed num1 mean: 4.983
-True num1 mean:    4.963
+Imputed num1 mean: 4.910
+True num1 mean:    4.909
 ```
+
+34 training values were missing; after imputation, 0 are. The imputed column mean (4.910)
+is within 0.001 of the observed mean (4.909).
 
 KNN imputation recovers the true mean closely because `num1` and `num2` are correlated — the
 neighbours' `num2` values guide the fill.
 
+Matching the *mean* is the easy part, though: under MCAR even mean-filling matches it.
+KNN's real advantage is that each filled value is close to that row's own true value,
+because `num2` $\approx$ `2 * num1` tells it where each row should sit.
+
 ### The wrong way: fit on all data
+
+**Leakage** is when information from the test set sneaks into training, so your test score
+looks better than it will be on truly new data (ch. 12).
 
 ```python
 import pandas as pd
@@ -220,15 +281,33 @@ print("Difference may seem small, but it violates the train/test contract.")
 ```
 
 ```output
-Leaky mean (full dataset): -0.0251
-Clean mean (train only):   -0.0631
+Leaky mean (full dataset): -0.0850
+Clean mean (train only):   -0.1646
 Difference may seem small, but it violates the train/test contract.
 ```
+
+Here the gap is large: the leaky mean is -0.0850 and the clean one -0.1646, almost a factor
+of two, because the test rows (40 of 200) shift the mean noticeably. The printed line says
+the difference "may seem small" — with small datasets it often is not. Either way, the leaky
+version used test data to make a training decision, which breaks the train/test contract.
 
 Always fit imputers — and every other statistic-computing transformer — on the training set
 only, then apply the fitted transformer to the test set.
 
+## Recap in plain words
+
+- MCAR blanks are pure luck, MAR blanks depend on other columns you can see, MNAR blanks
+  depend on the hidden value itself.
+- Higher missing rates in one observed group rule out MCAR; MNAR can't be detected from the
+  data alone.
+- Plot where the blanks are before choosing a fix.
+- `SimpleImputer` fills one statistic per column; `KNNImputer` borrows from similar rows.
+- Always `fit` the imputer on the training set and only `transform` the test set.
+
 ## Try it Yourself
+
+This experiment plants MCAR blanks in `feature_a` and MAR blanks in `feature_c`, then
+compares mean-filling with KNN-filling.
 
 ```python
 import pandas as pd
@@ -265,13 +344,21 @@ for name, imp in [('mean', SimpleImputer(strategy='mean')),
 
 ```output
 Missing counts:
-feature_a    59
-feature_b     0
-feature_c    32
+feature_a     57
+feature_b      0
+feature_c    183
 dtype: int64
-mean: imputed mean=9.974, error from true=0.026
-knn5: imputed mean=9.971, error from true=0.029
+mean: imputed mean=9.862, error from true=0.138
+knn5: imputed mean=9.867, error from true=0.133
 ```
+
+`feature_c` lost 183 of 400 values — the MAR rule (high `feature_b`) bit hard — while
+`feature_a` lost 57 (about 15%). Both imputers land near the true mean of 10 (errors 0.138
+and 0.133), and the error is mostly the observed train mean being 9.86 by chance. The
+column mean is a weak test. A sharper variation: keep a copy of `feature_a` before planting
+the blanks and compare each filled value with its true value. Measured that way (root mean
+squared error on the filled cells), mean-filling is off by about 1.76 and KNN by about
+1.33, because KNN uses the link between `feature_a` and `feature_b`.
 
 ## Exercise
 
@@ -280,6 +367,10 @@ You have a DataFrame with three columns: `hours_studied`, `exam_score`, and `abs
 Split 80/20, fit a `KNNImputer(n_neighbors=5)` on train only, and verify that:
 (a) no NaN remain after imputation, and (b) the imputed mean of `hours_studied` matches
 the observed train mean within 0.5 units.
+
+> **Hint:** to make `absences` MAR, let its missing probability depend on `exam_score`,
+> for example `np.where(score > 75, 0.5, 0.1)`. Fit the imputer on `X_train`, then call
+> `transform` on both splits.
 
 <details>
 <summary>Solution</summary>
@@ -293,11 +384,12 @@ from sklearn.model_selection import train_test_split
 rng = np.random.default_rng(7)
 n = 500
 hours = rng.uniform(1, 10, n)
+score = 50 + 4 * hours + rng.normal(0, 5, n)
 df = pd.DataFrame({
     'hours_studied': np.where(rng.random(n) < 0.15, np.nan, hours),
-    'exam_score':    50 + 4 * hours + rng.normal(0, 5, n),
+    'exam_score':    score,
     'absences':      np.where(
-        (rng.random(n) < 0.3),  # higher-score students tend to have absences missing
+        rng.random(n) < np.where(score > 75, 0.5, 0.1),  # MAR: high scorers miss more
         np.nan,
         rng.integers(0, 10, n).astype(float)
     ),
@@ -320,4 +412,7 @@ print(f"Difference:    {abs(X_train_imp['hours_studied'].mean() - observed_mean)
 
 The KNNImputer fills missing values by averaging the 5 nearest observed neighbours, so the
 imputed mean stays close to the true mean. The key insight: fit on train, transform both.
+Running it gives 0 NaN in both splits and a mean difference of 0.006, far inside the 0.5
+target. `exam_score` is the column that helps most here: it is built from `hours_studied`,
+so rows with similar scores have similar study hours.
 </details>

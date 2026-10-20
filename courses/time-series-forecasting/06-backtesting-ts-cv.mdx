@@ -7,13 +7,28 @@ order: 6
 
 ## Why random shuffle CV is wrong for time series
 
+A forecast is only honest if the model never peeks at the future. Shuffling the rows before
+splitting lets the model study next year's data and then "predict" last year — an exam where
+you were handed the answers.
+
 In standard k-fold CV you shuffle the data before splitting. For time series, this leaks
 the future: the model trains on observations at $t=100$ and tests on $t=50$. The model has
 seen the future and the evaluation is meaninglessly optimistic.
 
+**k-fold CV** (cross-validation) cuts the data into $k$ chunks and takes turns holding one chunk
+out as the test set. **Leakage** means information from the test period slips into training.
+
 The correct method is **rolling-origin evaluation**: for each origin $t$, train on
 $y_1, \ldots, y_t$ and forecast $y_{t+1}, \ldots, y_{t+h}$. The test window always lies
 strictly in the future of the training window.
+
+The **origin** is the "today" you pretend to stand at. You then move it forward one step at a
+time and repeat. This is also called **backtesting**: replaying history as if you had been
+forecasting live.
+
+> **Picture it:** checking a weather forecaster's skill. You hand them the records up to
+> 1 March, ask for 2 March, and compare. Then the records up to 2 March, ask for 3 March. You
+> never show them March 3 while asking about March 2.
 
 ```python
 import numpy as np
@@ -38,11 +53,29 @@ print(f"Test range:  {test_right.min():.1f}–{test_right.max():.1f}")
 
 ```output
 Correct: train covers t=0..79, test covers t=80..99
-Train range: 50.0–87.4
-Test range:  88.3–99.2
+Train range: 44.2–91.5
+Test range:  87.2–100.6
 ```
 
+The code builds the shuffled split but only prints the time-ordered one. Look at the ranges:
+training values run 44.2 to 91.5, test values 87.2 to 100.6. Most of the test set lies above
+anything seen in training — that is what forecasting a trending series really looks like. A
+shuffled split would scatter test points across the whole 0–99 range, where every one has
+close neighbours in training, and the error would look far smaller than it will be in real use.
+
+> **Watch out:** the same leak happens inside a pipeline. Scaling, imputing or building
+> features (ch. 7) with statistics from the *whole* series sneaks future information into
+> training. Fit every preprocessing step on the training window only.
+
 ## Implementing rolling-origin evaluation from scratch
+
+The loop is short: pick an origin, train on everything before it, forecast the next $h$
+values, record the error, move the origin one step forward. The average error over all origins
+is your score.
+
+`min_train` is the first origin: the smallest history you allow a model to learn from. The
+**naive** forecast says "next value = last value". **SES** is simple exponential smoothing
+from ch. 4, here with a fixed $\alpha = 0.3$.
 
 ```python
 import numpy as np
@@ -84,13 +117,24 @@ print(f"Number of evaluation origins: {len(naive_errs)}")
 ```
 
 ```output
-Naive MAE: 4.49
-SES   MAE: 3.87
-Numpy MAE: 3.87
+Naive MAE: 4.92
+SES   MAE: 6.75
 Number of evaluation origins: 60
 ```
 
+With origins 60 through 119 you get 60 evaluations, as printed. The naive forecast scores an
+MAE of 4.92; SES scores 6.75 — worse than the dumbest baseline. Why? This series has a
+$\pm 10$ seasonal wave. Naive copies last month, which is usually close. SES with
+$\alpha = 0.3$ averages several past months, so it lags behind the wave and trails the trend.
+
+> **Watch out:** always backtest a naive baseline next to your model. A "smart" model that
+> loses to "repeat the last value" is common, and you only notice if the baseline is on the
+> scoreboard.
+
 ## Forecast accuracy metrics
+
+Different metrics punish different mistakes. Pick the one that matches what a miss costs you,
+and keep a scale-free one around to compare across series.
 
 | Metric | Formula | Notes |
 |--------|---------|-------|
@@ -98,6 +142,15 @@ Number of evaluation origins: 60
 | RMSE | $\sqrt{\frac{1}{n}\sum e_t^2}$ | Penalizes large errors more |
 | MAPE | $\frac{1}{n}\sum|e_t/y_t|$ | Undefined when $y_t=0$; asymmetric |
 | MASE | $\text{MAE} / \text{MAE}_\text{naive}$ | Scale-free; < 1 beats naive |
+
+Here $e_t$ is the error, actual minus forecast. **MAE** is the mean absolute error. **RMSE**
+(root mean squared error) squares errors first, so one big miss counts more than several small
+ones. **MAPE** is the error as a percentage of the actual value. **MASE** (mean absolute scaled
+error) divides your MAE by the naive forecast's MAE: 0.8 means "20% better than naive".
+
+> **Watch out:** MAPE is "asymmetric" because it divides by the actual value. Over-forecasting
+> a small actual gives a huge percentage, and a forecast of 0 can never be more than 100% wrong.
+> Models tuned on MAPE learn to forecast low.
 
 ```python
 import numpy as np
@@ -122,13 +175,29 @@ for k, v in m.items(): print(f"{k}: {v:.3f}")
 ```
 
 ```output
-MAE: 5.119
-RMSE: 6.489
-MAPE: 3.423
-MASE: 0.985
+MAE: 6.187
+RMSE: 7.329
+MAPE: 4.269
+MASE: 0.991
 ```
 
+All four numbers describe the same 30 forecasts. MAE 6.187 and RMSE 7.329: RMSE is larger, as
+it always is, because squaring weights the bigger misses. MAPE says the typical miss is 4.27%
+of the value. MASE is 0.991, just under 1.
+
 MASE < 1 means this (slightly better than naive) forecast beats the random-walk baseline.
+
+By less than 1%, though. Adding 0.4 helps a little because the series rises by 1 per step, but
+the noise (std 5) dwarfs that correction. Here the naive MAE is computed on the same 30 test
+values ("in-sample naive"); Hyndman's original MASE uses the naive MAE on the training data.
+
+## Recap in plain words
+
+- Shuffled CV lets a time-series model train on the future, so its scores are too optimistic.
+- Rolling-origin evaluation trains on everything up to an origin, forecasts the next $h$ steps, then moves the origin forward.
+- Always include naive baselines; simple models often beat fancier ones.
+- MAE and RMSE are in the series' units; RMSE punishes big misses more.
+- MAPE is a percentage but breaks near zero; MASE compares you to naive and works across series.
 
 ## Try it Yourself
 
@@ -157,14 +226,28 @@ print(f"Seasonal Naive MAE: {err_snaive.mean():.2f}")
 ```
 
 ```output
-Naive MAE:          5.22
-Seasonal Naive MAE: 4.09
+Naive MAE:          5.29
+Seasonal Naive MAE: 7.86
 ```
+
+Surprise: the plain naive forecast (MAE 5.29) beats the seasonal naive (MAE 7.86), even though
+the series has a yearly wave. The **seasonal naive** forecast copies the value from 12 months
+earlier. It gets the season right, but it misses a whole year of trend: $0.6 \times 12 = 7.2$
+units. And it carries two noise draws, last year's and this month's. The wave here is gentle
+($\pm 8$), so month-to-month changes are smaller than year-to-year ones.
+
+Try setting the trend to 0 (`60 + 0.0*np.arange(n)`) or the seasonal amplitude to 30 and
+re-run: you should see seasonal naive take the lead. Then try `h=3` with a model that
+returns three values.
 
 ## Exercise
 
 Backtest Holt-Winters on a 120-observation monthly series and compute MASE relative to
 the seasonal naive baseline. Verify that Holt-Winters achieves MASE < 1.
+
+> **Hint:** use a `pd.Series` with a monthly index, loop the origin from 60 to 119, refit
+> `ExponentialSmoothing(train, trend='add', seasonal='add', seasonal_periods=12)` at each
+> origin, and collect `|actual - forecast|` for both Holt-Winters and `train.iloc[-12]`.
 
 <details>
 <summary>Solution</summary>
@@ -188,7 +271,7 @@ for t in range(min_train, len(y) - h + 1):
     train = series.iloc[:t]
     actual = series.iloc[t]
     hw = ExponentialSmoothing(train, trend='add', seasonal='add',
-                               seasonal_periods=12).fit(disp=False)
+                               seasonal_periods=12).fit()
     hw_errs.append(abs(actual - hw.forecast(1).iloc[0]))
     sn_errs.append(abs(actual - train.iloc[-12]))
 
@@ -198,4 +281,11 @@ print(f"HW MAE:      {mae_hw:.2f}")
 print(f"Seasonal NV: {mae_sn:.2f}")
 print(f"MASE:        {mae_hw / mae_sn:.3f}")
 ```
+
+Running it prints HW MAE 2.68, seasonal naive 11.92 and MASE 0.225: Holt-Winters is more than
+four times better. The seasonal naive misses a full year of trend (12 units here, since the
+series rises 1 per month), while Holt-Winters tracks both the trend and the season. An MAE of
+2.68 is about the size of the noise itself (std 4), so there is little left to gain.
+Refitting at each of the 60 origins takes a few seconds; for slow models you would refit every
+few steps instead.
 </details>

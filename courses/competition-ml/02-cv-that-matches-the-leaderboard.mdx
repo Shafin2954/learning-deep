@@ -7,9 +7,26 @@ order: 2
 
 ## Two numbers, one of them noisy
 
+Every submission gives you two report cards that often disagree. This chapter is about deciding
+which one to trust, and the answer comes from counting how many rows stand behind each grade.
+
 You get a CV score computed on all your training rows and a public leaderboard score computed on a
 slice of the test set you cannot see. The whole discipline of competition validation is deciding
 **which one to believe** — and the answer is almost always the one with more rows behind it.
+
+The organiser's hidden test set is usually cut in two. The **public leaderboard** (public LB) is
+scored on a small slice and shown to you during the competition. The **private leaderboard** is
+scored on the rest and revealed only at the end; it decides the final ranking. Your **CV score**
+is your own estimate from cross-validation on the training data (ch. 1).
+
+> **Picture it:** you want to know how good a basketball player is. One coach watched 20,000
+> shots. Another watched 2,000 shots from the bleachers in fog. Both report a shooting
+> percentage. You trust the first coach — not because the second is lying, but because 2,000
+> foggy shots cannot tell a 86.0% shooter from an 86.5% one.
+
+The simulation below gives twelve models a known **true skill** (the AUC each would get on
+infinite data) and then shows each one through three noisy windows: CV (small noise), public LB on
+2,000 rows (large noise), and private LB on 18,000 rows (medium noise).
 
 ```python
 import numpy as np
@@ -53,13 +70,23 @@ m10  0.872  0.8725     0.8734      0.8761
 m11  0.875  0.8744     0.8666      0.8754
 ```
 
+Follow one column at a time. `true` climbs steadily from 0.860 to 0.875. `cv` mostly climbs with
+it (m00 is lowest at 0.8577, m11 is highest at 0.8744). `public_lb` jumps around: m01 scores
+0.8407 and m02 scores 0.8836, although their true skills differ by only 0.001.
+
 The twelve models are genuinely different — the best is 0.015 AUC better than the worst — but the
 public leaderboard sees each of them through a 0.01 blur.
 
 ## The only diagnostic that matters: does CV *rank* like the LB?
 
+You do not need CV and LB to give the same number. You need them to put your models in the same
+order, because "which file do I submit?" is an ordering question.
+
 An offset between CV and LB is harmless. A scrambled ordering is fatal, because your submission
 choice is a ranking decision.
+
+Two ways to measure agreement: **Pearson correlation** checks whether the numbers line up on a
+straight line; **rank correlation** (Spearman) checks only whether the order matches.
 
 ```python
 def agreement(a, b):
@@ -87,14 +114,29 @@ CV picks     : m11 (true 0.8750)
 public LB picks: m02 (true 0.8620)
 ```
 
+The first line is the one that matters: CV versus the private LB has a rank correlation of +0.790,
+so CV orders models much like the final judge. The public LB versus the private LB manages only
++0.322. Follow each selection rule: CV picks m11, whose true skill (0.8750) is the best of all
+twelve; the public LB picks m02, with true skill 0.8620 — tenth of twelve.
+
 Selecting by the public leaderboard picks a worse model here, and this is the ordinary case rather
 than bad luck: a 2,000-row public split cannot resolve differences of a few thousandths, so its
 ranking is mostly noise.
 
+> **Watch out:** "my CV is 0.01 above my LB" is not a problem by itself. Look at the mean offset
+> line: 0.0101 on average, and the CV still picked the best model. Chasing the offset instead of
+> the ranking is a classic waste of a week.
+
 ### How many rows does a leaderboard need?
+
+The fewer rows a leaderboard is scored on, the more its number wobbles. A formula tells you how
+much, before you submit anything.
 
 For AUC the standard error can be approximated from the sample size and the positive rate. The
 useful form is: **what difference can this leaderboard actually resolve?**
+
+The **standard error** (SE) is the typical size of the wobble: if you re-drew the public rows many
+times, the AUC would scatter around its true value by about one SE.
 
 $$
 \mathrm{SE}(\mathrm{AUC}) \approx
@@ -102,6 +144,13 @@ $$
 $$
 
 with $Q_1 = A/(2-A)$ and $Q_2 = 2A^2/(1+A)$ (Hanley and McNeil).
+
+> **In plain words:**
+> - $A$ is the AUC you expect (here 0.86).
+> - $n_1$ is the number of positive rows and $n_0$ the number of negative rows.
+> - $Q_1$ and $Q_2$ are helper terms that depend only on $A$.
+> - The whole thing is "spread of the AUC estimate", and it shrinks as $n_0 n_1$ in the
+>   denominator grows — more rows of both classes, less wobble.
 
 ```python
 def auc_se(auc, n_pos, n_neg):
@@ -126,6 +175,11 @@ for rows in (500, 2_000, 10_000, 50_000):
    50,000     10,000    0.0024              0.0068
 ```
 
+Read the 2,000-row line: the SE is 0.0122, and two models must differ by 0.0338 before the
+leaderboard can tell them apart. Even at 50,000 rows the board only resolves gaps of 0.0068. The
+"resolves" column is $1.96 \times \mathrm{SE} \times \sqrt{2}$: 1.96 for 95% confidence, and
+$\sqrt{2}$ because comparing two models adds two wobbles together.
+
 The last column is the gap two models must differ by before the leaderboard can tell them apart
 with 95% confidence. On a 2,000-row public split that is roughly 0.03 AUC — larger than the entire
 spread of the top hundred teams in most competitions. **The public leaderboard is a coin flip
@@ -133,8 +187,14 @@ dressed as feedback.**
 
 ## When CV and LB genuinely disagree
 
+Sometimes the disagreement is not noise: your CV is grading a different exam from the one the
+organiser set. The pattern of the disagreement tells you which case you are in.
+
 A constant offset is fine. Diverging *ranks* mean your CV is answering a different question from
 the leaderboard, and there are only a few reasons why.
+
+The report below looks at two things: the **offset** (LB minus CV, per model) and how much that
+offset varies, plus the rank correlation. Three simulated cases show the three verdicts.
 
 ```python
 def cv_lb_report(cv_scores, lb_scores, names):
@@ -174,15 +234,33 @@ mean offset -0.0168 | offset std 0.0074 | rank corr +0.203
   -> ranks scrambled with tight offsets: your CV scheme is WRONG
 ```
 
+- **Case 1:** every LB score is CV minus 0.02, so the offset std is 0.0000 and the rank
+  correlation is +1.000. Trust CV.
+- **Case 2:** the offset std is 0.0126 — bigger than the true gaps between models — so the LB is
+  too blurry to read.
+- **Case 3:** the offsets are tighter (std 0.0074) but the rank correlation is only +0.203. The
+  CV numbers are inflated by different amounts for different models.
+
 Case 3 is the dangerous one. The offsets are tight enough to look like a systematic shift, but the
 ranks are scrambled, which means the CV is measuring something the test set does not reward — a
 leak inside the folds, a split that ignores groups, or preprocessing fitted on everything
 (eval-tuning ch. 5).
 
+> **Picture it:** a bathroom scale that always reads 2 kg heavy is still useful for tracking
+> your weight. A scale that adds a random 1–3 kg depending on how you stand is not — even though
+> its "average error" looks similar.
+
 ## Making CV less noisy is cheaper than making the LB bigger
+
+The leaderboard size is fixed by the organiser. Your CV is yours to improve — and only one of the
+two obvious knobs makes it steadier.
 
 You cannot add rows to the public leaderboard. You can always reduce the variance of your own
 estimate — but only one of the two obvious levers actually does it.
+
+The two levers are **more folds** (k = 10 instead of 5) and **repeats** (run k-fold several times
+with different random splits and average). The function models each validation row as adding a
+little independent noise.
 
 ```python
 def cv_noise(n_rows, k, repeats, per_row_sd=0.30):
@@ -212,8 +290,15 @@ folds cancels out of the variance entirely. More folds buys you larger training 
 pessimistic bias), not a more stable estimate. **Repeats** are what shrink the noise, by a factor
 of $\sqrt{R}$.
 
+Check that against the table: 5-fold x 3 has noise 0.00122, which is 0.00212 divided by
+$\sqrt{3} \approx 1.73$.
+
 Repeated 10-fold on 20,000 rows resolves differences of 0.0026 against the public leaderboard's
 0.0277 — an order of magnitude finer. The cost is compute, which is the cheapest input you have.
+
+> **Watch out:** this toy model treats rows as independent. In real data, folds share most of
+> their training rows, so fold scores are correlated and repeated CV is less of a free lunch than
+> the table suggests (the solution below corrects for this).
 
 The other lever is **matching the structure** of the test split, which costs nothing at all:
 
@@ -226,8 +311,14 @@ The other lever is **matching the structure** of the test split, which costs not
 
 ## Using the leaderboard as one extra fold
 
+The public LB is not worthless; it is one more measurement, just a blurry one. Blurry measurements
+deserve a small say, not zero say and not the final word.
+
 The public LB is not useless — it is one noisy fold, and it is the only fold drawn from the actual
 test distribution. Treat it as evidence with a weight, not as an oracle.
+
+The code mixes the two scores as `(1 - w_lb) * cv + w_lb * lb` for several weights and reports
+which model each mix would pick.
 
 ```python
 def blended_selection(cv, lb, w_lb):
@@ -252,6 +343,9 @@ print(f"\nbest possible: {models['true'].max():.4f} ({models['true'].idxmax()})"
 best possible: 0.8750 (m11)
 ```
 
+With `w_lb` = 0.0 the pick is m11, the true best. At 0.2 and 0.5 it slides to m09 (0.8700), and
+from 0.8 up it lands on m02 (0.8620). Every step toward the leaderboard made the pick worse.
+
 Even a 20% leaderboard weight is enough to swap the pick from m11 (true 0.8750) to m09 (0.8700)
 here. The right weight follows from the noise levels, not from taste. If CV has standard deviation
 $\sigma_{cv}$ and the LB has $\sigma_{lb}$, the minimum-variance combination weights each by its
@@ -260,6 +354,10 @@ inverse variance:
 $$
 w_{lb} = \frac{1/\sigma_{lb}^2}{1/\sigma_{cv}^2 + 1/\sigma_{lb}^2}
 $$
+
+> **In plain words:** each source gets a vote proportional to $1/\sigma^2$, "how sharp it is". A
+> source with five times the wobble gets $5^2 = 25$ times less vote. The weights then get scaled
+> so they add up to 1.
 
 ```python
 sd_cv, sd_lb = 0.0020, 0.0100
@@ -273,7 +371,24 @@ optimal LB weight with sd_cv=0.002 and sd_lb=0.01: 0.038
 i.e. the public leaderboard deserves 3.8% of the decision, not 100%
 ```
 
+With CV noise 0.002 and LB noise 0.01, the leaderboard earns a weight of 0.038. That is the
+formula's answer to "how much should the public LB change my mind?": about 4%.
+
+## Recap in plain words
+
+- The score with more rows behind it is the one to believe; usually that is your CV.
+- What matters is whether CV and LB **order** your models the same way, not whether their numbers
+  match.
+- A 2,000-row public split at AUC 0.86 cannot separate models closer than about 0.03.
+- Tight offsets with scrambled ranks mean your CV scheme is broken; noisy offsets mean the LB is
+  too small.
+- More folds do not reduce CV noise; repeats do, by $\sqrt{R}$.
+- Weight the LB by inverse variance; here that gives it about 4% of the decision.
+
 ## Try it Yourself
+
+`shakeup` replays the final-day decision 400 times with fresh noise and counts how often each rule
+lands on one of the three truly best models, and how much true skill it gives up on average.
 
 ```python
 def shakeup(models, n_trials=400, seed=0, w_lb=0.0):
@@ -304,9 +419,16 @@ for name, w in (("CV only", 0.0), ("80% CV / 20% LB", 0.2),
             public LB only                59.5%           0.00513
 ```
 
+Trusting CV alone picks a top-3 model 99.8% of the time and loses only 0.00052 of skill on
+average. Trusting the public LB alone drops to 59.5% and loses ten times more skill (0.00513).
+Every rule in between sits in between.
+
 Change the noise levels inside `shakeup` to match a competition you know — a large public split,
 or a CV you have reason to distrust — and the ranking of the rules moves accordingly. That is the
 point: the correct weight is a property of the two noise levels, and both are measurable.
+
+Variation to try: change the LB noise from `0.0100` to `0.0015` (a huge public split) and re-run.
+The 50/50 rule should now rival or beat CV only.
 
 ## Exercise
 
@@ -315,6 +437,10 @@ submissions with CV scores, public LB scores, and the sizes behind each, choose 
 submissions. Estimate both noise levels from the data you have, compute the inverse-variance
 weight, and report the expected loss from each rule so the choice is defensible rather than
 superstitious.
+
+> **Hint:** you have two formulas already. `auc_se` gives the LB noise from row count and
+> positive rate. For the CV noise, use the spread of the five fold scores. Then plug both into the
+> inverse-variance weight.
 
 <details>
 <summary>Solution</summary>
@@ -383,11 +509,11 @@ after the private leaderboard is revealed:
   sub4: true 0.8590
 ```
 
-The estimated LB standard deviation comes out roughly five times the CV standard error, so the
-inverse-variance rule gives the public leaderboard about 4% of the decision — which is another way
-of saying *ignore it, but not quite*. That number is derived, not asserted: it falls out of
-2,000 rows at a 20% positive rate through the Hanley-McNeil formula, and it would change if the
-organiser had published a 50,000-row public split.
+The estimated LB standard deviation (0.01215) comes out roughly six times the CV standard error
+(0.00205), so the inverse-variance rule gives the public leaderboard about 3% of the decision
+(0.028) — which is another way of saying *ignore it, but not quite*. That number is derived, not
+asserted: it falls out of 2,000 rows at a 20% positive rate through the Hanley-McNeil formula, and
+it would change if the organiser had published a 50,000-row public split.
 
 Two design choices worth defending. The CV standard error uses the **Nadeau-Bengio inflation**
 (eval-tuning ch. 12) rather than the plain standard error of the fold mean, because folds share
@@ -398,13 +524,13 @@ genuinely different bets when they disagree, and costs nothing when they agree.
 
 Now read what actually happened, because the procedure did not find the best model: it chose sub1
 and sub2, whose true skills rank third and second. sub3, the real best, sat third on blended score
-because one unlucky set of five folds put its CV mean 0.007 below its true skill. With an
-estimated CV standard error of 0.00205 and true gaps of 0.0008 between the top three, **no rule
-could have separated them from this evidence** — the honest output of the procedure is "these
-three are indistinguishable, pick two of them", and it did that. Notice too that the hedge
-degenerated to a single name: blend-best and CV-best agree, which is itself the signal that the
-leaderboard added nothing, and the second submission should then be the runner-up rather than a
-duplicate.
+because one unlucky set of five folds put its CV mean (0.85977) about 0.005 below its true skill
+(0.8650). With an estimated CV standard error of 0.00205 and true gaps of 0.0008 between the top
+three, **no rule could have separated them from this evidence** — the honest output of the
+procedure is "these three are indistinguishable, pick two of them", and it did that. Notice too
+that the hedge degenerated to a single name: blend-best and CV-best agree, which is itself the
+signal that the leaderboard added nothing, and the second submission should then be the runner-up
+rather than a duplicate.
 
 What the procedure cannot rescue is a CV that measures the wrong thing. Every number here assumes
 your folds resemble the test split; if they do not, a tight CV standard error simply means you are

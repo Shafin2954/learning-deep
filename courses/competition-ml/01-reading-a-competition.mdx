@@ -7,10 +7,31 @@ order: 1
 
 ## The first hour decides the month
 
+Before you train anything, read the rules like a contract. Three answers in that contract decide
+whether the next month of work moves your rank at all.
+
 Before a single model, three questions have answers that constrain everything after them: **what
 exactly is being scored**, **how could this data leak**, and **what validation scheme reproduces
 the leaderboard**. Teams that get these wrong spend weeks improving a number that does not move
 their rank.
+
+A few words you will meet on every page of this course:
+
+- The **metric** is the formula the organiser uses to turn your predictions into one score.
+- A **leak** is a clue in the training file that gives the answer away but will not be there when
+  the model is used for real.
+- **CV** (cross-validation) is your home-made exam: you hide part of the training data, predict
+  it, and score yourself. The **leaderboard** (LB) is the organiser's exam on their hidden test
+  set.
+
+> **Picture it:** you are training for a race whose course is secret. The metric tells you
+> whether it is a sprint or a marathon. A leak is a shortcut on your practice track that will
+> not exist on race day. Your CV is the practice course; if it is not shaped like the real one,
+> faster practice times mean nothing.
+
+The setup below builds one toy competition you will reuse for the whole chapter: 8,000 rows, a
+hidden "true" probability for each row, and two models that put the rows in exactly the same
+order but report very different probabilities.
 
 ```python
 import numpy as np
@@ -33,10 +54,20 @@ rows 8000 | positive rate 0.228
 model A mean prediction 0.231 | model B 0.124
 ```
 
+About 22.8% of rows are positive. Model A's average prediction (0.231) matches that rate, so A is
+**calibrated** — when it says 30%, about 30% of those rows really are positive. Model B averages
+only 0.124: it ranks rows the same way but systematically under-reports the probability.
+
 Two models, one of them a monotone squashing of the other. They are identical to any rank-based
 metric and very different to any probability-based one.
 
+A **monotone** transform keeps order: if row 1 scores higher than row 2 under A, it still scores
+higher under B.
+
 ## Metric families, and what each one rewards
+
+Metrics come in three families, and the family tells you which kind of work pays. Score both
+models with one metric from each family and watch which numbers move.
 
 ```python
 from sklearn.metrics import roc_auc_score, log_loss, average_precision_score, accuracy_score
@@ -60,6 +91,11 @@ print(pd.DataFrame(rows).to_string(index=False))
 B same ranking, squashed  0.71431  0.4322   0.52931   0.77238
 ```
 
+Look at the columns one at a time. ROC AUC is 0.71431 for both models, and PR AUC is 0.4322 for
+both: those metrics only look at the order. Log loss moves from 0.49733 (A) to 0.52931 (B): it
+punishes B for wrong probability values even though B's order is perfect. Accuracy at a 0.5 cut
+moves too (0.77975 versus 0.77238), because squashing pushes rows across the fixed threshold.
+
 Read that table as a decision tree for your effort:
 
 - **Rank metrics** (ROC AUC, MAP, NDCG) — only the ordering matters. Calibration work is wasted;
@@ -68,6 +104,15 @@ Read that table as a decision tree for your effort:
   still lose badly, and calibration is free score (eval-tuning ch. 4).
 - **Threshold metrics** (accuracy, F1, quadratic kappa) — the cut point is part of your
   submission. Optimising it on out-of-fold predictions is usually worth more than a better model.
+
+> **Picture it:** a rank metric is a judge who only says who finished first, second, third. A
+> probability metric is a judge who also checks your predicted finishing times. A threshold
+> metric is a judge who only asks "did you finish under 4 hours?" — so where you draw that line
+> matters as much as how fast you run.
+
+The **threshold** is the cut that turns a probability into a yes/no. **F1** is a threshold metric
+that balances catching positives (recall) against not crying wolf (precision). Here is what
+choosing that cut is worth on model A:
 
 ```python
 best_thr, best_f1 = None, -1
@@ -93,12 +138,32 @@ F1 at the tuned threshold 0.24    : 0.4650
 free gain from one line of code : +0.2135
 ```
 
+At the default 0.5 cut, F1 is only 0.2515. Sweeping 99 thresholds finds 0.24, where F1 jumps to
+0.4650 — a gain of +0.2135 from one loop. The best cut sits near the positive rate (0.228)
+because only 22.8% of rows are positive, so a 0.5 cut throws away most of them.
+
 That gain is larger than most feature-engineering ideas will give you, and it costs a loop.
+
+> **Watch out:** tune the threshold on **out-of-fold** predictions (predictions each model made
+> on rows it did not train on, ch. 2), never on the same rows you trained on. A threshold tuned
+> on training predictions fits the noise and moves on the leaderboard.
 
 ## Leak hunting is a checklist, not an instinct
 
+A leak is a clue that sneaked into the data by accident. You find leaks by running the same few
+tests every time, not by waiting for a hunch.
+
 A leak is any signal in the training data that will not exist at prediction time. Four patterns
 cover most competition leaks, and all four are detectable in minutes.
+
+The four families: **identifier** leaks (an ID or row number carries the answer), **order** leaks
+(the position of a row in the file carries it), **duplicate** leaks (the same row appears in train
+and test), and **group** leaks (many rows from one entity land on both sides of a split). The
+first test is the cheapest: correlate every ID-like column with the target.
+
+> **Picture it:** an exam paper where all the "true" answers happen to be printed on the left
+> page and all the "false" ones on the right. You can score 100% without reading a question —
+> until the real exam is shuffled.
 
 ```python
 comp = pd.DataFrame({
@@ -132,7 +197,15 @@ correlation of the target with:
 A model handed that column will top your local CV and score at chance on the leaderboard. The rule
 is blunt: **any identifier, index, or file-order artefact is suspect until proven inert.**
 
+Compare the honest feature: `feature_1` (a noisy copy of the real signal) only reaches +0.3106.
+When a bookkeeping column beats your best real feature by more than double, that is not a
+discovery; it is a bug in how the file was made. `id` (+0.0193) and `recorded_at` (+0.0194) are
+inert here, because the sort was by target first and `id` second.
+
 ### Duplicates that cross the split
+
+The second test: does the same row appear in both train and test? Turn each row's features into a
+text **key** (rounded so tiny float differences do not hide a match) and intersect the two sets.
 
 ```python
 dup_rows = comp.sample(300, random_state=1).copy()
@@ -153,11 +226,23 @@ train rows 6000 | test rows 2300
 exact feature-duplicate rows shared across the split: 221 (9.6% of test)
 ```
 
+221 test rows — 9.6% of the 2,300 — are exact feature copies of a training row. If your
+validation had the same overlap, your CV would be flattered on about one row in ten: those rows
+are answered by memory, not by skill.
+
 Duplicates across a split are two different things at once: a validation problem (your CV is
 optimistic by the duplicate share) and an opportunity (if the *real* test set has them, a
 nearest-neighbour lookup is a legitimate part of a solution). Measure it before you decide which.
 
+> **Watch out:** compare **rounded** keys. Floats written at full precision almost never match
+> exactly, so an unrounded check reports zero duplicates when a large share of the test set is a
+> copy.
+
 ### Group structure hiding as rows
+
+The third test: do many rows belong to the same person, shop, or device? If so, a model can learn
+"this customer usually churns" and look brilliant when that customer appears in both the training
+and validation folds.
 
 ```python
 comp["customer_id"] = rng.integers(0, 900, len(comp))     # many rows per customer
@@ -175,7 +260,15 @@ share of customers whose rows all share one label: 12.2%
 => random k-fold would put the same customer on both sides of the split
 ```
 
+900 customers own the 8,000 rows, about 9 rows each (median). For 12.2% of customers every row
+has the same label, so seeing one of their rows in training gives away the rest. A **random
+k-fold** split (cut the rows into k random piles) would scatter each customer across piles, and
+the model would be graded partly on people it has already met.
+
 ## Designing the CV before the first model
+
+Your CV is a guess about how the organiser split train from test. Write that guess down first,
+then build folds that copy it.
 
 The validation scheme is a *hypothesis about the test split*. State it explicitly, then check it
 against whatever the organiser told you.
@@ -187,6 +280,21 @@ against whatever the organiser told you.
 | a time column, test after train | future | rolling origin / a single time cut |
 | both | future rows of unseen entities | grouped + time cut |
 | heavy class imbalance | same imbalance | repeated stratified k-fold |
+
+The words in that table, in plain terms:
+
+- **i.i.d.** rows are independent and identically distributed: no row tells you anything about
+  another, and all come from the same source.
+- **Stratified k-fold** cuts the data into k folds that each keep the same positive rate.
+- **GroupKFold** keeps every row of one entity inside a single fold, so validation is on
+  entities the model has never seen.
+- A **rolling origin** split trains on the past and validates on the next stretch of time, then
+  slides forward.
+
+> **Picture it:** if the real exam will ask about cities you have never visited, practice with
+> quiz questions about cities you have never visited — not with questions about your home town.
+
+The helper below turns the leak checks into a written plan:
 
 ```python
 def suggest_cv(frame, target="target", id_like=(), time_col=None, group_col=None):
@@ -220,10 +328,31 @@ for note in suggest_cv(comp, id_like=("id", "row_number"), time_col="recorded_at
 - DROP 'row_number': |corr with target| = 0.726
 ```
 
+Each line is one decision with its evidence. The largest customer has 21 rows, so grouping is
+needed. The time column means "train on the past, validate on the future". And `row_number` gets
+dropped with its 0.726 correlation printed next to the verdict. There is no "repeated folds" line:
+the minority class has far more than 500 rows (22.8% of 8,000 is about 1,800).
+
 The output is a plan you can defend, produced before any modelling. When your CV and the
 leaderboard later disagree (ch. 2), this is the document you re-read first.
 
+> **Watch out:** a plan is a hypothesis, not a fact. If the organiser says "test is the next
+> three months", that beats anything your helper guesses from the columns.
+
+## Recap in plain words
+
+- Read the metric first: rank metrics ignore calibration, probability metrics punish it, and
+  threshold metrics make the cut part of your answer.
+- Tuning the F1 threshold on this data was worth +0.21 — more than most features.
+- A leak is a clue that will not exist at prediction time; IDs, row order, duplicates, and groups
+  cover most of them.
+- Any column that describes the file rather than the world is guilty until proven innocent.
+- Your CV scheme is a written guess about how the test set was cut; choose it before any model.
+
 ## Try it Yourself
+
+The function below folds this chapter into one printout: it names the metric family, states what
+that family implies, and attaches the CV plan from `suggest_cv`.
 
 ```python
 def competition_brief(frame, target, metric, id_like=(), time_col=None, group_col=None):
@@ -266,9 +395,18 @@ validation plan:
   - stratified k-fold; no structure detected
 ```
 
+The two calls on the same data give two different briefs. With AUC and full structure info, you
+get the rank advice plus three CV lines. With F1 and only `id` passed, the helper sees no group or
+time column and falls back to "stratified k-fold; no structure detected" — the brief can only
+check what you tell it to check.
+
 Run this on every competition you enter, before you open a modelling notebook. Add your own
 checks — a train/test column-set diff, a missing-value pattern comparison, a check for constant
 columns — and the brief becomes the first cell of every solution you write.
+
+Variation to try: call `competition_brief(comp, "target", "logloss", id_like=("id", "row_number"))`
+and check that the implication line switches to calibration advice and the `row_number` drop still
+appears.
 
 ## Exercise
 
@@ -277,6 +415,10 @@ produce a report with a numeric risk level for each of the four leak families (i
 duplicate, group), a recommended CV scheme, and a list of columns to drop before modelling. Test
 it on a clean dataset and on a deliberately poisoned one, and confirm it stays quiet on the clean
 one.
+
+> **Hint:** reuse the three tests from this chapter (ID correlation, rounded-key overlap,
+> rows-per-group), add one for file order (correlate `np.arange(len(train))` with the target), and
+> return each test's raw number next to a low / medium / HIGH label.
 
 <details>
 <summary>Solution</summary>

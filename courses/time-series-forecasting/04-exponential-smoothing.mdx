@@ -7,13 +7,28 @@ order: 4
 
 ## Why exponential weights
 
+To guess the next value, you average the past — but you trust recent values more than old
+ones. Exponential smoothing gives yesterday the biggest say, the day before a bit less, and so
+on, with each step back shrinking the weight by the same factor.
+
 A simple moving average weights recent and distant observations equally. Exponential
 smoothing weights each past observation by $\alpha(1-\alpha)^k$, so the most recent
 observation gets weight $\alpha$ and weights decay geometrically into the past. This
 makes the model adaptive: a high $\alpha$ chases recent values; a low $\alpha$ relies
 more on history.
 
+Here $\alpha$ (alpha) is the **smoothing parameter**, a number between 0 and 1, and $k$ counts
+steps into the past. **Decays geometrically** means each weight is the previous one times the
+same factor $(1-\alpha)$. With $\alpha = 0.3$ the weights are 0.30, 0.21, 0.147, 0.103, …
+
+> **Picture it:** your memory of a song. Last night's concert is vivid, last month's is fuzzy,
+> last year's is faint. You never forget completely, but every month the memory dims by the
+> same percentage.
+
 ## Simple Exponential Smoothing (SES)
+
+SES keeps one running number, "my current best guess of the level". Each new observation nudges
+that guess a fraction $\alpha$ of the way toward what really happened.
 
 The SES update equation:
 
@@ -21,9 +36,21 @@ $$
 \hat{y}_{t+1} = \alpha\, y_t + (1-\alpha)\,\hat{y}_t, \quad \alpha \in (0,1)
 $$
 
+> **In plain words:** next forecast = $\alpha$ times what you just saw + $(1-\alpha)$ times what
+> you had predicted. Rewritten, it is "old forecast + $\alpha$ times the error": you correct by
+> a fraction of your miss.
+
 which expands to $\hat{y}_{t+1} = \sum_{k=0}^{t-1} \alpha(1-\alpha)^k y_{t-k}$.
 
+That expansion comes from plugging the equation into itself: $\hat{y}_t$ is itself
+$\alpha y_{t-1} + (1-\alpha)\hat{y}_{t-1}$, and so on back to the start. Every past value
+appears once, with weight $\alpha(1-\alpha)^k$ — the exponential weights from the previous
+section.
+
 Optimal $\alpha$: minimize sum of squared one-step-ahead errors on the training set.
+
+A **one-step-ahead error** is "actual value minus the forecast made the period before". The
+code tries $\alpha$ values between 0.01 and 0.99 and keeps the one with the smallest total.
 
 ```python
 import numpy as np
@@ -55,29 +82,61 @@ print(f"Last forecast (t=60): {forecasts[-1]:.1f}  (true: {y[-1]:.1f})")
 ```
 
 ```output
-Optimal alpha: 0.297
-Training MSE:  16.78
-Last forecast (t=60): 66.3  (true: 68.1)
+Optimal alpha: 0.278
+Training MSE:  13.33
+Last forecast (t=60): 66.2  (true: 71.6)
 ```
 
-$\alpha \approx 0.30$ is moderate — the model neither ignores history nor discards it
-entirely. The last one-step forecast (66.3) is close to the true value (68.1).
+The optimiser picked $\alpha = 0.278$: each new value moves the forecast 27.8% of the way toward
+it. The average squared one-step error is 13.33, close to the noise variance $4^2 = 16$, so most
+of the remaining error is pure noise. The last forecast is 66.2 against a true 71.6 — a miss of
+5.4.
+
+Rounded, that is $\alpha \approx 0.30$: moderate — the model neither ignores history nor discards it
+entirely. Part of that last miss is noise: the true trend there is $50 + 0.3 \times 59 = 67.7$,
+and this observation landed 3.9 above it. The rest is lag.
+
+> **Watch out:** SES has no idea what a trend is. Its forecast is a weighted average of the
+> past, so on a rising series it always trails behind, and its forecast for every future step
+> is one flat line. For trends you need Holt's method, next.
 
 ## Holt's method: adding trend
+
+Holt keeps two running numbers instead of one: where the series is now (the level) and how
+fast it is moving (the slope). To forecast $h$ steps ahead, start at the level and walk $h$
+slopes forward.
 
 Holt extends SES with a trend component $b_t$:
 
 $$
 l_t = \alpha\, y_t + (1-\alpha)(l_{t-1} + b_{t-1})
 $$
+
+> **In plain words:** the new level is a blend of today's value and where you *expected* to
+> be (last level plus last slope).
+
 $$
 b_t = \beta(l_t - l_{t-1}) + (1-\beta)\, b_{t-1}
 $$
+
+> **In plain words:** the new slope is a blend of the latest step in the level and the old
+> slope. $\beta$ (beta) plays the role of $\alpha$ for the slope: high means the slope reacts
+> fast.
+
 $$
 \hat{y}_{t+h} = l_t + h\, b_t
 $$
 
+> **In plain words:** the forecast is a straight line: current level plus $h$ times the
+> current slope.
+
 $l_t$ is the level estimate; $b_t$ is the trend estimate; $h$ is the forecast horizon.
+
+The **forecast horizon** is how many steps into the future you are predicting.
+
+> **Picture it:** a car on a motorway. The level is where it is now, the trend is its speed.
+> "In 5 minutes it will be 5 times its per-minute distance further on." Each time you glance
+> at it, you update both your idea of its position and of its speed.
 
 ```python
 import numpy as np
@@ -116,11 +175,19 @@ print(f"5-step-ahead forecast: {h5:.1f}  (true would be ~{100+2*(60+5):.1f})")
 ```
 
 ```output
-alpha=0.396  beta=0.237
-5-step-ahead forecast: 219.8  (true would be ~230.0)
+alpha=0.331  beta=0.182
+5-step-ahead forecast: 224.5  (true would be ~230.0)
 ```
 
+The optimiser chose $\alpha = 0.331$ and $\beta = 0.182$, so the slope updates more slowly than
+the level. The 5-step forecast is 224.5. The last observation is $t = 59$, so five steps ahead
+is $t = 64$, where the true line is $100 + 2 \times 64 = 228$ (the code's "~230.0" counts one
+step too far). A miss of about 3.5 after five steps is small next to the noise std of 5.
+
 ## Holt-Winters: adding seasonality
+
+Holt-Winters adds a third running memory: one number for each season ("January is usually
++12, February $-3$, …"). The forecast is the trend line plus the right seasonal bump.
 
 Triple exponential smoothing adds a seasonal factor $s_t$. Additive variant (seasonal
 effect is a constant added to level):
@@ -128,15 +195,32 @@ effect is a constant added to level):
 $$
 l_t = \alpha(y_t - s_{t-m}) + (1-\alpha)(l_{t-1}+b_{t-1})
 $$
+
+> **In plain words:** before updating the level, remove this month's usual seasonal bump
+> $s_{t-m}$ (its value one full season ago), so the level only tracks the de-seasonalised
+> value.
+
 $$
 b_t = \beta(l_t - l_{t-1}) + (1-\beta)b_{t-1}
 $$
+
+> **In plain words:** the slope update is the same as in Holt's method.
+
 $$
 s_t = \gamma(y_t - l_{t-1} - b_{t-1}) + (1-\gamma)s_{t-m}
 $$
+
+> **In plain words:** this month's seasonal bump is a blend of "how far today sat above the
+> expected level" and last year's bump for the same month. $\gamma$ (gamma) controls how fast
+> the seasonal pattern can change.
+
 $$
 \hat{y}_{t+h} = l_t + h\,b_t + s_{t-m+h \bmod m}
 $$
+
+> **In plain words:** forecast = level + $h$ slopes + the seasonal bump of the matching month
+> from the most recent season. The $\bmod m$ ("remainder after dividing by $m$") picks the
+> right month in the 12-month cycle.
 
 ```python
 import numpy as np
@@ -163,17 +247,42 @@ print(fcast.round(1).to_string())
 ```
 
 ```output
-alpha=0.412 beta=0.089 gamma=0.188
-AIC: 356.7
+alpha=0.109 beta=0.109 gamma=0.000
+AIC: 177.9
 
 6-month forecast:
-2023-01-31    169.8
-2023-02-28    165.3
-2023-03-31    175.4
-2023-04-30    188.2
-2023-05-31    196.4
-2023-06-30    202.1
+2023-01-31    160.2
+2023-02-28    173.2
+2023-03-31    181.8
+2023-04-30    183.0
+2023-05-31    186.3
+2023-06-30    177.4
+Freq: ME
 ```
+
+Look at the three smoothing parameters. $\alpha = 0.109$ and $\beta = 0.109$ are small: level
+and slope change slowly, which fits a clean straight-line trend. $\gamma = 0.000$ means the
+seasonal bumps were estimated once at the start and never updated — correct here, because the
+simulated sine wave has the same size every year. The 6-month forecast rises from 160.2 in
+January to 186.3 in May and then drops to 177.4 in June: the trend line plus the seasonal wave.
+The true wave peaks in April ($t = 63$), so the true values are about 183 in April and 181 in
+May; the fitted May bump came out a few units high because the bumps are estimated from only
+five noisy years.
+
+**AIC** (Akaike Information Criterion) scores fit while penalising extra parameters; lower is
+better, and it is only comparable between models fitted on the same data.
+
+> **Watch out:** a smoothing parameter of exactly 0 or 1 is a hint, not a bug. $\gamma = 0$
+> says "the season never changes"; $\alpha$ near 1 says "the level is basically the last
+> value" (a random-walk-like series).
+
+## Recap in plain words
+
+- Exponential smoothing averages the past with weights that shrink by a constant factor $(1-\alpha)$ per step.
+- SES tracks one level; its forecast is flat and lags behind any trend.
+- Holt adds a slope, so the forecast is a straight line: level plus $h$ slopes.
+- Holt-Winters adds a seasonal bump per period, updated with its own parameter $\gamma$.
+- The smoothing parameters are fitted by minimising one-step-ahead squared errors; AIC helps choose between variants.
 
 ## Try it Yourself
 
@@ -197,16 +306,28 @@ print(f"Winner: {'additive' if m_add.aic < m_mul.aic else 'multiplicative'}")
 ```
 
 ```output
-Additive AIC:       284.6
-Multiplicative AIC: 289.3
+Additive AIC:       111.8
+Multiplicative AIC: 113.6
 Winner: additive
 ```
+
+The data was built additively (a fixed $\pm 15$ cosine on top of the trend), and AIC agrees:
+111.8 for the additive model against 113.6 for the multiplicative one. A gap of under 2 AIC
+points is small, though; with only 48 months and a trend that grows by about 50%, the two
+models are hard to tell apart.
+
+Try making the season multiplicative: `y = (80 + 0.8*t) * (1 + 0.2*np.cos(2*np.pi*t/12)) + noise`.
+Does the winner flip? Then lengthen the series to 120 months and see how the AIC gap changes.
 
 ## Exercise
 
 Implement Holt's double exponential smoothing from scratch (level + trend, no seasonality).
 Fit $\alpha$ and $\beta$ by minimizing MSE. Compare the 3-step-ahead forecast to
 `statsmodels.tsa.holtwinters.ExponentialSmoothing(trend='add')`.
+
+> **Hint:** reuse the Holt loop from above. Write one function that returns the in-sample MSE
+> for given $(\alpha, \beta)$, hand it to `scipy.optimize.minimize`, and then run the loop once
+> more with the winning values to get $l_T + 3 b_T$.
 
 <details>
 <summary>Solution</summary>
@@ -245,10 +366,17 @@ res = minimize(obj, [0.3, 0.1], args=(y,), method='Nelder-Mead')
 scratch_f = holt_forecast(y, *res.x, h=3)
 
 sm_model = ExponentialSmoothing(y, trend='add').fit()
-sm_f = sm_model.forecast(3).iloc[-1]
+sm_f = sm_model.forecast(3)[-1]
 
 print(f"Scratch 3-step-ahead: {scratch_f:.2f}")
 print(f"Statsmodels:          {sm_f:.2f}")
 print(f"Difference:           {abs(scratch_f - sm_f):.3f}")
 ```
+
+Running it prints 184.69 for the scratch version and 179.09 for statsmodels, a difference of
+5.599. They differ because statsmodels also *optimises* the starting level and slope, while the
+scratch version fixes them at $l_0 = y_0$ and $b_0 = y_1 - y_0$. That first difference is one
+noisy step, and a slowly updating slope remembers it for a long time. The true value three steps
+past $t = 49$ is $100 + 1.5 \times 52 = 178$, so the statsmodels forecast is closer. Initial
+values matter a lot on short series.
 </details>

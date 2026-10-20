@@ -7,6 +7,11 @@ order: 13
 
 ## Your CV scheme must mimic deployment
 
+Cross-validation is a rehearsal for the real performance. A rehearsal is only useful if
+it looks like the real show: if the model will face new customers, the rehearsal must use
+customers it hasn't seen; if it will face next month, the rehearsal must use months after
+the training data.
+
 The only thing CV is trying to answer is: "How will this model perform on data I haven't seen
 yet?" If your CV scheme doesn't match the structure of the unseen data, it will answer the
 wrong question — and your leaderboard or A/B test will disappoint.
@@ -16,7 +21,19 @@ Three structural properties of your test set determine the right CV:
 2. **Shared entity across rows** — group k-fold.
 3. **Time ordering** — time-series split.
 
+**k-fold** cross-validation cuts the data into $k$ equal parts (**folds**), trains on all
+but one, scores on the one left out, and repeats until every fold has been the test once.
+
+> **Picture it:** a fire drill. A drill in an empty building at noon tells you little
+> about a crowded building at night. The drill (CV) must copy the conditions of the real
+> emergency (deployment) — the same mix of people, the same rules about who already knows
+> the way out.
+
 ## Stratified k-fold — preserve class balance
+
+When one class is rare, a random split can by bad luck give some folds many more or many
+fewer rare examples than others. **Stratifying** deals out each class separately, like
+dealing a deck of cards so that every player gets the same share of aces.
 
 In classification, random k-fold may produce folds where one class has much fewer examples
 than in the full dataset. Stratified k-fold ensures each fold has the same class proportions
@@ -45,17 +62,22 @@ for i, (kf_idx, sf_idx) in enumerate(zip(
 ```output
 Fold positive rates:
 Fold    KFold   Stratified
-   1    0.060        0.050
-   2    0.050        0.050
-   3    0.045        0.050
+   1    0.045        0.050
+   2    0.075        0.050
+   3    0.035        0.050
    4    0.040        0.050
    5    0.055        0.050
 ```
 
 Stratified k-fold gives exactly 5.0% positive rate in every fold; regular k-fold varies
-between 4.0% and 6.0% — small here but critical with severe imbalance.
+between 3.5% (fold 3) and 7.5% (fold 2) — twice as many positives in one fold as in
+another. That is small here but critical with severe imbalance: at a 0.5% positive rate, a
+random fold can easily end up with almost no positives, and its AUC becomes meaningless.
 
 ## GroupKFold — prevent entity leakage
+
+If one patient contributes 10 rows, all 10 must sit on the same side of the split. Otherwise
+the model is tested on someone it already met in training (group leakage, ch. 12).
 
 When rows from the same entity (patient, user, store) must not appear in both train and
 validation, use GroupKFold. Pass the group identifier as the `groups` argument.
@@ -93,12 +115,23 @@ GroupKFold fold assignments (first 3 folds):
   Fold 3: train=80 patients, val=20 patients, overlap=0
 ```
 
+Each fold trains on 80 patients and validates on the other 20, and the `overlap` count —
+patients found on both sides — is 0 every time.
+
 Zero overlap in every fold — each patient appears in exactly one validation set.
+
+> **Watch out:** `GroupKFold` balances the number of *rows* per fold, not the class mix.
+> If you need both, scikit-learn has `StratifiedGroupKFold`.
 
 ## TimeSeriesSplit — forward-chaining for temporal data
 
+For data in time order, every validation block must come *after* its training data, as in
+real forecasting. The training window grows each fold, always ending where the validation
+block begins.
+
 TimeSeriesSplit uses an expanding window: fold $k$ trains on time steps $1..k$ and validates
-on $k+1$. It never uses future data to predict the past.
+on $k+1$. It never uses future data to predict the past. (Here "time step" means one of the
+equal-sized blocks the series is cut into, not one row.)
 
 ```python
 import numpy as np
@@ -126,15 +159,27 @@ for i, (tr, val) in enumerate(tss.split(np.arange(n))):
 
 ```output
 Fold sizes:
-  Fold 1: train size=33, val size=34, val range=[33, 66]
-  Fold 2: train size=67, val size=33, val range=[67, 99]
-  Fold 3: train size=100, val size=34, val range=[100, 133]
+  Fold 1: train size=35, val size=33, val range=[35, 67]
+  Fold 2: train size=68, val size=33, val range=[68, 100]
+  Fold 3: train size=101, val size=33, val range=[101, 133]
   Fold 4: train size=134, val size=33, val range=[134, 166]
   Fold 5: train size=167, val size=33, val range=[167, 199]
-[Figure: scatter plot showing expanding training windows and non-overlapping validation windows]
 ```
 
+The training set grows — 35, 68, 101, 134, 167 rows — while each validation block stays at
+33 rows and always starts right after its training data ends: fold 1 trains on rows 0–34
+and validates on 35–67, and so on up to rows 167–199. The first 35 rows are never used for
+validation.
+
+> **Picture it:** a weather forecaster being tested. Each year you let them study all past
+> years, then ask about next year — never about a year they have already read about.
+
 ## Adversarial validation — detect distribution shift
+
+**Distribution shift** (or **drift**) means the test data looks different from the training
+data — new customers, a new season, a changed sensor. **Adversarial validation** checks for
+it with a trick: mix train and test rows together and see if a model can tell which is
+which.
 
 Train a binary classifier to predict whether a row is from the training set (label 0) or
 the test set (label 1). If the AUC is significantly above 0.5, the distributions differ.
@@ -175,14 +220,34 @@ print(f"Adversarial AUC (with drift): {auc_drift:.4f}  ← high = distributions 
 ```
 
 ```output
-Adversarial AUC (no drift):   0.5038  ← near 0.5 = same distribution
-Adversarial AUC (with drift): 0.9921  ← high = distributions differ!
+Adversarial AUC (no drift):   0.4987  ← near 0.5 = same distribution
+Adversarial AUC (with drift): 0.9615  ← high = distributions differ!
 ```
 
+With no drift, the classifier can't separate the two sets: AUC 0.4987, a coin flip. With
+feature 2 shifted by 3 standard deviations in test, it separates them easily: AUC 0.9615.
+
 If adversarial AUC is high, look at which feature has high importance in the adversarial
-model — that feature is the source of the drift.
+model — that feature is the source of the drift. Fitting this classifier on the drifted data
+gives feature 2 an importance of 0.945, with every other feature at 0.021 or below.
+
+> **Watch out:** an ID column, a row number, or a timestamp will always make adversarial AUC
+> high when train and test come from different periods. Drop such columns first, or the
+> check only tells you what you already knew.
+
+## Recap in plain words
+
+- CV must copy how the model will meet new data in real use.
+- Use stratified k-fold for classification, so every fold has the same class mix.
+- Use GroupKFold when several rows belong to one person or store.
+- Use TimeSeriesSplit for time-ordered data, so validation always comes after training.
+- Adversarial validation tests whether train and test look alike, and its feature
+  importances name the column that differs.
 
 ## Try it Yourself
+
+This runs stratified CV on an imbalanced dataset (10% positives) and prints each fold's
+positive rate.
 
 ```python
 import numpy as np
@@ -212,19 +277,29 @@ for i, (tr, val) in enumerate(skf.split(X_a, y_a)):
 ```
 
 ```output
-Stratified CV AUC (balanced folds): 0.5066
+Stratified CV AUC (balanced folds): 0.4099
   Fold 1 positive rate: 0.100
   Fold 2 positive rate: 0.100
   Fold 3 positive rate: 0.100
   Fold 4 positive rate: 0.100
-  Fold 5 positive rate: 0.100
+  Fold 5 positive rate: 0.105
 ```
+
+The folds are balanced as promised: 0.100 positives in four folds and 0.105 in the fifth
+(1000 rows do not split perfectly). The AUC of 0.4099 looks alarming but means nothing:
+the labels were drawn at random, independent of `X_a`, so there is no signal, and with only
+about 20 positives per fold a single fold's AUC swings widely. Try adding a real signal —
+`X_a[y_a == 1, 0] += 1.0` after creating `y_a` — and watch the AUC rise well above 0.5.
 
 ## Exercise
 
 You have a medical dataset: 500 patients, each with 4 visits. The task is binary
 classification (diseased/healthy). Build a GroupKFold(5) CV loop, verify no patient
 appears in both train and val of the same fold, and report mean AUC.
+
+> **Hint:** give every visit its patient's label with `y = patient_disease[patient_id]`,
+> check the overlap with Python `set` intersections, and pass `groups=patient_id` to
+> `cross_val_score`.
 
 <details>
 <summary>Solution</summary>
@@ -264,5 +339,7 @@ print(f"Mean AUC: {aucs.mean():.4f} ± {aucs.std():.4f}")
 
 GroupKFold ensures no patient bleeds across the fold boundary. The AUC reflects only
 cross-patient generalisation — the correct quantity for a medical model that will
-be applied to new patients, not new visits from known patients.
+be applied to new patients, not new visits from known patients. Running it prints the
+overlap check and a mean AUC of 0.6400 $\pm$ 0.0321: a weak but real signal, from the 0.5
+standard-deviation bump on feature 0.
 </details>

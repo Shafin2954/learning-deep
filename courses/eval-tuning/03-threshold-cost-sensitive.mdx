@@ -7,8 +7,25 @@ order: 3
 
 ## The model outputs a score; the business needs a decision
 
+A model says "this transaction is 3% likely to be fraud". Somebody still has to decide
+whether to stop it. That decision rule — "stop anything above X%" — is a business choice, and
+picking X well is often worth more than a better model.
+
 A classifier's threshold is not a modelling parameter — it is where you convert a probability
 into an action, and the right value comes from **the cost of each mistake**, not from 0.5.
+
+A **cost matrix** puts a price on each of the four outcomes from ch. 1. In the demo below a
+caught fraud saves 40 (written as a cost of $-40$), a false alarm costs 6 in review time and
+customer annoyance, a missed fraud costs the full 250, and correctly leaving a good transaction
+alone costs nothing.
+
+> **Picture it:** a smoke alarm. A false alarm (burnt toast) costs you a minute of waving a
+> towel. A missed fire costs you the house. Nobody sets a smoke alarm to go off only when it
+> is more than 50% sure there is a fire.
+
+The data is **calibrated by construction**: each case gets a true probability $p$, and its
+outcome is drawn with exactly that probability, so a score of 0.02 really means "2 in 100 such
+cases are fraud".
 
 ```python
 import numpy as np
@@ -47,11 +64,21 @@ threshold 0.100: TP    4 FP     41 FN  647 -> total cost    161,836
 threshold 0.500: TP    0 FP      0 FN  651 -> total cost    162,750
 ```
 
+The prevalence is 1.3%, and the mean predicted probability (0.0132) matches it — the
+calibration check passes. Now read the cost column: 174,288 at a threshold of 0.005 (too many
+false alarms: 31,648), down to 109,454 at 0.02, and back up to 162,750 at 0.5, where the model
+flags nothing and all 651 frauds are missed ($651 \times 250$).
+
 On a problem where positives are rare and misses are expensive, the sensible cutoff is nowhere
-near 0.5 — it is two percent, and using the default costs you a third of the achievable value. **The threshold is where most of the realizable
+near 0.5 — it is two percent, and the default threshold wastes 53,296, about a third of the
+162,750 you lose by doing nothing. **The threshold is where most of the realizable
 value of a classifier lives**, and it costs one line of code to move.
 
 ## The optimal threshold, derived
+
+For each case you have two choices: act (flag it) or do nothing. Pick whichever has the lower
+expected cost. Write that comparison down and solve it, and the best threshold falls out as a
+formula.
 
 Act when the expected cost of acting is lower than the expected cost of not acting. With a
 calibrated probability $p$:
@@ -60,11 +87,27 @@ $$
 p\,C_{TP} + (1-p)\,C_{FP} \;<\; p\,C_{FN} + (1-p)\,C_{TN}
 $$
 
+> **In plain words:** the left side is the average cost of flagging: with chance $p$ it is real
+> fraud (you pay $C_{TP}$, here a benefit) and with chance $1-p$ it is a false alarm (you pay
+> $C_{FP}$). The right side is the average cost of letting it through: with chance $p$ you miss
+> a fraud ($C_{FN}$), with chance $1-p$ nothing happens ($C_{TN}$). Flag whenever the left is smaller.
+
 Rearranging gives the classic threshold:
 
 $$
 \boxed{\;p^{*} = \frac{C_{FP} - C_{TN}}{(C_{FN} - C_{TP}) + (C_{FP} - C_{TN})}\;}
 $$
+
+> **In plain words:** $p^{*}$ is the probability at which the two choices cost the same.
+> The top is "how much a false alarm hurts compared with a correct pass". The bottom adds "how
+> much a miss hurts compared with a catch". When misses are far more expensive than false
+> alarms, the bottom is big and $p^{*}$ is small, so you flag even at low probabilities.
+
+### Plugging in the numbers
+
+With these costs, $p^{*} = (6 - 0) / ((250 - (-40)) + (6 - 0)) = 6 / 296 \approx 0.0203$. The
+code below computes it and then checks it against brute force: try 500 thresholds and keep
+the cheapest.
 
 ```python
 def optimal_threshold(costs=COSTS):
@@ -90,11 +133,22 @@ cost at 0.5         = 162,750
 value of moving the threshold: 53,296
 ```
 
+The formula says 0.0203; the grid's best is 0.0200. Moving from 0.5 to the optimum saves 53,296.
+
 The formula and the grid search agree, which is the check worth running: **if they disagree, your
 probabilities are not calibrated** (ch. 4), because the derivation assumes $p$ is a real
 probability rather than a score that merely ranks well.
 
+> **Watch out:** most models (boosted trees, SVMs, over-regularized logistic regressions) output
+> scores that rank well but are not honest probabilities. Plugging such a score into $p^{*}$
+> gives a confident-looking but wrong threshold.
+
 ### Cost ratios, not absolute costs
+
+The formula only cares how many times worse a miss is than a false alarm. Doubling every cost
+leaves $p^{*}$ unchanged, so you never need the exact price of anything.
+
+The loop below keeps the false-alarm cost at 6 and changes the miss cost from 50 to 5,000.
 
 ```python
 for fn_cost in (50, 250, 1_000, 5_000):
@@ -112,11 +166,24 @@ miss costs  1000: p* 0.0057 -> flag 30,523 cases, catch  610/651, miss   41
 miss costs  5000: p* 0.0012 -> flag 43,770 cases, catch  649/651, miss    2
 ```
 
+As a miss gets more expensive, $p^{*}$ falls from 0.0625 to 0.0012. At 50 per miss you flag only
+649 cases and catch 46 of 651 frauds; at 5,000 per miss you flag 43,770 cases (most of the
+50,000) and catch 649. One business number swings the policy from "almost never act" to
+"almost always act".
+
 Only the *ratio* between costs matters, which is liberating: nobody can tell you what a missed
 fraud costs to the nearest dollar, but everyone can answer "is a miss worth ten false alarms, or
 a hundred?" — and that is enough to fix the threshold.
 
 ## When you cannot price the errors: constrained optimization
+
+Sometimes nobody will put a price on a mistake, but somebody will set a rule: "at least half the
+flags must be real", or "catch at least 80%", or "we can review 500 cases, no more". Then you
+pick the best threshold that obeys the rule.
+
+That is **constrained optimization** — find the best option among only those that satisfy a
+hard limit. The function below scans every distinct score as a threshold, throws away those
+that break the rule, and among the rest keeps the one with the best recall (or precision).
 
 ```python
 def threshold_for_constraint(y, score, kind, target):
@@ -154,6 +221,10 @@ recall >= 80%          -> threshold 0.013 | precision 0.029 recall 0.800 flagged
 at most 500 flagged    -> threshold 0.066 | precision 0.066 recall 0.051 flagged 497
 ```
 
+Each row satisfies its rule, but look at what that costs. The precision floor of 50% is met by
+flagging just 6 cases (recall 0.005). The recall floor of 80% needs 17,991 flags at 2.9%
+precision. The capacity limit of 500 gives 497 flags that catch 5.1% of frauds.
+
 Three legitimate ways to pick a threshold without a cost model: a **precision floor** (a
 compliance or trust requirement), a **recall floor** (a regulator or a safety case), and a
 **capacity constraint** (the review team's throughput — usually the real one). Read the first row
@@ -161,10 +232,28 @@ carefully: on a 1.3% base rate this model can only reach 50% precision by flaggi
 the constraint is effectively infeasible. That is a finding, not a bug — it says the signal is
 too weak for an automated block, and the honest response is triage rather than a threshold.
 
+> **Watch out:** a constraint that "succeeds" with 6 flags out of 50,000 is technically met and
+> practically useless. Always print the flagged count next to a constrained threshold.
+
 ## Multiple actions, not one
 
-Real systems rarely have a single binary decision. Two thresholds give you three actions, and
-the middle band is where a human or a cheaper check goes.
+You are not limited to "yes" or "no". With two cutoffs you get three bins: let the obvious
+good cases through automatically, block the obvious bad ones automatically, and send the
+uncertain middle to a person.
+
+Two thresholds give you three actions, and
+the middle band is where a human or a cheaper check goes. Below the **low** threshold: auto-accept.
+Between low and high: **review** (costs 6, and a reviewer catches 90% of frauds). At or above
+**high**: auto-block (saves 40 per fraud, but blocking a good customer costs 25).
+
+Real systems rarely have a single binary decision.
+
+> **Picture it:** a hospital emergency room. Triage sends the clearly fine home, the clearly
+> critical straight to surgery, and only the unclear cases wait for a doctor's careful look. The
+> doctor's time is the scarce resource, so you spend it where it changes the outcome.
+
+The first two rows are single cutoffs (low = high, so there is no review band); the last two
+are genuine two-threshold policies.
 
 ```python
 def three_way(y, score, low, high, cost_review=6.0, cost_miss=250.0, cost_block=40.0,
@@ -181,7 +270,7 @@ def three_way(y, score, low, high, cost_review=6.0, cost_miss=250.0, cost_block=
     return cost, int(auto_accept.sum()), int(review.sum()), int(auto_block.sum())
 
 print(f"{'low':>6}{'high':>7}{'auto-accept':>13}{'review':>9}{'block':>8}{'cost':>12}")
-for low, high in [(0.02, 0.02), (0.01, 0.05), (0.005, 0.10), (0.01, 0.20)]:
+for low, high in [(0.02, 0.02), (0.12, 0.12), (0.01, 0.05), (0.02, 0.12)]:
     cost, a, r, b = three_way(y, p, low, high)
     print(f"{low:>6.2f}{high:>7.2f}{a:>13,}{r:>9,}{b:>8,}{cost:>12,.0f}")
 ```
@@ -189,21 +278,40 @@ for low, high in [(0.02, 0.02), (0.01, 0.05), (0.005, 0.10), (0.01, 0.20)]:
 ```output
    low   high  auto-accept   review   block        cost
   0.02   0.02       38,952        0  11,048     311,690
+  0.12   0.12       49,989        0      11     162,080
   0.01   0.05       27,775   20,723   1,502     190,043
-  0.01   0.10       17,737   32,218      45     218,448
-  0.01   0.20       27,775   22,224       1     169,444
+  0.02   0.12       38,952   11,037      11     138,077
 ```
+
+Compare the rows. Blocking everything above 0.02 is a disaster (311,690): it blocks 11,048
+cases, almost all good customers at 25 each. The best single cutoff of the four, 0.12, blocks
+only 11 cases and costs 162,080 — barely better than doing nothing. Adding a review band
+between 0.02 and 0.12 drops the cost to 138,077, the lowest in the table, by sending 11,037
+uncertain cases to people and auto-blocking only the 11 most certain.
 
 The two-threshold policy beats every single cutoff because it **spends human attention only where
 the model is uncertain**. This is also the design that makes a model shippable when precision is
 too low for automation: the model does not decide, it *triages*.
 
+> **Watch out:** a badly placed band is worse than none — the (0.01, 0.05) row costs 190,043 because
+> it auto-blocks 1,502 cases, most of them good customers. The band edges need the same cost
+> analysis as a single threshold.
+
 ## Thresholds per segment: only when calibration or costs differ
+
+It is tempting to give each customer group its own threshold. With honest probabilities you
+almost never need to: the same cutoff makes the right call in every group. You need separate
+cutoffs only when the scores lie differently in different groups, or when mistakes cost
+different amounts.
 
 With **calibrated** probabilities the optimal threshold does not depend on the base rate — the
 formula contains only costs. A segment with four times the risk simply has more cases above the
 same cutoff. Segment-specific thresholds are needed for two other reasons: the model is
 miscalibrated *differently* per segment, or the costs differ per segment.
+
+A **segment** is a slice of the data such as a sales channel. In the demo, segment 2 is
+genuinely riskier (4 times the base risk), and the model also under-scores it, reporting only
+45% of its true probability.
 
 ```python
 segment = rng.integers(0, 3, n)                          # e.g. channel: web, app, partner
@@ -234,11 +342,27 @@ segment    prevalence   calibration  own optimum  cost at 0.02    saving
 2              0.0524          0.45        0.010        47,902     8,798
 ```
 
+Check the "calibration" column first: 1.00 for segments 0 and 1, 0.45 for segment 2. Segments 0
+and 1 find their own optimum at 0.018, close to the shared 0.0203; switching gains them a
+little (2,124 and 1,432), which is mostly grid and sampling noise. Segment 2's optimum is 0.010,
+and using it would save 8,798, the largest gain by far.
+
 Segments 0 and 1 are calibrated and land on the shared optimum; segment 2, whose scores are
-scaled down by 55%, needs a proportionally lower threshold to make the same decision. **The fix
+scaled down by 55%, needs a proportionally lower threshold to make the same decision
+($0.45 \times 0.0203 \approx 0.009$). **The fix
 is usually to calibrate per segment (ch. 4), not to maintain three thresholds** — and when the
 segment is a protected attribute, differing thresholds are a policy with legal weight that must
 be decided deliberately, documented, and audited per group (ch. 12).
+
+## Recap in plain words
+
+- A threshold turns a probability into an action, and its best value comes from the costs of mistakes.
+- With calibrated probabilities the best threshold is $p^{*}$, which depends only on the cost ratio.
+- If the formula and a brute-force grid disagree, the probabilities are not calibrated.
+- Without prices, use a precision floor, a recall floor, or a capacity limit — and print the
+  flagged count.
+- Two thresholds (accept / review / block) put human effort where the model is unsure.
+- Separate thresholds per group are a sign of miscalibration; calibrate per group instead.
 
 ## Try it Yourself
 
@@ -277,10 +401,19 @@ cost ratio miss:alarm = 8:1 -> threshold 0.124
    flag 7 | catch 3/651 (0.5%) | miss 648 | cost 162,000
 ```
 
-The third line is the one to sit with: a capacity constraint overrides the cost model entirely.
-When the optimum says "flag 4,000 cases" and the team can review 800, the threshold is set by the
+Each pair of lines is one scenario. The baseline ratio is about 42:1 ($250/6$) and picks 0.020,
+catching 62.1% of frauds. Raising the miss cost to 1,000 (ratio 167:1) drops the threshold to
+0.008 and catches 90.0%, but needs 25,749 flags. Add a capacity of 3,000 and the threshold is
+forced up to 0.040: recall falls to 22.9% and the cost jumps to 512,420. The last scenario makes
+false alarms 5 times dearer (ratio 8:1) and the threshold rises to 0.124 — only 7 cases are flagged.
+
+The third scenario is the one to sit with: a capacity constraint overrides the cost model entirely.
+When the optimum says "flag 25,749 cases" and the team can review 3,000, the threshold is set by the
 team, and the remaining value has to come from somewhere else — a better model, a cheaper
 triage tier, or more reviewers.
+
+Try this variation: set the capacity to 10,000 instead of 3,000 and see how much of the
+lost value comes back.
 
 ## Exercise
 
@@ -290,6 +423,10 @@ required minimum recall; it returns the chosen threshold, the expected monthly c
 confusion matrix, and a sensitivity analysis showing how the choice moves if the cost ratio is
 off by 2x in either direction. Then show what happens to the recommended threshold when the
 prevalence in production is half what it was in validation.
+
+> **Hint:** set the false-alarm cost to 1 and the miss cost to the ratio, so all costs are in
+> "alarm units". Filter the threshold grid by the constraints first, then take the cheapest
+> survivor; return a clear "no feasible threshold" when nothing survives.
 
 <details>
 <summary>Solution</summary>
@@ -371,16 +508,26 @@ ratio   40:1 -> t 0.055 | recall 11.0% | flag   21,420/mo | miss  5,800/mo | cos
    validation prevalence 0.0130 vs production 0.0065
 ```
 
+Read the sensitivity block first: at 20:1 the threshold is 0.055 (recall 10.4%), at 80:1 it is
+0.010 (recall 86.5%). A 2x error in the ratio moves recall by a factor of 6 to 8, so here the
+argument about the exact ratio really matters. The 90% recall floor alone is reachable (94.5%
+recall at 0.005, with 645,260 flags a month), but combined with a 12,000 review budget it is
+impossible.
+
 The insight: three separate things move the threshold, and only one of them is about the model.
 The **cost ratio** is a business input, and the sensitivity block exists because that input is
 always a guess — if the recommendation is stable from 20:1 to 80:1, you can stop arguing about
-the exact number; if it swings wildly, the argument matters and someone senior has to own it.
+the exact number; if it swings wildly, as it does here, the argument matters and someone senior has to own it.
 The **capacity limit** overrides everything, and the row where a 90% recall floor and a 12,000
 review budget cannot both be satisfied is the most useful output in the whole harness: it is a
 formal proof that the constraints are contradictory, which converts an engineering problem into
-a resourcing conversation. And **prevalence** shifts the optimum even with the model untouched,
-because the same threshold flags a different mix when positives get rarer — which is why the
-threshold is not a constant to be set once, but a parameter to be re-derived whenever the base
+a resourcing conversation. And **prevalence** shifts the optimum even with the model untouched:
+here the threshold moves from 0.020 to 0.055.
+
+Why, if the segment section said calibrated thresholds ignore the base rate? Because halving the positives
+while keeping the scores makes every score twice too high — the model is no longer calibrated
+for production. That is exactly what a base-rate shift does to a deployed model, which is why
+the threshold is not a constant to be set once, but a parameter to be re-derived whenever the base
 rate moves (ch. 5 for how validation prevalence goes wrong, and the MLOps course for detecting it
 in production).
 </details>

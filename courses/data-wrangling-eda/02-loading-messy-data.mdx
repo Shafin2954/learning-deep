@@ -7,12 +7,25 @@ order: 2
 
 ## Real data is never clean at load time
 
+Files that people send you are full of small traps, and most of them can be fixed *while
+you load the file*, not afterwards. `pd.read_csv` has a switch for nearly every trap.
+
 The first file you receive will have at least one of: wrong encoding, mixed dtypes in a
 column, thousands separator commas, ambiguous date formats, sentinel values masquerading
 as NaN, or rows that crashed the exporter. `pd.read_csv` has a parameter for almost all
 of these — knowing them is faster than writing a post-load cleanup loop.
 
+> **Picture it:** `read_csv` is a customs desk at the border. If you tell the officer the
+> rules up front ("this column is text", "`-999` means empty"), every row is checked once
+> on the way in. If you don't, bad values get into the country and you hunt them down
+> street by street later.
+
 ## Encoding: the invisible source of `UnicodeDecodeError`
+
+A file on disk is only bytes. An **encoding** is the codebook that turns those bytes back
+into letters, and if you use the wrong codebook the letters come out garbled or the read
+fails. Plain English letters look the same in most codebooks; accented and non-Latin
+letters do not.
 
 ```python
 import pandas as pd, io
@@ -32,11 +45,15 @@ print(df)
 ```
 
 ```output
-utf-8 failed: 'utf-8' codec can't decode byte 0xe9 in position 0: inv
-  name   city
+utf-8 failed: 'utf-8' codec can't decode byte 0xe9 in position 17: invalid
+    name    city
 0  Alice  Résumé
-1    Bob   Café
+1    Bob    Café
 ```
+
+The error message points at **byte `0xe9` in position 17**: that is `é` in Latin-1, a
+single byte that is not a legal start of a character in UTF-8 (pandas' default). Reading
+the same bytes with `encoding='latin-1'` gives back `Résumé` and `Café` intact.
 
 When you don't know the encoding, try `encoding='latin-1'` first (it never errors —
 every byte is valid Latin-1) or use `chardet`/`charset-normalizer` to detect it:
@@ -44,16 +61,27 @@ every byte is valid Latin-1) or use `chardet`/`charset-normalizer` to detect it:
 ```python
 import chardet, io
 
-raw = "name\nAlice\nMeiying".encode('gb2312')
+raw = "city,note\n北京,中国的首都\n上海,最大的城市\n广州,南方的城市".encode('gb2312')
 result = chardet.detect(raw)
 print(result)
 ```
 
 ```output
-{'encoding': 'GB2312', 'confidence': 0.99, 'language': 'Chinese'}
+{'encoding': 'GB18030', 'confidence': 0.6390296506584145, 'language': 'zh', 'mime_type': 'text/plain'}
 ```
 
+`chardet` guessed `GB18030`, a superset of GB2312 (so decoding with it is correct), and
+spotted the language as `zh` (Chinese). Look at the `confidence`: only 0.64. Detection is
+statistical guessing from byte patterns, and three short lines are not much evidence.
+
+> **Watch out:** "Latin-1 never errors" is not the same as "Latin-1 is right". It maps
+> every byte to *some* character, so a UTF-8 file read as Latin-1 loads without complaint
+> but shows `Ã©` where `é` should be. Always eyeball a few non-ASCII values after loading.
+
 ## Dtype control at load time
+
+When you don't say what type each column is, pandas guesses by looking at the values. Its
+guesses are reasonable but often not what you want.
 
 Let `read_csv` infer dtypes and you get surprises: a column of integers with one missing
 value becomes float64; a column of numeric IDs becomes int64 when you need strings; a
@@ -88,26 +116,43 @@ print(df_typed.memory_usage(deep=True).sum(), "bytes")
 
 ```output
 auto dtypes:
-id           int64
+id            int64
 score       float64
 active        int64
-category     object
+category        str
 dtype: object
-341 bytes
+231 bytes
 
 explicit dtypes:
-id          object
-score      float32
-active       int64
-category  category
+id               str
+score        float32
+active         int64
+category    category
 dtype: object
-461 bytes
+225 bytes
 ```
 
-For large files the dtype savings compound: a 10 M-row `object` column of 4-character
-categories uses ~650 MB; as `category` dtype it uses ~10 MB.
+In the inferred version `id` became `int64` — so an ID like `00123` would lose its leading
+zeros — and `score` became `float64` because of the empty cell. Passing `dtype=` made
+`id` a string, `score` a smaller `float32`, and `category` a pandas `category`. `active`
+was not listed, so it stayed `int64` (the comment in the code mentions bool, but you would
+need `'active': bool` in the dict for that). On three rows the memory barely moves: 231 to
+225 bytes.
+
+For large files the dtype savings compound. Measured on 1 M rows of 4-character labels
+from 4 possible values: about 53 MB as Python-`object` strings, 12 MB as pandas 3's `str`
+dtype, and 1 MB as `category` — so a 10 M-row `object` column costs roughly half a
+gigabyte, while the `category` version costs about 10 MB.
+
+> **Picture it:** a `category` column stores each distinct label once in a small lookup
+> table and then keeps only a tiny integer code per row — like writing "see note 2" instead
+> of copying the whole note into every row.
 
 ## Handling missing-value sentinels
+
+A **sentinel** is a fake value that someone used to mean "unknown" — like `-999` in an age
+column. Unless you tell pandas, it treats `-999` as a real age and drags your averages
+down.
 
 Many real datasets use custom sentinel values: `-9999`, `'N/A'`, `'n.a.'`, `'.'`, empty
 string, `'NULL'`, `'None'`. `read_csv`'s `na_values` parameter handles all of them.
@@ -133,11 +178,11 @@ print(df.isna().sum())
 ```
 
 ```output
-   age    income          note
-0   25  50000.0            ok
-1  NaN      NaN  missing income
-2   32      NaN  missing income
-3   40  75000.0            ok
+    age   income            note
+0  25.0  50000.0              ok
+1   NaN      NaN  missing income
+2  32.0      NaN  missing income
+3  40.0  75000.0              ok
 
 missing counts:
 age       1
@@ -146,7 +191,18 @@ note      0
 dtype: int64
 ```
 
+Row 1 had `-999` for age and `.` for income: both became `NaN`. Row 2's `N/A` became
+`NaN` too. The counts confirm it — 1 missing age, 2 missing incomes. Without `na_values`,
+the mean age would have been $(25 - 999 + 32 + 40)/4 = -225.5$.
+
+> **Watch out:** `na_values` applies to *every* column. If `0` or `-1` is a sentinel in one
+> column but a real value in another, pass a dict instead:
+> `na_values={'age': ['-999']}`.
+
 ## Thousands separators and decimal commas
+
+The same number is written differently in different countries. The US writes one thousand
+two hundred thirty-four and a half as `1,234.5`; much of Europe writes `1.234,5`.
 
 European locales use `.` for thousands and `,` for decimals (`1.234,56`). The US uses
 the reverse. `read_csv` has `thousands` and `decimal` parameters.
@@ -156,20 +212,32 @@ import pandas as pd, io
 
 csv = "amount\n1.234,56\n89.012,00\n5.000,00"
 buf = io.StringIO(csv)
-df = pd.read_csv(buf, thousands='.', decimal=',')
+df = pd.read_csv(buf, sep=';', thousands='.', decimal=',')
 print(df)
 print("dtype:", df['amount'].dtype)
 ```
 
 ```output
-   amount
-0  1234.56
-1  8901200
-2  5000.00
+     amount
+0   1234.56
+1  89012.00
+2   5000.00
 dtype: float64
 ```
 
+All three values came out right — `1234.56`, `89012.00`, `5000.00` — and the dtype is
+`float64`, a real number column. Notice `sep=';'`: because the comma is busy being the
+decimal mark, files from these locales use a semicolon between fields.
+
+> **Watch out:** without `sep=';'` the reader splits `1.234,56` at the comma into two
+> fields. The header has one column and each row has two, so pandas silently turns the
+> first piece into the row index — you get an index of `1234` and an `amount` of `56`, with
+> no error at all.
+
 ## Bad rows: `on_bad_lines`
+
+A **bad line** is a row with the wrong number of fields — usually a stray comma inside an
+unquoted text value, or an exporter that crashed mid-line.
 
 When a CSV row has more (or fewer) fields than the header, pandas raises an error by default.
 Use `on_bad_lines='skip'` to drop them or `'warn'` to count them.
@@ -195,7 +263,17 @@ print("rows after skip:", len(df))
 rows after skip: 2
 ```
 
+The middle row had four fields under a three-column header, so it was dropped: only the
+rows `1,2,3` and `7,8,9` remain, and the count is 2.
+
+> **Watch out:** `'skip'` throws data away without telling you how much. Run once with
+> `'warn'` first; if hundreds of rows are bad, the real problem is probably the separator or
+> the quoting, not a few broken rows.
+
 ## Chunked loading for very large files
+
+If a file is bigger than your computer's memory, you read it a slice at a time, do your
+work on each slice, and keep only the small result.
 
 When a file doesn't fit in RAM, read it in chunks:
 
@@ -216,10 +294,30 @@ print("total val:", total)          # 0+2+4+...+(2*999999) = 999999*1000000 = 99
 total val: 999999000000
 ```
 
+Five chunks of 200,000 rows each were summed one after another, and the total
+999,999,000,000 matches the formula in the comment. At no point were all 1 M rows in
+memory at once.
+
 Process each chunk independently (aggregate, filter, write to a new file). Never store
 all chunks in a list and concatenate — that defeats the purpose.
 
+> **Picture it:** emptying a swimming pool with a bucket. You never need a tank as big as
+> the pool — only a bucket and a running tally.
+
+## Recap in plain words
+
+- Read errors like `UnicodeDecodeError` mean the wrong encoding; Latin-1 always loads but
+  can still be wrong.
+- Tell `read_csv` the dtypes you want — IDs as text, low-variety labels as `category`.
+- List every fake "missing" marker in `na_values`, or it pollutes your statistics.
+- European numbers need `thousands='.'`, `decimal=','`, and usually `sep=';'`.
+- `on_bad_lines` decides what happens to rows with the wrong number of fields.
+- `chunksize` lets you process files larger than memory, one slice at a time.
+
 ## Try it Yourself
+
+This CSV mixes several traps at once: sentinels, a blank name and category, a `-999`
+stock count, and integers that need to allow missing values.
 
 ```python
 import pandas as pd, io
@@ -246,19 +344,19 @@ print("\nna counts:\n", df.isna().sum())
 ```
 
 ```output
-  product_id           name  price  stock   category
-0       P001       Widget A   1299     50  electronics
-1       P002       Gadget B    NaN      0  electronics
-2       P003            NaN  24.99   <NA>         NaN
-3       P004   Doohickey D   8.49    200     hardware
-4       P005  Thingamajig E    NaN     10     hardware
+  product_id           name   price  stock     category
+0       P001       Widget A   1.299     50  electronics
+1       P002       Gadget B     NaN      0  electronics
+2       P003            NaN  24.990   <NA>          NaN
+3       P004    Doohickey D   8.490    200     hardware
+4       P005  Thingamajig E     NaN     10     hardware
 
 dtypes:
- product_id     object
-name           object
+ product_id        str
+name              str
 price         float64
 stock           Int32
-category       object
+category          str
 dtype: object
 
 na counts:
@@ -270,6 +368,15 @@ category      1
 dtype: int64
 ```
 
+Product `P003` shows the fixes working together: blank `name` and `category` became `NaN`,
+and stock `-999` became `<NA>` — the missing marker of the **nullable integer** dtype
+`Int32` (capital I), which, unlike `int64`, can hold a gap without turning into floats.
+The `na counts` show 2 missing prices, both from `N/A`. Note `price` for `P001` is
+`1.299`: with `thousands=','` the dot stays a decimal point. If that file came from Europe
+and meant one thousand two hundred ninety-nine, you would need `thousands='.'` instead.
+Try it: `1.299` becomes `1299` — but `24.99` also becomes `2499`, because one column can
+only follow one number convention. Mixed conventions need cleaning by hand.
+
 ## Exercise
 
 Write a function `load_clean(path_or_buf)` that:
@@ -278,6 +385,10 @@ Write a function `load_clean(path_or_buf)` that:
 3. Returns a DataFrame with `object` columns that have fewer than 20 unique values
    automatically converted to `category`.
 4. Prints a one-line summary: shape, total missing, and memory usage in MB.
+
+> **Hint:** `chardet.detect` needs *bytes*, so read a raw sample first (from a file opened
+> in `'rb'` mode, or a `BytesIO`), then rewind with `seek(0)` before handing the same buffer
+> to `read_csv`.
 
 <details>
 <summary>Solution</summary>
@@ -304,7 +415,7 @@ def load_clean(path_or_buf):
     )
 
     # 3) auto-categorize low-cardinality object columns
-    for col in df.select_dtypes('object').columns:
+    for col in df.select_dtypes(include=['object', 'str']).columns:
         if df[col].nunique() < 20:
             df[col] = df[col].astype('category')
 
@@ -313,4 +424,9 @@ def load_clean(path_or_buf):
     print(f"shape={df.shape}  missing={df.isna().sum().sum()}  mem={mb:.2f} MB")
     return df
 ```
+
+Detecting the encoding on a 100 KB sample is fast and usually enough. Step 3 selects both
+`object` and `str` columns because pandas 3 stores text as the `str` dtype by default;
+`select_dtypes('object')` alone would stop matching text in a future version. The function
+expects a path or a bytes buffer — a `StringIO` would hand `chardet` a string and fail.
 </details>

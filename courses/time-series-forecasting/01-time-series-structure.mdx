@@ -7,9 +7,22 @@ order: 1
 
 ## What makes a time series different
 
+A time series is a list of measurements where the order matters: today's value comes after
+yesterday's, and yesterday's value helps you guess today's. Shuffle the rows of a normal
+table and nothing breaks; shuffle a time series and you destroy the very thing you wanted to
+learn.
+
 A time series is a sequence of observations $y_1, y_2, \ldots, y_T$ ordered by time. The
 key difference from ordinary tabular data: observations are **serially dependent** — knowing
 $y_{t-1}$ tells you something about $y_t$. That dependence is the signal you want to model.
+
+Here $t$ is the time step (month 1, month 2, …) and $T$ is the last one you have. **Serially
+dependent** means "each value leans on the ones before it".
+
+> **Picture it:** the temperature outside your window. If it was 20 degrees an hour ago, it
+> is almost certainly not $-5$ now. Each reading is a strong clue about the next one. A
+> table of unrelated customers has no such clue: customer 41 tells you nothing about
+> customer 42.
 
 Three structural components appear in almost every real series:
 
@@ -17,9 +30,16 @@ $$
 y_t = T_t + S_t + R_t \quad \text{(additive)}
 $$
 
+> **In plain words:** what you observe = slow drift + repeating wiggle + leftover jitter,
+> all *added* together.
+
 - $T_t$ — **trend**: the long-run direction (up, down, flat)
 - $S_t$ — **seasonal**: a repeating pattern at a fixed frequency (weekly, monthly, yearly)
 - $R_t$ — **residual**: everything left over; ideally unpredictable noise
+
+> **Picture it:** ice-cream sales over five years. The shop gets more popular every year
+> (trend), sales jump every summer and dip every winter (seasonal), and a rainy Saturday
+> knocks a random week down (residual).
 
 When the seasonal amplitude grows proportionally with the level, use the **multiplicative**
 form instead:
@@ -28,11 +48,30 @@ $$
 y_t = T_t \times S_t \times R_t
 $$
 
+> **In plain words:** here the pieces are *multiplied*. The seasonal part is a percentage
+> ("summer is 30% above normal"), so when the trend doubles, the summer bump doubles too.
+> The **seasonal amplitude** is the size of that bump — the distance from peak to trough.
+
 Taking logs of a multiplicative series converts it to additive: $\log y_t = \log T_t + \log S_t + \log R_t$.
+
+This works because the logarithm turns products into sums: $\log(a \times b) = \log a + \log b$.
+After the log, a "30% bump" becomes a bump of fixed size, no matter how big the level is.
+
+> **Watch out:** the log only exists for positive numbers. A series with zeros or negative
+> values (profit, temperature in Celsius) cannot be logged directly; you would need a shift
+> or a different transform first.
 
 ## Datetime indexing in pandas
 
+pandas can label every row of a series with a real date instead of a row number. Once it
+knows the dates, it can do calendar arithmetic for you: group by year, shift by a month, or
+spot that the data is monthly.
+
 pandas carries a `DatetimeIndex` that unlocks resampling, shifting, and frequency inference.
+
+A **`DatetimeIndex`** is a row label made of timestamps. **Resampling** means changing the
+time grain — for example, turning 12 monthly values into 1 yearly value. **Frequency
+inference** means pandas noticing on its own that the gaps are "one month-end apart".
 
 ```python
 import pandas as pd
@@ -56,29 +95,48 @@ print(f"Annual mean:\n{series.resample('YE').mean().round(1)}")
 ```
 
 ```output
-2019-01-31    104.99
-2019-02-28    111.82
-2019-03-31    125.52
-2019-04-30    130.30
-2019-05-31    131.27
+2019-01-31    101.218868
+2019-02-28    104.140064
+2019-03-31    117.592186
+2019-04-30    121.162259
+2019-05-31    108.386240
 Freq: ME, Name: value, dtype: float64
 
-Frequency: ME
+Frequency: <MonthEnd>
 Annual mean:
-2019-12-31    118.6
-2020-12-31    125.9
-2021-12-31    133.6
-2022-12-31    141.0
-2023-12-31    148.5
+2019-12-31    103.8
+2020-12-31    114.4
+2021-12-31    124.6
+2022-12-31    133.6
+2023-12-31    142.8
 Freq: YE-DEC, Name: value, dtype: float64
 ```
+
+Look at the first block: every date is a month-end (Jan 31, Feb 28, …) because `freq='ME'`
+means "month end". The line `Frequency: <MonthEnd>` confirms pandas recorded that grain. In
+the yearly table, the averages climb 103.8, 114.4, 124.6, 133.6, 142.8.
 
 `resample('YE').mean()` collapses the series to one value per year-end — the annual averages
 increase ~7 units each year, confirming the upward trend.
 
+To be exact, the steps are 10.6, 10.2, 9.0 and 9.2 — about 10 units per year. That matches
+the code: the trend rises $0.8$ per month, and $0.8 \times 12 = 9.6$ per year. Averaging a
+whole year also cancels the seasonal wave (the sine sums to roughly zero over 12 months),
+which is why the trend shows up so cleanly.
+
+> **Watch out:** recent pandas versions renamed the frequency codes. Use `'ME'` (month end)
+> and `'YE'` (year end); the old `'M'` and `'Y'` now raise an error.
+
 ## Simulating additive vs multiplicative series
 
+The quickest way to tell the two shapes apart is to measure the seasonal swing early in the
+series and late in the series. If the swing stays the same size, the series is additive. If
+the swing grows as the level grows, it is multiplicative.
+
 Seeing both structures side by side clarifies when to apply the log transform.
+
+The code below builds both kinds from the same trend. It measures **peak-to-trough** — the
+biggest value in a 12-month window minus the smallest — in the first year and the last year.
 
 ```python
 import pandas as pd
@@ -109,15 +167,37 @@ print("Multiplicative — late: ", round(y_mul[36:].max() - y_mul[36:].min(), 1)
 ```
 
 ```output
-Additive — early peak-to-trough: 20.2
-Additive — late  peak-to-trough: 21.8
-Multiplicative — early: 22.0
-Multiplicative — late:  29.4
+Additive — early peak-to-trough: 16.9
+Additive — late  peak-to-trough: 20.0
+Multiplicative — early: 26.7
+Multiplicative — late:  59.1
 ```
 
+Read the four numbers. The additive series swings 16.9 in year one and 20.0 in year four:
+roughly the same size (the gap is noise plus a little trend inside each window). The
+multiplicative series swings 26.7 early and 59.1 late — more than double.
+
 The additive series keeps a roughly constant seasonal swing (~20). The multiplicative series
-has a larger swing late (~29) than early (~22) because the seasonal factor scales with the
+has a larger swing late than early because the seasonal factor scales with the
 growing trend.
+
+Why more than double? The seasonal factor goes from 0.7 to 1.3: the peak is 30% above the
+trend and the trough 30% below it, so the swing is proportional to the trend level. The trend
+grows from about 57 in year one to about 100 in year four, so the swing grows with it (noise
+adds a few units on top).
+
+> **Picture it:** a rubber band with marks on it. In an additive series the marks stay the
+> same distance apart. In a multiplicative series you stretch the band (the trend grows) and
+> the marks spread out with it.
+
+## Recap in plain words
+
+- A time series is ordered data where each value carries information about the next.
+- Most series split into a trend (slow drift), a seasonal pattern (repeating wiggle) and a residual (leftover noise).
+- Additive means the seasonal swing has a fixed size; multiplicative means it is a percentage of the level.
+- A log transform turns a multiplicative series into an additive one.
+- A pandas `DatetimeIndex` lets you resample, shift and group by calendar periods.
+- Comparing early and late peak-to-trough swings is a fast test for additive vs multiplicative.
 
 ## Try it Yourself
 
@@ -146,17 +226,30 @@ print("Max: ", round(series.max(), 2))
 ```
 
 ```output
-Mean: 94.57
-Std:  8.93
-Min:  74.49
-Max:  111.96
+Mean: 87.86
+Std:  7.6
+Min:  73.26
+Max:  102.56
 ```
+
+The code builds a 36-month additive series: trend from 80 rising $0.5$ per month, a seasonal
+wave of amplitude 10, and noise with standard deviation 2. The mean 87.86 sits near the
+trend's middle value ($80 + 0.5 \times 17.5 = 88.75$). The range 73.26 to 102.56 is about
+29 wide: the seasonal wave alone spans 20 (from $-10$ to $+10$), and the trend rise plus noise add the rest.
+
+Try `amp = 30`: the standard deviation should jump, because the seasonal wave now dominates
+the spread. Then swap to a multiplicative seasonal factor (`trend * (1 + 0.2 * np.sin(...))`)
+and repeat the early-vs-late swing check from the previous section.
 
 ## Exercise
 
 Create a multiplicative time series with 60 monthly observations where the trend grows from
 100 to 200. Apply a log transform and verify that the seasonal amplitude becomes constant
 after the transform.
+
+> **Hint:** build the trend with `np.linspace`-style growth, multiply it by a factor like
+> `1 + 0.25 * sin(...)`, and compare the peak-to-trough of the first 12 months with the last
+> 12 months, before and after `np.log`.
 
 <details>
 <summary>Solution</summary>
@@ -178,9 +271,9 @@ series = pd.Series(y, index=idx)
 log_series = np.log(series)
 
 early_swing = y[:12].max() - y[:12].min()
-late_swing  = y[36:].max() - y[36:].min()
+late_swing  = y[48:].max() - y[48:].min()
 log_early   = log_series[:12].max() - log_series[:12].min()
-log_late    = log_series[36:].max() - log_series[36:].min()
+log_late    = log_series[48:].max() - log_series[48:].min()
 
 print(f"Original  — early swing: {early_swing:.1f},  late swing: {late_swing:.1f}")
 print(f"Log-trans — early swing: {log_early:.3f}, late swing: {log_late:.3f}")
@@ -188,4 +281,11 @@ print(f"Log-trans — early swing: {log_early:.3f}, late swing: {log_late:.3f}")
 
 The log-transformed series shows nearly equal early and late seasonal swings, confirming the
 multiplicative structure has been made additive.
+
+Running it prints an original swing of 48.2 early and 91.4 late — almost double, because the
+trend doubled. After the log the swings are 0.438 and 0.486: close, with the small gap coming
+from the trend's rise inside each 12-month window and the noise. For reference,
+$\log 1.25 - \log 0.75 \approx 0.51$ is the pure seasonal swing in log units. Compare
+windows of the same length; a longer late window would contain more trend and inflate the
+swing.
 </details>

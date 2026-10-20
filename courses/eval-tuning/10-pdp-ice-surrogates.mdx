@@ -7,9 +7,18 @@ order: 10
 
 ## What shape did the model learn?
 
+A linear model hands you its story in one number per feature: "each extra month of tenure adds
+0.6 to spend". A forest or a boosted model has no such number. The tools in this chapter recover
+that story by turning one knob at a time and watching how the predictions move.
+
 SHAP (ch. 9) tells you how much a feature contributed to one prediction. Partial dependence asks
 a different question: **as this feature sweeps across its range, how does the model's output move
 on average?** It is the closest thing to reading a coefficient out of a black box.
+
+A **black box** is a model whose inner rules are too complex to read directly. The demo predicts
+monthly spend from three features: tenure (months as a customer), discount (percent off), and
+support tickets. The data hides an **interaction** — the effect of one feature depends on another:
+a discount *raises* spend for customers under 24 months and *lowers* it for longer-tenured ones.
 
 ```python
 import numpy as np
@@ -41,14 +50,26 @@ train R2 0.8265 | test R2 0.7650
 mean spend 63.70
 ```
 
+The forest explains 76.5% of the variation in spend on held-out rows ($R^2$ 0.7650), against
+0.8265 on training rows — a modest gap, so it has learned real structure.
+
 There is a real interaction buried in that data. Watch partial dependence walk straight past it.
 
 ## Partial dependence, from the definition
+
+To see how spend depends on discount, give *every* customer the same discount, ask the model
+for all their predictions, and average. Repeat for 0%, 10%, 20%, and so on. The line through
+those averages is the partial dependence.
 
 $$
 \mathrm{PD}_j(z) = \mathbb{E}_{X_{-j}}\bigl[f(z, X_{-j})\bigr]
 \;\approx\; \frac{1}{n}\sum_{i=1}^{n} f\bigl(z,\; x^{(i)}_{-j}\bigr)
 $$
+
+> **In plain words:** $\mathrm{PD}_j(z)$, the partial dependence of feature $j$ at value $z$, is the
+> average prediction when feature $j$ is forced to $z$ and all other features ($X_{-j}$) keep each
+> row's real values. The right side is how you compute it: loop over the $n$ rows, replace feature
+> $j$ by $z$ in row $i$, predict, and average.
 
 Set feature $j$ to $z$ for **every** row, predict, average. Repeat across a grid of $z$. That is
 the whole algorithm — the same interventional replacement SHAP uses, restricted to one feature.
@@ -80,8 +101,18 @@ discount  40.0%  ->  mean predicted spend  62.940
 total swing across the range: 1.822
 ```
 
+The averages barely move: 64.604 at 0% discount, 62.940 at 40%. The whole swing is 1.822 units of
+spend, which looks like "discount has almost no effect, maybe a slight negative".
+
 Read that as "discount barely matters". It is wrong, and it is wrong in the specific way partial
 dependence is always wrong: **averaging destroys anything that cancels**.
+
+> **Picture it:** half a class finds a new teaching method much better and the other half much
+> worse. The class average does not change. "The method has no effect" is true of the average and
+> false of every student.
+
+Before fixing that, a check against the library. scikit-learn's `partial_dependence` should give
+the same numbers once its two hidden choices are matched.
 
 ```python
 from sklearn.inspection import partial_dependence as sk_pd
@@ -100,6 +131,9 @@ sklearn PD  : [64.613 65.059 64.694 64.326 63.558 63.709 63.49  63.498 63.028]
 ours, same  : [64.613 65.059 64.694 64.326 63.558 63.709 63.49  63.498 63.028]
 ```
 
+The two bottom lines are identical at all 9 grid points. Notice sklearn's grid starts at 1.7 and
+ends at 37.46, not at 0 and 40: it stays inside the bulk of the observed data.
+
 Identical, once you match two things sklearn chooses for you. It picks its grid by *percentile* of
 the observed feature rather than by `linspace`, so it never asks about values the data does not
 contain. And `method` defaults to `"recursion"` for tree ensembles, which walks the trees instead
@@ -109,8 +143,15 @@ interventional value function.
 
 ## ICE: one curve per row, no averaging
 
+Skip the averaging step. Draw one line per customer showing how *their* prediction changes as the
+discount changes. If all lines go the same way, the average is fine. If they go different ways,
+the average was lying.
+
 Individual Conditional Expectation plots the same sweep **per row** instead of averaging. If the
 curves fan out, the average was hiding something.
+
+An **ICE curve** (individual conditional expectation) is exactly that per-row line. Its **slope**
+— how much the prediction rises per unit of the feature — summarises it in one number.
 
 ```python
 def ice(model, X, feature, grid):
@@ -140,11 +181,21 @@ per-row slope of spend vs discount:
   10th / 90th percentile slope: -0.3230 / +0.4020
 ```
 
+The average slope is $-0.0009$, essentially zero, matching the flat PDP. But 44% of customers have
+a positive slope and 56% a negative one, and the 10th and 90th percentiles are $-0.3230$ and
+$+0.4020$ — big effects in both directions.
+
 Half the customers respond positively to a discount and half negatively, so the average is flat.
 A PDP alone would have told the business "discounts do nothing"; the ICE spread says "discounts do
 a lot, in opposite directions, to different people".
 
 ### Splitting the ICE curves reveals the driver
+
+Once you know the curves fan out, the next question is *who* goes up and *who* goes down. Split
+the curves by a second feature you suspect is responsible.
+
+A feature that changes another feature's effect is called a **moderator**. Here the suspect is
+tenure, split at 24 months.
 
 ```python
 new_cust = sub["tenure"].values < 24
@@ -160,6 +211,10 @@ tenure < 24 months     n= 87 | spend at 0%   54.37 -> at 40%   69.44 (+15.07)
 tenure >= 24 months    n=113 | spend at 0%   70.29 -> at 40%   58.63 (-11.66)
 ```
 
+For the 87 newer customers, a 40% discount raises predicted spend by 15.07. For the 113 longer-
+tenured ones it lowers it by 11.66. The two groups pull in opposite directions, and the PDP showed
+only their sum.
+
 That is the interaction the data generator put in, recovered from the model. The workflow: PDP
 looks flat, so check the ICE spread, then group the curves by a candidate moderator. Colouring ICE
 curves by a second feature is the standard visual version of these three lines.
@@ -168,6 +223,8 @@ curves by a second feature is the standard visual version of these three lines.
 
 Raw ICE curves are stacked at different heights because rows differ in their other features.
 Subtract each curve's value at the left edge and only the *shape* remains:
+
+**Centred ICE** (also called c-ICE) starts every curve at zero, so you compare changes, not levels.
 
 ```python
 centred = curves - curves[:, [0]]
@@ -186,14 +243,24 @@ for j, z in enumerate(grid):
      40.0    -0.04      +15.07      -11.66
 ```
 
+Read across the 40% row: $+15.07$ for new customers, $-11.66$ for old ones, $-0.04$ on average.
+
 The centred view is what you show a stakeholder: from a common starting point, a 40% discount is
 worth +15.07 to a new customer and -11.66 to a long-tenured one, and the `mean` column — never
 more than 0.51 away from zero at any point on the grid — is the flat line that told you nothing.
 
 ## PDP extrapolates into data that does not exist
 
+Forcing every row to the same value creates customers that cannot exist: a brand-new customer with
+the credit limit of a five-year one. The model was never trained on such rows, so its predictions
+for them are guesses.
+
 The replacement step evaluates $f(z, x_{-j})$ for every row, including combinations that never
 occur. With correlated features that means asking the model about impossible customers.
+
+The demo adds `credit_limit`, which is almost a copy of tenure (it grows by 8 per month of tenure,
+plus noise), and has **no effect on spend at all** in the generator. For each grid point it also
+counts how many rows really have a credit limit within 40 of it.
 
 ```python
 df_corr = df.copy()
@@ -224,13 +291,25 @@ limit    584 -> PDP  65.176   (rows actually near this value: 18%)
 limit    656 -> PDP  65.997   (rows actually near this value: 12%)
 ```
 
+The correlation is 0.994 — tenure and credit limit move almost in lockstep. The PDP rises from
+62.069 to 65.997 across the range, even though credit limit does nothing in the generator. And the
+last column shows that at each grid point only 12% to 20% of rows actually have a credit limit nearby.
+
 Every PDP point averages over 400 rows, but only 12–20% of them plausibly *could* have that credit
 limit given their tenure. The rest are fabricated customers, and the model's answer about them is
 an extrapolation you have no way to check.
 
+> **Watch out:** **extrapolation** means predicting outside the region the model was trained on.
+> Tree models answer every question confidently, even about impossible rows, so nothing in the
+> output warns you.
+
 ### ALE: only ask about differences that are local
 
-Accumulated Local Effects fixes this by bingeing on locality: inside each bin of the feature,
+**Accumulated Local Effects (ALE)** avoids made-up rows. It cuts the feature into small bins, and
+inside each bin it only moves the rows that are already there, and only by a little — from the
+bin's lower edge to its upper edge. Then it adds up those small changes bin by bin.
+
+Accumulated Local Effects fixes this by staying local: inside each bin of the feature,
 compute the prediction *difference* between the bin edges **for the rows that are actually in that
 bin**, then accumulate.
 
@@ -238,6 +317,17 @@ $$
 \mathrm{ALE}_j(z) = \sum_{k:\,z_k \le z}\;
 \frac{1}{|S_k|}\sum_{i \in S_k}\bigl[f(z_k, x^{(i)}_{-j}) - f(z_{k-1}, x^{(i)}_{-j})\bigr]
 $$
+
+> **In plain words:**
+> - $z_0, z_1, \dots$ are the bin edges; $S_k$ is the set of rows whose value falls in bin $k$, and
+>   $|S_k|$ is how many there are.
+> - For each row in bin $k$, compute the prediction at the bin's upper edge $z_k$ minus the prediction
+>   at its lower edge $z_{k-1}$, keeping the row's other features.
+> - Average that difference within the bin, then add up the bin averages for every bin up to $z$.
+
+> **Picture it:** measuring the slope of a hill by walking it in short steps and noting how much
+> you climb in each step, then adding the climbs. PDP instead teleports everyone to the same
+> spot on the hill — including people who would have to stand in mid-air.
 
 ```python
 def ale(model, X, feature, n_bins=8):
@@ -276,6 +366,9 @@ for e, p, a in zip(edges, pd_centred, ale_vals):
           694           2.074     4.564
 ```
 
+Both columns are centred (they average to zero) so they can be compared. ALE runs from $-5.035$ to
+$+4.564$; PDP from $-2.066$ to $+2.074$.
+
 The two curves disagree, and ALE is the *steeper* one: it spans about 9.6 units of spend against
 the PDP's 4.1. That is the opposite of what people expect, and it is the right result. Inside a
 narrow band of `credit_limit`, every row has a similar tenure, so nudging the limit to the band's
@@ -290,8 +383,15 @@ you specifically want the "what if we forced this value on everyone" answer, and
 
 ## Global surrogates: approximate the model with something readable
 
+If the model is too complex to read, train a simple model to imitate it and read that instead —
+but first check how good the imitation is.
+
 Fit an interpretable model to the black box's **predictions** (not to `y`), then read the simple
 model — but only if it is faithful.
+
+A **global surrogate** is that imitation, here a shallow decision tree. Its **fidelity** is how well
+it reproduces the black box's predictions, measured as $R^2$ against the black box's outputs on
+held-out rows. Its **accuracy** is how well it predicts the real target.
 
 ```python
 from sklearn.tree import DecisionTreeRegressor, export_text
@@ -314,12 +414,17 @@ for depth in (1, 2, 3, 5, 8):
      8                 0.9658                 0.7334
 ```
 
+Fidelity climbs with depth: 0.2556 at depth 1, 0.4725 at depth 3, 0.7752 at depth 5, 0.9658 at
+depth 8. The accuracy column is lower at every depth.
+
 Fidelity is the number that licenses the explanation, and on this model it is brutal: a depth-3
 tree reproduces only 47% of the forest's variance. That tree is not an explanation of the forest;
 it is a different, worse model. You need depth 8 — 256 leaves, unreadable — before fidelity
 reaches 0.97. Report fidelity whenever you show a surrogate, and never let the surrogate's *own*
 accuracy against the truth (the right-hand column) stand in for it: those numbers are lower still
 and answer a question nobody asked.
+
+Here is what the depth-3 surrogate actually says:
 
 ```python
 surrogate = DecisionTreeRegressor(max_depth=3, random_state=0).fit(Xtr, black_box_preds)
@@ -354,12 +459,27 @@ fidelity R2 = 0.4725
 |   |   |   |--- value: [70.2]
 ```
 
+The first split is tenure at 43.8 months. Every path then uses support tickets or discount, and
+each leaf shows the average predicted spend for customers who reach it, from 51.8 to 76.4.
+
 The rules are readable and directionally sensible — tenure dominates, support tickets subtract —
 which is exactly what makes them dangerous at a fidelity of 0.47. Notice also what the tree does
 with `discount`: it splits on it only inside the long-tenure branch, and there *higher* discount
 maps to lower predicted spend. That fragment of the interaction is real, but a reader would take
 the whole rule list as a description of the model, and less than half of the model is in it. A
 surrogate is a summary you must earn with a fidelity number, not a translation.
+
+> **Watch out:** a surrogate with low fidelity is not "a rough explanation". It is a different
+> model. Quote its rules only next to its fidelity number.
+
+## Recap in plain words
+
+- Partial dependence forces one feature to each value for every row and averages the predictions.
+- Averaging hides effects that cancel; ICE curves show one line per row and expose them.
+- Splitting ICE curves by a second feature finds the moderator behind an interaction.
+- PDP invents impossible rows when features are correlated; ALE only moves rows a little, locally.
+- Both PDP and ALE describe the model, not cause and effect.
+- A surrogate tree is only an explanation if its fidelity to the model is high.
 
 ## Try it Yourself
 
@@ -385,6 +505,11 @@ discount         PDP swing   0.852 | mean slope +0.0002 | share positive 44% | s
 support_tickets  PDP swing   7.573 | mean slope -2.5243 | share positive 0% | slope spread (p90-p10) 1.2296
 ```
 
+`inspect_feature` sweeps each feature from its 5th to 95th percentile and summarises the ICE
+slopes. Tenure: every row slopes up (100% positive). Support tickets: every row slopes down (0%
+positive, mean slope $-2.5243$ per ticket). Discount: only 0.852 of PDP swing, but 44% positive
+and the widest relative spread.
+
 The last two columns are the diagnostic: a feature where every row's slope has the same sign is
 safe to summarise with a PDP, and a feature where the share is near 50% with a wide spread must
 never be summarised that way. Change `n_grid`, or run `inspect_feature` on the correlated dataset
@@ -396,6 +521,10 @@ Turn this into a shippable check. Build a model-behaviour report that, for each 
 the expected direction of effect (from domain knowledge), measures the actual direction from ICE
 slopes, flags disagreements and heterogeneity, and reports the fidelity of a depth-3 surrogate.
 The output should be something you could paste into a model card and a reviewer could act on.
+
+> **Hint:** compute ICE slopes per row as in the Try it block. Call a feature **heterogeneous** when
+> the share of positive slopes is between 20% and 80%, and compare the sign of the mean slope with
+> a dictionary of expected directions.
 
 <details>
 <summary>Solution</summary>
@@ -455,6 +584,10 @@ verdict: surrogate is NOT faithful enough to quote as an explanation
 1 feature(s) need a human look:
   - discount: DIRECTION DISAGREES WITH DOMAIN; HETEROGENEOUS (PDP is misleading)
 ```
+
+Only `discount` is flagged, and it trips both flags. Tenure and support tickets match their
+expected directions with unanimous slopes. The surrogate's fidelity, 0.4725, is far below the 0.9
+bar, so the report refuses to quote it.
 
 The report catches the thing a PDP chart would have hidden. `discount` trips both flags at once: a
 mean slope of -0.018 nominally disagrees with the expected direction, and 41% of rows still slope

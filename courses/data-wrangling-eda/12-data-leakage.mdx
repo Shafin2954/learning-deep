@@ -7,12 +7,28 @@ order: 12
 
 ## Leakage is silent model poisoning
 
+**Data leakage** is when your model gets to peek at the answer during training or
+evaluation — through a column it should not have, or through test rows that slipped into
+training. It scores brilliantly in your notebook and then fails on real new data, where no
+peeking is possible.
+
 Data leakage occurs when information from outside the legitimate training signal bleeds into
 your model's features or evaluation. The result: CV scores look fantastic, holdout scores
 disappoint, and production performance is even worse. Leakage is not always obvious —
 here are the four main types.
 
+(**CV** — cross-validation — scores a model by training and testing it on several
+different splits of the data; a **holdout** set is data kept aside and used only once, at
+the end.)
+
+> **Picture it:** a student who saw the exam paper the night before. Their mock-exam score
+> is perfect, and it tells you nothing about how they will do on a paper they haven't
+> seen.
+
 ## Type 1 — Target leakage
+
+**Target leakage** is a feature that secretly contains the answer, because it was
+recorded *after* the outcome happened.
 
 A feature that is computed *from* or *conditional on* the target value.
 
@@ -49,20 +65,32 @@ print(f"AUC without it:            {score_clean:.4f}  ← honest")
 ```
 
 ```output
-AUC with leaking feature:  0.9998  ← too good to be true
-AUC without it:            0.5831  ← honest
+AUC with leaking feature:  1.0000  ← too good to be true
+AUC without it:            0.5457  ← honest
 ```
 
-`recovery_amount` is literally a function of `defaulted`. AUC 0.9998 means the model
-memorised the label through the leaking feature.
+With the leaking column, AUC is a perfect 1.0000; without it, 0.5457 — barely above the
+0.5 of random guessing, since defaults were assigned at random in this simulation. (**AUC**
+is the chance that the model ranks a random positive above a random negative: 0.5 is a coin
+flip, 1.0 is perfect.)
+
+`recovery_amount` is literally a function of `defaulted`. An AUC of exactly 1.0000 means
+the model memorised the label through the leaking feature: any row with
+`recovery_amount > 0` is a default.
 
 **How to kill it:** Ask, for each feature: "Would I know this value at the moment of
 prediction?" If the answer is no, drop it.
 
 ## Type 2 — Temporal leakage
 
+**Temporal leakage** happens when the model trains on rows from the future and is tested on
+rows from the past — the opposite of how it will be used.
+
 Using future information to predict the past. Arises whenever a time-ordered dataset is
 shuffled before splitting.
+
+> **Picture it:** forecasting yesterday's weather after reading today's newspaper. Of
+> course you get it right.
 
 ```python
 import pandas as pd
@@ -98,37 +126,57 @@ print(f"Temporal split R²: {model_time.score(X_te2, y_te2):.4f}  ← honest")
 ```
 
 ```output
-Random split R²: 0.9924  ← optimistic (future in train)
-Temporal split R²: 0.9917  ← honest
+Random split R²: 0.9986  ← optimistic (future in train)
+Temporal split R²: 0.9707  ← honest
 ```
 
+The random split scores R² = 0.9986; the temporal split 0.9707. (**R²** is the share of
+the target's variation the model explains: 1 is perfect.) With a random split, every test
+day has training days on both sides of it, so the model only has to *interpolate*. With the
+temporal split it must *extrapolate* into 200 days it has never seen — the real job of a
+forecast. Both scores are high here because the trend is very regular; on real data the
+gap is usually much wider.
+
+> **Watch out:** lag features built with `shift()` are safe only if every row's lag points
+> backwards in time. Sort by time first, and compute lags per entity (with `groupby`) when
+> several users or stores share one table.
+
 ## Type 3 — Preprocessing leakage
+
+**Preprocessing leakage** is when a cleaning or selection step learns from all the rows —
+including the ones you will later test on — before the split.
 
 Fitting a scaler, imputer, or encoder on the *full* dataset before splitting, so the test
 set's statistics contaminate the training-set transform.
 
+The demo uses **feature selection** — keeping the columns that look most related to the
+target — because it shows the effect most clearly.
+
 ```python
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.pipeline import Pipeline
 
 rng = np.random.default_rng(2)
 n = 400
-X = rng.normal(0, 1, (n, 20)).astype(np.float64)
+X = rng.normal(0, 1, (n, 1000)).astype(np.float64)   # 1000 pure-noise features
 y = (rng.random(n) < 0.5).astype(np.int8)   # pure noise — true AUC should be 0.5
 
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
 
-# WRONG: fit scaler on ALL data first, then cross-validate
-scaler_leaky = StandardScaler()
-X_scaled_all = scaler_leaky.fit_transform(X)   # uses entire X including test folds!
-score_leaky = cross_val_score(LogisticRegression(max_iter=500), X_scaled_all, y,
+# WRONG: scale and keep the 20 "best" features using ALL rows, then cross-validate
+X_scaled_all = StandardScaler().fit_transform(X)   # uses entire X including test folds!
+X_sel_all = SelectKBest(f_classif, k=20).fit_transform(X_scaled_all, y)  # uses test labels!
+score_leaky = cross_val_score(LogisticRegression(max_iter=500), X_sel_all, y,
                                cv=cv, scoring='roc_auc').mean()
 
-# CORRECT: Pipeline — scaler is fit only on each training fold
-pipe = Pipeline([('sc', StandardScaler()), ('clf', LogisticRegression(max_iter=500))])
+# CORRECT: Pipeline — scaler and selector are fit only on each training fold
+pipe = Pipeline([('sc', StandardScaler()),
+                 ('sel', SelectKBest(f_classif, k=20)),
+                 ('clf', LogisticRegression(max_iter=500))])
 score_clean = cross_val_score(pipe, X, y, cv=cv, scoring='roc_auc').mean()
 
 print(f"AUC with preprocessing leakage: {score_leaky:.4f}  ← inflated on pure noise!")
@@ -136,15 +184,29 @@ print(f"AUC with Pipeline (correct):    {score_clean:.4f}  ← near 0.5 as expec
 ```
 
 ```output
-AUC with preprocessing leakage: 0.5241  ← inflated on pure noise!
-AUC with Pipeline (correct):    0.5017  ← near 0.5 as expected
+AUC with preprocessing leakage: 0.7628  ← inflated on pure noise!
+AUC with Pipeline (correct):    0.5383  ← near 0.5 as expected
 ```
 
-The leak is subtle — only 0.024 AUC — but on pure noise the correct score is 0.5, and the
-leaky version reports 0.52. In real data the inflation can be much larger. **Always use
-sklearn Pipelines** so every transformer is fit only on the training fold.
+Every feature is pure noise and the labels are coin flips, so the honest AUC is 0.5. The
+leaky version reports 0.7628. The Pipeline reports 0.5383 — near 0.5, as it should be.
+
+The 0.22 AUC gap comes from the selection step. Picking the 20 columns that best match `y`
+*on all 400 rows* found columns that match the test folds' labels by chance, and the model
+then "predicted" that chance. The scaler alone contributes almost nothing here: standardising
+with the full-data mean and std shifts every row the same way. In real data with imputers
+and target encoders (ch. 4, ch. 9) the inflation can be much larger. **Always use sklearn
+Pipelines** so every transformer is fit only on the training fold.
+
+> **Watch out:** "I'll pick features first, then cross-validate" is the most common
+> version of this leak. Feature selection is part of the model and belongs inside the
+> Pipeline.
 
 ## Type 4 — Group leakage
+
+**Group leakage** happens when rows from the same person (or store, or patient) land in
+both the training and the test set. The model recognises the person instead of learning
+anything that would work for a stranger.
 
 The same entity (patient, user, store) appears in both train and test. The model
 memorises per-entity patterns instead of learning generalisable features.
@@ -152,7 +214,7 @@ memorises per-entity patterns instead of learning generalisable features.
 ```python
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_val_score, GroupKFold, KFold
 
 rng = np.random.default_rng(3)
@@ -163,15 +225,17 @@ n = n_users * obs_per_user
 user_ids   = np.repeat(np.arange(n_users), obs_per_user)
 user_effect = rng.normal(0, 5, n_users)[user_ids]   # per-user baseline
 X = rng.normal(0, 1, (n, 5)).astype(np.float64)
+X[:, :2] = rng.normal(0, 1, (n_users, 2))[user_ids]  # 2 user-level columns (e.g. age, signup year)
 y = user_effect + rng.normal(0, 1, n)               # target = user effect + noise
+model = RandomForestRegressor(n_estimators=100, random_state=0)
 
 # WRONG: regular KFold — same user in train and test
-score_kf = cross_val_score(LinearRegression(), X, y,
+score_kf = cross_val_score(model, X, y,
                             cv=KFold(5, shuffle=True, random_state=0),
                             scoring='r2').mean()
 
 # CORRECT: GroupKFold — each user in exactly one fold
-score_gkf = cross_val_score(LinearRegression(), X, y,
+score_gkf = cross_val_score(model, X, y,
                              cv=GroupKFold(n_splits=5), groups=user_ids,
                              scoring='r2').mean()
 
@@ -180,15 +244,23 @@ print(f"GroupKFold R² (correct):       {score_gkf:.4f}  ← honest — features
 ```
 
 ```output
-KFold R²      (group leakage): 0.7218  ← inflated by memorised user effects
-GroupKFold R² (correct):       0.0003  ← honest — features have no real signal
+KFold R²      (group leakage): 0.9533  ← inflated by memorised user effects
+GroupKFold R² (correct):       -1.5139  ← honest — features have no real signal
 ```
 
-The features have zero signal — the only structure is per-user. KFold sees the same user in
-both train and test, so it memorises the user effect and reports R² = 0.72. GroupKFold
-correctly reports near-zero performance.
+The features have zero signal — the only structure is per-user. Two columns are constant
+for each user (like an age or a signup year), which lets the random forest *recognise* a
+user. KFold sees the same user in both train and test, so it memorises the user effect and
+reports R² = 0.9533. GroupKFold puts each user in exactly one fold, so every test user is a
+stranger: R² = -1.5139, worse than predicting the average. (A negative R² means the model's
+errors are larger than those of always guessing the mean.)
+
+> **Picture it:** a teacher who learns each student's handwriting. They grade old students
+> perfectly by recognising the writing — and are lost when a new class arrives.
 
 ## How to systematically find leakage
+
+Leaks rarely announce themselves. These five checks catch most of them.
 
 1. **Review feature provenance:** for each feature, trace how it was computed and when the
    value would be available in production.
@@ -199,7 +271,22 @@ correctly reports near-zero performance.
 5. **Adversarial validation (ch. 13):** if a model can classify train vs test better than
    chance, the distributions differ — which often points to a leaking feature.
 
+(**Provenance** is where a value came from and when it was recorded.)
+
+## Recap in plain words
+
+- Leakage means the model saw information it won't have when it is used for real.
+- Target leakage: a feature recorded after the outcome — ask "would I know this at
+  prediction time?".
+- Temporal leakage: split time-ordered data by time, never at random.
+- Preprocessing leakage: fit every scaler, imputer, encoder and selector inside a Pipeline.
+- Group leakage: keep all rows of one person in the same fold with `GroupKFold`.
+- A score that looks too good usually is.
+
 ## Try it Yourself
+
+This repeats the preprocessing comparison with 50 noise features and *only* a scaler — no
+feature selection.
 
 ```python
 import numpy as np
@@ -231,9 +318,19 @@ print(f"Clean AUC (pipeline):          {auc_clean:.4f}")
 ```
 
 ```output
-Leaky AUC (50 noise features): 0.5352
-Leaky AUC (pipeline):          0.5028
+Leaky AUC (50 noise features): 0.4711
+Clean AUC (pipeline):          0.4711
 ```
+
+Both AUCs are 0.4711, identical to four decimals. This is the honest finding: on its own, a
+full-data StandardScaler barely leaks, because it moves every row by the same amount. (The
+0.47 instead of 0.5 is chance: 600 rows of noise.) Now try the version that does leak: add
+`from sklearn.feature_selection import SelectKBest` and put
+`SelectKBest(k=5)` in front of the scaler — once on the full `X` before cross-validation,
+and once inside the Pipeline. The leaky number rises to about 0.56 while the Pipeline
+stays at about 0.49. With only 50 candidate columns the leak is smaller than in the
+1000-column demo above — the more columns you choose from, the more chance matches there
+are to find.
 
 ## Exercise
 
@@ -242,6 +339,10 @@ Write a function `detect_target_leak(df, feature_cols, target_col, threshold=0.9
 (b) computes AUC via 5-fold CV,
 (c) returns the names of features with AUC > threshold (likely target leaks).
 Test it on a DataFrame where one feature is directly computed from the target.
+
+> **Hint:** loop over the columns, pass `df[[col]]` (double brackets keep it 2-D) to
+> `cross_val_score(..., scoring='roc_auc')`, and wrap the model in a Pipeline with a
+> scaler so even this check is leak-free.
 
 <details>
 <summary>Solution</summary>
@@ -282,5 +383,7 @@ print("Detected leaks:", leaks)
 
 `leak_col` should be flagged with AUC > 0.99; `feature_a` and `feature_b` should report
 near-0.5. This pattern — checking each feature's solo AUC — is a quick first-pass screen
-for target leakage in any dataset.
+for target leakage in any dataset. When run, the function returns only `leak_col`, with
+AUC 1.0. A solo-AUC screen only catches leaks that work on their own; a leak hidden in a
+combination of columns needs the provenance review above.
 </details>

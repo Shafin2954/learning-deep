@@ -7,10 +7,24 @@ order: 4
 
 ## Six patterns cover most of the gains
 
+You do not need a flash of genius to build good features. You need a short list of moves that
+work again and again, and the habit of measuring each one.
+
 Feature engineering in tabular competitions is not creativity, it is coverage. The same handful of
 transformations pay repeatedly: group aggregations, deviations from a group, ratios, frequency
 counts, date decomposition, and lags. This chapter builds each one, measures what it adds, and
 keeps only what pays.
+
+A **feature** is a column the model is allowed to learn from. **Feature engineering** means
+building new columns out of the raw ones so that a pattern the model would struggle to find
+becomes one it can read off directly.
+
+> **Picture it:** a cook with a pantry of raw ingredients. The six patterns are prep moves —
+> chop, reduce, marinate. You will not use every move in every dish, but you taste after each one
+> and throw out what made it worse.
+
+The dataset is 18,000 card transactions from 1,200 customers. Fraud depends on how big a charge is
+**compared with that customer's usual spending**, and on whether it happens at the weekend.
 
 ```python
 import numpy as np
@@ -44,10 +58,16 @@ print(tx.head(3).to_string(index=False))
       613    0        34  125.98      0
 ```
 
+Only 2.21% of transactions are fraud, so this is an **imbalanced** problem: positives are rare,
+and AUC is a sensible metric because it does not reward predicting "no fraud" for everyone.
+
 The signal is deliberately *relative*: a 200-unit charge is unremarkable for one customer and
 alarming for another. No raw column contains that comparison — you have to build it.
 
 ## A harness that measures every block the same way
+
+A **harness** is a fixed test bench: same model, same folds, same metric, every time. Only then
+does a change in score mean the features changed and not the setup.
 
 ```python
 from sklearn.model_selection import StratifiedKFold
@@ -73,10 +93,20 @@ print(f"raw columns only: AUC {base_score:.4f}")
 raw columns only: AUC 0.6369
 ```
 
+With only the raw `amount`, `day` and `merchant`, the model reaches AUC 0.6369. It can see that
+big charges are a bit more suspicious, but it cannot see "big *for this customer*".
+
 Every block below is measured against that number, with the same folds and the same model. A
 feature idea that cannot beat this harness does not go in the submission.
 
+> **Watch out:** if you change the model, the folds, or the seed between two experiments, the
+> difference in score mixes your feature with the setup change. Keep one of them moving at a time.
+
 ## Pattern 1: group aggregations
+
+An **aggregation** describes a whole group in one number: this customer's average charge, their
+biggest charge, how many charges they have. Each row then carries a summary of the entity it
+belongs to.
 
 Summaries of an entity computed from *features only* — never the target (ch. 5 covers what
 changes when the target is involved).
@@ -101,10 +131,21 @@ print(f"  added: {[c for c in with_aggs.columns if c.startswith('customer_')]}")
   added: ['customer_amount_mean', 'customer_amount_std', 'customer_amount_max', 'customer_amount_count']
 ```
 
+Four new columns (`mean`, `std`, `max`, `count` of the customer's amounts) lift AUC from 0.6369 to
+0.6709, a gain of +0.0339. The model can now compare a charge with the customer's profile —
+but only by learning that comparison itself.
+
 ## Pattern 2: deviation from the group
+
+Once you know a customer's normal, the useful question is "how far is this charge from normal?".
+Compute that distance yourself instead of hoping the model works it out.
 
 The aggregation alone is not the signal — the *distance from it* is. This one line is the single
 highest-yield transformation in transactional competitions.
+
+Three ways to measure the distance: a ratio (amount divided by the customer mean), a difference
+(amount minus the mean), and a **z-score** (the difference divided by the customer's standard
+deviation — "how many usual wobbles away is this?").
 
 ```python
 dev = with_aggs.copy()
@@ -121,14 +162,28 @@ print(f"+ deviation features: AUC {dev_score:.4f}  ({dev_score - agg_score:+.4f}
 + deviation features: AUC 0.6941  (+0.0232 over aggs, +0.0571 over raw)
 ```
 
+The deviations add +0.0232 on top of the aggregations, and the total since the raw columns is now
++0.0571. The fraud rule was written in terms of `amount / (60 * cust_scale)`, so a ratio column
+is close to the true signal.
+
 A gradient-boosted tree can *in principle* learn a ratio from `amount` and `customer_amount_mean`,
 but it would need a deep, axis-aligned staircase to approximate a diagonal. Handing it the ratio
 directly converts an impossible split into a single threshold.
 
+> **Picture it:** a tree can only ask questions like "is amount > 150?" or "is the customer mean above
+> 80?". Drawing a slanted line (amount = 2 x mean) with those questions takes a staircase of
+> many tiny steps. One ratio column turns the slanted line into a single "is ratio > 2?".
+
 ## Pattern 3: frequency and count encoding
+
+**Frequency encoding** replaces a category with a count: "merchant 25" becomes "merchant 25
+appears this many times in the data". Rare and common categories then look different to the model.
 
 Replace a categorical with how often it occurs. It is cheap, leak-free (no target involved), and
 often beats one-hot for high-cardinality columns.
+
+**One-hot** encoding makes one 0/1 column per category; with thousands of categories that is
+thousands of mostly-empty columns, which is why counts often win.
 
 ```python
 freq = dev.copy()
@@ -150,6 +205,12 @@ measured. Keep the pattern in your toolkit and keep the measurement next to it.
 
 ## Pattern 4: date decomposition, including the cyclical trick
 
+A raw day number (0 to 364) hides the patterns people follow: weekdays, weekends, weeks. Split the
+date into those parts so the model can see them.
+
+The code adds day-of-week (`dow`), a weekend flag, the week number, and a sine/cosine pair that
+places the seven weekdays around a circle.
+
 ```python
 dated = freq.copy()
 dated["dow"] = dated["day"] % 7
@@ -165,14 +226,26 @@ print(f"+ date parts: AUC {date_score:.4f}  ({date_score - freq_score:+.4f})")
 + date parts: AUC 0.7086  (+0.0176)
 ```
 
+The date parts add +0.0176, because the fraud rule includes a weekend bump of 0.8 on the logit
+(the log-odds scale the generator uses). `is_weekend` names that effect exactly.
+
 Two notes on the sine/cosine pair. It exists so that day 6 and day 0 are *close*, which a raw
 integer cannot express — but trees split on thresholds and do not care about circular distance, so
 the pair earns its place in linear models and neural nets far more than in a GBDT. Include it when
 you plan to blend a linear model in (ch. 7); skip it when trees are all you will fit.
 
+> **Picture it:** a clock face. 11 o'clock and 1 o'clock are two hours apart, but the numbers 11
+> and 1 look ten apart. Sine and cosine give each hour a position on the circle, so neighbours
+> stay neighbours across midnight.
+
 ## Pattern 5: lags and expanding history
 
+A **lag** is "the value from this customer's previous row". An **expanding mean** is "the average
+of every earlier row for this customer". Both let a row see its own history.
+
 For panel data — repeated rows per entity, ordered in time — the previous row is a feature.
+
+**Panel data** means many entities, each observed many times (customers with many transactions).
 
 ```python
 lagged = dated.copy()
@@ -200,11 +273,21 @@ autocorrelation in fraud, so a customer's previous amount carries nothing. On a 
 fraud comes in bursts, this block is usually the largest single win. The pattern's value is
 data-dependent; the harness is what tells you which world you are in.
 
+**Autocorrelation** means a value is related to the values just before it — one fraud making the
+next more likely, for example.
+
 Expanding and rolling statistics must be computed **causally** — `expanding()` after a sort, never
 a full-column `groupby().transform("mean")` — or you have leaked the future into every row and
 your CV will be beautiful and worthless.
 
+> **Watch out:** the comment in the code matters. `shift(1)` comes *before* `expanding()`, so the
+> row's own amount is not in its own history. Swap the order and every row sees itself.
+
 ## Pattern 6: ratios and differences between columns
+
+Divide or subtract columns whose relationship might matter: this charge versus the customer's
+biggest, the gap between their max and their mean. Each one hands the model a comparison
+ready-made.
 
 ```python
 ratios = lagged.copy()
@@ -223,11 +306,21 @@ print(f"\ntotal: {base.shape[1]} -> {ratios.shape[1] - 1} columns, "
 total: 3 -> 26 columns, AUC 0.6369 -> 0.6959 (+0.0590)
 ```
 
+This last block costs 0.0063. Over all six patterns, the frame grew from 3 to 26 columns and AUC
+from 0.6369 to 0.6959 (+0.0590). But notice that the best point along the way was 0.7086, right
+after the date parts — the last two blocks made things worse.
+
 ## Keeping only what pays
+
+Adding blocks one after another tells you how each looked when it arrived. To decide what to
+keep, take each block *out* of the final set and see whether the score drops.
 
 Adding blocks in sequence tells you the *marginal* value of each, in the order you happened to add
 them. Removing one block at a time tells you what it is worth *given everything else*, which is
 the number that decides whether to keep it (eval-tuning ch. 8).
+
+That removal test is an **ablation**: knock one piece out, re-measure, and see how much the
+whole thing misses it.
 
 ```python
 blocks = {
@@ -262,13 +355,34 @@ frame substitutes for the weekday effect. Every other block — including `devia
 worth +0.0232 on the way in — scores *better* when deleted: with 26 columns fitted on 18,000 rows
 and a 2.2% positive rate, the redundant ones are contributing variance rather than signal.
 
+Why can `deviations` look useless here? The aggregations, ratios and lags together let the model
+rebuild most of what the deviation columns say, so in the full frame they are duplicates. Only
+about 400 rows are fraud, and many near-duplicate columns give the trees more ways to fit noise.
+
 **Ablation and marginal addition are different questions.** The order of addition tells you where
 the signal first appeared; ablation tells you what is still carrying it once everything else is
 present. It is the ablation column that decides what ships, and here it says the 26-column frame
 should be cut back hard — which is exactly what the greedy selector in the exercise does,
 arriving at 11 columns and a *better* score.
 
+> **Watch out:** these differences are a few thousandths of AUC on a dataset with about 400
+> positives. Before you ship a decision based on a 0.004 gap, repeat the CV with another seed and
+> check that the sign holds.
+
+## Recap in plain words
+
+- A handful of patterns — aggregations, deviations, frequencies, date parts, lags, ratios — cover
+  most tabular gains.
+- Deviation from the entity's own normal is usually the strongest; here it added +0.0232 on top of
+  the aggregations.
+- Every block must be measured on a fixed harness; frequency, lags and ratios all lost score here.
+- History features must be causal: shift first, then aggregate.
+- Ablation (remove one block, re-score) decides what ships; only the date block survived it here.
+
 ## Try it Yourself
+
+`try_block` adds one idea, scores it on the harness, and keeps it only if it gains more than
+0.001 AUC. It also prints the gain per added column.
 
 ```python
 def try_block(new_cols_fn, frame, y, name, current_score):
@@ -308,6 +422,14 @@ training time, and a chance to overfit the fold structure. Try adding your own b
 merchant-level aggregation, a rolling 7-day count, an amount rounded to the nearest 10 (round
 numbers are suspicious in fraud data).
 
+An **interaction** is a feature that combines two others (here merchant times the weekend flag),
+so the model can treat "this merchant at the weekend" differently from "this merchant on a
+Tuesday".
+
+Variation to try: start from `state, score = dated, date_score` instead of `ratios, ratio_score`
+— the best point in the sequence — and see whether the same three ideas still get the same
+verdicts.
+
 ## Exercise
 
 Turn the ad-hoc sequence into a **greedy block selector**: given a dictionary of candidate blocks,
@@ -315,6 +437,10 @@ evaluate each against the current feature set, add the best one if it clears a t
 repeat until nothing does. Report the order in which blocks were chosen, the marginal gain of
 each, and the total cost in columns — then compare the greedy set against using every block at
 once.
+
+> **Hint:** write each block as a function that takes a frame and returns it with new columns.
+> Then loop: try every remaining function on the current frame, keep the best if its gain is above
+> the threshold, and remove it from the candidate list.
 
 <details>
 <summary>Solution</summary>
@@ -405,6 +531,10 @@ Greedy selection buys you a smaller feature set at a similar score, and — more
 prints the *order*, which is a map of where the signal lives. The block chosen first is the one
 that matters; everything after it is marginal by construction, and the stopping message names the
 best idea that was not worth its columns.
+
+Here the greedy set is actually better: 11 columns at AUC 0.7069 against 15 columns at 0.6978 for
+all blocks together (+0.0091). Deviations came first (+0.0485), dates second (+0.0195), and
+aggregations barely cleared the bar (+0.0020) — the same story as the ablation table.
 
 Three things this procedure gets right and one thing to watch. It re-evaluates every remaining
 block at every step, so a block that looks useless alone but shines once another is present can

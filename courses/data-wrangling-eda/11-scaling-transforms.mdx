@@ -7,6 +7,11 @@ order: 11
 
 ## When scaling matters — and when it doesn't
 
+**Scaling** changes the units of a column so that all columns sit on a similar range, like
+converting prices in cents and prices in millions to the same kind of number. Some models
+compare columns by size and get fooled by big units; others only ask "bigger or smaller?"
+and don't care.
+
 Scaling makes features commensurable (on the same numerical scale). Models that use
 distance or gradient descent are scale-sensitive; tree models are not.
 
@@ -18,11 +23,24 @@ distance or gradient descent are scale-sensitive; tree models are not.
 | Neural networks | Yes — gradient updates depend on scale |
 | Decision trees, Random Forest, XGBoost | No — splits are rank-based |
 
+> **Picture it:** measuring how "close" two houses are using price in dollars and number
+> of bedrooms. A $1,000 price difference swamps a 3-bedroom difference, purely because
+> dollars are small units. Scaling puts both on a "how unusual is this?" footing, so a
+> distance-based model listens to both.
+
 ## StandardScaler — zero mean, unit variance
+
+**Standardising** shifts a column so its average is 0, then stretches it so its standard
+deviation is 1. The result is a z-score (ch. 5): "how many standard deviations from the
+average".
 
 $$
 z = \frac{x - \mu}{\sigma}
 $$
+
+> **In plain words:** subtract the column's mean $\mu$, then divide by its standard
+> deviation $\sigma$. A value of $z = 2$ means "two standard deviations above average",
+> whatever the original units were.
 
 Assumes the feature is roughly Gaussian. Sensitive to outliers because $\mu$ and $\sigma$ are
 sensitive to outliers.
@@ -54,18 +72,29 @@ print(f"Scaler std  (from train): {scaler.scale_.round(1)}")
 
 ```output
 Train stats after scaling:
-  mean:  [-0.     0.    -0.   ]
+  mean:  [-0. -0. -0.]
   std:   [1. 1. 1.]
 
-Scaler mean (from train): [  50.2 5011.5 5050.1]
-Scaler std  (from train): [ 10.1 994.9  10.1]
+Scaler mean (from train): [  48.7 5090.6 5049.9]
+Scaler std  (from train): [  9.7 922.   10.5]
 ```
 
+After scaling, every column has mean 0 and standard deviation 1 on the training data (the
+`-0.` is a tiny negative rounding error). The scaler stored what it learned: column 1's
+mean of 5090.6 and standard deviation of 922.0, column 2's offset of about 5050. Those
+very different units are now gone.
+
 ## MinMaxScaler — maps to [0, 1]
+
+**Min-max scaling** squeezes a column so its smallest value becomes 0 and its largest
+becomes 1, keeping everything else in proportion between them.
 
 $$
 z = \frac{x - x_{\min}}{x_{\max} - x_{\min}}
 $$
+
+> **In plain words:** how far is $x$ from the minimum, as a fraction of the whole range
+> from minimum to maximum? The minimum maps to 0, the maximum to 1.
 
 Extreme outliers compress the rest of the values to a narrow band. Use only when you know the
 feature has hard bounds and no outliers.
@@ -93,20 +122,34 @@ print(f"Outlier maps to: {mms.transform([[100.0]])[0,0]:.3f}")
 ```
 
 ```output
-Without outlier — max normal value maps to: 0.062
-Entire normal range compressed to: [0.062]
-95% of data in range: [0.000, 0.058]
+Without outlier — max normal value maps to: 0.060
+Entire normal range compressed to: [0.057]
+95% of data in range: [0.000, 0.041]
 Outlier maps to: 1.000
 ```
+
+The printed labels are terse, so read them this way: a fairly extreme normal value (3.5)
+maps to only 0.060; the largest non-outlier training value maps to 0.057; 95% of the data
+lands between 0.000 and 0.041; and the outlier at 100 takes the value 1.000.
 
 The single outlier at 100 claims the entire [0, 1] range; the actual data cluster in [0, 0.06].
 This is why MinMaxScaler is dangerous with outliers.
 
+> **Picture it:** zooming a photo out until the one person standing far away fits into
+> the frame — everyone else shrinks to a dot in the corner.
+
 ## RobustScaler — IQR-based, outlier-resistant
+
+**Robust scaling** uses the median as the centre and the width of the middle half of the
+data (the **IQR**, ch. 5) as the ruler. Outliers sit outside the middle half, so they
+can't move either.
 
 $$
 z = \frac{x - Q_2}{Q_3 - Q_1}
 $$
+
+> **In plain words:** $Q_2$ is the median, and $Q_3 - Q_1$ is the interquartile range.
+> Subtract the median, divide by the IQR.
 
 Uses the median and IQR instead of mean and std, so outliers don't distort the centering or
 scaling.
@@ -135,22 +178,32 @@ for ax, vals, title in zip(axes,
 plt.tight_layout(); plt.show()
 
 # Bulk data statistics
-bulk_std    = X_std[np.abs(X_std) < 10]
-bulk_robust = X_robust[np.abs(X_robust) < 10]
-print(f"StandardScaler bulk std:  {bulk_std.std():.3f}  (wanted ≈ 1)")
-print(f"RobustScaler   bulk std:  {bulk_robust.std():.3f}  (wanted ≈ 1)")
+bulk = np.abs(data) < 10    # the 497 non-outlier points (raw std ≈ 1)
+print(f"StandardScaler bulk std:  {X_std[bulk].std():.3f}")
+print(f"RobustScaler   bulk std:  {X_robust[bulk].std():.3f}")
 ```
 
 ```output
-StandardScaler bulk std:  0.303  (wanted ≈ 1)
-RobustScaler   bulk std:  0.984  (wanted ≈ 1)
-[Figure: histograms showing StandardScaler compressed by outliers vs RobustScaler well-centred]
+StandardScaler bulk std:  0.216
+RobustScaler   bulk std:  0.703
 ```
 
-StandardScaler compresses the bulk of the data into a narrow range (std 0.30) because the
-3 extreme values inflated the computed std. RobustScaler maintains the correct spread.
+StandardScaler compresses the bulk of the data into a narrow range (std 0.216, where the
+raw bulk has std about 1) because the 3 extreme values inflated the computed std from about
+1 to about 4.7. RobustScaler keeps the correct spread: its 0.703 is close to what you get
+on clean normal data. Why not exactly 1? For a normal distribution the IQR is about 1.35
+standard deviations, so dividing by the IQR gives a standard deviation of about
+$1 / 1.35 \approx 0.74$ — the outliers had nothing to do with it.
+
+> **Watch out:** RobustScaler does not *remove* outliers. The point at 80 is still about
+> 59 units out after scaling. It only stops them from distorting how everything *else* is
+> scaled.
 
 ## PowerTransformer — make distributions more Gaussian
+
+Scalers only shift and stretch; they never change a distribution's *shape*. A **power
+transform** (ch. 8) bends the shape itself — pulling in a long tail so the column looks
+more like a bell curve.
 
 ```python
 import numpy as np
@@ -183,12 +236,27 @@ print(f"expenses λ: {pt.lambdas_[1]:.3f}")
 ```
 
 ```output
-income  λ: 0.164
-expenses λ: 0.508
-[Figure: before/after histograms for income and expenses showing near-normal transformed distributions]
+income  λ: 0.282
+expenses λ: 0.921
 ```
 
+Yeo-Johnson picked a separate $\lambda$ for each column. Income got 0.282 — a strong
+bend, close to a log — because it is heavily right-skewed (skew 1.63 in the plot titles;
+-0.05 after). Expenses is almost as skewed (1.54) but got 0.921, barely a bend. The reason
+is its negative values (the `- 5000` shift): Yeo-Johnson bends negative values with the
+power $2 - \lambda$, so a strong bend for the positive side would warp the negative side.
+The fit compromises, and expenses still has skew 0.46 afterwards.
+
+> **Watch out:** Yeo-Johnson is not unit-free. The same expenses column measured in
+> thousands gets $\lambda = 0.666$ instead of 0.921. Scale columns to a sensible unit
+> before fitting it (`PowerTransformer` standardises only the *output*).
+
 ## QuantileTransformer
+
+The most aggressive option ignores the values' spacing altogether and keeps only their
+order: the smallest value maps to the lowest slot of a target bell curve, the median to
+its middle, and so on. The **empirical CDF** used here is "what fraction of the data is
+below this value".
 
 Maps any distribution to a uniform or normal output by applying the empirical CDF. The most
 robust transform — immune to any shape, including bimodal and heavy-tailed distributions.
@@ -212,11 +280,23 @@ print(f"Quantile — mean: {x_qt.mean():.2f}, std: {x_qt.std():.2f}, skew: {pd.S
 ```
 
 ```output
-Original — mean: 0.01, std: 3.05, skew: -0.02
-Quantile — mean: 0.00, std: 1.00, skew: -0.01
+Original — mean: -0.01, std: 3.15, skew: 0.00
+Quantile — mean: 0.00, std: 1.02, skew: 0.00
 ```
 
+Mean and skew look the same before and after (both about 0), but the shapes are completely
+different. The original had two humps at -3 and +3 (a **bimodal** distribution) with
+standard deviation 3.15. The output is a single bell with standard deviation 1.02. The two
+humps were merged — the gap between them, which may carry real meaning, is gone.
+
+> **Watch out:** summary numbers like mean, std and skew can match while the shapes differ
+> completely. Always look at a histogram after a transform.
+
 ## The golden rule: fit on train, transform both
+
+A scaler *learns* numbers (a mean, a standard deviation) when you `fit` it. Those numbers
+must come from training data only; the test set is then converted with the training
+numbers, as if it were brand-new data arriving later.
 
 ```python
 import numpy as np
@@ -241,15 +321,32 @@ print(X_test_sc.std(axis=0).round(3))
 
 ```output
 Test mean (should be ~0, not exact 0 — that's expected):
-[-0.011  0.099 -0.009]
+[ 0.219  0.14  -0.233]
 Test std (should be ~1, slight deviation because test != train):
-[0.971 0.988 1.007]
+[1.035 1.035 0.982]
 ```
 
+The test means are 0.219, 0.14 and -0.233 — not 0 — and the test standard deviations are
+around 1.0 but not exactly. That is the honest picture: 100 test rows never match 400
+training rows perfectly.
+
 The test set deviates slightly from 0/1 — that's correct. If you fit on the full dataset,
-the test mean would be exactly 0 and std exactly 1, which is leakage.
+the combined data would have mean exactly 0 and std exactly 1, and the test set's own
+numbers would have shaped the scaler — that is leakage.
+
+## Recap in plain words
+
+- Distance- and gradient-based models need scaling; tree models don't.
+- StandardScaler gives mean 0 and std 1, but outliers inflate the std and squash the rest.
+- MinMaxScaler maps to [0, 1] and is wrecked by a single outlier.
+- RobustScaler uses the median and IQR, so outliers can't distort it.
+- PowerTransformer and QuantileTransformer change the *shape*, not only the scale.
+- Fit every scaler on training data only, then transform both sets.
 
 ## Try it Yourself
+
+Here a right-skewed column with 10 huge outliers goes through RobustScaler and
+PowerTransformer, and you compare the skew afterwards.
 
 ```python
 import numpy as np
@@ -280,15 +377,24 @@ for name, Xsc in [('RobustScaler', X_train_rob), ('PowerTransformer', X_train_pt
 ```
 
 ```output
-RobustScaler: feature0 skew=9.312
-PowerTransformer: feature0 skew=-0.027
+RobustScaler: feature0 skew=7.884
+PowerTransformer: feature0 skew=0.025
 ```
+
+RobustScaler leaves the skew at 7.884: shifting and dividing can't change a shape. The
+Yeo-Johnson transform brings it to 0.025, nearly symmetric. So scaling and transforming do
+different jobs. Try running RobustScaler *after* the PowerTransformer — a common recipe
+when a column is both skewed and outlier-heavy.
 
 ## Exercise
 
 Given features `age` (Normal), `salary` (log-normal), and `score` (0-100, bounded), apply:
 (a) StandardScaler to `age`, (b) PowerTransformer to `salary`, (c) MinMaxScaler to `score`.
 Use a Pipeline with ColumnTransformer. Verify no leakage by fitting on train only.
+
+> **Hint:** a `ColumnTransformer` takes a list of `(name, transformer, columns)` triples.
+> After `pipe.fit`, reach the fitted scaler via
+> `pipe.named_steps['prep'].named_transformers_['std']`.
 
 <details>
 <summary>Solution</summary>
@@ -333,5 +439,7 @@ print(f"True train mean age:       {X_train['age'].mean():.2f}")
 
 The scaler mean matches the training mean exactly — proof that fitting happened only on
 training data. The ColumnTransformer applies the correct transform per column without any
-test-data contamination.
+test-data contamination. When run, both means print 39.82, and train and test R² are close
+(0.502 and 0.506) — the R² is modest only because the target has large noise
+(standard deviation 5) on purpose.
 </details>

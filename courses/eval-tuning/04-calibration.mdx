@@ -7,9 +7,21 @@ order: 4
 
 ## Ranking well and being right are different properties
 
+A model can put the riskiest cases at the top of its list and still be wrong about how risky
+they are. Getting the *order* right and getting the *numbers* right are two separate skills.
+
 A model is **calibrated** when, among cases it scores 0.30, about 30% are positive. AUC does not
 require this — it only cares about order — so a model can rank perfectly and still be
 systematically wrong about magnitudes, which breaks every cost calculation from ch. 3.
+
+> **Picture it:** a weather forecaster who always says "80% chance of rain" on the rainiest days
+> and "40%" on the drier ones. If it actually rains on only 30% of the "80%" days, the forecaster
+> orders days correctly (rainier days get higher numbers) but you cannot plan a picnic with those
+> numbers. Calibration is about whether "80%" really means 8 out of 10.
+
+The demo gives each of 40,000 cases a true probability, draws outcomes from it, and builds three
+score sets with the *same order*: the truth itself, an **overconfident** version (inflated
+probabilities, $p^{0.55}$), and a **shrunk** version (deflated, $0.4p$).
 
 ```python
 import numpy as np
@@ -40,11 +52,30 @@ overconfident  AUC 0.7669 | mean predicted 0.2055 | actual rate 0.0690
 shrunk         AUC 0.7669 | mean predicted 0.0280 | actual rate 0.0690
 ```
 
+All three have AUC 0.7669 to four decimals, because pushing every score up (or down) without
+swapping any two keeps the order. But only "perfect" has a mean prediction (0.0701) that matches
+the actual rate (0.0690). The overconfident model averages 0.2055, three times too high; the shrunk
+one averages 0.0280, less than half.
+
 Identical AUC, wildly different probabilities. The overconfident model claims a 21% average risk
 where the truth is 7%; fed into the threshold formula from ch. 3, it flags a wildly wrong number
 of cases while its AUC insists nothing is wrong.
 
 ## Measuring calibration: reliability, ECE, and Brier
+
+To check calibration you group cases with similar scores and compare the average score in each
+group with how often the event really happened there. If the model said "about 10%" for a group,
+roughly 10% of that group should be positive.
+
+The tools:
+
+- **Reliability table** (drawn as a **reliability diagram**) — sort cases by score, cut them
+  into equal-sized bins, and list the mean predicted probability next to the observed positive
+  rate for each bin. A calibrated model has the two columns equal.
+- **ECE** (expected calibration error) — the average gap between those two columns, weighted
+  by how many cases are in each bin.
+- **Brier score** — the mean squared difference between the predicted probability and the 0/1
+  outcome. Lower is better, and it rewards both calibration and good ranking.
 
 ```python
 def reliability(y, s, bins=10):
@@ -95,10 +126,17 @@ overconfident  ECE 0.1365 | Brier 0.08152 | AUC 0.7669
 shrunk         ECE 0.0410 | Brier 0.06298 | AUC 0.7669
 ```
 
+Every bin of the overconfident model is flagged. In bin 0 it says 0.0381 and the truth is 0.0035
+— more than 10 times too high. Even the top bin says 0.4396 against a real 0.2208, twice too high.
+In the summary, ECE separates the three cleanly (0.0029, 0.1365, 0.0410) and so does Brier
+(0.05974, 0.08152, 0.06298), while AUC is the same 0.7669 for all three.
+
 Read the table as "what I said" versus "what happened". **ECE** is the average gap, weighted by
 bin size; **Brier** is the mean squared error of the probabilities, which decomposes into
 calibration plus refinement — so a model can improve Brier either by being better calibrated or
 by separating the classes better.
+
+### The Brier decomposition
 
 $$
 \mathrm{Brier} = \underbrace{\mathbb{E}\left[(\hat{p} - \bar{y}_{\text{bin}})^2\right]}_{\text{calibration}}
@@ -106,7 +144,23 @@ $$
 \; + \; \underbrace{\bar{y}(1 - \bar{y})}_{\text{irreducible}}
 $$
 
+> **In plain words:** Brier splits into three parts.
+> - **Calibration** — how far each prediction $\hat{p}$ is from the real positive rate
+>   $\bar{y}_{\text{bin}}$ of its bin, squared. Smaller is better; zero means perfectly calibrated.
+> - **Refinement** — how far each bin's rate is from the overall rate $\bar{y}$. It is
+>   *subtracted*: a model whose bins have very different rates (good separation) earns a bonus.
+> - **Irreducible** — $\bar{y}(1-\bar{y})$, the Brier score of always predicting the overall rate.
+>   No model can change it; it depends only on how common the positives are.
+
+> **Watch out:** ECE depends on how many bins you use. With 10 bins and few rows per bin, ECE is
+> noisy and biased upward. Compare ECE values only when they were computed with the same binning
+> on the same data size.
+
 ## Platt scaling: fit a sigmoid on the scores
+
+If a model's probabilities are wrong in a smooth, consistent way, you can learn a small
+correction formula that maps "what the model says" to "what really happens", using a fresh set
+of labelled data the model never saw.
 
 Platt scaling fits a one-dimensional logistic regression from the model's score (or its logit) to
 the label, on a **held-out** set:
@@ -114,6 +168,15 @@ the label, on a **held-out** set:
 $$
 \hat{p} = \sigma(a \cdot z + b), \qquad z = \operatorname{logit}(s)
 $$
+
+> **In plain words:** first turn the score $s$ into its **logit** $z$, the log-odds
+> $\log(s/(1-s))$, which stretches 0–1 onto the whole number line. Then fit two numbers: a
+> slope $a$ (how much to stretch or squash) and a shift $b$ (how much to move everything up or
+> down). The **sigmoid** $\sigma$ squeezes the result back into 0–1.
+
+A **held-out** set is data kept apart from training. Here the 40,000 rows are split in half:
+the calibrator is fitted on the first 20,000 and scored on the other 20,000. The fit is plain
+gradient descent on the log loss.
 
 ```python
 def logit(p, eps=1e-6):
@@ -155,14 +218,35 @@ platt-calibrated   0.0055   0.05861   0.7637   0.0702
 actual rate                                    0.0673
 ```
 
+The fitted slope $a = 1.478$ stretches the logits and the shift $b = -0.843$ pulls everything down.
+ECE falls from 0.1378 to 0.0055, Brier from 0.08087 to 0.05861, and the mean prediction from
+0.2051 to 0.0702, close to the actual 0.0673. AUC stays at 0.7637.
+
 Two things to notice. Calibration **does not change the ranking** — AUC is untouched, because a
 monotone transform cannot reorder anything. And the calibrator must be fitted on data the model
 did not train on; fitting it on the training set reproduces the training-set overconfidence.
 
+> **Watch out:** a **monotone** transform — one that always keeps bigger inputs bigger — cannot
+> fix a model that ranks badly. Calibration repairs the numbers, never the order.
+
 ## Isotonic regression: monotone, non-parametric, hungrier for data
+
+Platt can only bend the scores along one fixed S-shaped curve. Isotonic regression is free to
+draw any staircase, as long as the staircase never goes down. More freedom means it can fix
+stranger distortions, but it needs more data to avoid fitting noise.
 
 Platt assumes the distortion is sigmoid-shaped. Isotonic regression assumes only that the mapping
 is **monotone non-decreasing**, and fits an arbitrary step function by pool-adjacent-violators.
+
+**Non-parametric** means it has no fixed formula with a few parameters; its shape is learned from
+the data. **Pool-adjacent-violators** works like this: sort cases by score, then walk along the
+labels; whenever a later group has a lower average than an earlier one (a "violation" of
+going-up-only), merge the two groups into one with their combined average. Repeat until the
+averages only go up.
+
+> **Picture it:** a row of children lined up by age who must also be lined up by height. Whenever
+> a younger child is taller than the older one next to them, you make the pair share one average
+> height. Keep merging until the heights never drop along the line.
 
 ```python
 def fit_isotonic(scores, y):
@@ -206,6 +290,15 @@ platt        ECE 0.0055 | Brier 0.05861 | AUC 0.7637
 isotonic     ECE 0.0056 | Brier 0.05861 | AUC 0.7642
 ```
 
+The staircase has 716 steps. Isotonic matches Platt here: ECE 0.0056 versus 0.0055, identical
+Brier 0.05861. Its AUC moves slightly (0.7642 versus 0.7637) because a staircase gives many cases
+the *same* value, and ties change how this AUC function breaks orderings — isotonic is
+non-decreasing, not strictly increasing.
+
+The next demo compares the two methods on two kinds of damage and three sizes of calibration set.
+The **sigmoid-shaped** distortion is the same $p^{0.55}$ as before; the **kinked** one multiplies
+small probabilities by 4 and then abruptly flattens, a shape no sigmoid can follow.
+
 ```python
 def sigmoid_distortion(pt):
     return np.clip(pt ** 0.55, 0, 1)                 # exactly the shape Platt assumes
@@ -246,6 +339,12 @@ kinked distortion:
    20,000    0.0820     0.0223        0.0049  isotonic
 ```
 
+Read the "winner" column. With the sigmoid distortion Platt wins at 200 rows (0.0113 versus
+0.0234) and at 1,000; at 20,000 the two tie (0.0051 versus 0.0049). With the kinked distortion
+Platt is stuck near 0.022 whatever the data size, while isotonic falls to 0.0162 at 1,000 rows and
+0.0049 at 20,000. One more detail: isotonic's numbers are identical in both halves (0.0234, 0.0162,
+0.0049), because it only uses the *order* of the scores, and both distortions preserve the order.
+
 Both halves of the standard guidance are visible here. When the distortion really is
 sigmoid-shaped, Platt's two parameters are exactly right and isotonic can only lose — badly at
 200 rows, where it overfits. When the distortion is kinked, Platt cannot represent it at any
@@ -254,6 +353,9 @@ small calibration sets, isotonic when you have thousands of held-out rows and no
 the sigmoid assumption.**
 
 ## What breaks calibration in the first place
+
+Most training tricks that improve ranking quietly damage the probabilities. Knowing the usual
+culprits tells you when to expect miscalibration before you measure it.
 
 ```python
 causes = [
@@ -293,11 +395,25 @@ training on a 50/50 resample of a 2% problem multiplies the odds by 49x
    model says 0.90 -> true probability 0.1552
 ```
 
+The last three lines show the biggest offender. **Resampling** — changing the class mix of the
+training set, for example by throwing away negatives until it is 50/50 — teaches the model a
+world where positives are common. Here the odds of being positive are inflated 49 times, so a
+model output of 0.50 really means 0.0200, and 0.90 means only 0.1552.
+
 If you rebalance the training set, the model's probabilities refer to the **rebalanced** world.
 The prior-correction formula above undoes it exactly, and forgetting it is how a model that
 "performs great" produces flag volumes ten times the plan.
 
+> **Watch out:** `class_weight="balanced"` in scikit-learn does the same thing as resampling to
+> 50/50 as far as probabilities are concerned. If you use it, calibrate afterwards.
+
 ## Calibration is a per-segment property
+
+A model can be right on average across everyone and wrong for one group, because the
+over-predictions in one group cancel the under-predictions in another.
+
+The demo has two segments. Segment 1 is really 2.2 times riskier, but the model does not know
+segments exist and gives both groups the same scores.
 
 ```python
 seg = rng.integers(0, 2, n)
@@ -318,9 +434,22 @@ overall ECE 0.0420
   segment 1: predicted 0.0703 actual 0.1522 ECE 0.0819
 ```
 
+Overall ECE is 0.0420, which looks tolerable. Split by segment, segment 0 is fine (ECE 0.0049,
+predicted 0.0699 versus actual 0.0718), while segment 1 is predicted at 0.0703 but really happens
+at 0.1522 — the model under-states its risk by more than half (ECE 0.0819).
+
 A model can be well calibrated on average and badly calibrated for a group that matters. **Always
 report calibration per segment**, especially for segments that map to people — this is where a
 fairness audit starts (ch. 12).
+
+## Recap in plain words
+
+- Calibrated means "a score of 0.3 comes true 30% of the time"; AUC cannot see calibration.
+- A reliability table compares what the model said with what happened; ECE and Brier summarize it.
+- Platt scaling fits a two-number S-curve correction; isotonic fits a free staircase that only goes up.
+- Use Platt for small calibration sets, isotonic for thousands of rows and odd distortions.
+- Always fit the calibrator on held-out data, never on the training set.
+- Resampling and class weights break calibration on purpose; check calibration per segment too.
 
 ## Try it Yourself
 
@@ -359,9 +488,15 @@ platt: ECE 0.0048 | Brier 0.05861 | mean p 0.0702 vs actual 0.0673
    said  0.218 | happened  0.200 | n= 2,500 ##############################
 ```
 
-Change `overconfident` to `shrunk` and rerun: the bars move the other way, the ECE is similar,
-and Platt fixes both — because a sigmoid can stretch as well as squash. Then try calibrating on
-only 200 rows and watch isotonic fall apart while Platt holds.
+Each bar is the observed rate in one of 8 bins, scaled so the tallest is 30 characters. The bars
+are the *same* in both reports, because calibration does not reorder cases. What changes is the
+"said" column: raw scores say 0.044 to 0.421, Platt-calibrated ones say 0.005 to 0.218, which now
+sit right next to "happened" (0.004 to 0.200). ECE with 8 bins is 0.0048 after Platt.
+
+Change `overconfident` to `shrunk` and rerun: the "said" column now sits *below* "happened"
+instead of above, the ECE is smaller (the shrinkage is milder), and Platt fixes both — because a
+sigmoid can stretch as well as squash. Then try calibrating on only 200 rows and watch isotonic do
+about twice as badly as Platt.
 
 ## Exercise
 
@@ -370,6 +505,10 @@ on train, fit both Platt and isotonic calibrators on the calibration split, choo
 by cross-validated Brier score on the calibration split, and then show the *decision* consequence
 — compute the cost-optimal threshold from ch. 3 on raw and calibrated scores and report the
 difference in expected cost on the test set.
+
+> **Hint:** use three disjoint slices of rows. Inside the calibration slice, split again: fit both
+> calibrators on one half and compare their Brier scores on the other half. Then refit the winner
+> on the whole calibration slice before touching the test set.
 
 <details>
 <summary>Solution</summary>
@@ -450,11 +589,19 @@ raw        cost at p*     14,380 | empirical best t 0.2530 cost     10,228 | gap
 platt      cost at p*     10,574 | empirical best t 0.0230 cost     10,300 | gap       274
 ```
 
-The insight: the calibrated model has the **same AUC** and is worth real money, because the whole
+Read the last two lines. On raw scores the analytic $p^{*} = 0.0203$ costs 14,380, while the best
+threshold found by searching the test labels (0.2530) costs 10,228 — a gap of 4,152. After Platt,
+$p^{*}$ costs 10,574, within 274 of the searched best (0.0230). The rebalanced training made the
+raw scores five times too high on average (0.3953 against an actual 0.0783).
+
+The insight: the calibrated model has the **same AUC** and, used with the analytic threshold, saves
+about 3,800 on this test set, because the whole
 cost-optimal-threshold machinery from ch. 3 assumes the number it thresholds is a probability.
 Look at the last column — on raw scores, applying the analytic $p^{*}$ lands far from the actual
 optimum, so you would have had to grid-search the threshold on a labelled validation set and
-re-search it every time costs changed. After calibration the analytic threshold is close to
+re-search it every time costs changed. (A searched threshold on raw scores does about as well —
+10,228 versus 10,300 — because the ranking is the same; calibration's value is that you do not need
+the search.) After calibration the analytic threshold is close to
 optimal, which means the business can change the cost ratio in a config file and the system does
 the right thing without re-tuning. Three practical notes. The **three-way split matters**: fitting
 the calibrator on training data teaches it the training-set overconfidence, and fitting it on the

@@ -7,6 +7,10 @@ order: 7
 
 ## Framing forecasting as supervised learning
 
+A regular machine-learning model needs a table: columns of clues and one column to predict.
+A time series is one long column. The trick is to build the clue columns out of the series'
+own past — "what was it yesterday, last week, on average this month?".
+
 Any ML model can forecast if you reframe the problem: treat past values as features and
 the future value as the target. This is just regression:
 
@@ -14,11 +18,27 @@ $$
 \hat{y}_{t+1} = f(y_t, y_{t-1}, \ldots, y_{t-p+1}, \mathbf{x}_t)
 $$
 
+> **In plain words:** tomorrow's forecast is some function $f$ (a linear model, a tree
+> ensemble, a neural net) of the last $p$ values plus extra clues $\mathbf{x}_t$. The model
+> learns $f$ from thousands of (past clues, next value) pairs cut out of history.
+
 where $\mathbf{x}_t$ can include rolling statistics, calendar signals, and any external
 covariates. The key constraint: features must be computable from data available at time $t$
 — no look-ahead.
 
+A **feature** is one input column. **Covariates** are outside series that may help, like
+temperature for electricity demand. **Look-ahead** means a feature secretly uses information
+from after the moment you forecast from — the leakage of ch. 6, hidden inside a column.
+
+> **Picture it:** a shop owner guessing tomorrow's bread sales. She looks at today's sales,
+> the same weekday last week, and whether tomorrow is a holiday. Each of those is a feature.
+> She cannot look at tomorrow's receipt — that would be look-ahead.
+
 ## Building the lag matrix
+
+A **lag** is the series shifted back in time: "lag 7" in row $t$ holds the value from 7 days
+earlier. Stacking several lags side by side turns the series into a table a model can learn
+from.
 
 ```python
 import numpy as np
@@ -46,20 +66,37 @@ print(f"\nShape: {df.shape}")
 ```
 
 ```output
-            y  lag_1  lag_2  lag_3  lag_7  lag_14
-2018-02-15  97.35  96.84  97.21  102.47  96.84   99.32
-2018-02-16  99.14  97.35  96.84   97.21  97.31  101.73
-2018-02-17  96.20  99.14  97.35   96.84  98.62  100.84
+                 y   lag_1   lag_2  lag_3   lag_7  lag_14
+2018-01-15  103.53   96.85   92.61  99.26  100.67  100.61
+2018-01-16  108.88  103.53   96.85  92.61  109.27  105.92
+2018-01-17  113.45  108.88  103.53  96.85  109.71  111.62
 
 Shape: (351, 6)
 ```
 
+Read row 2018-01-16: the target is 108.88, and `lag_1` is 103.53 — exactly the previous row's
+target. `lag_7` (109.27) is close to the target because the series has a weekly wave: the same
+weekday a week ago is a strong clue. The table starts on 2018-01-15 because the 14-day lag
+needs 14 earlier days, so the first 14 rows are dropped: $365 - 14 = 351$ rows.
+
 Note that `shift(1)` moves the series down by one row — `lag_1` at row $t$ contains
 $y_{t-1}$, which is observable at prediction time.
 
+> **Watch out:** a lag shorter than your forecast horizon is look-ahead. If you must forecast
+> 7 days out, `lag_1` will not exist yet on the day you need it. Use only lags $\ge h$, or
+> build a separate model per horizon (ch. 8).
+
 ## Rolling statistics
 
+A rolling statistic answers "what has the recent stretch looked like?" — its average, how
+jumpy it was, its highest and lowest value over the last few days.
+
 Rolling statistics summarize recent behavior and capture regime changes:
+
+A **rolling window** of 7 slides along the series and summarises the 7 values inside it. A
+**regime change** is a lasting shift in behaviour, like demand stepping up after a store
+opens. Note the `shift(1)` *before* `.rolling(7)`: the window covers days $t-7$ to $t-1$, so the
+target day is never inside its own feature.
 
 ```python
 import numpy as np
@@ -85,18 +122,31 @@ print(f"Correlation of lag_1 with target:       {df['lag_1'].corr(df['y']):.3f}"
 ```
 
 ```output
-            y  lag_1  roll_mean_7  roll_std_7  roll_min_7  roll_max_7
-2018-01-09  100.50  104.31       100.54        3.28       96.48      104.31
-2018-01-10   97.16  100.50        99.97        3.21       95.54      104.31
+                 y   lag_1  roll_mean_7  roll_std_7  roll_min_7  roll_max_7
+2018-01-08  100.07   93.04        99.68        8.74       88.15      111.45
+2018-01-09  108.58  100.07        99.60        8.73       88.15      111.45
 
-Correlation of roll_mean_7 with target: 0.621
-Correlation of lag_1 with target:       0.474
+Correlation of roll_mean_7 with target: 0.809
+Correlation of lag_1 with target:       0.859
 ```
 
-The 7-day rolling mean is more correlated with the target than the raw lag — it reduces
-noise and captures the weekly cycle level.
+Row 2018-01-09: the 7-day mean is 99.60 and the 7-day std is 8.73 — large, because each window
+holds one whole weekly wave of amplitude 10. Now compare the correlations: `roll_mean_7` scores
+0.809 and `lag_1` scores 0.859.
+
+So the raw lag wins here. The 7-day mean averages over exactly one weekly cycle, which cancels
+the weekly wave: it tracks the level well and filters noise, but it has thrown away the weekday
+pattern that `lag_1` still partly carries. The rolling mean's value is as a *different* view of
+the series — the smooth level — which a model can combine with lags.
+
+> **Watch out:** writing `df['y'].rolling(7).mean()` without the `shift(1)` puts today's value
+> into today's feature. Backtests then look brilliant and live forecasts disappoint.
 
 ## Calendar features and cyclical encoding
+
+Dates carry signal too: weekends, months, hours. But feeding "month = 12" and "month = 1" as
+plain numbers tells the model December and January are 11 apart, when they are next-door
+neighbours.
 
 Raw calendar numbers have discontinuities: month 12 and month 1 are adjacent but
 numerically far apart. Cyclical encoding maps them onto a unit circle:
@@ -105,7 +155,15 @@ $$
 \sin\!\left(\frac{2\pi m}{M}\right), \quad \cos\!\left(\frac{2\pi m}{M}\right)
 $$
 
+> **In plain words:** place the 12 months like the hours on a clock face and give each one its
+> two coordinates (sine and cosine). Then December and January sit right next to each other.
+> You need both coordinates: sine alone gives the same value to two different months.
+
 where $M$ is the period (12 for months, 7 for days of week, 24 for hours).
+
+> **Picture it:** a clock. 11 p.m. and 1 a.m. are 22 hours apart if you subtract the numbers,
+> but on the clock face they are two ticks apart. Sine and cosine give you the position on the
+> face.
 
 ```python
 import numpy as np
@@ -132,13 +190,24 @@ print(df[['y','month','month_sin','month_cos','dow_sin','is_weekend']].head(3).r
 ```
 
 ```output
-            y  month  month_sin  month_cos  dow_sin  is_weekend
-2020-01-01  99.231      1      0.5        0.866    0.782           0
-2020-01-02  96.834      1      0.5        0.866   -0.975           0
-2020-01-03  99.102      1      0.5        0.866   -0.434           1
+                  y  month  month_sin  month_cos  dow_sin  is_weekend
+2020-01-01  100.251      1        0.5      0.866    0.975           0
+2020-01-02  103.903      1        0.5      0.866    0.434           0
+2020-01-03  106.671      1        0.5      0.866   -0.434           0
 ```
 
+All three rows are January, so `month_sin` = 0.5 and `month_cos` = 0.866: those are
+$\sin(2\pi/12)$ and $\cos(2\pi/12)$. 2020-01-01 was a Wednesday (`dow` = 2), giving
+`dow_sin` $= \sin(4\pi/7) = 0.975$; the next two days move around the circle to 0.434 and
+$-0.434$. `is_weekend` is 0 for all three because none is a Saturday or Sunday.
+
 ## Full ML pipeline: lag + rolling + calendar → linear regression
+
+Now put everything in one table and fit a plain linear model. The split is time-ordered: the
+first 80% trains, the last 20% never touches training (ch. 6).
+
+**Ridge** is linear regression with a small penalty on large coefficients, which keeps it
+stable when many features are correlated — and lags of the same series are very correlated.
 
 ```python
 import numpy as np
@@ -180,12 +249,24 @@ print(f"MASE:        {mae/naive_mae:.3f}")
 ```
 
 ```output
-Ridge MAE:   2.14
-Naive MAE:   4.87
-MASE:        0.439
+Ridge MAE:   1.63
+Naive MAE:   3.79
+MASE:        0.429
 ```
 
-Ridge with lag + calendar features halves the naive MAE (MASE ≈ 0.44).
+Ridge scores an MAE of 1.63 against the naive forecast's 3.79, so the MASE is 0.429: the model's
+typical miss is less than half the naive one. With noise std 2, the best possible MAE is about
+$2 \times 0.8 = 1.6$, so Ridge is close to the floor.
+
+Ridge with lag + calendar features more than halves the naive MAE (MASE $\approx$ 0.43).
+
+## Recap in plain words
+
+- Any regression model can forecast once you turn the series into a table of past-value features and a next-value target.
+- Lag features copy the series shifted back $k$ steps; the first $k$ rows are lost.
+- Rolling statistics summarise a recent window; shift by 1 before rolling so the target never leaks in.
+- Calendar features need cyclical sine/cosine encoding so the end of a cycle sits next to its start.
+- Split by time, train on the past, and compare against the naive baseline with MASE.
 
 ## Try it Yourself
 
@@ -213,17 +294,28 @@ print(df[['y','lag_1','roll_mean_4','week_sin']].head(3).round(2).to_string())
 
 ```output
 Feature matrix shape: (48, 8)
-            y  lag_1  roll_mean_4  week_sin
-2021-02-01  215.46  209.45       204.36     0.481
-2021-02-08  218.73  215.46       208.02     0.591
-2021-02-15  224.87  218.73       211.60     0.694
+                 y   lag_1  roll_mean_4  week_sin
+2021-02-01  213.16  220.07       208.80      0.57
+2021-02-08  235.46  213.16       211.99      0.66
+2021-02-15  229.60  235.46       220.03      0.75
 ```
+
+52 weekly rows minus the 4 dropped by `lag_4` leaves 48 rows, and 8 columns (target, 4 lags,
+the rolling mean and two week features). The first row is 2021-02-01, ISO week 5, so
+`week_sin` $= \sin(2\pi \cdot 5/52) \approx 0.57$, rising week by week. `roll_mean_4` (208.80)
+is the average of the four previous weeks.
+
+Extend it: fit `Ridge` on the first 40 rows and score the last 8, then add `lag_52` and notice
+that a single year of data cannot support a yearly lag — every row would be dropped.
 
 ## Exercise
 
 Build a lag-feature dataset for a weekly series (52 observations), using lags 1–4 and
 cyclical week-of-year features. Fit a Ridge regression and report MASE relative to the
 last-value naive baseline.
+
+> **Hint:** reuse the Try it block. Split by position (not randomly), fit on the early rows,
+> and divide the test MAE by the mean of `np.abs(np.diff(...))` on the test targets.
 
 <details>
 <summary>Solution</summary>
@@ -254,4 +346,10 @@ mae  = np.mean(np.abs(y_arr[split:] - preds))
 mase = mae / np.mean(np.abs(np.diff(y_arr[split:])))
 print(f"MAE: {mae:.2f}  MASE: {mase:.3f}")
 ```
+
+The solution uses two years (104 weeks) so there is room for an 80-row training set and a
+20-week test. It prints MAE 5.39 and MASE 0.969: Ridge beats naive, but only by 3%. The noise
+here (std 4) is large next to the weekly change (trend 1.5 per week), and lags 1–4 carry that
+noise into the features, so there is little predictable signal left. The line
+`Ridge(alpha=1.0).fit(...)` on its own is redundant: the model is refit inside the `preds` line.
 </details>

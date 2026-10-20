@@ -7,6 +7,11 @@ order: 9
 
 ## Encoding strategy depends on cardinality and model type
 
+Models do arithmetic, so a text column like `color = 'red'` must become numbers first.
+**Encoding** is that translation. The best translation depends on two things: how many
+different categories the column has (its **cardinality**, ch. 6), and whether the model
+splits on thresholds (trees) or multiplies by weights (linear models).
+
 | Cardinality | Tree models | Linear models |
 |-------------|------------|---------------|
 | Low (2–10 categories) | Ordinal encoding fine | One-hot (drop one column) |
@@ -16,10 +21,23 @@ order: 9
 Tree models don't need linear separability — they can split on any integer code. Linear
 models need orthogonal or meaningful numeric representations.
 
+> **Picture it:** a tree model is a sorting machine that asks "is the code below 2.5?" —
+> any numbering works, because it can ask several such questions to carve out any group. A
+> linear model is a scale that adds up `weight × value`; if `blue = 2` and `red = 0`, it
+> will insist blue counts twice as much as green. It needs numbers whose sizes mean
+> something.
+
 ## One-hot encoding
+
+**One-hot encoding** gives each category its own yes/no column: a red row gets 1 in the
+`red` column and 0 everywhere else.
 
 Create one binary column per category. The dummy-variable trap: with $k$ categories, drop
 one column to avoid perfect multicollinearity (all others being 0 implies the dropped one is 1).
+
+**Multicollinearity** means one column can be computed exactly from others. Here the $k$
+one-hot columns always add up to 1, so any one of them is "1 minus the rest" — and a
+linear model with an intercept then has no unique best set of weights.
 
 ```python
 import pandas as pd
@@ -44,21 +62,32 @@ print(f"feature names: {enc.get_feature_names_out()}")
 
 ```output
 pd.get_dummies (drop_first=True):
-  color  green  red
-0   red      0    1
-1   red      0    1
-2  blue      0    0
-3   red      0    1
-4  green      1    0
-5  blue      0    0
-6   red      0    1
-7  green      1    0
+   color  green  red
+0   blue      0    0
+1  green      1    0
+2  green      1    0
+3    red      0    1
+4    red      0    1
+5    red      0    1
+6    red      0    1
+7    red      0    1
 
 sklearn OHE categories: [array(['blue', 'green', 'red'], dtype=object)]
 feature names: ['color_green' 'color_red']
 ```
 
+`blue` was dropped (it comes first alphabetically), so a blue row is the row of all zeros
+— row 0. Green rows have `green = 1`, red rows `red = 1`. scikit-learn's encoder found the
+same three categories and produced the same two columns, `color_green` and `color_red`.
+
+> **Watch out:** dropping a column matters for unregularised linear models. For trees and
+> for regularised models (ridge, lasso), keeping all $k$ columns is fine and often easier
+> to read.
+
 ## Ordinal encoding
+
+**Ordinal encoding** maps each category to one integer, 0, 1, 2, … in an order you
+choose. One column instead of $k$.
 
 Use only when a meaningful natural order exists in the categories. Arbitrary integer
 assignment for unordered categories gives the model false distance information.
@@ -91,11 +120,29 @@ print(f"\nCategory order: {enc.categories_[0]}")
 Category order: ['S' 'M' 'L' 'XL' 'XXL']
 ```
 
+`S` became 0, `M` 1, `L` 2, `XL` 3, `XXL` 4 — the order you listed, not alphabetical (which
+would put `L` first). Every `XL` row got the same code 3.
+
+> **Watch out:** if you leave out `categories=`, scikit-learn sorts the labels
+> alphabetically: `L=0, M=1, S=2, XL=3, XXL=4`. That puts `S` above `M` and silently scrambles
+> the order.
+
 ## Target encoding — powerful but leaks if done wrong
+
+**Target encoding** replaces each category with the average target value for that
+category — "brand Nike" becomes "the average sale for Nike rows". One number carries the
+information that one-hot would spread over many columns.
 
 Target encoding replaces a category with the mean of the target within that category. Done
 naively on the full dataset before splitting, the target value of each row influences its
 own encoded feature — that's leakage.
+
+The safe version is **out-of-fold** encoding: split the rows into 5 groups (**folds**), and
+fill each fold using means computed from the other 4 only. No row ever sees its own target.
+
+> **Picture it:** grading an essay by the class average — but the class average includes
+> the essay you are grading. A tiny class makes that circular; out-of-fold encoding grades
+> each essay against the averages of the *other* classes.
 
 ```python
 import pandas as pd
@@ -134,36 +181,46 @@ print(df.groupby('cat')['enc_safe'].mean().round(3))
 ```output
 Category means (true signal):
 cat
-A    1.985
-B   -0.007
-C    0.058
-D    0.010
-E   -0.027
-dtype: float64
+A    1.851
+B    0.032
+C   -0.007
+D   -0.047
+E   -0.034
+Name: target, dtype: float64
 
 Leaky encoding (mean of each row is itself in the mean):
 cat
-A    1.985
-B   -0.007
-C    0.058
-D    0.010
-E   -0.027
-dtype: float64
+A    1.851
+B    0.032
+C   -0.007
+D   -0.047
+E   -0.034
+Name: enc_leaky, dtype: float64
 
 Safe encoding (out-of-fold):
 cat
-A    1.954
-B   -0.027
-C    0.032
-D    0.003
-E   -0.058
-dtype: float64
+A    1.844
+B    0.029
+C   -0.008
+D   -0.041
+E   -0.034
+Name: enc_safe, dtype: float64
 ```
 
-Both look similar here — the leak is subtle. The damage appears when you compare CV
-score to holdout score: the leaky version will be optimistic.
+The planted signal is clear: category A averages 1.851, all others sit near 0. The leaky
+encoding matches the true means exactly (by construction — it *is* the mean). The safe
+encoding is a hair different, 1.844 for A, because each fold's mean comes from the other 4
+folds.
+
+Both look similar here — the leak is subtle. With about 100 rows per category, one row's
+own target moves its category mean by only about 1%. The damage appears when you compare
+CV score to holdout score: the leaky version will be optimistic. It grows sharply for rare
+categories — in a category with 2 rows, each row's own target is half of its encoding.
 
 ## Frequency encoding
+
+**Frequency encoding** replaces a category with how often it appears — "user 6" becomes
+"15", the number of rows user 6 has.
 
 Replace each category with its count (or proportion) in the training set. Useful for tree
 models with high-cardinality features where frequency correlates with importance.
@@ -176,7 +233,7 @@ rng = np.random.default_rng(2)
 n = 400
 # Simulated user IDs: some are frequent, most are rare
 df = pd.DataFrame({'user_id': rng.choice(np.arange(200), n,
-                                          p=np.r_[np.ones(10)/3, np.ones(190)*0.7/190])})
+                                          p=np.r_[np.ones(10)*0.3/10, np.ones(190)*0.7/190])})
 
 # Fit frequency map on train only
 train = df.iloc[:300].copy()
@@ -194,17 +251,28 @@ print(f"\nUnseen users in test: {test['user_freq'].eq(0).sum()}")
 ```output
 Top 5 most frequent users (train):
 user_id
-9     29
-1     28
-5     27
-7     27
-3     26
+6    15
+8    14
+1    13
+3    12
+5    12
 Name: user_freq, dtype: int64
 
-Unseen users in test: 4
+Unseen users in test: 31
 ```
 
+The most frequent user in train (user 6) appears 15 times. The second line is the real
+lesson: 31 of the 100 test rows belong to users never seen in train, so they get frequency
+0 via `fillna(0)`.
+
+> **Watch out:** two different categories with the same count get the same code. If users 3
+> and 5 both appear 12 times, the model cannot tell them apart from this feature alone.
+
 ## Rare category handling
+
+**Rare categories** — those with only a handful of rows — give unreliable statistics, and
+many of them will not appear in the test set at all. Pooling them into one `'Other'` group
+fixes both problems.
 
 High-cardinality features have many rare categories that will be unseen at test time.
 Group them into "Other" using a count threshold.
@@ -236,20 +304,39 @@ print(train['city_enc'].value_counts())
 ```
 
 ```output
-Unique cities in raw train: 100
+Unique cities in raw train: 95
 Unique cities after grouping: 6
+
 City_enc value counts:
 city_enc
-Other     303
-city_0     56
-city_1     55
-city_2     54
-city_3     51
-city_4     49
+Other     254
+city_2     53
+city_3     52
+city_1     49
+city_0     48
+city_4     44
 Name: count, dtype: int64
 ```
 
+The raw training data has 95 distinct cities; after grouping, only 6 remain — the 5
+popular cities (each about 50 rows, the planted 10%) plus `Other` with 254 rows. Every
+city below 10 occurrences was folded into `Other`, and any city first seen in test lands
+there too.
+
+## Recap in plain words
+
+- Pick the encoding by how many categories there are and what kind of model you use.
+- One-hot gives each category its own 0/1 column; drop one for unregularised linear models.
+- Ordinal codes are only for categories with a real order — and you must state the order.
+- Target encoding is powerful but must be computed out-of-fold, or each row sees its own
+  answer.
+- Frequency encoding counts rows per category; unseen categories get 0.
+- Pool rare categories into `'Other'` so their statistics are stable.
+
 ## Try it Yourself
+
+Four brands, two of them with a planted boost to the target. You one-hot encode the brand
+and then target-encode it out-of-fold.
 
 ```python
 import pandas as pd
@@ -284,16 +371,22 @@ print(df.groupby('brand')[['target', 'brand_enc']].mean().round(2))
 
 ```output
 OHE shape: (300, 3)
-Features: ['brand_Adidas' 'brand_Nike' 'brand_Puma']
+Features: ['brand_Nike' 'brand_Puma' 'brand_Reebok']
 
 Safe target encoding by brand:
-         target  brand_enc
+        target  brand_enc
 brand
-Adidas    55.48      55.45
-Nike      65.38      65.24
-Puma      49.40      49.21
-Reebok    49.69      49.59
+Adidas   54.70      54.79
+Nike     64.15      64.07
+Puma     48.49      48.56
+Reebok   49.49      49.52
 ```
+
+One-hot gives 3 columns for 4 brands: `Adidas` was dropped as the baseline (first
+alphabetically). The target-encoded means track the true ones within about 0.1: Nike
+64.15 vs 64.07, Adidas 54.70 vs 54.79 — the +15 and +5 boosts on top of 50 are clearly
+visible. Try `n = 30` instead of 300: with only a few rows per brand, the safe encoding
+drifts much further from the true mean.
 
 ## Exercise
 
@@ -301,6 +394,10 @@ Given a DataFrame with `color` (5 categories, ordinal: red < orange < yellow < g
 and `size` (high-cardinality, 50 unique sizes), apply:
 (a) Ordinal encoding to `color` using the order above.
 (b) Frequency encoding to `size` on the training set only.
+
+> **Hint:** pass the colour order to `OrdinalEncoder(categories=[[...]])`, fit on train,
+> and only `transform` test. For sizes, build `value_counts()` on train and `map` it onto
+> both, filling unseen sizes with 0.
 
 <details>
 <summary>Solution</summary>
@@ -339,5 +436,7 @@ print(f"Unseen sizes in test: {test['size_freq'].eq(0).sum()}")
 
 Ordinal encoding only works for `color` because the order is meaningful and domain-defined.
 For `size`, there's no natural order, so frequency encoding is preferable — it lets the model
-learn that frequent sizes might have different behaviour than rare ones.
+learn that frequent sizes might have different behaviour than rare ones. Note that both
+encoders are fitted on the 320 training rows only, and the test set reuses those maps;
+that is the same train-only rule as imputation (ch. 4).
 </details>

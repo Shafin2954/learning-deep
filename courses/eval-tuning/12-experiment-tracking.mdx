@@ -7,10 +7,25 @@ order: 12
 
 ## A run is a claim, and a claim needs evidence
 
+A score on its own is a rumour. To trust it, you need to know exactly what produced it — which
+data, which settings, which random seed — so that you (or anyone) can produce it again and fairly
+compare it with another score.
+
 "The new model gets 0.912" is not a result. A result is: *this code, on this data, with these
 hyperparameters and this seed, produced these per-fold scores, and here is the artefact.* Tracking
 is the practice of recording exactly enough to (a) reproduce the number and (b) compare it
 honestly against another number. Everything in this chapter serves one of those two goals.
+
+A **run** is one training-and-evaluation attempt. An **artefact** is a file the run produced, such
+as the saved model. **Experiment tracking** is keeping a record of every run.
+
+> **Picture it:** a lab notebook. A chemist who writes "it turned blue!" without noting the
+> amounts, the temperature, and which bottle they used has a story, not a result. Nobody — not even
+> the chemist next week — can repeat it.
+
+The first tool is a **fingerprint**: a short code computed from the exact bytes of the data or
+settings, using a **hash** function (SHA-256 here). Change one byte and the fingerprint changes
+completely; keep the bytes identical and you get the same fingerprint on any machine.
 
 ```python
 import numpy as np
@@ -46,10 +61,21 @@ data fingerprint y: b42534562e26
 config fingerprint: 944676a597fb
 ```
 
+Each fingerprint is 12 hexadecimal characters. If next month the data fingerprint of "the same"
+training set is not `bf06a9ced910`, the data changed, whatever anyone remembers.
+
 Those twelve characters are the cheapest insurance in machine learning. A run whose data
 fingerprint you did not record cannot be reproduced, only re-enacted.
 
 ## The minimum viable tracker
+
+You do not need a big platform to track experiments well. A list of dictionaries with the right
+fields does most of the job; tools like MLflow or Weights & Biases add storage, a UI, and sharing on
+top of the same idea.
+
+The tracker below stores, for each run, its settings and their fingerprint, the data fingerprint,
+every fold's score, and a note. The `cv_scores` helper runs 5-fold **stratified** CV (each fold
+keeps the same class balance as the full data) with a fixed seed.
 
 ```python
 RUNS = []
@@ -102,8 +128,13 @@ notes      reference model, do not delete
 tags       []
 ```
 
+The baseline logistic regression scores a mean AUC of 0.8980 across five folds that range from
+0.8876 to 0.9088. The run id is 0, a counter, so re-running the notebook gives the same ids.
+
 Note what is stored: **every fold score**, not just the mean. A mean without its folds cannot be
 compared to anything — the next section is entirely about why.
+
+Two more runs, a random forest and a gradient-boosted model, logged the same way:
 
 ```python
 rf_cfg = {"model": "rf", "n_estimators": 300, "min_samples_leaf": 5, "cv_seed": 0, "k": 5}
@@ -127,7 +158,14 @@ print(board.to_string(index=False))
       2      hgb-depth4 0.9655 0.0055 bf06a9ced910
 ```
 
+The leaderboard shows the boosted model (0.9655) slightly ahead of the forest (0.9626), both far
+above the baseline (0.8980). All three carry the same data fingerprint, so they are at least
+compared on the same data.
+
 ## The mean is not the result
+
+Two average scores can look different only because each fold's test rows happened to be easier
+or harder. Before declaring a winner, look at the individual folds.
 
 Three runs, three means, and the temptation is to declare a winner. The fold scores say how much
 that ranking is worth.
@@ -145,11 +183,21 @@ forest-300       mean 0.9626 | folds 0.9742 0.9552 0.9546 0.9660 0.9629 | spread
 hgb-depth4       mean 0.9655 | folds 0.9733 0.9612 0.9602 0.9688 0.9638 | spread 0.0131
 ```
 
+The boosted model's fold scores run from 0.9602 to 0.9733 (spread 0.0131); the forest's from
+0.9546 to 0.9742 (spread 0.0196). Their means differ by only 0.0029.
+
 The gap between the best and second-best mean is smaller than the fold-to-fold spread of either.
 That does not prove they are equivalent — it means the comparison has to be done **paired**, fold
 by fold, because the folds are shared and their difficulty is a common source of variance.
 
+**Paired** means comparing the two models on the same fold, one fold at a time, and studying the
+five differences. An easy fold lifts both models, so the difference cancels that luck out.
+
 ### Paired differences, and why the naive t-test lies
+
+A **t-test** asks whether a mean difference is large compared with its own noise; the **p-value** is
+the chance of seeing a difference this big if the two models were really equal (small = convincing).
+The ordinary paired t-test assumes the five folds are independent. They are not.
 
 ```python
 from scipy import stats
@@ -188,6 +236,9 @@ naive paired t     : t=+2.128  p=0.1004
 corrected (NB)     : t=+1.419  p=0.2290
 ```
 
+The boosted model beats the forest on 4 of 5 folds, by $+0.0029$ on average. The naive test says
+$p = 0.1004$; the corrected test says $p = 0.2290$ — more than twice as large, so much less convincing.
+
 The correction multiplies the variance by $\tfrac{1}{k} + \tfrac{n_{\text{test}}}{n_{\text{train}}}$
 because cross-validation folds are **not independent** — every pair of training sets overlaps in
 most of their rows, so the naive estimate of the difference's variance is far too small and the
@@ -197,9 +248,26 @@ $$
 \hat{\sigma}^2_{\text{corrected}} = \left(\frac{1}{k} + \frac{n_{\text{test}}}{n_{\text{train}}}\right) \hat{\sigma}^2_{d}
 $$
 
+> **In plain words:** $\hat{\sigma}^2_{d}$ is the variance of the per-fold differences you observed.
+> The naive test effectively multiplies it by $\tfrac{1}{k}$ ($k$ = number of folds). The
+> **Nadeau–Bengio correction** adds $n_{\text{test}}/n_{\text{train}}$ — here $800/3{,}200 = 0.25$ — to
+> account for the folds sharing training rows. With $k = 5$ that turns $0.2$ into $0.45$, more than
+> doubling the variance.
+
+> **Picture it:** five friends taste-testing two cakes, but four of them share one plate and talk
+> to each other between bites. Their five verdicts are not five independent opinions, so "five out
+> of five agreed" is less impressive than it sounds.
+
 Log the folds and this test costs four lines. Log only the mean and you cannot run it at all.
 
 ## Practical significance is a separate question
+
+A difference can be real and still too small to matter. Decide in advance how big a gain must be
+to be worth shipping, and check both "is it real?" and "is it big enough?".
+
+The `decide` function combines the corrected p-value, a **bootstrap confidence interval** for the
+mean difference (resample the fold differences many times, take the middle 95%), and an **effect
+floor** — the smallest gain you would bother to ship, here 0.005 AUC.
 
 ```python
 def decide(a, b, n_test, n_train, min_effect=0.005, alpha=0.05):
@@ -229,12 +297,22 @@ forest-300   vs baseline: {'mean_diff': 0.0646, 'p_corrected': 0.0008, 'boot_95c
 hgb-depth4   vs baseline: {'mean_diff': 0.0675, 'p_corrected': 0.0003, 'boot_95ci': (0.0598, 0.0724), 'verdict': 'SHIP: significant and large enough to matter'}
 ```
 
+Both challengers beat the baseline by about 0.065 AUC, with corrected p-values below 0.001 and
+intervals that stay far above the 0.005 floor (0.0552 to 0.0706 for the forest, 0.0598 to 0.0724 for
+the boosted model). Both get "SHIP".
+
 Two thresholds, deliberately separate: **statistical** significance (is the difference real?) and
 **practical** significance (is it worth shipping?). A 0.0004 AUC gain can be real and still not
 justify a new dependency, a slower model, or a retraining pipeline. Write your effect floor down
 *before* you run the comparison — it is the number people quietly move afterwards.
 
 ## The winner's curse in a leaderboard
+
+Run many equally good models and one will come out on top by luck alone. Its score is inflated,
+and it will look worse the next time you measure it.
+
+The **winner's curse** is that inflation. The simulation makes 20 candidates that are *identical in
+truth* (quality 0.80) and gives each 5 noisy fold scores.
 
 ```python
 rng = np.random.default_rng(0)
@@ -259,6 +337,9 @@ the champion, re-evaluated  : 0.7944
 inflation from picking a max: +0.0233
 ```
 
+The best of 20 reports 0.8249, while the average of all candidates is 0.8016 — an inflation of
+0.0233 from picking the maximum. Re-evaluated on fresh folds, the champion scores 0.7944.
+
 Twenty identical models, and the leaderboard shows a clear winner sitting 2.3 points of AUC above
 the field — which evaporates to 0.7944, *below* the field average, the moment it is re-evaluated
 on fresh folds. This is
@@ -267,7 +348,13 @@ easy to run hundreds of variants. The defences are the same: hold out a final se
 re-evaluate the champion on fresh folds before believing it, and record how many runs you did —
 which is a field in your run store, not a memory.
 
+> **Watch out:** "we tried 300 configurations and the best scored X" means X is optimistic, and
+> more so the more configurations you tried. Report the count next to the score.
+
 ## What to log
+
+Every field below answers a question someone will eventually ask about a result. If the field is
+missing, so is the answer.
 
 | Field | Why it earns its place |
 |-------|------------------------|
@@ -280,6 +367,8 @@ which is a field in your run store, not a memory.
 | slice metrics for known segments | catches the regression an average hides (ch. 11) |
 | library versions, git commit | the silent-change surface |
 | artefact path and hash, and the number of runs in the search | so "the model" is a file you can point at, with context for the winner's curse |
+
+A **manifest** puts all of it into one JSON document per run:
 
 ```python
 def run_manifest(run, extra=None):
@@ -332,8 +421,20 @@ print(json.dumps(m, indent=1)[:430])
   "numpy
 ```
 
+The printout is cut at 430 characters, so it stops in the middle of `env`. Everything a reviewer
+needs — settings, data fingerprint, per-fold scores, and CV protocol — is already visible.
+
 That manifest is the unit a reviewer reads. If any line of it is missing, some question they will
 ask has no answer.
+
+## Recap in plain words
+
+- A score is only a result when you record the code, data, settings, and seeds that produced it.
+- Fingerprints (hashes) of data and settings make "is this the same?" a yes/no check.
+- Store every fold's score; the mean alone cannot be compared fairly.
+- Compare models fold by fold, and use the corrected t-test because CV folds share training rows.
+- Separate "is it real?" from "is it big enough to ship?", with an effect floor set in advance.
+- The best of many runs is inflated by luck; log how many runs you did and re-check the winner.
 
 ## Try it Yourself
 
@@ -373,6 +474,11 @@ runs sharing a (config, data) fingerprint: {'f21867c9': [2, 3]}
 same config and data reproduce the metric: True
 ```
 
+`compare_configs` prints the settings of two runs side by side and stars the differences: the model
+type and three model-specific knobs differ, while the CV seed and $k$ match, so the comparison is
+fair. The re-run of `hgb-depth4` gets run id 3, shares fingerprint `f21867c9` with run 2, and
+reproduces its fold scores exactly (`True`).
+
 The duplicate check is the assertion that turns a log into a test suite: an identical
 `(config_fp, data_fp)` pair must produce identical fold scores, and when it does not, something
 unrecorded is varying — an unseeded shuffle, a library upgrade, thread non-determinism. Change one
@@ -384,6 +490,10 @@ Write the report a reviewer needs to approve or reject a model change: a champio
 comparison that states the effect size with a confidence interval, the corrected significance, the
 per-slice check for regressions, and an explicit verdict with its reasoning. Run it on two
 challengers, one that genuinely improves and one that does not.
+
+> **Hint:** evaluate the champion and each challenger on the same folds with the same seed, keep
+> the **out-of-fold** predictions (each row predicted by the model that did not train on it), and
+> compute slice AUCs from those. Block a challenger if any slice gets worse by more than 0.005.
 
 <details>
 <summary>Solution</summary>
@@ -445,6 +555,10 @@ challenger logreg-C0.9
   VERDICT: NO: confidently smaller than the effect floor
 ```
 
+The boosted challenger wins by $+0.0675$ with no slice regressions and ships. The re-tuned logistic
+regression ($C = 0.9$ instead of 1.0) changes nothing measurable: difference $+0.0000$, $p = 0.8843$,
+and it is rejected.
+
 The two challengers land on opposite sides of every test, which is the point of running both. The
 boosted model clears the effect floor by a wide margin (+0.0675, corrected p 0.0003) and its
 bootstrap interval never approaches zero. The re-tuned logistic regression moves the mean by
@@ -475,11 +589,11 @@ before you ship it.
 Rare and advanced topics you should at least know the name of. You will not need them daily, but
 you will stop being surprised when you meet them.
 
-- **Conformal prediction** — wraps any model in prediction sets with a guaranteed coverage rate, distribution-free; the honest answer when "give me a confidence" actually needs to mean something.
+- **Conformal prediction** — wraps any model in prediction sets with a guaranteed coverage rate, distribution-free; the honest answer when "give me a confidence" actually needs to mean something. In plain words: instead of one answer, the model returns a short list that contains the truth, say, 90% of the time — guaranteed.
 - **Counterfactual and contrastive explanations** — "what would have to change for this decision to flip?", which is what a rejected applicant actually wants to know, rather than an attribution.
 - **LIME and anchors** — fit a sparse local model (LIME) or find a rule that pins the prediction (anchors) around one point; faster than SHAP, less consistent, still common in production.
 - **Influence functions** — which *training rows* drove this prediction; the tool for finding the mislabelled example that broke a segment, at a heavy compute cost.
-- **Fairness metrics and bias audits** — demographic parity, equalized odds, calibration within groups; mathematically incompatible with each other in general, so the choice is a policy decision, not a metric selection.
+- **Fairness metrics and bias audits** — demographic parity, equalized odds, calibration within groups; mathematically incompatible with each other in general, so the choice is a policy decision, not a metric selection. In plain words: "fair" has several precise definitions, and you usually cannot satisfy all of them at once.
 - **Multi-objective and Pareto tuning, ASHA and Hyperband** — fronts instead of winners (ch. 7) and asynchronous rung schedules that keep every worker busy on large sweeps.
-- **Drift and performance monitoring (PSI, KS)** — population-stability index and Kolmogorov-Smirnov tests on live feature distributions; the bridge from this course to MLOps.
+- **Drift and performance monitoring (PSI, KS)** — population-stability index and Kolmogorov-Smirnov tests on live feature distributions; the bridge from this course to MLOps. In plain words: alarms that ring when today's data stops looking like the data you trained on.
 - **Statistical significance of model comparisons** — corrected resampled t-tests, McNemar's test for paired classifications, and multiple-comparison corrections; the discipline that stops a leaderboard from shipping noise.

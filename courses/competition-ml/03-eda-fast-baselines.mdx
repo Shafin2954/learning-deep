@@ -7,9 +7,24 @@ order: 3
 
 ## Exploration you can act on
 
+Looking at data is only useful when it changes what you do next. Aim every look at a decision, and
+get a first score on the board within the hour.
+
 Most EDA is decoration. The version that pays produces four decisions: which columns to drop,
 which need encoding, where the missingness comes from, and what score a trivial model already
 gets. Everything else can wait until you have a baseline to beat.
+
+**EDA** (exploratory data analysis) means looking at the data before modelling: counts, missing
+values, distributions, correlations. A **baseline** is the simplest model that produces a valid
+score — the number every later idea must beat.
+
+> **Picture it:** a mechanic does not admire an engine; they run a checklist that ends in
+> "replace this, tighten that". EDA should end the same way — in a list of actions, not a folder of
+> pretty charts.
+
+The toy dataset is a churn problem — **churn** means a customer leaving. It has 15,000 customers
+and deliberately planted traps: a noisy high-cardinality `zip_code`, a constant column, and a
+`support_score` that is missing more often for customers who churn.
 
 ```python
 import numpy as np
@@ -46,7 +61,18 @@ print(df.head(3).to_string(index=False))
     56001 basic      15   11.4  south           1.0            NaN      1
 ```
 
+41.8% of customers churn, so the classes are fairly balanced. Already in three rows you can see
+two traps: `constant_col` is 1.0 everywhere, and `support_score` is NaN in two of the three rows.
+
 ## A profile that flags decisions, not statistics
+
+A **profile** is one row per column with the few facts that drive a decision. Instead of printing
+means and quartiles, the function below writes the decision into an `action` column.
+
+The rules it applies: one unique value means drop; text with many distinct values means encode
+(ch. 5); a numeric column whose values are almost all distinct, non-negative and spread over a huge
+range looks like an ID; more than 5% missing means add a **missing indicator** (a 0/1 column that
+says "this value was blank") before filling the blanks.
 
 ```python
 def profile(frame, target):
@@ -85,7 +111,14 @@ print(profile(df, "churn").to_string(index=False))
 support_score float64    8878    0.408         missing 41%: add an indicator before imputing
 ```
 
+Three columns get an action. `zip_code` has 13,833 distinct values in 15,000 rows — that is an ID,
+not a quantity, so "zip 86555 is bigger than zip 67325" means nothing. `constant_col` has a single
+value and can carry no signal. `support_score` is 40.8% missing. The other four columns say "ok".
+
 ### Missingness is a feature until proven otherwise
+
+A blank cell is information: something about the customer caused it to be blank. Before you fill
+blanks with an average, check whether "being blank" predicts the target.
 
 ```python
 miss = df["support_score"].isna()
@@ -100,13 +133,29 @@ churn rate when it is present            : 0.313
 missing share overall                    : 0.408
 ```
 
+Customers with a missing `support_score` churn at 0.569; customers with a score churn at 0.313.
+That 26-point difference is bigger than anything most single features give.
+
 The missingness carries more signal than the column's values will. Impute silently and you throw
 it away; add `support_score_isna` and the model keeps it. This is the single most common free
 score in tabular competitions.
 
+**Imputing** means filling blanks with a guess, such as the column's median.
+
+> **Watch out:** median-imputing without an indicator makes a churner with a blank score look
+> identical to an average customer. The model can no longer see that the value was missing at all.
+
 ## The baseline ladder
 
+Climb from the dumbest possible model upward, one step at a time. Each step's gain tells you where
+the remaining work lives.
+
 Climb four rungs before you tune anything. Each rung answers a question the next one depends on.
+
+The rungs: a **constant** model (predicts 0.5 for everyone, so AUC 0.5 by definition), a logistic
+regression on the single most obvious feature, a logistic regression on everything, and a
+**gradient boosting** model (many small decision trees added together; it can learn curves and
+interactions that a linear model cannot). Every rung is scored with the same 5-fold stratified CV.
 
 ```python
 from sklearn.model_selection import StratifiedKFold
@@ -170,6 +219,10 @@ Read the *gaps*, not the scores:
 - **rung 2 to 3** — how much is non-linear or interaction-driven? A small gap means the problem is
   mostly additive, and your effort belongs in features rather than in a bigger model.
 
+> **Picture it:** a ladder where each rung tells you something about the next. If stepping from
+> rung 2 to rung 3 does not lift you, a taller ladder (a bigger model) is not the fix — you need
+> better footholds (features).
+
 ```python
 print(f"signal exists      (0 -> 1): {results['1. one feature (tenure)'] - 0.5:+.4f}")
 print(f"other features add (1 -> 2): "
@@ -184,10 +237,25 @@ other features add (1 -> 2): +0.0717
 non-linearity adds (2 -> 3): -0.0072
 ```
 
+Tenure alone lifts AUC by +0.1865 above chance, so the signal is real. The other features add
++0.0717 on top. Gradient boosting *loses* 0.0072 against logistic regression: this problem was
+generated from an additive formula (a sum of feature effects), so the linear model already
+matches its shape and the trees bring only extra variance.
+
+> **Watch out:** the `+- 0.0054` spread on each CV score is about the same size as the 0.0072 GBM
+> gap. Do not read a gap that small as "linear is definitely better" — read it as "trees add
+> nothing here".
+
 ## Pick an iteration size from the learning curve
+
+Testing ideas on all the data is slow. Find the smallest sample that still ranks your models in
+the same order, and do most of your experiments there.
 
 You will run hundreds of experiments. Run them on the smallest subsample whose ranking still
 matches the full data.
+
+A **learning curve** is the score plotted against the number of training rows. Here you score both
+model families at four sizes and check whether the winner stays the same.
 
 ```python
 sizes = [1_000, 3_000, 7_000, 15_000]
@@ -216,11 +284,26 @@ Here the ordering is stable from 1,000 rows up — logistic regression wins at e
 competition with 150,000 rows instead of 15,000 would very likely flip this table, and that is
 worth knowing before you write off a model family.
 
+Note how fast logistic regression saturates: 0.7409 at 1,000 rows and 0.7577 at 15,000. The GBM
+gains 0.08 over the same range. Simple models learn quickly and stop; flexible models keep
+improving with data.
+
 The rule: if the *ordering* is stable from some size upward, iterate at that size and re-run only
 the finalists on everything. If the ordering flips as the data grows, you are reading noise and
 the subsample is too small.
 
+## Recap in plain words
+
+- EDA should end in decisions: drop, encode, add a missing indicator, or leave alone.
+- A column that is missing more for one class is a feature; add a 0/1 indicator before imputing.
+- Climb the baseline ladder (constant, one feature, linear, GBM) and read the gaps between rungs.
+- A near-zero or negative linear-to-GBM gap means the work is in features, not in a bigger model.
+- Iterate on the smallest subsample whose model ranking matches the full data.
+
 ## Try it Yourself
+
+`first_look` bundles the profile, a correlation ranking, and a duplicate count into one call — the
+first cell for a new dataset.
 
 ```python
 def first_look(frame, target, id_like=()):
@@ -230,7 +313,8 @@ def first_look(frame, target, id_like=()):
     print(f"\n{len(flagged)} column(s) need a decision:")
     print(flagged[["column", "unique", "missing", "action"]].to_string(index=False))
     num = frame.select_dtypes("number").drop(columns=[target])
-    corr = num.corrwith(frame[target]).abs().sort_values(ascending=False)
+    with np.errstate(invalid="ignore", divide="ignore"):   # constant column -> NaN, no warning
+        corr = num.corrwith(frame[target]).abs().sort_values(ascending=False)
     print(f"\nnumeric columns by |corr| with the target:")
     print(corr.round(4).to_string())
     dupes = int(frame.duplicated().sum())
@@ -247,10 +331,6 @@ shape (15000, 8) | target rate 0.4178
      zip_code   13833    0.000 id-like numeric: treat as categorical or drop (ch. 1)
  constant_col       1    0.000                                        DROP: constant
 support_score    8878    0.408         missing 41%: add an indicator before imputing
-/usr/local/lib/python3.11/dist-packages/numpy/lib/_function_base_impl.py:3023: RuntimeWarning: invalid value encountered in divide
-  c /= stddev[:, None]
-/usr/local/lib/python3.11/dist-packages/numpy/lib/_function_base_impl.py:3024: RuntimeWarning: invalid value encountered in divide
-  c /= stddev[None, :]
 
 numeric columns by |corr| with the target:
 tenure           0.3186
@@ -262,16 +342,29 @@ constant_col        NaN
 fully duplicated rows: 0
 ```
 
+The decision table repeats the three flags from the profile. In the correlation list, `tenure`
+leads with 0.3186 and `constant_col` shows `NaN`: a column that never changes has zero spread, so
+its correlation is undefined — another way the constant column announces itself. `support_score`
+sits at 0.0188, because the values that are present barely matter; its signal lives in the
+missingness, which this list cannot see.
+
 Add the checks your competitions keep needing — a train/test column diff, a per-column
 train-versus-test mean comparison, a date-range print — and this becomes the first cell you paste
 into every new notebook. Try running it before and after adding the missingness indicator to see
 the correlation table change.
+
+Variation to try: run `first_look(df.assign(support_score_isna=df["support_score"].isna().astype(int)), "churn")`
+and see where the new indicator lands in the correlation ranking.
 
 ## Exercise
 
 Write the script you run in the first hour of a competition: profile the data, build the baseline
 ladder, size the iteration subsample from a learning curve, and end with a short memo that states
 what to do next and why. The memo must be generated from the numbers, not written by hand.
+
+> **Hint:** reuse `profile` to find columns to drop, add `_isna` columns for anything noticeably
+> missing, run `cv_auc` for each rung, and turn each gap into one memo line with an `if` that
+> picks the wording.
 
 <details>
 <summary>Solution</summary>
@@ -360,6 +453,10 @@ would set it an order of magnitude lower. The 0.01 non-linearity bar decides whe
 a GBDT at all, and it is the one that saves the most time: when the gap is genuinely near zero, a
 regularised linear model on well-built features trains in seconds, blends beautifully with trees
 (ch. 7), and never overfits a small competition.
+
+On this data the memo says exactly that: non-linearity adds -0.0072, so a linear model plus good
+features may match a GBDT, and the 2,000-row subsample already ranks the two families the same way
+as the full 15,000 rows.
 
 The missingness handling deserves the last word. The script adds an indicator for any column above
 2% missing *before* imputing, which is cheap insurance against exactly the failure this chapter

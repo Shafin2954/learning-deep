@@ -7,10 +7,22 @@ order: 11
 
 ## One number cannot tell you what to do next
 
+A single test score tells you how good the model is, but not where it goes wrong or what to fix.
+Error analysis breaks the mistakes down by group so you can see which problems are worth your time.
+
 A test AUC is a grade, not a work list. Error analysis converts the same predictions into a
 ranked set of actions: *this segment is broken, that one is mislabelled, this third one is fine
 and you should stop looking at it.* The discipline is mechanical — slice, measure, rank by
 impact, act — and it beats another round of tuning almost every time.
+
+> **Picture it:** a teacher who only knows a student's overall grade (C+) cannot help much. The
+> same teacher with a breakdown — perfect at algebra, failing geometry, and every wrong answer on
+> one page smudged by coffee — knows exactly which lesson to give and which page to reprint.
+
+The demo is a fraud model on 12,000 orders, built with three planted problems you should find
+again: the **partner** channel follows its own rules driven by a hidden variable the model never
+sees; the **phone** channel's labels are wrong 18% of the time (a noisy manual process); and
+everything else is ordinary. The model is a **gradient-boosted tree** model (`HistGradientBoostingClassifier`).
 
 ```python
 import numpy as np
@@ -51,13 +63,28 @@ print(f"overall: AUC {roc_auc_score(yte, p):.4f} | accuracy {accuracy_score(yte,
 overall: AUC 0.6769 | accuracy 0.6906 | log loss 0.5820 | fraud rate 0.311
 ```
 
+Overall AUC is 0.6769 and accuracy 0.6906, with 31.1% of test orders being fraud. **Log loss** —
+the average penalty for each predicted probability, large when the model is confidently wrong —
+is 0.5820. Nothing in that line points at the planted problems.
+
 That looks like a decent model. Three separate problems are hiding inside it.
 
 ## Slice, measure, rank by impact
 
+Cut the test set into groups, check how badly the model does in each, and rank the groups by
+how much the *overall* score would improve if you fixed them. A small group with terrible
+results can matter less than a big group with mediocre ones.
+
 The unit of error analysis is a **slice**: a subgroup defined by feature values. For each one you
 need three numbers — the metric inside the slice, the slice's size, and the *impact* if you fixed
 it. Impact is what ranks the work; a terrible slice covering 0.3% of traffic is not your problem.
+
+The report's columns:
+
+- **share** — the slice's fraction of all test rows.
+- **lift** — the slice's error rate divided by the overall error rate (1.44 = 44% worse than average).
+- **headroom** — share times the excess error: how much the *overall* error rate would fall if
+  this slice were brought down to the average. This is the ranking key.
 
 ```python
 def slices_from(frame, max_bins=4):
@@ -111,6 +138,9 @@ device_age in [44, 59) 933 0.2592     0.3280 0.3194 1.0322    0.0026
             country=BR 508 0.1411     0.3346 0.3248 1.0496    0.0022
 ```
 
+The top slice, amounts from 358 to 1,577, has an error of 0.4444 and a headroom of 0.0337: fixing
+it to average would lower the overall error by 3.4 points. `channel=phone` comes second (0.0177).
+
 The `headroom` column is the whole point. It converts "this slice is bad" into "fixing this slice
 moves the overall number by *this much*", which is the only form a stakeholder can prioritise.
 `channel=partner` has a lift of 1.33 and sits sixth, below slices with smaller lifts, because it
@@ -121,7 +151,13 @@ rate of 0.467 — a coin flip — so a high error rate there is mostly *intrinsi
 defect. Any slice whose base rate approaches 0.5 will float to the top of an error-rate ranking
 whether or not anything is wrong with it, which is the first thing to check before assigning work.
 
+> **Watch out:** always set a minimum slice size (`min_support=100` here). Tiny slices have
+> error rates that bounce around by chance and will crowd the top of any "worst slices" list.
+
 ## Three findings, three different fixes
+
+Knowing *where* the model fails is half the job. You also need to know *why*, because a missing
+input, wrong labels, and wrong probabilities each need a different fix.
 
 A high-error slice is a symptom. The diagnosis comes from asking *why* the model is wrong there,
 and each answer implies a different action.
@@ -141,12 +177,19 @@ phone    n= 547 | base rate 0.430 | mean p 0.414 | AUC 0.5871 | error 0.4260
 partner  n= 192 | base rate 0.380 | mean p 0.391 | AUC 0.4721 | error 0.4115
 ```
 
+`web` and `app` look alike (AUC about 0.69, error about 0.27 to 0.29). `phone` drops to AUC 0.5871,
+and `partner` to 0.4721 — below 0.5, no better than guessing.
+
 Two of those channels are broken in completely different ways, and the AUC column separates them.
 `partner` has a poor AUC: **the model cannot rank inside that segment**, because its true driver
 (`hidden`) is not a column. That is a *feature* problem — no amount of tuning fixes a missing
 variable. `phone` also scores badly, but read the next section before deciding why.
 
 ### Is it the model or the labels?
+
+**Label noise** means some of the recorded answers are wrong. A model cannot score well against
+wrong answers, however good it is. The clue is in *how* the model loses: per row, through the
+**row loss** (each row's own log-loss penalty).
 
 ```python
 row_loss = -(yte * np.log(np.clip(p, 1e-9, 1)) + (1 - yte) * np.log(np.clip(1 - p, 1e-9, 1)))
@@ -181,8 +224,14 @@ finds you confident mistakes; averaging loss per slice finds you broken segments
 views, and the mean-loss column is the one that points at label noise.
 
 The `|mean p - base|` column rules out the third possibility: every channel's average prediction
-sits within three points of its actual rate, so nothing here is a calibration failure (ch. 4)
+sits within about three points of its actual rate, so nothing here is a calibration failure (ch. 4)
 that a per-segment adjustment would fix.
+
+> **Picture it:** a student who keeps answering "maybe" scores a steady, middling penalty on every
+> question. A student who answers "definitely yes" and is wrong collects a few huge penalties. The
+> first pattern points at questions that cannot be answered; the second at overconfidence.
+
+Next, how much do the noisy phone labels drag down the headline number?
 
 ```python
 clean = (dte["channel"] != "phone").values
@@ -197,13 +246,24 @@ AUC excluding the noisy set : 0.6802
 AUC on the noisy set alone  : 0.5871
 ```
 
+Removing phone orders raises the AUC from 0.6769 to 0.6802 — a small lift, because phone is only
+15% of rows. Inside the phone slice alone the AUC is 0.5871, and with 18% of its labels flipped,
+it cannot climb much higher.
+
 The ceiling on a segment with flipped labels is not 1.0, and no model will reach past it. Knowing
 that stops you from burning a week on a segment that is already at its noise limit.
 
 ## Cluster the errors when you do not know the slices
 
+Hand-written slices only find problems along lines you already suspected. Grouping the wrong
+predictions by similarity can reveal a group you never thought to look at.
+
 Predefined slices only find problems in dimensions you thought of. Clustering the misclassified
 rows lets the errors group themselves.
+
+**K-means clustering** splits rows into $k$ groups so that rows in a group are close to their
+group's centre. It is run only on the misclassified rows, using the three numeric features
+(amount on a log scale, scaled so each feature counts equally).
 
 ```python
 from sklearn.cluster import KMeans
@@ -234,14 +294,28 @@ print(prof.to_string())
 3  300        541.4          399.0         web                0.333
 ```
 
+Four clusters of about 260 to 300 errors each. The `false_positive_rate` column is the share of a
+cluster's errors that were false alarms; the rest were misses. In clusters 1 (old accounts,
+722 days on average) and 2 (small amounts, 23.3 on average) more than 90% of errors are misses.
+Clusters 0 and 3 (high amounts, over 470) hold most of the false alarms, about a third of their errors.
+
 Each cluster is a candidate slice you did not write down. Read the `false_positive_rate` column
-alongside the profile: a cluster of high-amount, long-lived accounts that the model flags as fraud
-is a different bug from a cluster of new accounts it misses.
+alongside the profile: a cluster of high-amount orders that the model wrongly flags is a different
+bug from a cluster of small orders or long-lived accounts where it misses fraud — one needs a
+higher threshold or a feature that clears good large orders, the other a feature that catches
+quiet fraud.
 
 ## Regression errors: look at the residual structure
 
+The same idea works when the model predicts a number. Group the misses by predicted size and
+check whether the model is consistently too high or too low anywhere, and whether its misses get
+bigger in some range.
+
 For a regressor the same discipline applies to residuals — the question is whether the error is
 *uniform* or *structured*.
+
+The **residual** is truth minus prediction. **Bias** is the mean residual in a bin (positive means
+the model predicts too low); **spread** is their standard deviation.
 
 ```python
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -268,10 +342,23 @@ Q3      -0.015   0.419  450
 Q4 high  0.020   0.417  450
 ```
 
+Every bin's bias is within 0.02 of zero, and the spread stays between 0.417 and 0.433, about the
+0.4 of noise the target was built with. This regressor has no structured error to fix.
+
 Bias near zero in every bin means the model is not systematically over- or under-predicting
 anywhere. A rising `spread` column would say the model is *less certain* at the high end even when
 unbiased — which is a prediction-interval problem (quantile regression, ch. 2), not an accuracy
 problem.
+
+## Recap in plain words
+
+- One overall score hides where and why a model fails; error analysis slices it into groups.
+- Rank slices by headroom (share times excess error), not by how bad they look.
+- Check each slice's base rate: near 50% means hard, not broken.
+- Low AUC inside a categorical slice with honest average predictions suggests a missing feature or
+  noisy labels; a gap between mean prediction and base rate suggests a calibration fix.
+- Worst single rows find confident mistakes; mean loss per slice finds broken segments.
+- Clustering the errors finds slices you did not think to define.
 
 ## Try it Yourself
 
@@ -315,10 +402,17 @@ metric=logloss  overall=0.5820
   channel=partner              n=  192 logloss=0.6980   headroom=0.00619
 ```
 
+Both lists use the same slices but different yardsticks. The error-rate list puts `channel=phone`
+second; the log-loss list moves it to fourth and brings in `channel=partner` at fifth, because log
+loss punishes the uninformed mid-range probabilities those channels get.
+
 The two metrics rank the work differently, and neither ranking is wrong — error rate asks "how
 many decisions are wrong", log loss asks "how badly calibrated are the scores" (ch. 4). Change
 `threshold` to see the error-rate list reshuffle while the log-loss list stays put, which is the
 clearest demonstration that a threshold is a business choice layered on top of a model.
+
+Try this variation: set `threshold=0.3` (closer to the 31% base rate) and compare the top five
+slices with the list above.
 
 ## Exercise
 
@@ -327,6 +421,10 @@ worst slices, estimate the overall-metric gain from fixing it to parity, classif
 using evidence you can compute (ranking failure versus label noise versus simple scarcity), and
 attach the action each cause implies. Then sanity-check the total claimed headroom against what is
 actually achievable.
+
+> **Hint:** test the causes in order — calibration gap first (cheap to fix), then "near 50% base rate
+> in a numeric bin", then low AUC in a categorical slice, then small size. Compute the overlap of the
+> top two slices to see how much the headroom double-counts.
 
 <details>
 <summary>Solution</summary>
@@ -400,6 +498,10 @@ sum of claimed headroom: 0.0919 of an overall error rate of 0.3094
 overlap between the top two slices: 0.0353 of all rows (headroom double-counts any overlap)
 ```
 
+The three mid-range numeric slices are classed "near the decision boundary", the two weak channels
+"cannot rank inside slice". The claimed headroom adds up to 0.0919, but the top two slices share
+3.5% of all rows, so that total counts some errors twice.
+
 Three things this plan gets right, and one it cannot.
 
 It ranks by **headroom**, not by how bad a slice looks, so `channel=partner` — the worst-ranked
@@ -412,6 +514,12 @@ top slice's 0.5791 is not evidence of a ranking failure, and a naive `auc < 0.6`
 sent an engineer hunting for a feature that does not exist. Only categorical slices get the
 "cannot rank" verdict, which is why `phone` and `partner` are the two flagged for feature work.
 Each cause carries an **action**, so the output is a work list rather than a dashboard.
+
+Notice, though, that the rules get `phone` wrong. We planted label noise there, not a missing
+feature, yet both problems look the same to these tests: low AUC inside the slice with an honest
+average prediction. Telling them apart needs the other evidence from this chapter — the
+steady-loss pattern in the worst-200 table — and, finally, a person auditing a sample of phone
+labels. An automated diagnosis is a first guess to verify, not a verdict.
 
 What it cannot do is add up. Slices overlap — the printed overlap between the top two is real
 traffic counted twice — so the summed headroom is an upper bound, not a forecast. Fixing the top

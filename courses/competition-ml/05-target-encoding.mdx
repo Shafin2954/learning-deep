@@ -7,9 +7,24 @@ order: 5
 
 ## The most dangerous useful feature
 
+Some columns are labels with thousands of possible values, like city or product ID. A powerful
+trick turns each value into a number, but done carelessly it hands the model the answers.
+
 A column with 5,000 categories cannot be one-hot encoded and means nothing as an integer. Target
 encoding replaces each category with the mean target inside it — enormously effective, and the
 fastest way to destroy a competition run, because the naive version quietly memorises the labels.
+
+**Target encoding** means: for each category, compute the average of the target (here the share
+of positives) among training rows in that category, and use that average as the feature. The
+**target** is the thing you are predicting.
+
+> **Picture it:** to guess whether a student passes, you look up their school's pass rate. That
+> works well for a school with 300 students. For a "school" with one student — the student you
+> are asking about — the pass rate *is* that student's result. You have not predicted anything;
+> you have peeked.
+
+The data has two categorical columns: `city` (400 levels, each with a real effect on the target)
+and `random_id` (4,000 possible levels, pure noise), plus one numeric feature.
 
 ```python
 import numpy as np
@@ -43,7 +58,17 @@ city: 400 levels, median 50 rows each
 random_id: 3977 levels, median 5 rows each
 ```
 
+`city` has about 50 rows per level — enough to estimate each city's rate reasonably. `random_id`
+has 3,977 levels and only about 5 rows each, so any "rate" computed from it is mostly luck. The
+noise column is the trap.
+
 ## The naive version, and what it does
+
+The naive encoder computes each category's mean on the training set and then uses it as a feature
+for the same training rows. Each row's own label is part of its own feature.
+
+The helper `score_with` trains a model on the encoded columns plus `numeric`, then reports AUC on
+the training rows and on a 30% **holdout** (rows set aside and never used for fitting).
 
 ```python
 def naive_target_encode(train, test, col, y_train):
@@ -72,9 +97,14 @@ naive target encoding | train AUC 0.9217 | holdout AUC 0.5760
 gap: +0.3457
 ```
 
+Training AUC 0.9217 against holdout 0.5760: a gap of 0.3457. The holdout score is barely above
+chance, and far below what the `numeric` column and the city effect alone should give.
+
 The training score is enormous and the holdout score is not. `random_id` has 4,000 levels and no
 relationship to the target whatsoever, but with a handful of rows per level its "mean target" is
 mostly *that row's own label*. The model reads the answer off the feature.
+
+The next cell counts how many noise categories are tiny enough to be pure label copies.
 
 ```python
 tiny = pd.Series(ytr).groupby(Xtr["random_id"].values).agg(["mean", "count"])
@@ -89,12 +119,23 @@ random_id levels with <=2 training rows: 1164 of 3877
 of those, share encoded as exactly 0.0 or 1.0: 80.2%
 ```
 
+1,164 of the 3,877 levels have at most two training rows, and 80.2% of those are encoded as
+exactly 0.0 or 1.0 — that is, the row's own label (or the label it shares with one other row).
+
 A feature that equals the label for thousands of rows is not a feature.
+
+That is about 930 levels and well over a thousand rows carrying a copy of their own answer.
 
 ## Out-of-fold encoding
 
+The fix is to hide each row's own label when you compute its feature. Encode every row using only
+the statistics of other rows.
+
 The fix: to encode a row, use only *other* rows. Split the training data into folds and encode
 each fold from the statistics of the others.
+
+**Out-of-fold** (OOF) means "computed on the folds this row is not in". With 5 folds, each row's
+encoding comes from the other 80% of the training data.
 
 ```python
 def oof_target_encode(train, test, col, y_train, k=5, seed=0, prior_weight=0.0):
@@ -128,20 +169,39 @@ out-of-fold encoding  | train AUC 0.7574 | holdout AUC 0.7370
 gap: +0.0205
 ```
 
+Training AUC falls from 0.9217 to 0.7574, and holdout AUC rises from 0.5760 to 0.7370. The gap
+shrinks from 0.3457 to 0.0205.
+
 The training score collapses to something believable and the holdout score *improves*. Both
 changes are the same fact: the model can no longer read labels, so it spends its capacity on real
 structure.
 
+> **Watch out:** look at the comment in the code: the test set is encoded from *all* the training
+> rows. That is correct, because no test label was ever involved. Only training rows need the
+> out-of-fold treatment.
+
 ## Smoothing: shrink small categories toward the prior
+
+A rate computed from three rows is a wild guess. Smoothing mixes each category's rate with the
+overall rate, and the fewer rows a category has, the more of the overall rate it gets.
 
 A category with three rows should not be trusted as much as one with three hundred. Blend the
 category mean with the global prior, weighted by count:
+
+The **prior** is the overall positive rate in the training data — your best guess when you know
+nothing about the category.
 
 $$
 \mathrm{enc}(c) = \frac{n_c \bar{y}_c + m \bar{y}}{n_c + m}
 $$
 
 where $m$ is the smoothing strength in units of "pseudo-rows of prior".
+
+> **In plain words:**
+> - $n_c$ is the number of rows in category $c$, and $\bar{y}_c$ is their mean target.
+> - $\bar{y}$ is the global mean (the prior).
+> - The formula pretends each category has $m$ extra rows whose target equals the prior, then
+>   takes the average. Few real rows: the pretend rows win. Many real rows: the real data wins.
 
 ```python
 print(f"{'m':>5} {'holdout AUC':>12} {'enc of a 1-row level':>22} {'enc of a 300-row level':>24}")
@@ -168,6 +228,10 @@ print(f"\nprior (global positive rate): {prior:.4f}")
 prior (global positive rate): 0.2044
 ```
 
+Read the "1-row level" column: a category seen once with a positive label is encoded as 1.0 with
+no smoothing, 0.3370 at $m = 5$, and 0.2122 at $m = 100$ — almost the prior of 0.2044. The
+300-row column hardly moves until $m = 100$.
+
 Smoothing is doing two jobs at once. It pulls a one-row category from 1.0 down to 0.34 at $m=5$,
 while a 300-row category barely moves (0.4000 to 0.3968) — the shrinkage is automatically
 proportional to how little you know. Holdout AUC rises monotonically here, from 0.7370 to 0.7415,
@@ -175,6 +239,10 @@ because the noise column has thousands of tiny categories and they all need shri
 cross-validation; on data with fewer rare levels the curve is usually flat between 5 and 50.
 
 ## Leave-one-out, and why it can be worse
+
+Leave-one-out sounds like the perfect compromise: encode each row from every other row in its
+category. The catch is that the formula then contains the row's own label in a way a model can
+undo.
 
 Leave-one-out encoding uses every other row in the *whole* training set, which sounds strictly
 better than five folds. It has a subtle failure: the encoding becomes a deterministic function of
@@ -185,6 +253,15 @@ $$
 $$
 
 A tree can invert that relationship and recover $y_i$ whenever $n_c$ is small.
+
+> **In plain words:** take the category's total of positives, remove this row's own label $y_i$,
+> and divide by the remaining count. Inside one category, every row starts from the same total,
+> so a row with $y_i = 1$ always gets a *lower* number than a row with $y_i = 0$. The difference
+> is the label, written backwards.
+
+> **Picture it:** a class of five shares one grade total. If you tell each student "the average
+> of everyone except you", the students who did well hear a lower number and the students who did
+> badly hear a higher one. Anyone who knows the class total can read off each student's grade.
 
 ```python
 def loo_encode(train, test, col, y_train):
@@ -226,10 +303,20 @@ A tree that first splits on the category and then on the encoding recovers the l
 the holdout AUC lands well below the out-of-fold encoder's while the training AUC sits well above
 it. Leave-one-out needs added noise to be safe; out-of-fold does not.
 
+In numbers: raw correlation +0.0115, within-category correlation -0.7169. Holdout AUC is 0.6927
+against 0.7370 for out-of-fold, and training AUC is 0.8259 against 0.7574.
+
 ## The rule that makes all of this safe
+
+The encoder learns from labels, so it is part of the model. Fit it inside each CV fold, never
+once on all the data beforehand.
 
 Target encoding is a **fitted transformation**, so it belongs inside the cross-validation loop
 like any other (eval-tuning ch. 5). Wrapping it in a transformer makes that automatic.
+
+A **transformer** in scikit-learn is an object with `fit` (learn from data) and `transform`
+(apply what was learned). A **pipeline** chains transformers and a model, so that fitting the
+pipeline on a fold fits every step on that fold only.
 
 ```python
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -281,11 +368,31 @@ print(f"pipeline CV AUC {np.mean(scores):.4f} +- {np.std(scores):.4f}")
 pipeline CV AUC 0.7374 +- 0.0054
 ```
 
+The full-data pipeline scores 0.7374 +- 0.0054 in 5-fold CV — in line with the 0.7370 holdout of
+the hand-built out-of-fold encoder, which is what an honest setup should give.
+
 The pipeline gets it right by construction: `fit_transform` runs on the training fold and produces
 out-of-fold values, while `transform` on the validation fold uses the map fitted on the training
 fold only. Nothing you can forget.
 
+> **Watch out:** the two methods must differ. If `fit_transform` used the full-fit map, every
+> training row would see its own label again, and the leak would return inside the pipeline.
+
+## Recap in plain words
+
+- Target encoding replaces a category with its average target; it is powerful for
+  high-cardinality columns.
+- The naive version lets each row see its own label; on the noise column it pushed training AUC to
+  0.92 and holdout to 0.58.
+- Out-of-fold encoding uses only other folds' rows and closed the gap to 0.02.
+- Smoothing pulls small categories toward the global rate, more so the smaller they are.
+- Leave-one-out leaks inside each category, because subtracting your own label encodes it.
+- Put the encoder inside the CV loop, as a pipeline step, so it is refitted per fold.
+
 ## Try it Yourself
+
+`encoding_report` encodes one column at a time with several smoothing strengths and prints the
+holdout AUC, the leak correlation, and how spread out the encoded values are.
 
 ```python
 def encoding_report(col, prior_weights=(0, 1, 5, 20, 100)):
@@ -319,9 +426,17 @@ column 'random_id' (3877 levels in train)
   m= 100 | holdout AUC 0.6709 | corr(encoding, own label) +0.0052 | encoding spread 0.0065
 ```
 
+For `city`, the leak correlation stays near +0.229 at every $m$: that is real signal, because the
+city really predicts the target. For `random_id`, it stays near zero (+0.003 to +0.005). Watch
+the spread column: heavy smoothing squeezes the noise column's spread from 0.2646 to 0.0065, so
+it becomes almost a constant — which is exactly what a pure-noise column should be.
+
 The `corr(encoding, own label)` column is your leak detector: for an out-of-fold encoding it
 should be small and *positive* for an informative column (the category really does predict) and
 near zero for a noise column. Run the same report on the naive encoder to watch that number jump.
+
+Variation to try: replace `oof_target_encode` with `loo_encode` inside `encoding_report` (drop the
+`prior_weight` argument) and compare the `random_id` holdout AUC with the out-of-fold numbers.
 
 ## Exercise
 
@@ -329,6 +444,10 @@ Compare the four encoders — naive, leave-one-out, out-of-fold, and smoothed ou
 same data, and report for each: the training AUC, the holdout AUC, the optimism gap, and the leak
 correlation on a column known to be pure noise. Then stress-test the winner on categories that
 appear in the test set but never in training.
+
+> **Hint:** wrap each encoder in a lambda that takes a column name, so one `evaluate_encoder`
+> function can score all four. For the stress test, add 10,000 to every test category so none of
+> them exists in training.
 
 <details>
 <summary>Solution</summary>
@@ -387,15 +506,17 @@ encodings all collapsed to the prior 0.2044: True
 
 The table sorts the four encoders by exactly the property that matters, and the `optimism` column
 is the tell. Naive encoding posts a training AUC far above its holdout — that gap *is* the leak,
-measured. Leave-one-out looks less extreme on the gap but carries a negative leak correlation on a
-column of pure noise, which is the more insidious failure: the number does not look wrong until
-you check what it correlates with. Both out-of-fold variants keep the gap modest and the leak
-correlation near zero, and smoothing buys a little more holdout AUC on top.
+measured (and its raw leak correlation on the noise column is 0.5289). Leave-one-out is the more
+insidious failure: its `noise_leak_corr` of +0.0115 looks harmless, because its leak is a strongly
+negative correlation (-0.7169) that only appears *within* each category, as the leave-one-out
+section measured. The number does not look wrong until you check what it correlates with; here its
+optimism of 0.1331, six times the out-of-fold gap, gives it away. Both out-of-fold variants keep the
+gap modest and the leak correlation near zero, and smoothing buys a little more holdout AUC on top.
 
 The stress test answers the question that decides whether this ships: what happens when the test
 set contains categories you have never seen? Every encoding falls back to the prior, the encoded
 columns become constants, and the model lands at 0.6659 against a numeric-only floor of 0.6687 —
-three ten-thousandths below, which is the cost of feeding a tree two constant columns rather than
+0.0028 below, which is the cost of feeding a tree two constant columns rather than
 a real degradation. That fallback is not automatic — it is the `.fillna(prior)` in the encoder, and
 forgetting it produces NaNs at inference time in a competition where the private test set has
 categories the public one did not.

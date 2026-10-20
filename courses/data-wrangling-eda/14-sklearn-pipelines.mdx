@@ -7,6 +7,11 @@ order: 14
 
 ## Why you need Pipelines
 
+A **Pipeline** bundles every preparation step and the model into one object, so that
+"learn from the training data, then apply to new data" happens the same way every time,
+for every step, without you having to remember it. It is the practical cure for the
+preprocessing leakage of ch. 12.
+
 Any transformation that computes statistics from the data (mean, variance, category counts,
 target means) must be fit on training data only and then applied to test data. If you apply
 these transformations outside a Pipeline — even carefully — you will eventually forget to do
@@ -17,7 +22,18 @@ A `Pipeline` is a sequence of `(name, estimator)` pairs. During `fit`, it calls
 `fit_transform` on every step except the last (which gets `fit`). During `predict` or
 `transform`, it calls `transform` on every step except the last (which gets `predict`).
 
+(An **estimator** is any scikit-learn object with a `fit` method: a model, a scaler, an
+imputer. A **transformer** is an estimator that also has `transform`.)
+
+> **Picture it:** an assembly line in a factory. Each station does one job — fill holes,
+> resize, paint — and the line is set up once using sample parts (the training data).
+> After that, every new part goes through the same stations in the same order, with the
+> settings left exactly as they were.
+
 ## Basic Pipeline
+
+The simplest Pipeline chains steps for all columns at once: fill the blanks, scale, then
+classify.
 
 ```python
 import numpy as np
@@ -51,21 +67,36 @@ print(f"CV AUC (5-fold): {auc:.4f}")
 ```
 
 ```output
-Train accuracy: 0.8450
-Test  accuracy: 0.8200
-CV AUC (5-fold): 0.8912
+Train accuracy: 0.8575
+Test  accuracy: 0.7900
+CV AUC (5-fold): 0.9197
 ```
+
+Train accuracy is 0.8575 and test accuracy 0.7900 — a gap worth noting, but on 100 test
+rows a few misclassified rows move accuracy by several points. The CV AUC of 0.9197 comes
+from calling `cross_val_score` on the *whole* pipeline, so every fold re-fits the imputer
+and the scaler on its own training part.
 
 The imputer mean is computed only on each training fold; the same transform is applied to
 the val fold — entirely automated by Pipeline.
 
+> **Watch out:** pass the *pipeline* to `cross_val_score`, not a model plus pre-scaled data.
+> If you scale `X` first and then cross-validate only the model, the leak of ch. 12 is back.
+
 ## ColumnTransformer — different transforms per column
+
+Numbers and categories need different preparation: numbers get filled and scaled,
+categories get filled and one-hot encoded. A **ColumnTransformer** sends each group of
+columns down its own mini-pipeline and glues the results back together side by side.
 
 Real datasets have mixed types: some columns need imputing then scaling, others need imputing
 then one-hot encoding, and tree models may need no scaling at all.
 
 `ColumnTransformer` applies a different `Pipeline` (or single transformer) to each subset of
 columns and horizontally concatenates the results.
+
+> **Picture it:** a sorting office. Letters go to one desk, parcels to another; each desk
+> handles its own kind, and everything is loaded onto the same truck at the end.
 
 ```python
 import numpy as np
@@ -117,18 +148,30 @@ full_pipe = Pipeline([
 ])
 
 full_pipe.fit(X_train, y_train)
-print(f"Test AUC via score: {full_pipe.score(X_test, y_test):.4f}")
+print(f"Test accuracy:      {full_pipe.score(X_test, y_test):.4f}")
 
 cv_auc = cross_val_score(full_pipe, df, y, cv=5, scoring='roc_auc').mean()
 print(f"CV AUC (5-fold):    {cv_auc:.4f}")
 ```
 
 ```output
-Test AUC via score: 0.9253
-CV AUC (5-fold):    0.9271
+Test accuracy:      0.9000
+CV AUC (5-fold):    0.9595
 ```
 
+Test accuracy is 0.9000 and the 5-fold CV AUC is 0.9595. (`pipe.score` reports
+*accuracy* for a classifier; AUC needs `scoring='roc_auc'` as in the CV call.) The single
+`full_pipe` object holds both branches, so fitting it once fitted all four columns'
+preparation steps on the training rows only.
+
+> **Watch out:** `handle_unknown='ignore'` matters. Without it, a category that appears
+> only in the test set — a new region, say — makes `transform` raise an error. With it, that
+> row gets zeros in all the region columns.
+
 ## Inspecting pipeline internals
+
+You can open up a fitted pipeline and read what each step learned. That is how you
+*prove* nothing was fitted on test data.
 
 Verifying that transformers were fit only on training data is easy — check their learned
 parameters:
@@ -168,16 +211,26 @@ print("Match train means:", abs(imp.statistics_ - [X_train['age'].mean(), X_trai
 ```
 
 ```output
-Imputer means:  age=40.12, income=49942.44
-True train means: age=40.12, income=49942.44
-Scaler means:   age=40.12, income=49942.44
+Imputer means:  age=39.25, income=50674.56
+True train means: age=39.25, income=50674.56
+Scaler means:   age=39.25, income=50674.56
 Match train means: True
 ```
 
+The imputer's means (age 39.25, income 50674.56), the scaler's means, and the training
+set's own means are identical, and the check prints `True`. The test rows never touched
+the fitted statistics. `named_transformers_` reaches into the ColumnTransformer and
+`named_steps` reaches into a Pipeline, each by the names you gave the steps.
+
 ## Custom transformers
+
+When no built-in step does what you need, you can write your own — a small class with a
+`fit` method that learns and a `transform` method that applies.
 
 When you need a transform that sklearn doesn't provide, subclass `BaseEstimator` and
 `TransformerMixin`. The `fit` method learns parameters; `transform` applies them.
+(`TransformerMixin` gives you `fit_transform` for free; `BaseEstimator` gives you
+`get_params`, which cloning in CV needs.)
 
 ```python
 import numpy as np
@@ -189,7 +242,7 @@ class LogTransformer(BaseEstimator, TransformerMixin):
     """Apply log(1+x) to all columns."""
 
     def fit(self, X, y=None):
-        self._min = np.min(X, axis=0)  # remember min for validation
+        self.min_ = np.min(X, axis=0)  # learned attrs end in _
         return self
 
     def transform(self, X):
@@ -215,12 +268,33 @@ print(f"Test transformed: {X_test_log.mean():.3f}")
 ```
 
 ```output
-Original mean:    99.4
-After log:        4.143
-Test transformed: 4.183
+Original mean:    105.5
+After log:        4.129
+Test transformed: 4.125
 ```
 
+The training values average 105.5 before the transform and 4.129 after — the log
+squeezed values in the hundreds down to about 4 to 5. The test set gives a similar 4.125,
+transformed with the same object.
+
+> **Watch out:** scikit-learn decides whether a step has been fitted by looking for
+> attributes whose names *end* in an underscore, like `min_`. Name a learned attribute
+> `self._min` (leading underscore) instead, and `pipe.transform` raises `NotFittedError`
+> even after a successful `fit`. Also: never set learned attributes in `__init__`.
+
+## Recap in plain words
+
+- A Pipeline chains preparation steps and a model, and always fits them on training data
+  only.
+- Cross-validate the whole pipeline, so every fold re-learns every step.
+- A ColumnTransformer sends numeric and categorical columns down separate branches.
+- `named_transformers_` and `named_steps` let you read what each fitted step learned.
+- Custom steps need `fit` and `transform`, and learned attributes ending in `_`.
+
 ## Try it Yourself
+
+This is the full recipe on a churn-style table: two numeric and two categorical columns,
+a ColumnTransformer, and a random forest, scored with stratified 5-fold CV.
 
 ```python
 import numpy as np
@@ -259,14 +333,24 @@ print(f"CV AUC: {aucs.mean():.4f} ± {aucs.std():.4f}")
 ```
 
 ```output
-CV AUC: 0.9452 ± 0.0098
+CV AUC: 0.9995 ± 0.0006
 ```
+
+The CV AUC is 0.9995 $\pm$ 0.0006 — nearly perfect. That is not leakage: the target is an
+exact rule on two columns (`tenure > 24` and `spend > 300`) with no noise, and a random
+forest finds those two thresholds easily. The only imperfection comes from the 12% of
+`tenure` values that were blank. Try adding noise to the label — flip 10% of `y` at random
+with `y = np.where(rng.random(n) < 0.1, 1 - y, y)` — and see how far the AUC falls.
 
 ## Exercise
 
 Build a Pipeline for a regression problem: `ColumnTransformer` with a numeric branch
 (`SimpleImputer` + `StandardScaler`) and a categorical branch (`SimpleImputer` +
 `OneHotEncoder`), followed by `Ridge`. Run 5-fold CV and report mean RMSE.
+
+> **Hint:** copy the `preproc` block from the Try-it, swap the classifier for `Ridge()`, and
+> use `scoring='neg_root_mean_squared_error'`. scikit-learn negates error scores so that
+> "higher is better" everywhere — flip the sign back before printing.
 
 <details>
 <summary>Solution</summary>
@@ -308,7 +392,9 @@ print(f"CV RMSE: {(-rmses).mean():.0f} ± {rmses.std():.0f}")
 
 A complete Pipeline ensures every preprocessing step is re-fit on each training fold.
 Checking the `named_steps` of the fitted pipeline would confirm the imputer's `statistics_`
-match the training-fold mean/median — not the full-dataset statistic.
+match the training-fold mean/median — not the full-dataset statistic. When run, the CV RMSE
+is about 15,314 (spread 782 across folds), right at the 15,000 noise level built into `y`:
+the model has found all the structure there is, and the rest is noise no model can remove.
 </details>
 
 ## Under the Trench
@@ -316,10 +402,10 @@ match the training-fold mean/median — not the full-dataset statistic.
 Rare and advanced topics you should at least know the name of. You won't need them daily,
 but you'll stop being surprised when you meet them.
 
-- **Adversarial validation** — train a binary classifier to predict whether a sample is from train or test; AUC significantly above 0.5 means the distributions differ; use it to identify which features are leaking or drifted.
-- **Target/leave-one-out encoding with CV folds** — for each training fold, compute target mean per category using only the OTHER folds; prevents the target from leaking into the categorical feature representation.
-- **Weight of evidence & information value (IV)** — $\text{WoE} = \log(P(\text{event}|cat)/P(\text{non-event}|cat))$; IV $= \sum \text{WoE} \times (P_e - P_{ne})$; IV > 0.3 signals strong predictor; used heavily in credit scoring.
-- **Entity/record linkage & fuzzy joins** — match records without a clean foreign key; Jaccard similarity on token sets, Levenshtein edit distance, blocking (only compare records sharing first letter) to scale.
-- **Imbalanced data: SMOTE family vs class weights** — SMOTE synthesises new minority samples in feature space via interpolation; Borderline-SMOTE focuses on boundary; class weights adjust the loss instead of sampling; SMOTE helps tree models, weights help logistic/SVM.
-- **Great Expectations / data contracts** — define expectations (non-null, value range, regex pattern) as test suites that run in CI; catch schema drift before it corrupts downstream models.
+- **Adversarial validation** — train a binary classifier to predict whether a sample is from train or test; AUC significantly above 0.5 means the distributions differ; use it to identify which features are leaking or drifted. (You met it in ch. 13.)
+- **Target/leave-one-out encoding with CV folds** — for each training fold, compute target mean per category using only the OTHER folds; prevents the target from leaking into the categorical feature representation. (The out-of-fold encoding of ch. 9.)
+- **Weight of evidence & information value (IV)** — $\text{WoE} = \log(P(\text{event}|cat)/P(\text{non-event}|cat))$; IV $= \sum \text{WoE} \times (P_e - P_{ne})$; IV > 0.3 signals strong predictor; used heavily in credit scoring. In plain words: WoE says how much more common the event is in a category than the non-event, on a log scale; IV adds this up over categories into one "how predictive" score.
+- **Entity/record linkage & fuzzy joins** — match records without a clean foreign key; Jaccard similarity on token sets, Levenshtein edit distance, blocking (only compare records sharing first letter) to scale. (Levenshtein distance counts the single-letter edits needed to turn one string into another.)
+- **Imbalanced data: SMOTE family vs class weights** — SMOTE synthesises new minority samples in feature space via interpolation; Borderline-SMOTE focuses on boundary; class weights adjust the loss instead of sampling; SMOTE helps tree models, weights help logistic/SVM. Resample only inside the training folds, or the synthetic rows leak into validation.
+- **Great Expectations / data contracts** — define expectations (non-null, value range, regex pattern) as test suites that run in CI; catch schema drift before it corrupts downstream models. (CI — continuous integration — runs the checks automatically on every change.)
 - **Feature stores & training/serving skew** — if a feature is computed differently at training time (using historical data) vs serving time (using real-time data), predictions degrade silently; feature stores enforce identical computation both ways.

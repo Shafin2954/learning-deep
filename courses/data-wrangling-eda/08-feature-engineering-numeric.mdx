@@ -7,15 +7,34 @@ order: 8
 
 ## Why transform numeric features?
 
+A **feature** is a column the model learns from, and **feature engineering** is reshaping
+or combining columns so the pattern you care about becomes easy to see. A model can only
+use what its maths can express; a good transform hands it the pattern in a form it can
+use.
+
 Most linear models assume a linear relationship between features and target — and that error
 variance is constant. Right-skewed features, multiplicative relationships, and bounded counts
 violate these assumptions. Numeric feature engineering turns awkward distributions into
 model-friendly ones and creates new signals your model can't find from raw values alone.
 
+(**Error variance** is how spread out the model's mistakes are; "constant" means the
+mistakes are about as big for small values as for large ones.)
+
+> **Picture it:** a straight-edge ruler can only draw straight lines. If the true shape
+> is a curve, you can either buy a curved ruler (a fancier model) or bend the paper first
+> so the curve becomes straight (a transform). Feature engineering is bending the paper.
+
 ## Binning
+
+**Binning** sorts a number into labelled buckets — ages 18 to 30, 31 to 43, and so on — so
+the model treats each bucket as one group.
 
 Binning discretises a continuous feature into categorical bins. Use it when you believe the
 relationship with the target is step-like (e.g., age brackets, credit score tiers).
+
+There are two common ways to choose the bucket edges. **Uniform-width** bins (`pd.cut`)
+make every bucket the same size in value. **Quantile** bins (`pd.qcut`) make every bucket
+hold the same number of rows.
 
 ```python
 import pandas as pd
@@ -41,32 +60,51 @@ print(df['age_bin_uniform'].value_counts().sort_index())
 
 ```output
    age age_bin_uniform age_bin_quantile
-0   66           57-69               Q4
-1   30           18-30               Q1
-2   59           57-69               Q3
-3   52           44-56               Q3
-4   62           57-69               Q4
-5   23           18-30               Q1
-6   33           31-43               Q2
-7   75           70-80               Q4
+0   70           70-80               Q4
+1   57           57-69               Q3
+2   49           44-56               Q2
+3   34           31-43               Q1
+4   37           31-43               Q2
+5   20           18-30               Q1
+6   22           18-30               Q1
+7   19           18-30               Q1
 
 Uniform bin counts:
 age_bin_uniform
-18-30    119
-31-43    114
-44-56    130
-57-69    100
-70-80     37
-dtype: int64
+18-30    100
+31-43     81
+44-56    100
+57-69     99
+70-80    120
+Name: count, dtype: int64
 ```
 
+The uniform counts range from 81 to 120 rows per bin, even though every bin spans the same
+width of ages. The quantile bins split the rows into four groups of roughly 125 (the exact
+counts are 133, 120, 127, 120 — ages are whole numbers, so tied values can't be split
+across a boundary).
+
 Uniform bins produce unequal counts; quantile bins produce equal counts. Quantile bins are
-better for tree-based models because they create balanced splits.
+better for tree-based models because they create balanced splits — though trees can also
+find their own split points on the raw numbers, so binning is mostly useful for linear
+models and for making a feature readable.
+
+> **Watch out:** the labels you pass to `pd.cut` are names only — pandas does not check
+> them. With `bins=5` on ages 18 to 79 the real edges are 30.2, 42.4, 54.6, and 66.8, so
+> age 57 lands in the bin labelled `'57-69'` while its true range is 54.6 to 66.8, and a
+> 55-year-old would get the same label. Pass explicit edges such as
+> `bins=[17, 30, 43, 56, 69, 80]` when the labels must be correct.
 
 ## Log transform — taming right skew
 
+A **log transform** replaces each value with its logarithm, which turns "times 10" into
+"plus 1". Big values get squeezed together; small ones spread apart.
+
 For right-skewed positive data, $\log(x + 1)$ compresses large values and stretches small
 ones, making the distribution more symmetric.
+
+> **Picture it:** on a log scale, 10, 100, 1,000 and 10,000 are equally spaced. A
+> billionaire stands a few steps from a millionaire instead of a thousand miles away.
 
 ```python
 import numpy as np
@@ -91,18 +129,37 @@ print(f"Log     — mean: {log_income.mean():.2f}, std: {log_income.std():.2f}, 
 ```
 
 ```output
-Income  — mean: 40189, std: 40442, skew: 2.02
-Log     — mean: 10.30, std: 1.00, skew: -0.10
-[Figure: before/after histogram showing right-skewed → near-normal distribution]
+Income  — mean: 40336, std: 41158, skew: 2.13
+Log     — mean: 10.03, std: 1.24, skew: -0.87
 ```
 
+Before: skew 2.13, with the standard deviation (41,158) as big as the mean (40,336) — a
+long right tail. After: the values sit around 10.03 with a spread of 1.24, and the skew is
+-0.87. Notice the sign flipped. The log over-corrected: the exponential distribution has
+many values near zero, and the log stretches those out into a *left* tail.
+
+> **Watch out:** "log fixes skew" is a rule of thumb, not a law. It works best on
+> log-normal data (where it gives a skew near 0). Always print the skew after transforming;
+> when the log over-corrects like here, a power transform with a fitted $\lambda$ does
+> better.
+
 ## Box-Cox and Yeo-Johnson power transforms
+
+A **power transform** raises the data to some power — square root is power 0.5 — and
+picks the power that makes the result look most like a bell curve. The log is one member
+of this family.
 
 Box-Cox finds the optimal power $\lambda$ that best normalises the data via MLE:
 
 $$
 x^{(\lambda)} = \begin{cases} \frac{x^\lambda - 1}{\lambda} & \lambda \neq 0 \\ \log x & \lambda = 0 \end{cases}
 $$
+
+> **In plain words:** raise $x$ to the power $\lambda$, subtract 1, divide by $\lambda$.
+> When $\lambda = 1$ the shape doesn't change; $\lambda = 0.5$ is a square root; and as
+> $\lambda$ shrinks to 0, the formula smoothly becomes $\log x$. **MLE** (maximum
+> likelihood estimation) picks the $\lambda$ under which the transformed data looks most
+> like a normal distribution.
 
 Requires $x > 0$. Yeo-Johnson extends it to handle zero and negative values.
 
@@ -132,24 +189,38 @@ print(f"Input had negatives: {(x_mixed < 0).sum()} values below 0")
 ```
 
 ```output
-Box-Cox λ:       0.241
-Box-Cox output — skew: 0.009
+Box-Cox λ:       0.273
+Box-Cox output — skew: -0.054
 
-Yeo-Johnson λ:   0.532
-Yeo-Johnson output — skew: -0.013
-Input had negatives: 167 values below 0
+Yeo-Johnson λ:   0.290
+Yeo-Johnson output — skew: 0.066
+Input had negatives: 180 values below 0
 ```
+
+Box-Cox picked $\lambda = 0.273$, between a log (0) and a square root (0.5), and the
+result has skew -0.054. Yeo-Johnson picked 0.290 on data where 180 of 500 values were
+negative — Box-Cox would have refused that column — and reached skew 0.066.
 
 Both transforms produce near-zero skew. `PowerTransformer` fits the optimal $\lambda$ on
 training data and applies the same transform to test data — always use it inside a Pipeline.
+(It also standardises the output to mean 0 and standard deviation 1 by default.)
 
 ## Polynomial features and interactions
+
+Some patterns are about *combinations*: an area of 100 m² means one thing in a 1-room flat
+and another in a 5-room house. An **interaction** feature multiplies (or divides) columns
+so the model can see a combination directly. **Polynomial features** add squares,
+products, and higher powers of the inputs.
 
 Polynomial features capture non-linear structure and feature interactions:
 
 $$
 [x_1, x_2] \xrightarrow{\text{degree=2}} [1, x_1, x_2, x_1^2, x_1 x_2, x_2^2]
 $$
+
+> **In plain words:** with degree 2, two inputs become six columns: a constant 1, each
+> input on its own, each input squared, and the product $x_1 x_2$. That product is the
+> interaction: it is large only when both inputs are large together.
 
 ```python
 import numpy as np
@@ -172,28 +243,47 @@ print(X_poly.round(3))
 
 ```output
 Original X:
-[[ 1.76  0.4 ]
- [ 0.98  2.24]
- [ 1.87 -0.98]
- [-0.98  0.95]
- [-0.15 -0.1 ]
- [ 0.41  0.14]]
+[[ 2.04 -2.56]
+ [ 0.42 -0.57]
+ [-0.45 -0.22]
+ [-2.02 -0.23]
+ [-0.87  3.32]
+ [ 0.23 -0.35]]
 
 After PolynomialFeatures(degree=2): shape (6, 5)
 Feature names: ['x1' 'x2' 'x1^2' 'x1 x2' 'x2^2']
-[[ 1.76   0.4    3.098  0.704  0.16 ]
- [ 0.98   2.24   0.96   2.195  5.018]
- [ 1.87  -0.98   3.497 -1.833  0.96 ]
- [-0.98   0.95   0.96  -0.931  0.903]
- [-0.15  -0.1    0.023  0.015  0.01 ]
- [ 0.41   0.14   0.168  0.057  0.02 ]]
+[[ 2.04  -2.56   4.162 -5.222  6.554]
+ [ 0.42  -0.57   0.176 -0.239  0.325]
+ [-0.45  -0.22   0.202  0.099  0.048]
+ [-2.02  -0.23   4.08   0.465  0.053]
+ [-0.87   3.32   0.757 -2.888 11.022]
+ [ 0.23  -0.35   0.053 -0.08   0.122]]
 ```
+
+With `include_bias=False` the constant 1 is dropped, so 2 columns became 5. Check the first
+row: $2.04^2 = 4.162$, $2.04 \times (-2.56) = -5.222$, and $(-2.56)^2 = 6.554$.
 
 With 10 input features at degree 2, you get 65 output features. At degree 3 with 10 features,
 you get 285. Use polynomial features only when you have a specific hypothesis about
 interactions, not as a blanket approach.
 
+> **Watch out:** the count grows fast — 10 inputs make 65 columns at degree 2 (10 originals,
+> 10 squares, 45 pairwise products), and 285 at degree 3. More columns than you have rows
+> to support them is a recipe for overfitting.
+
+## Recap in plain words
+
+- Transforms reshape a column so a simple model can use the pattern in it.
+- Bins turn numbers into groups; `qcut` makes equal-count groups, `cut` equal-width ones,
+  and your labels must match the real edges.
+- A log squeezes long right tails, but can over-correct into a left tail.
+- Box-Cox (positive data only) and Yeo-Johnson (any sign) fit the best power for you.
+- Interaction and polynomial features expose combinations, but the column count explodes.
+
 ## Try it Yourself
+
+This compares the original skew of transaction amounts with a log and a Yeo-Johnson
+transform.
 
 ```python
 import numpy as np
@@ -224,11 +314,15 @@ print(f"Yeo-Johnson skew:  {pd.Series(yj_amt).skew():.2f}")
 ```
 
 ```output
-Original skew:     2.02
-Log skew:          0.02
-Yeo-Johnson skew:  -0.01
-[Figure: three histograms showing progressive normalisation of skewed data]
+Original skew:     1.96
+Log skew:          -0.89
+Yeo-Johnson skew:  -0.04
 ```
+
+The log takes skew from 1.96 to -0.89 — over-correcting again, as with income above.
+Yeo-Johnson lands at -0.04, almost perfectly symmetric, because it fits its power to this
+data instead of always using the log. Try `rng.lognormal(5, 1, n)` instead of the
+exponential: for log-normal data, the plain log should win.
 
 ## Exercise
 
@@ -236,6 +330,9 @@ Given a DataFrame with `price` (log-normal), `area` (normal), and `rooms` (integ
 (a) Apply log(1+price) and verify skew drops below 0.5.
 (b) Create an interaction term `area_per_room = area / rooms`.
 (c) Create quantile bins for `price` with 5 bins, and print the count in each.
+
+> **Hint:** a log-normal variable is `np.exp` of a normal one, so its log is normal again.
+> For (c), `pd.qcut(..., q=5)` does the binning.
 
 <details>
 <summary>Solution</summary>
@@ -268,5 +365,7 @@ print(f"\nQuantile bin counts:\n{df['price_q5'].value_counts().sort_index()}")
 
 Log transform brings skew below 0.5. `area_per_room` is a domain-motivated interaction —
 a 20-room flat of 80m² is very different from a 2-room flat of 80m². Quantile bins produce
-~80 rows per bin regardless of the distribution shape.
+~80 rows per bin regardless of the distribution shape. When run, the skew drops from 4.55
+to -0.04, and every bin holds exactly 80 rows. Unlike the exponential examples above,
+log-normal data is the case where the log transform is exactly right.
 </details>

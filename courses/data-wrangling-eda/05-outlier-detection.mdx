@@ -7,6 +7,11 @@ order: 5
 
 ## Why outliers demand investigation, not deletion
 
+An **outlier** is a value that sits far away from the rest — a 200 in a column where
+almost everything is between 30 and 70. Some outliers are mistakes; some are the most
+important rows in the dataset. Finding them is easy; deciding what they *are* is the real
+work.
+
 An outlier is any observation that deviates markedly from the bulk of the data. Before acting,
 you need to know *why* it's there:
 
@@ -16,13 +21,25 @@ you need to know *why* it's there:
 
 Deleting outliers without understanding them corrupts the model's view of the real world.
 
+> **Picture it:** a smoke alarm going off. It might be a burnt toast (a harmless glitch) or a
+> real fire (the thing you most need to know about). Ripping the alarm off the wall every
+> time it beeps is the "delete all outliers" strategy.
+
 ## IQR-based fences
 
-The interquartile range (IQR = Q3 − Q1) is robust to outliers by definition, so using it to
-detect outliers avoids the circularity of mean-based methods.
+The plain idea: find the middle half of the data, measure how wide it is, and call anything
+that lands far outside that band suspicious. Because the middle half ignores the extremes,
+the extremes cannot drag the band around.
+
+The **quartiles** split sorted data into four equal parts: **Q1** is the value 25% of the way
+up and **Q3** the value 75% of the way up. The interquartile range (IQR = Q3 − Q1) is robust
+to outliers by definition, so using it to detect outliers avoids the circularity of
+mean-based methods. **Robust** means a few wild values barely change it.
 
 - **Mild outlier:** $x < Q1 - 1.5 \cdot \text{IQR}$ or $x > Q3 + 1.5 \cdot \text{IQR}$.
 - **Extreme outlier:** $x < Q1 - 3 \cdot \text{IQR}$ or $x > Q3 + 3 \cdot \text{IQR}$.
+
+These limits are called **fences**: points beyond them are flagged.
 
 ```python
 import pandas as pd
@@ -48,12 +65,25 @@ print(f"Outliers detected ({len(outliers)}): {outliers.values}")
 ```
 
 ```output
-Q1=43.5, Q3=56.5, IQR=13.0
-Fences: [24.0, 76.0]
-Outliers detected (5): [150. -30. 200. -50. 180.]
+Q1=42.7, Q3=57.0, IQR=14.4
+Fences: [21.1, 78.6]
+Outliers detected (8): [150.         -30.         200.         -50.          80.66036739
+  18.93663199 180.          20.63954554]
 ```
 
+The middle half spans 42.7 to 57.0 (IQR 14.4), so the fences sit at 21.1 and 78.6. All 5
+planted values were caught — 150, -30, 200, -50, 180 — but so were 3 ordinary points:
+80.66, 18.94, and 20.64. Those are honest draws from the normal distribution's tails.
+
+> **Watch out:** the 1.5-IQR rule flags about 0.7% of perfectly normal data. In 300 rows
+> that is around 2 false alarms; in a million rows it is about 7,000. Flagged does not mean
+> wrong.
+
 ## Z-score and its weakness
+
+A **z-score** says how many standard deviations a value is from the mean. The problem: the
+mean and standard deviation are themselves pulled toward the outliers, so the ruler you
+measure with is bent by the thing you are measuring.
 
 The z-score $z = (x - \mu) / \sigma$ is corrupted by the very outliers you're trying to detect:
 the mean and std shift toward them, making extreme values look less extreme.
@@ -73,16 +103,30 @@ print(f"Std inflated to: {data.std():.1f} (true: ~10)")
 ```
 
 ```output
-True outlier z-scores: 14.96, 17.96
+True outlier z-scores: 10.66, 13.04
 Threshold |z| > 3 catches them: 2 observations
-Mean shifted to: 52.0 (true: ~50)
-Std inflated to: 29.2 (true: ~10)
+Mean shifted to: 52.3 (true: ~50)
+Std inflated to: 42.0 (true: ~10)
 ```
 
+Two values out of 300 inflated the standard deviation from about 10 to 42.0 and moved the
+mean from about 50 to 52.3. Here $|z| > 3$ still catches both, but look at how much they
+shrank: measured with the true spread, 500 sits $(500 - 50)/10 = 45$ standard deviations
+out. With the inflated spread it scores only 10.66.
+
 With heavy enough outliers the z-score threshold may miss them because the std inflates so
-much that even extreme values look like they're within 3 std of the mean.
+much that even extreme values look like they're within 3 std of the mean. This
+**masking** gets worse with more outliers or fewer rows: with many outliers, each one
+props up the spread that hides the others.
+
+> **Watch out:** in a sample of $n$ points, no z-score can exceed $(n-1)/\sqrt{n}$ (using
+> the sample standard deviation, as pandas does) or $\sqrt{n-1}$ (using NumPy's default).
+> With 10 rows those caps are 2.85 and 3.0, so the $|z| > 3$ rule can never flag anything.
 
 ### Modified z-score — robust alternative
+
+The fix is to build the ruler from robust pieces: the median instead of the mean, and the
+median distance from the median instead of the standard deviation.
 
 Replace mean with median and std with MAD (median absolute deviation):
 
@@ -92,6 +136,14 @@ $$
 
 where $\text{MAD} = \text{median}|x_i - \tilde{x}|$ and 0.6745 makes the scale consistent
 with the standard deviation for normal data.
+
+> **In plain words:**
+> - $\tilde{x}$ is the median of the data.
+> - $x_i - \tilde{x}$ is how far point $i$ is from the median.
+> - **MAD** (median absolute deviation) is the typical such distance, taken with a median so
+>   the outliers can't inflate it.
+> - Multiplying by 0.6745 rescales it so that, on normal data, $\tilde{z}_i$ reads like an
+>   ordinary z-score. The usual cut-off is $|\tilde{z}_i| > 3.5$.
 
 ```python
 import numpy as np
@@ -110,17 +162,30 @@ print(f"|mz| > 3.5 detects: {(np.abs(mz) > 3.5).sum()} outliers")
 ```
 
 ```output
-Median: 49.9, MAD: 9.6
-Modified z-scores of outliers: 31.4, 37.7
+Median: 49.3, MAD: 7.3
+Modified z-scores of outliers: 41.5, 50.8
 |mz| > 3.5 detects: 2 outliers
 ```
+
+The median (49.3) and MAD (7.3) look like the clean data's centre and spread — the two
+planted values did not move them. Measured with that ruler, the outliers score 41.5 and
+50.8, close to their "true" distance, and the $3.5$ cut-off flags exactly those 2.
 
 The modified z-score is unaffected by the outliers themselves.
 
 ## Isolation Forest — multivariate detection
 
-For multivariate data, the Isolation Forest isolates anomalies by recursively random-splitting
-features. Outliers are isolated with fewer splits (shorter path length).
+Some outliers are only strange as a *combination*: a 2-metre-tall person is unusual, and a
+40-kg adult is unusual, but a 2-metre, 40-kg adult is far stranger than either. Checking
+one column at a time can miss that.
+
+For multivariate data, the **Isolation Forest** isolates anomalies by recursively
+random-splitting features. Outliers are isolated with fewer splits (shorter path length).
+
+> **Picture it:** a game of "guess who" with random yes/no questions such as "is x above
+> 2.3?". A loner standing in an empty corner is singled out after two or three questions; a
+> person in the middle of the crowd needs many. The forest plays the game hundreds of times
+> and flags whoever gets singled out fastest on average.
 
 ```python
 import numpy as np
@@ -149,7 +214,18 @@ Outliers found: 15
 True positives (planted): 10 / 10
 ```
 
+All 10 planted corner points were flagged (10 / 10). The forest flagged 15 in total because
+`contamination=0.05` tells it to flag 5% of 300 rows — so 5 ordinary points were flagged
+to fill the quota.
+
+> **Watch out:** `contamination` is your guess of the outlier share, and the model flags
+> exactly that share. Set it too high and you get false alarms; too low and real outliers
+> slip through. It is a decision, not something the model learns.
+
 ## Treatment options
+
+Once a value is flagged and investigated, you can cap it, delete it, mark it, or leave it
+alone. Each choice changes your statistics differently.
 
 Once you've identified outliers, choose from four approaches — and record your reasoning:
 
@@ -159,6 +235,9 @@ Once you've identified outliers, choose from four approaches — and record your
 | **Remove** row | Strong evidence of recording error; small fraction |
 | **Flag** as feature | Outlier may carry signal (fraud, failure) |
 | **Leave** as-is | Tree models handle them; removing introduces bias |
+
+**Clipping** (also called **capping** or **winsorizing**) replaces each value beyond a fence
+with the fence value itself.
 
 ```python
 import pandas as pd
@@ -184,14 +263,33 @@ print(f"Removed   — mean: {s_drop.mean():.1f}, std: {s_drop.std():.1f}, n={len
 ```
 
 ```output
-Original  — mean: 101.7, std: 37.9, n=500
-Clipped   — mean: 100.4, std: 14.5, n=500
-Removed   — mean: 100.3, std: 14.3, n=497
+Original  — mean: 101.7, std: 41.3, n=500
+Clipped   — mean: 100.2, std: 15.4, n=500
+Removed   — mean: 100.4, std: 14.8, n=494
 ```
 
-Clipping preserves sample size; removing reduces it. Both recover the true std ≈ 15.
+Three bad values pushed the standard deviation from about 15 to 41.3. Clipping kept all 500
+rows and brought it back to 15.4; removing dropped 6 rows (the 3 planted errors plus 3
+natural tail points) and gave 14.8.
+
+Clipping preserves sample size; removing reduces it. Both recover the true std
+$\approx 15$.
+
+## Recap in plain words
+
+- Investigate every outlier: typo, real rare event, or units mix-up each need a different
+  fix.
+- IQR fences use the middle half of the data, so the outliers can't move them.
+- Plain z-scores are distorted by the outliers they hunt; use the modified z-score with the
+  median and MAD.
+- Isolation Forest finds rows that are odd as a combination of columns, and flags exactly
+  the `contamination` share you ask for.
+- Clip to keep rows, remove for confirmed errors, flag when the oddness itself is a signal.
 
 ## Try it Yourself
+
+Eight "bot" rows with huge revenue *and* huge session counts are planted in 400 normal
+rows. You compare a one-column IQR check with a two-column Isolation Forest.
 
 ```python
 import pandas as pd
@@ -222,9 +320,15 @@ print(f"IsoForest detected: {iso_flag.sum()} outliers, TP: {iso_flag[:8].sum()}/
 ```
 
 ```output
-IQR detected: 8 outliers, TP: 8/8
+IQR detected: 14 outliers, TP: 8/8
 IsoForest detected: 12 outliers, TP: 8/8
 ```
+
+Both methods caught all 8 bots (`TP: 8/8`, where **TP** — true positives — counts real
+outliers correctly flagged). The difference is in false alarms: IQR flagged 14 rows, so 6
+normal ones; the forest flagged 12 (its 3% quota), so 4 normal ones. Try making the bots
+subtler — revenue around 1,600 and sessions around 90, each only mildly high — and watch
+which method keeps finding them.
 
 ## Exercise
 
@@ -234,6 +338,10 @@ values at 500000, -10000, 999999, and -5000. Use:
 (b) modified z-score (threshold 3.5) to detect outliers,
 (c) clip the series to the IQR fences.
 Report how many each method finds and the mean/std before and after clipping.
+
+> **Hint:** reuse the code from the IQR and modified z-score sections; the only new step is
+> `s.clip(lower, upper)`. Expect both detectors to flag *more* than 4 values, and check which
+> extra ones they pick.
 
 <details>
 <summary>Solution</summary>
@@ -266,7 +374,9 @@ print(f"\nBefore clip — mean: {s.mean():.0f}, std: {s.std():.0f}")
 print(f"After clip  — mean: {s_clipped.mean():.0f}, std: {s_clipped.std():.0f}")
 ```
 
-Both IQR and modified z-score should catch all 4 planted outliers. Clipping brings the mean
-and std close to the true 60000 and 8000. The key insight: always investigate *why* values
-are extreme before deciding on treatment.
+Both IQR and modified z-score catch all 4 planted outliers — and more: when run, IQR
+flags 10 values and the modified z-score 6, the extras being genuine tail salaries.
+Clipping brings the mean and std close to the true 60000 and 8000: from 62263 / 47305
+before to 59810 / 8221 after. The key insight: always investigate *why* values are extreme
+before deciding on treatment — here 6 of IQR's 10 flags are real people.
 </details>

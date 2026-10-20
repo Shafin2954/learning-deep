@@ -7,9 +7,24 @@ order: 5
 
 ## The only question CV answers
 
+Cross-validation is a rehearsal for launch day. It is only useful if the rehearsal looks like
+the real thing: the data the model is tested on must be "new" in the same way production data
+will be new.
+
+**Cross-validation (CV)** splits the data into $k$ parts called **folds**; it trains on $k-1$ of
+them and scores on the one left out, rotating until every fold has been the test once, then
+averages the $k$ scores.
+
 Cross-validation estimates *how well this procedure generalizes to data drawn the way your test
 data will be drawn*. Every pitfall in this chapter is the same mistake: the folds do not
 resemble the deployment split, so the number is optimistic and nobody finds out until launch.
+
+> **Picture it:** a driving test. If the examiner lets you practise on the exact route the test
+> will use, you pass easily — and then get lost on your first real drive. Each pitfall below is a
+> way of accidentally practising on the test route.
+
+The setup is a synthetic dataset of 3,000 rows and 30 features where only the first 5 features
+carry signal.
 
 ```python
 import numpy as np
@@ -33,11 +48,22 @@ print(f"X {X.shape} | positive rate {y.mean():.3f}")
 X (3000, 30) | positive rate 0.496
 ```
 
+The two classes are almost balanced (49.6% positive), so accuracy is a fair metric for the demos
+that use this data.
+
 ## Pitfall 1: preprocessing outside the folds
+
+Anything that looks at the data to decide something — the mean for scaling, which columns to keep
+— is part of the model. If it looks at the test fold, the test fold is no longer a surprise.
 
 Any step that *learns* from the data — scaling, imputation, target encoding, feature selection —
 must be fitted inside each fold. Fit it once on everything and the validation rows have already
 influenced the transform.
+
+This mistake is called **leakage**: information from the validation rows "leaks" into training.
+The demo uses **feature selection** (keep the 5 columns most correlated with the label) on data
+with 2,000 columns of pure noise and only 300 rows. A **Pipeline** chains a scaler and a model so
+both are fitted together on the training fold only.
 
 ```python
 def kfold_indices(n, k, seed=0):
@@ -77,15 +103,33 @@ pure noise, 2,000 features, 300 rows:
   selection inside each fold  : accuracy 0.497 +- 0.041   (chance = 0.510)
 ```
 
+There is nothing to learn, so an honest score must sit at chance (0.510, the share of the bigger
+class). Selection done inside each fold scores 0.497 — chance, as it should be. Selection done
+once on all 300 rows scores 0.660: a 15-point "improvement" built out of nothing.
+
 There is no signal in that data whatsoever, and selecting features on the full set manufactures
 a model that looks better than chance. This is the single most common way a Kaggle notebook or a
 research result turns out to be nothing.
 
+> **Watch out:** with 2,000 noise columns, some will correlate with the label by pure luck. Picking
+> the luckiest 5 using *all* the rows means picking columns that happen to fit the validation rows
+> too. Use a Pipeline (or redo selection per fold) so the luck cannot follow you into validation.
+
 ## Pitfall 2: ignoring groups
+
+If the same person appears many times in your data, a random split puts some of their rows in
+training and some in testing. The model then recognises the person instead of learning
+anything that works for strangers.
 
 When rows are not independent — several visits per patient, several sessions per user, several
 photos of the same object — random folds put the *same entity* on both sides of the split. The
 model then wins by recognising the entity, not by learning anything transferable.
+
+The fix is **group k-fold**: assign whole entities (all of one user's rows) to a single fold. The
+demo makes 300 users with 10 rows each. Each user has a hidden tendency that pushes their labels
+up or down, and six feature columns that act as a **fingerprint** (they are almost the same on
+every row of that user). The model is **k-nearest neighbours (KNN)**, which predicts the label of
+the 5 most similar training rows.
 
 ```python
 from sklearn.neighbors import KNeighborsClassifier
@@ -129,6 +173,9 @@ grouped 5-fold: accuracy 0.5980 +- 0.0307
 optimism from ignoring groups: +0.2433
 ```
 
+Random folds report 0.8413 accuracy; grouped folds report 0.5980. The gap of +0.2433 is the
+"recognise the user" bonus — it will not exist on launch day for new users.
+
 Both numbers are honest measurements of *different questions*. Random folds answer "another
 session from a user I have already seen" — the nearest neighbour is usually the same person, so
 the model just copies their previous label. Grouped folds answer "a user I have never seen",
@@ -140,7 +187,20 @@ Note that the leak survives dropping the obvious ID column. The fingerprint here
 feature columns; nothing is labelled `user_id`. Any set of features that identifies the entity
 will do it.
 
+> **Picture it:** a quiz where some questions are repeated from the practice sheet with the answers
+> already filled in. Your score is high, but it measures memory, not understanding.
+
 ## Pitfall 3: shuffling time
+
+When the data is a sequence in time, shuffling lets the model peek at tomorrow while being
+tested on today. In production it only ever has the past.
+
+The demo is a **random walk** — a series that drifts up and down by small random steps, like a
+stock price — plus noise. A ridge regression (a linear model with a small penalty on large
+weights) is fitted on two features: the time index and a seasonal sine wave.
+
+The honest splitter is **rolling-origin** CV: train on the first stretch, test on the stretch
+right after it, then grow the training window and repeat. The test fold is always in the future.
 
 ```python
 def time_series_data(n=2_000, seed=2):
@@ -175,18 +235,37 @@ random k-fold on a time series : RMSE 2.3006
 rolling-origin (past -> future): RMSE 3.4404   per fold [1.84, 4.81, 3.42, 4.47, 2.66]
 ```
 
+Random k-fold reports RMSE 2.3006; rolling-origin reports 3.4404. Look at the per-fold list:
+the errors swing from 1.84 to 4.81 depending on which period is being forecast.
+
 Random folds let the model fit a trend line through the whole span and then *interpolate* between
 neighbouring timestamps; production only ever asks it to extrapolate past the end of the training
 data, which is 50% worse here. The per-fold numbers matter as much as the mean: they range from
 1.84 to 4.81 because the walk drifts more in some periods than others. A single averaged
 time-series score hides exactly the regime risk you are trying to measure.
 
+> **Watch out:** **interpolate** means "fill in a gap between known points"; **extrapolate**
+> means "guess beyond the last known point". The first is much easier. Random folds on time data
+> quietly turn a forecasting test into a gap-filling test.
+
 ## Pitfall 4: tuning on the same folds you report
+
+If you try 25 settings and report the best score, part of that score is luck: one of 25 noisy
+measurements will come out high by chance. The best of many is always too optimistic.
 
 Selecting a hyperparameter by CV score and then reporting that same score is **selection bias**:
 you have chosen the maximum of a noisy quantity, so it is biased upward. The clean way to see it
 is to re-score the winner on a *different fold assignment* of the same data. Both numbers estimate
 the same thing; only the first one was maximised over.
+
+A **hyperparameter** is a setting you choose before training, such as `C`, the strength of the
+penalty in logistic regression (small `C` = strong penalty). The demo draws 25 random values of
+`C` between $10^{-4}$ and $10^{2}$, tunes on one set of folds (A), and re-scores the winner on a
+different shuffle (B).
+
+> **Picture it:** 25 people each flip a coin 20 times. The one with the most heads looks like a
+> skilled flipper. Ask them to flip 20 more and they score about average — the first result was
+> the luck of being chosen as best.
 
 ```python
 def cv_for(X, y, c, fold_seed):
@@ -220,6 +299,9 @@ dataset 4: reported max 0.6400 | median candidate 0.6150 | winner re-scored 0.58
 mean gap over 5 datasets: +0.0245
 ```
 
+All five gaps are positive: the winner's reported score always drops on fresh folds, by between
+0.0075 and 0.0575. The mean gap is +0.0245.
+
 Every one of the five gaps is positive, averaging about two and a half points. Look at the median
 candidate column: on this data `C` barely changes anything, so the search is almost entirely
 ranking noise — and picking the top of 25 noisy draws still buys you a couple of points of pure
@@ -229,8 +311,15 @@ believe.
 
 ### Nested CV: the correct procedure
 
+To get an honest score for "tune, then train", you have to test the *whole recipe* — tuning
+included — on data the tuning never saw. Nested CV does this with two loops.
+
 Nested CV puts the entire tuning procedure inside each outer fold, so no outer validation row
 ever influenced the choice of hyperparameter that is scored on it.
+
+- The **outer loop** splits the data into 5 folds and holds one out for scoring.
+- The **inner loop** runs a 3-fold CV on the remaining 4 folds to pick `C`.
+- The chosen `C` is refitted on all 4 training folds and scored once on the held-out outer fold.
 
 ```python
 def nested_cv(X, y, outer_k=5, n_candidates=25, seed=0):
@@ -268,6 +357,8 @@ naive tuned score : 0.6525   <- the number people report
 nested CV estimate: 0.6500 +- 0.0500
 ```
 
+The naive score is 0.6525; nested CV gives 0.6500, with a fold-to-fold spread of $\pm 0.05$.
+
 Two things to read here honestly. The nested estimate sits below the naive one, as expected — but
 by less than its own fold-to-fold spread, because with 400 rows the outer folds are 80 rows each
 and everything is noisy. Nested CV removes the *bias*; it does nothing about the **variance**, and
@@ -278,7 +369,16 @@ procedure*, tuning included. Use it when the estimate matters (a paper, a go/no-
 a single held-out test set when compute is tight — it is cheaper and just as honest, as long as
 you touch it once.
 
+> **Watch out:** here that is $5 \times 3 \times 25 = 375$ fits plus 5 refits. Nested CV with a
+> large search on a slow model can take hours — plan for it, or use a single locked test set.
+
 ## How noisy is a CV estimate?
+
+A CV score is itself a random number: shuffle the rows differently and you get a slightly
+different answer. Before comparing two models, know how big that wobble is.
+
+The demo runs the same 5-fold CV with 8 different shuffles (**repeated CV**) at three dataset
+sizes and prints the lowest and highest of the 8 means.
 
 ```python
 def repeated_cv(X, y, k=5, repeats=8):
@@ -306,9 +406,22 @@ n= 1000: CV mean 0.7746 | spread across shuffles [0.7690, 0.7820] (range 0.0130)
 n= 3000: CV mean 0.7677 | spread across shuffles [0.7643, 0.7707] (range 0.0063)
 ```
 
+At 300 rows the 8 shuffles range over 0.0333 (from 0.6800 to 0.7133). At 1,000 rows the range
+shrinks to 0.0130, and at 3,000 rows to 0.0063. More rows, steadier estimate. (The mean at 300
+rows is lower because each model trains on fewer rows.)
+
 The fold assignment alone moves the score by a visible amount on small data. **If two models
 differ by less than the spread across shuffles, you have not measured a difference** — repeat the
 CV with several seeds and compare distributions, not single numbers (ch. 12).
+
+## Recap in plain words
+
+- CV is only honest when its folds are "new" in the same way production data is new.
+- Fit every data-driven step (scaling, selection, encoding) inside each fold, ideally in a Pipeline.
+- If entities repeat, hold out whole entities (group k-fold).
+- If time matters, always test on the future (rolling-origin).
+- The best of many tuned scores is biased upward; nested CV or a locked test set fixes the bias.
+- A CV score wobbles with the shuffle; small differences need repeated CV to mean anything.
 
 ## Try it Yourself
 
@@ -317,7 +430,8 @@ def diagnose(X, y, groups=None, times=None):
     checks = []
     n, d = X.shape
     checks.append(("rows per feature", f"{n/d:.1f}",
-                   "under 10 -> selection and tuning will overfit; prefer nested CV"))
+                   "under 10 -> selection and tuning will overfit; prefer nested CV"
+                   if n / d < 10 else "plenty of rows per feature"))
     if groups is not None:
         sizes = np.bincount(groups)
         checks.append(("grouping", f"{len(sizes)} groups, {sizes.mean():.1f} rows each",
@@ -350,18 +464,27 @@ rows per feature  0.1                         under 10 -> selection and tuning w
 class balance     0.473                       fewer than 30 positives per fold -> stratify and consider fewer folds
 
 dataset B: grouped panel
-rows per feature  428.6                       under 10 -> selection and tuning will overfit; prefer nested CV
+rows per feature  428.6                       plenty of rows per feature
 grouping          300 groups, 10.0 rows each  use GroupKFold: random folds leak entity identity
 class balance     0.512                       stratify anyway; it costs nothing
 
 dataset C: rare positives
-rows per feature  250.0                       under 10 -> selection and tuning will overfit; prefer nested CV
+rows per feature  250.0                       plenty of rows per feature
 class balance     0.003                       fewer than 30 positives per fold -> stratify and consider fewer folds
 ```
+
+The helper prints one line per check. Dataset A has 0.1 rows per feature, so it gets the "prefer
+nested CV" warning, and with 300 rows and 47.3% positives it also has only about 28 minority rows
+per fold. Dataset B has plenty of rows per feature (428.6) but 300 groups of 10, so it gets the
+GroupKFold advice. Dataset C's positive rate is 0.003 — about 3 positives per fold — so stratify
+and use fewer folds.
 
 Run this before choosing a splitter, not after the results disappoint. Add your own checks — a
 duplicate-row detector, a date-range printer per fold — and you have a validation design review
 that takes thirty seconds.
+
+Try this variation: add a duplicate-row check (`len(np.unique(X, axis=0)) < n`) to `diagnose`,
+then feed it `np.vstack([Xg, Xg[:50]])` with matching labels and watch it fire.
 
 ## Exercise
 
@@ -370,6 +493,9 @@ description (grouped, temporal, rare-positive, or plain), runs the CV with per-f
 and reports the estimate with its fold-to-fold spread. Then demonstrate on one dataset that has
 **both** groups and time ordering — the case where most codebases quietly get it wrong — and show
 the three different numbers you get from random, grouped, and grouped-temporal splits.
+
+> **Hint:** for the combined case, each fold's validation set is "later rows of the users in this
+> chunk", and its training set is "earlier rows of all other users". Both conditions at once.
 
 <details>
 <summary>Solution</summary>
@@ -444,6 +570,10 @@ groups=True  time=False n=5,000 pos=0.20 -> GroupKFold
 groups=False time=True  n=5,000 pos=0.20 -> rolling-origin / TimeSeriesSplit
 groups=False time=False n=5,000 pos=0.02 -> repeated stratified k-fold (rare positives need repeats)
 ```
+
+The AUC falls in three steps: 0.8608 for random folds, 0.7100 once users are held out, 0.6650
+once the future is held out too. The validation sets also shrink (1,250 rows to 350), so the
+honest estimate is noisier ($\pm 0.0412$).
 
 The insight: each constraint you add removes a source of optimism, and they are **not
 interchangeable**. Random folds leak entity identity; grouping fixes that but still lets the model

@@ -7,9 +7,18 @@ order: 9
 
 ## The question SHAP answers
 
+When a model gives one person a score, that person may ask "why me?". SHAP answers by splitting
+the score into one piece per feature: this much came from your debt, this much from your age,
+and the pieces add up exactly to your score.
+
 Permutation importance (ch. 8) tells you what a model relies on *overall*. SHAP answers a
 narrower, harder question: **for this one prediction, how much did each feature contribute, and
 in which direction?** The answer has to add up — that constraint is what makes it useful.
+
+**SHAP** (SHapley Additive exPlanations) is a method for **local explanations** — explanations of
+one prediction, as opposed to global ones about the whole model. The demo is a loan-default model
+on four features. The starting point of every explanation is a **base value**: the model's average
+prediction over a **background** sample of 100 training rows, standing in for "a typical applicant".
 
 ```python
 import numpy as np
@@ -46,10 +55,17 @@ this applicant: age=55, income=66.7, debt=0.073, late_payments=1
 predicted default: 0.1074  (to explain: -0.1547)
 ```
 
+The typical applicant has a predicted default risk of 0.2621. This applicant (age 55, income 66.7,
+a very low debt ratio of 0.073, one late payment) gets 0.1074.
+
 The number to decompose is $-0.155$: this applicant is that much safer than average, and SHAP
 splits it across the four features.
 
 ## Shapley values, from the game
+
+SHAP borrows a fair-sharing rule from game theory. Picture the features as team members who
+together produced a result; each member's share is the extra they add when they join, averaged
+over every possible order in which the team could have assembled.
 
 Treat the features as players in a cooperative game whose payoff is the model's output. Define the
 value of a coalition $S$ as the prediction when only those features are set to the applicant's
@@ -59,6 +75,11 @@ $$
 v(S) = \mathbb{E}_{X_{-S}}\!\left[\,f(x_S, X_{-S})\,\right], \qquad v(\varnothing) = \mathbb{E}[f(X)]
 $$
 
+> **In plain words:** a **coalition** $S$ is any subset of features. $v(S)$ is the model's average
+> prediction when the features in $S$ are fixed to this applicant's values and every other feature
+> ($X_{-S}$, "all except $S$") takes values from the background rows. With no features fixed
+> ($\varnothing$, the empty set), $v$ is the plain average prediction — the base value.
+
 The Shapley value of feature $j$ is its average marginal contribution over every ordering in which
 the coalition could have formed:
 
@@ -67,10 +88,26 @@ $$
 \frac{|S|!\,(|F| - |S| - 1)!}{|F|!}\,\bigl[v(S \cup \{j\}) - v(S)\bigr]
 $$
 
+> **In plain words:**
+> - $F$ is the set of all features; the sum runs over every coalition $S$ that does not contain $j$.
+> - $v(S \cup \{j\}) - v(S)$ is $j$'s **marginal contribution**: how much the prediction changes when
+>   $j$ joins coalition $S$.
+> - The fraction is the share of all orderings in which exactly the members of $S$ arrived before
+>   $j$ ($|S|$ is the size of $S$, and $!$ is factorial: $3! = 3 \times 2 \times 1$).
+> - So $\phi_j$ is $j$'s marginal contribution averaged over every possible arrival order.
+
+> **Picture it:** three friends share a taxi home, dropping off one at a time. Each passenger's
+> fair share depends on who else was already in the cab. Shapley's rule says: try every order of
+> getting in, see how much each person adds to the fare each time, and average. Nobody can argue it
+> is unfair, because every order counted equally.
+
 This is the *unique* attribution satisfying four axioms: **efficiency** (the parts sum to the
 whole), **symmetry** (equal contributions get equal credit), **dummy** (a feature that never
 changes $v$ gets zero), and **additivity** (attributions of a sum of models add). Everything else
 in this chapter is an approximation to this formula.
+
+The code computes the formula by brute force: for 4 features it evaluates every one of the 16
+possible coalitions.
 
 ```python
 def v(S, x):
@@ -110,6 +147,10 @@ base 0.2621 + sum(phi) -0.1547 = 0.1074
 model prediction                          = 0.1074
 ```
 
+`debt` contributes $-0.1782$ — almost the whole story. The other three are small and nearly
+cancel: one late payment adds $+0.0238$, the above-average income subtracts $0.0224$, age 55 adds
+$0.0221$. Base 0.2621 plus the four parts gives 0.1074, exactly the model's prediction.
+
 That last pair of lines is the **efficiency axiom**, checked numerically. Any explanation method
 whose parts do not sum to the prediction is telling you a story, not decomposing a number.
 
@@ -117,7 +158,14 @@ The cost is $2^k$ coalitions — fine for 4 features, impossible for 40. That is
 KernelSHAP (sampled coalitions fitted with a weighted linear regression) and TreeSHAP (an exact
 $O(TLD^2)$ algorithm that exploits tree structure) exist.
 
+> **In plain words:** with 40 features there are $2^{40}$, about a trillion, coalitions. TreeSHAP's
+> cost instead grows with the number of trees $T$, the leaves per tree $L$, and the tree depth $D$
+> squared — no explosion in the number of features.
+
 ## TreeSHAP gives the same answer in milliseconds
+
+For tree models, the `shap` library has a shortcut that walks the trees directly and produces the
+exact same numbers as the brute-force formula, far faster.
 
 ```python
 import shap, contextlib, io
@@ -147,6 +195,9 @@ late_payments       +0.0238    +0.0238
 TreeSHAP base value: 0.2621
 ```
 
+Brute force and TreeSHAP agree to within 0.0001 on every feature, and TreeSHAP's base value is the
+same 0.2621.
+
 Identical to four decimals, at a fraction of the cost. Two arguments matter and people skip both:
 `data=background` selects the **interventional** value function — the $v(S)$ defined above — and
 `model_output="probability"` gives contributions in probability units instead of log-odds. Without
@@ -154,7 +205,13 @@ Identical to four decimals, at a fraction of the cost. Two arguments matter and 
 structure rather than intervening, and gives different (not wrong, but differently defined)
 numbers.
 
+> **Watch out:** a SHAP value means nothing without its base value and background. Change the
+> background sample and every number changes, even though the model did not.
+
 ## Reading a local explanation
+
+The most common picture of a SHAP explanation is a **waterfall**: start at the base value, then
+add one feature's contribution at a time until you arrive at the prediction.
 
 A waterfall plot is this table drawn as arrows from the base value to the prediction. The numbers
 are what matter:
@@ -181,6 +238,9 @@ age = 55.0              +0.0220  +                    -> 0.1074
 prediction               0.1074
 ```
 
+Follow the running total in the right column: 0.2621, down to 0.0840 after `debt`, then a little
+up, a little down, a little up again, landing on 0.1074.
+
 Read it as a sentence: *this applicant's default risk is 15 points below average almost entirely
 because their debt ratio is 0.073; being 55 and having one late payment push the risk back up, and
 an above-average income pulls it down again, but those three nearly cancel.* That is the shape of
@@ -189,6 +249,9 @@ a defensible answer to "why did the model score me this way?" — and note it is
 on it as a proxy for something it cannot see.
 
 ## Global SHAP is an aggregation, and the aggregation matters
+
+Explain many rows one at a time, and you can summarise the explanations into a picture of the
+whole model. But *how* you summarise decides what story you tell.
 
 ```python
 vals = shap_pos(Xte.iloc[:300])                            # (rows, features) for class 1
@@ -208,12 +271,19 @@ income           0.0768       0.0138   0.2180
 late_payments    0.0689      -0.0010   0.2901
 ```
 
+`debt` has the largest average size of contribution (0.1110), but its signed average is $-0.0007$:
+it pushes some applicants up and others down by similar amounts. `late_payments` ranks last on
+average (0.0689) yet has the largest single contribution of all (0.2901).
+
 `mean_abs` is the standard "SHAP importance" bar chart. `mean_signed` is near zero for every
 feature — an effect that pushes some rows up and others down averages out, which is why the bar
 chart drops the sign. `max_abs` is the one people never plot and often need: a feature with modest
 average impact can still be the deciding factor for a specific applicant.
 
 ### The dependence plot, as numbers
+
+A **dependence plot** asks: as this feature's value grows, how does its contribution change?
+Each dot is one row.
 
 A dependence plot puts the feature value on the x-axis and its SHAP value on the y-axis. Binning
 gives you the same information in text:
@@ -235,10 +305,16 @@ debt_bin
 (0.791, 0.999]   0.1674  0.0408     60
 ```
 
+The 60 lowest-debt applicants get an average $-0.1321$ from `debt`; the 60 highest get $+0.1674$.
+The middle bin (0.386 to 0.609) is close to zero, and it has the widest spread (std 0.0550).
+
 Monotone increasing, as the data-generating process says it should be. A dependence plot that is
 *not* monotone where you expect it to be is the fastest way to catch a model that learned a
 spurious kink — and the vertical spread within a bin (the `std` column) is interaction: the same
 debt ratio contributes differently depending on the other features.
+
+An **interaction** means one feature's effect depends on another feature's value. The next table
+splits the debt contribution by whether the applicant has any late payments.
 
 ```python
 i_debt, i_late = list(df.columns).index("debt"), list(df.columns).index("late_payments")
@@ -258,10 +334,20 @@ high debt         0.1227        0.1007
 low debt         -0.1168       -0.1053
 ```
 
+For high-debt applicants, debt adds 0.1227 when there are late payments and 0.1007 when there are
+none; for low-debt applicants it subtracts 0.1168 and 0.1053. The effect is a little stronger in
+both directions when late payments are present.
+
 The contribution of `debt` depends on `late_payments` — that cell-to-cell variation *is* the
 interaction, and it is what the vertical spread in a dependence plot is showing you.
 
 ## Where SHAP misleads
+
+SHAP's numbers are exact, but exact answers to the wrong question still mislead. The biggest traps
+are duplicated information, impossible feature combinations, units, and causality.
+
+The demo adds `debt_pct`, the same debt ratio expressed as a percentage plus a little noise, and
+refits.
 
 ```python
 df_c = df.copy()
@@ -287,11 +373,15 @@ mean|SHAP| of the twin         : 0.0643
 the pair together              : 0.1148
 ```
 
+Alone, `debt` averaged 0.1110. With its twin present, `debt` gets 0.0505 and `debt_pct` gets
+0.0643; together 0.1148.
+
 Shapley values split credit between correlated features exactly as permutation importance did
 (ch. 8) — the symmetry axiom *requires* it, since two columns carrying the same information have
 the same marginal contributions. The pair's total (0.1148) recovers the original single column's
-0.1110, but each half alone now ranks below `age`, so a bar chart sorted by mean-|SHAP| would tell
-you debt is the fourth most important feature in a model where it is the first.
+0.1110, but each half alone now ranks below `age`. In the refitted model the bar chart sorted by
+mean-|SHAP| puts `debt_pct` fourth and `debt` fifth — last — in a model where debt is really the
+most important feature.
 
 Three more traps worth naming:
 
@@ -302,6 +392,22 @@ Three more traps worth naming:
   which are cleaner mathematically but not what a stakeholder means by "how much".
 - **SHAP is not causal.** It attributes the *model's* output, not the effect of changing the
   feature in the world. Lowering someone's recorded debt does not lower their true risk.
+
+In plain words: the **data manifold** is the region where real rows live; "off-manifold" rows are
+mixtures that never occur, like a 20-year-old with 40 years of work history. **Log-odds** are
+$\log(p/(1-p))$, the scale a logistic model adds things on.
+
+> **Watch out:** before you show a SHAP bar chart, check for highly correlated columns. Group them
+> (sum their SHAP values) or the chart will rank a key signal near the bottom.
+
+## Recap in plain words
+
+- SHAP splits one prediction into per-feature pieces that add up exactly to prediction minus base value.
+- The pieces are Shapley values: each feature's extra contribution, averaged over every joining order.
+- TreeSHAP computes them exactly and fast for tree models; always say which background you used.
+- Global SHAP summaries (mean |SHAP|) hide signs and rare large effects; look at max |SHAP| too.
+- Dependence tables show how a feature's effect changes with its value and with other features.
+- Correlated features split SHAP credit; SHAP explains the model, not cause and effect.
 
 ## Try it Yourself
 
@@ -327,9 +433,17 @@ row 3: risk 0.116 vs base 0.262 | top 3: debt=0.218 (-0.178), age=34.0 (-0.098),
 row 7: risk 0.233 vs base 0.262 | top 3: age=62.0 (+0.130), income=93.0 (-0.114), debt=0.296 (-0.091)
 ```
 
+The riskiest applicant (row 620, risk 0.933) has two late payments, age 60, and a debt ratio of
+0.966, all pushing up. The safest (row 574, risk 0.000) has low debt, high income, and age 40, all
+pulling down. Row 3 shows mixed signs: low debt and youth pull down, but a low income of 35.3
+pushes up by $+0.094$.
+
 The same feature appears with opposite signs for different people — that is the whole point of a
 local explanation. Change `top` to 4 and the contributions will sum exactly to the gap between the
 risk and the base value; with `top=3` they do not, which is the honest cost of a short answer.
+
+Try this variation: explain row 620 with a different background, for example
+`Xtr.sample(100, random_state=1)`, and see how much each contribution moves.
 
 ## Exercise
 
@@ -338,6 +452,10 @@ a reason-code generator: for the highest-risk applicants, produce the top-3 posi
 with human-readable text, verify that the full attribution reconciles to the prediction, and
 measure how much of the explained gap the top-3 actually covers. Then check the global ranking
 from SHAP against permutation importance and explain any disagreement.
+
+> **Hint:** keep only contributions greater than zero (those are the reasons the risk went *up*),
+> sort them, and take three. **Reconciliation** means checking that base value plus all
+> contributions equals the prediction, within floating-point tolerance.
 
 <details>
 <summary>Solution</summary>
@@ -413,6 +531,10 @@ age                   0.0894                0.0763          2          2
 income                0.0768                0.0592          3          3
 late_payments         0.0689                0.0530          4          4
 ```
+
+The three riskiest applicants all get the same three reasons (late payments, age, debt) in slightly
+different orders. Each reconciles to within $5 \times 10^{-6}$, and the top 3 cover 84% to 87% of the
+total attribution.
 
 Here the two rankings agree exactly — same order, same top feature — which is the common case on
 clean tabular data with a well-fitted model. Do not treat the agreement as guaranteed, because

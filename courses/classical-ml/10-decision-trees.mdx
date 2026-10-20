@@ -7,7 +7,20 @@ order: 10
 
 ## The CART algorithm
 
+A decision tree is a game of twenty questions. Each question is "is feature $j$ at most $t$?",
+the answer sends you left or right, and after a few questions you reach a leaf that holds the
+prediction. Learning a tree means choosing good questions.
+
 A decision tree partitions the feature space into rectangles and assigns a prediction to each. The **Classification and Regression Trees (CART)** algorithm builds trees greedily: at each node, find the (feature, threshold) split that minimises weighted impurity in the two children.
+
+**Greedy** means each question is chosen as the best one *right now*, with no look-ahead to
+later questions. A **node** is one point in the tree where a question is asked; its
+**children** are the two groups the answer creates. **Impurity** measures how mixed a group's
+labels are: zero when everyone in the group has the same label.
+
+> **Picture it:** sorting a box of mixed fruit with one yes/no question at a time. "Is it
+> heavier than 150 g?" splits melons and apples from grapes and cherries. A good question
+> leaves each pile as unmixed as possible.
 
 For a node containing indices $I$, the split at feature $j$, threshold $t$ produces:
 - Left: $I_L = \{i \in I : x_{ij} \le t\}$
@@ -19,15 +32,26 @@ $$
 \text{score}(j, t) = \frac{|I_L|}{|I|}\,H(I_L) + \frac{|I_R|}{|I|}\,H(I_R)
 $$
 
+> **In plain words:** the impurity of each child, weighted by the share of points that land
+> in it. $|I|$ is the number of points in the node. A split that makes one tiny pure group
+> and leaves a big mixed one scores poorly, because the big mixed group carries most weight.
+
 where $H$ is the impurity of a node.
 
 ## Impurity measures
+
+Impurity is a number for "how mixed is this pile?". There are a few standard choices; they
+all hit zero for a pure pile and peak when the classes are evenly mixed.
 
 ### Gini impurity (classification)
 
 $$
 G = 1 - \sum_{k=1}^K p_k^2
 $$
+
+> **In plain words:** $p_k$ is the share of the node in class $k$. Gini is the chance that two
+> points drawn at random from the node (with replacement) have *different* labels. A 50/50
+> two-class node gives $1 - (0.25 + 0.25) = 0.5$.
 
 Gini is 0 at a pure node and $1-1/K$ at maximum disorder. It is faster to compute than entropy (no log).
 
@@ -37,6 +61,9 @@ $$
 H = -\sum_{k=1}^K p_k \log_2 p_k
 $$
 
+> **In plain words:** entropy is the average number of yes/no questions you'd need to guess
+> a random point's label. A pure node needs 0; a 50/50 two-class node needs exactly 1.
+
 Both Gini and entropy give nearly identical results in practice.
 
 ### MSE (regression)
@@ -44,6 +71,9 @@ Both Gini and entropy give nearly identical results in practice.
 $$
 H = \frac{1}{|I|}\sum_{i\in I}(y_i - \bar{y}_I)^2
 $$
+
+> **In plain words:** the variance of the labels in the node — the average squared distance
+> from the node's mean $\bar{y}_I$. A node whose labels are all similar has low impurity.
 
 Split reduces variance: predict the mean of each child node.
 
@@ -65,21 +95,32 @@ def entropy(y):
 # Pure node vs mixed node
 y_pure  = np.array([0, 0, 0, 0, 0])
 y_mixed = np.array([0, 0, 1, 1, 0])
-y_max   = np.array([0, 1, 0, 1, 0])
+y_max   = np.array([0, 1, 0, 1])   # 50/50: maximum disorder for 2 classes
 
 for name, y in [("pure", y_pure), ("mixed", y_mixed), ("max-disorder", y_max)]:
     print(f"{name:12}: gini={gini(y):.3f}, entropy={entropy(y):.3f}")
 ```
 
 ```output
-pure        : gini=0.000, entropy=0.000
+pure        : gini=0.000, entropy=-0.000
 mixed       : gini=0.480, entropy=0.971
 max-disorder: gini=0.500, entropy=1.000
 ```
 
+The pure node scores 0 on both (the `-0.000` is rounding from the `1e-15` guard inside the
+log). The mixed node, 3 to 2, scores Gini 0.480 and entropy 0.971. The 50/50 node hits the
+two-class maximum: Gini exactly 0.500 ($1 - 1/K$ with $K=2$) and entropy exactly 1.000.
+
 ## From-scratch decision stump
 
+A **stump** is a tree with only one question. Building one by brute force shows exactly
+what CART does at every node: try every feature and every threshold, and keep the best.
+
 A stump (depth=1) finds the single best split across all features and thresholds:
+
+This regression stump scores a split by the weighted variance of the two sides — the MSE
+impurity above. The test data is a step: $y$ is about 2 for $x < 5$ and about 6 for
+$x \ge 5$, plus noise with standard deviation 0.5.
 
 ```python
 import numpy as np
@@ -124,12 +165,23 @@ print(f"Stump MSE: {mse:.3f}")
 ```
 
 ```output
-Best split: x[0] <= 4.99
-Left pred: 2.017, Right pred: 6.002
-Stump MSE: 0.267
+Best split: x[0] <= 5.00
+Left pred: 2.025, Right pred: 5.910
+Stump MSE: 0.232
 ```
 
+The stump found the step: it splits at $x \le 5.00$ and predicts 2.025 on the left and 5.910
+on the right, close to the true 2 and 6. Its MSE of 0.232 is about the noise variance
+($0.5^2 = 0.25$), so there's nothing left for a deeper tree to learn here.
+
+> **Watch out:** trying every unique value as a threshold costs $O(n)$ per feature per node
+> when done with a running sum, but $O(n^2)$ done naively as above. Real libraries sort each
+> feature once and sweep — or bin features into a few hundred buckets (ch. 13).
+
 ## Depth and overfitting
+
+Each extra level of questions lets the tree carve smaller boxes. Deep enough, every training
+point gets its own box, and the tree has memorised the data — noise included.
 
 A deep tree memorises the training set; a shallow tree underfits. This is the classic bias-variance trade-off:
 
@@ -155,26 +207,51 @@ for depth in [1, 2, 3, 5, 8, 12, None]:
 ```output
  depth |   train |    test
 --------------------------
-     1 |  0.7725 |  0.7600
-     2 |  0.8625 |  0.8650
-     3 |  0.8925 |  0.8700
-     5 |  0.9475 |  0.8750
-     8 |  0.9875 |  0.8650
-    12 |  1.0000 |  0.8450
-  None |  1.0000 |  0.8400
+     1 | 0.8250 | 0.7700
+     2 | 0.9025 | 0.8500
+     3 | 0.9025 | 0.8500
+     5 | 0.9050 | 0.8500
+     8 | 0.9600 | 0.8600
+    12 | 0.9900 | 0.8200
+  None | 1.0000 | 0.8400
 ```
+
+Training accuracy climbs steadily with depth, reaching 1.0000 with no depth limit — every
+training point classified correctly, including the noisy ones. Test accuracy behaves
+differently: 0.77 at depth 1, flat at 0.85 from depth 2 to 5, a high of 0.86 at depth 8, then
+0.82 at depth 12. The gap between train and test widens from 0.05 at depth 2 to 0.16 at
+unlimited depth.
 
 Test accuracy peaks around depth 3–5 and falls as the tree memorises noise.
 
+That sentence is the textbook pattern, but this run doesn't match it exactly: the peak is at
+depth 8, and the 2-to-8 range differs by only 1 point of the 100 test points. With so few test
+points, the honest reading is "depth 2 to 8 is a plateau; past that, the tree overfits".
+
 ## Pruning
+
+**Pruning** means stopping a tree from growing too far, or cutting it back afterwards, so it
+keeps the useful questions and drops the ones that only fit noise.
 
 ### Pre-pruning (max constraints)
 
 `max_depth`, `min_samples_leaf`, `min_samples_split`, `max_leaf_nodes` — stop splitting early.
 
+For example, `min_samples_leaf=20` refuses any split that would leave fewer than 20 points in
+a leaf, so no leaf can be built around a single noisy point.
+
 ### Cost-complexity pruning
 
 sklearn's `ccp_alpha` controls pruning after the full tree is grown. Higher `ccp_alpha` → more pruning → simpler tree.
+
+> **In plain words:** grow the full tree, then charge `ccp_alpha` per leaf. A branch is cut
+> whenever the impurity it removes is smaller than the fee for its extra leaves. The
+> `cost_complexity_pruning_path` method lists every `ccp_alpha` at which some branch would
+> be cut.
+
+> **Picture it:** pruning a hedge. Pre-pruning is never letting a shoot grow past a line;
+> cost-complexity pruning is letting it grow wild and then cutting back every branch that
+> isn't earning its keep.
 
 ```python
 import numpy as np
@@ -200,8 +277,25 @@ print(f"Best ccp_alpha: {best_alpha:.5f}, test acc: {best_acc:.4f}")
 ```
 
 ```output
-Best ccp_alpha: 0.00420, test acc: 0.8950
+Best ccp_alpha: 0.00375, test acc: 0.8700
 ```
+
+The best of the tested values, `ccp_alpha = 0.00375`, reaches 0.8700 test accuracy — above
+every `max_depth` setting in the previous table (best 0.8600). Pruning can keep a deep split
+in one region while cutting shallow, useless splits elsewhere, which a single depth limit
+can't do.
+
+> **Watch out:** this code picks `ccp_alpha` by looking at the *test* set, which makes 0.8700
+> optimistic. In real work pick it by cross-validation on the training data and touch the test
+> set once.
+
+## Recap in plain words
+
+- A decision tree asks a sequence of yes/no questions on single features and predicts from the leaf you land in.
+- CART picks each question greedily, by the biggest drop in weighted impurity.
+- Gini and entropy measure label mixing for classification; variance does the job for regression.
+- An unlimited tree reaches 100% training accuracy by memorising noise.
+- Limit growth (depth, leaf size) or prune back afterwards with `ccp_alpha`, and tune either by cross-validation.
 
 ## Try it Yourself
 
@@ -227,20 +321,32 @@ for d in depths:
 ```
 
 ```output
- depth | cv_acc |    test
-     1 |  0.7103 |  0.7556
-     2 |  0.8667 |  0.8889
-     3 |  0.8962 |  0.9333
-     4 |  0.9038 |  0.9333
-     5 |  0.8740 |  0.9111
-     6 |  0.8740 |  0.8889
-     7 |  0.8514 |  0.8889
-  None |  0.8296 |  0.8667
+ depth |  cv_acc |    test
+     1 | 0.5934 | 0.6667
+     2 | 0.8721 | 0.8444
+     3 | 0.8940 | 0.9333
+     4 | 0.8940 | 0.9333
+     5 | 0.8940 | 0.9333
+     6 | 0.8940 | 0.9333
+     7 | 0.8940 | 0.9333
+  None | 0.8940 | 0.9333
 ```
+
+On the wine data, depth 1 is too crude (CV 0.5934) because one question can't separate three
+classes. Depth 2 jumps to 0.8721, and from depth 3 on every row is identical: CV 0.8940, test
+0.9333. The tree runs out of useful questions early: grown with no limit on the full training
+set it is only 4 levels deep, and the splits below level 3 cover so few points that accuracy
+doesn't move.
+
+The `StandardScaler` line does nothing for a tree: splits depend only on the order of values,
+not their scale. Delete it and check that every number stays the same.
 
 ## Exercise
 
 Implement Gini-based splitting for a classification tree (not just a stump). Allow `max_depth` parameter. Test on `make_moons` and verify your accuracy is within 1% of sklearn's `DecisionTreeClassifier` at the same depth.
+
+> **Hint:** write `best_split` first, then a recursive `build_tree` that stops when it hits
+> `max_depth` or the node is pure. Store each node as a dictionary.
 
 <details>
 <summary>Solution</summary>
@@ -291,4 +397,13 @@ tree = build_tree(X_tr, y_tr, 0, max_depth=4)
 preds = np.array([predict_one(tree, x) for x in X_te])
 print(f"Scratch tree acc: {np.mean(preds == y_te):.3f}")
 ```
+
+The scratch tree scores 0.817 on the 60 test points. `DecisionTreeClassifier(max_depth=4,
+random_state=0)` on the same split scores 0.833 — a gap of exactly one test point (1.7%), so
+"within 1%" isn't met on a 60-point test set, where one point is already 1.7%. The small
+difference comes from the thresholds: the scratch code splits at an observed value
+(`x <= t`), while sklearn splits halfway between neighbouring values, which places
+boundaries slightly differently for new points. Change the threshold loop to try midpoints,
+`u = np.unique(X[:, j])` then `for t in (u[:-1] + u[1:]) / 2:`, and the scratch tree also
+scores 0.833 — an exact match.
 </details>

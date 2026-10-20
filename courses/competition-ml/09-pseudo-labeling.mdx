@@ -7,11 +7,25 @@ order: 9
 
 ## Training on your own predictions
 
+When you have few answered examples and many unanswered ones, you can let the model guess the
+answers to the unanswered ones and learn from its own guesses. It sometimes helps a lot and
+sometimes quietly makes things worse.
+
 Pseudo-labeling takes the unlabelled rows — usually the test set — predicts them, and adds the
 confident ones to the training data as if they were labelled. It is one of the few techniques that
 can add *information* rather than squeezing the model harder, and it is also one of the easiest
 ways to build a confident, wrong model. The difference is entirely in the protocol, and in whether
 labels are actually your scarce resource.
+
+A **label** is the known answer for a row. **Unlabelled** rows have features but no answer. A
+**pseudo-label** is the model's own guess, used as if it were a label.
+
+> **Picture it:** a student with a 150-question answer key and a 6,000-question workbook with no
+> answers. They do the workbook, mark their most confident answers as "correct", and study from
+> those too. More practice helps — unless the student's confident answers are confidently wrong.
+
+The setup is deliberately label-starved: 150 labelled rows, an unlabelled pool of 6,000, and a
+separate labelled test set of 4,000 used only to measure the truth.
 
 ```python
 import numpy as np
@@ -48,7 +62,17 @@ labelled 150 | unlabelled pool 6,000 | test 4,000
 baseline on 150 labelled rows: test AUC 0.8025
 ```
 
+With 150 labelled rows, the baseline reaches test AUC 0.8025. Every experiment below is judged by
+how far it moves that number.
+
 ## One round
+
+One round means: train on the labelled rows, predict the pool, keep the rows where the model is
+confident, attach its guesses as labels, and retrain on everything.
+
+"Confident" means the predicted probability is at least the **threshold** (here 0.8) or at most
+1 minus it (0.2). The option `soft=True` gives each pseudo-row a weight that grows with confidence:
+a prediction of 0.5 gets weight 0, a prediction of 0 or 1 gets weight 1.
 
 ```python
 def pseudo_round(model, X_lab, y_lab, X_pool, threshold=0.9, weight=1.0, soft=False):
@@ -77,11 +101,17 @@ baseline        test AUC 0.8025
 after one round test AUC 0.8089  (+0.0064)
 ```
 
-Note what just happened: nearly a quarter of the added labels are **wrong**, and the model still
-improved. Pseudo-labeling is not about adding correct labels — it is about adding *rows*, so the
-model sees the shape of the input distribution in regions where it had no data at all.
+3,878 pool rows (64.6%) pass the 0.8 threshold, and 78.9% of them get the right label. The test
+AUC moves from 0.8025 to 0.8089 (+0.0064).
+
+Note what just happened: about a fifth of the added labels (21.1%) are **wrong**, and the model
+still improved. Pseudo-labeling is not about adding correct labels — it is about adding *rows*, so
+the model sees the shape of the input distribution in regions where it had no data at all.
 
 ## The threshold is the whole trade
+
+A low threshold admits many rows, but more of their guessed labels are wrong. A high threshold
+admits only rows the model is sure about, but there are few of them.
 
 ```python
 p = base_model.predict_proba(X_pool)[:, 1]
@@ -110,12 +140,22 @@ entire pool at threshold 0.5, with 71% label accuracy, scores as well as anythin
 0.99 threshold — 92.7% accurate labels on 382 rows — is worth almost nothing. Quantity beats
 purity when the model is starved of data, and the ordering reverses once it is not.
 
+Read the extremes: at 0.50 all 6,000 rows go in and the gain is +0.0075, the best in the table;
+at 0.99 only 382 rows go in and the gain is +0.0016. The differences between rows are small,
+though — a few thousandths of AUC on a 4,000-row test set.
+
 **The label-accuracy column is the one you cannot see in a real competition.** You would be
 choosing the threshold blind, which is why it belongs in cross-validation rather than intuition.
 
 ## Soft labels and down-weighting
 
+A guessed label should count for less than a real one. You can say so with weights: halve every
+pseudo-row's weight, or weight it by how confident the model was.
+
 A pseudo-label is a *belief*, not a fact. Encode the uncertainty rather than discarding it.
+
+A **sample weight** tells the model how much each row should count when it learns; weight 0.5
+means "half as important as a normal row".
 
 ```python
 variants = {
@@ -145,7 +185,13 @@ closer in size, or when the pseudo-labels are much dirtier than these. The reaso
 the harness is that it costs nothing and it is the only lever that keeps the real labels in charge
 when the pool is enormous.
 
+The arithmetic: 3,878 rows times 0.5 is 1,939 units of weight, against 150 for the real rows —
+about 13 to 1.
+
 ## When pseudo-labeling stops paying
+
+The more real labels you have, the less the model's own guesses can teach it. The next table
+repeats the recipe with 150, 400 and 2,000 labelled rows.
 
 This is the table that contradicts the folklore, so read it carefully.
 
@@ -169,6 +215,9 @@ for n_lab in (150, 400, 2_000):
     2,000     0.9487       0.9461  -0.0026       4,057     0.9495
 ```
 
+At 150 labels the gain is +0.0075. At 400 it shrinks to +0.0007. At 2,000 it turns negative
+(-0.0026), even though the pseudo-labels are now 94.95% correct.
+
 The gain evaporates as labels stop being scarce, and turns negative once the base model is good.
 The mechanism is simple: the pseudo-labels can only teach the model something it does not already
 know, and a model trained on 2,000 rows already knows almost everything its own confident
@@ -179,8 +228,19 @@ rows, the expected gain is zero or negative, and the honest thing is to measure 
 
 ## The failure mode: confirmation bias
 
+If your few labelled rows all come from one corner of the data, the model guesses badly
+elsewhere — and then learns from those bad guesses as if they were true.
+
 Scarcity is necessary but not sufficient. If the labelled rows are *unrepresentative*, the model
 extrapolates wrongly, labels the pool wrongly with high confidence, and then trains on that.
+
+**Confirmation bias** here means the model's mistakes get fed back as training data, so it
+becomes more sure of them. To simulate it, the labelled sample is taken only from rows where `f0`
+is in its lowest 35%.
+
+> **Picture it:** someone who has only ever seen swans in one lake, all white, labels every bird
+> in a far-away lake. The confident "white swan" labels on black swans now become their training
+> data, and they end up surer than before that all swans are white.
 
 ```python
 biased = (X_labelled["f0"] < X_labelled["f0"].quantile(0.35)).values
@@ -205,16 +265,29 @@ labelled sample drawn from one region of feature space (300 rows)
       0.90       3,466          0.7692     0.7405  -0.0105
 ```
 
-Twice as scarce as the case that worked, and it goes the other way — and *raising* the confidence
-threshold makes it worse, because the rows the biased model is most sure about are exactly the
-ones where its extrapolation is most wrong. That inversion is the diagnostic: if your gain shrinks
-as the threshold rises, suspect that your labelled sample is not representative of the pool.
+Both thresholds lose AUC: -0.0067 at 0.80 and -0.0105 at 0.90. Label accuracy is only 74–77%,
+worse than the 79% the representative 150-row sample achieved.
+
+Twice as many labels as the case that worked, and it goes the other way — and *raising* the
+confidence threshold makes it worse, because the rows the biased model is most sure about are
+exactly the ones where its extrapolation is most wrong. That inversion is the diagnostic: if your
+gain shrinks as the threshold rises, suspect that your labelled sample is not representative of
+the pool.
+
+> **Watch out:** in a real competition, check whether the labelled data and the pool look alike
+> before you pseudo-label. Adversarial validation (ch. 10) is the tool for that.
 
 ## The leak that ruins your CV
+
+If you make the pseudo-labels once, with a model trained on all your labelled rows, every CV fold
+gets labels that already "know" the validation rows. The CV score then lies.
 
 Pseudo-labels generated by a model that saw the whole training set contaminate every fold: the
 label attached to a pool row encodes information from rows that are about to be used for
 validation.
+
+The function runs the same 3-fold CV twice: once with pseudo-labels from a model fitted on all 150
+rows (`leaky=True`), once with pseudo-labels regenerated from each fold's training part only.
 
 ```python
 def cv_with_pseudo(X, y, pool, leaky, k=3, threshold=0.8, seed=0):
@@ -255,7 +328,20 @@ Regenerating the pseudo-labels inside each fold costs `k` extra fits and buys a 
 believe. It is the same rule as target encoding (ch. 5) and stacking (ch. 7): anything fitted on
 labels must be re-fitted inside the fold.
 
+## Recap in plain words
+
+- Pseudo-labeling adds the model's confident guesses on unlabelled rows to the training data.
+- It helps when labels are scarce: +0.0075 at 150 labels, about zero at 400, negative at 2,000.
+- Low thresholds add more rows with dirtier labels; under scarcity, more rows won here.
+- A labelled sample from one corner of the data makes pseudo-labeling hurt, and a higher threshold
+  hurts more.
+- Pseudo-labels must be regenerated inside each CV fold, or the CV score is fiction (0.9733 here).
+- Under scarcity, an honest CV is pessimistic, because each fold has fewer labels.
+
 ## Try it Yourself
+
+`pseudo_experiment` wraps one round with all its knobs: number of labelled rows, threshold,
+weight, and soft or hard weighting.
 
 ```python
 def pseudo_experiment(n_labelled, threshold=0.8, soft=True, weight=0.5):
@@ -281,15 +367,28 @@ labelled   150 thr 0.95 w 0.50 | 0.8025 -> 0.8034 (+0.0010) | added 1,832 at 87.
 labelled   400 thr 0.80 w 0.50 | 0.8938 -> 0.8945 (+0.0007) | added 3,959 at 88.9%
 ```
 
+The first two lines differ only in weight (0.5 versus 1.0): +0.0075 versus +0.0070. Raising the
+threshold to 0.95 admits fewer rows (1,832, at 87.4% accuracy) and the gain drops to +0.0010. With
+400 labels the gain is almost gone (+0.0007).
+
 Three knobs, one clear ordering: the size of the labelled set dominates, the threshold matters
-next, and the weight matters least. Try `soft=False` to confirm that discarding the confidence
+next, and the weight matters least. Try `soft=False` to test whether discarding the confidence
 costs you, and push `n_labelled` down to 80 to see the gain grow.
+
+Running those two variations: `soft=False` at threshold 0.8 and weight 0.5 gives +0.0076, the
+same as soft weighting (+0.0075) — on this data, discarding the confidence costs nothing, which
+fits the weight being the weakest knob. With `n_labelled=80` the baseline drops to 0.7495 and the
+gain grows to +0.0136.
 
 ## Exercise
 
 Build the safe procedure end to end: pseudo-labels regenerated inside every fold, soft labels with
 a tunable weight, exactly one round, and a fold-level comparison against no pseudo-labeling that
 decides whether to use it at all. Report the decision and the evidence behind it.
+
+> **Hint:** inside each fold, train a base model on the fold's training rows, score it plain, then
+> use that same model to pseudo-label the pool, retrain, and score again. Decide from the per-fold
+> differences, not only their mean.
 
 <details>
 <summary>Solution</summary>
@@ -373,6 +472,11 @@ correct. Each CV fold trains on 100 rows while the final model trains on 150, an
 pays *more* the scarcer the labels are (the table earlier in this chapter), so the folds
 systematically overstate the gain the full model will see. **Under label scarcity, cross-validation
 gets the decision right and the effect size wrong** — use it to choose, not to forecast.
+
+Note also that the folds preferred threshold 0.95 (+0.0251) over 0.8 (+0.0214), while on the
+held-out test set 0.8 did better (+0.0075 against +0.0010 in Try it Yourself). The two settings are
+within noise of each other in CV, so either choice is defensible; the bigger lesson is the size gap
+between the CV gain and the real one.
 
 Notice which knobs the search may touch and which it may not. Threshold and weight are tuned,
 because neither has a default that is right everywhere. The **number of rounds is fixed at one**:

@@ -7,8 +7,23 @@ order: 7
 
 ## A study is a loop that asks, evaluates, and tells
 
+Optuna is a library that runs the tuning loop for you. You describe one try — "pick some
+settings, train, return a score" — and Optuna decides which settings to hand you on each try,
+learning from the scores so far.
+
 Optuna inverts the search loop from ch. 6. You write an `objective(trial)` function that *asks*
 for values as it needs them; the sampler decides what to hand you based on every trial so far.
+
+The vocabulary:
+
+- **Study** — one whole tuning run: the full history of tries and their scores.
+- **Trial** — one try. `trial.suggest_int(...)` and `trial.suggest_float(...)` ask for a value.
+- **Sampler** — the strategy that picks values; `TPESampler` is the default smart one (explained
+  below), `RandomSampler` is plain random search.
+
+> **Picture it:** a chef (your objective) who cooks one dish per evening and a food critic (the
+> sampler) who tastes each dish and then tells the chef how much salt and heat to try tomorrow.
+> The chef only asks "how much salt?" when the recipe reaches the salt step.
 
 ```python
 import numpy as np
@@ -40,21 +55,37 @@ for k, v in study.best_params.items():
 ```
 
 ```output
-best AUC 0.9183 in trial 36
-  max_depth          12
-  min_samples_leaf   21
-  max_features       0.8034616332856443
-  ccp_alpha          2.0901002061682083e-06
+best AUC 0.9175 in trial 34
+  max_depth          26
+  min_samples_leaf   30
+  max_features       0.882930761491826
+  ccp_alpha          2.760097201764936e-06
 ```
+
+After 40 trials the best AUC is 0.9175, found in trial 34. The winning tree is deep
+(`max_depth` 26) but each leaf must hold at least 30 rows, and the pruning strength `ccp_alpha` is
+tiny. The long decimals are the raw sampled floats.
 
 `log=True` is the log-uniform sampling from ch. 6, declared once instead of hand-rolled. The
 sampler is seeded, so this study is reproducible — always do that, or you cannot tell a real
 improvement from a lucky re-run.
 
+> **Watch out:** a seed makes a study repeatable on the same library version and the same machine.
+> Upgrading Optuna or scikit-learn can change the exact trials and the reported best, so record
+> versions next to any number you publish (ch. 12).
+
 ## Define-by-run: the space is ordinary Python
+
+Because you ask for values inside normal Python code, an `if` statement can decide which
+questions get asked. Choose "forest" and you are asked about trees per forest; choose "logreg"
+and you are asked about `C` instead.
 
 Because the space is code, a branch can decide which knobs exist. There is no way to express this
 with a dict-of-lists grid.
+
+This is called **define-by-run**: the search space is defined while the objective runs, not
+written out beforehand. A **conditional space** is one where some knobs only exist when another
+knob has a certain value.
 
 ```python
 from sklearn.ensemble import RandomForestClassifier
@@ -96,10 +127,17 @@ tree      3 trials | best 0.9017 | median 0.8324
 winner: {'model': 'forest', 'rf_trees': 50, 'rf_depth': 9}
 ```
 
+Of 24 trials, the sampler spent 15 on random forests, 6 on logistic regression, and only 3 on
+single trees. That matches the scores: forests are best (0.9669), logistic regression is close
+behind (0.9536), and trees are clearly worse (best 0.9017, median 0.8324).
+
 The sampler learns which branch pays and spends its later trials there — model selection and
 hyperparameter tuning become one search rather than two nested ones.
 
 ## What TPE actually does
+
+TPE looks at all trials so far, splits them into "the good ones" and "the rest", and then picks
+new settings that look like the good ones and unlike the rest.
 
 Tree-structured Parzen Estimator does not model the objective. It splits the trials at a quantile
 $\gamma$ into "good" and "bad", fits a density to each, and prefers points where good is likely
@@ -111,9 +149,27 @@ g(x) = p(x \mid f(x) > y^\gamma), \qquad
 x_{\text{next}} = \arg\max_x \frac{l(x)}{g(x)}
 $$
 
+> **In plain words:**
+> - $y^\gamma$ is the cut-off score; trials on the good side of it form the "good" group (Optuna
+>   treats it as a minimisation internally, hence $\le$).
+> - $l(x)$ is how common the value $x$ is among good trials; $g(x)$ is how common it is among the rest.
+> - The next value is the one where the ratio $l(x)/g(x)$ is largest — common among winners, rare
+>   among losers.
+
+A **density** here is a smooth curve showing where values cluster; TPE builds it with **Parzen
+estimators** (also called kernel density estimates), which place a small bump on every observed
+value and add them up.
+
+> **Picture it:** a teacher looking at which study habits the top third of the class shares and the
+> bottom two-thirds does not, then recommending those habits. TPE never predicts anyone's exact
+> grade; it only compares the groups.
+
 Maximising $l/g$ is equivalent to maximising Expected Improvement (ch. 6) under this model, but it
 costs a kernel-density fit per parameter instead of a GP over the joint space — which is why it
 scales to dozens of knobs and handles categoricals natively.
+
+The benchmark is a 6-knob bowl with its best at a known point (score near 0), plus a wavy
+interaction term between `x0` and `x1`. Five seeds per sampler, averaged.
 
 ```python
 def hard(trial):                            # 6-D, one interaction term, cheap to evaluate
@@ -135,13 +191,20 @@ for name, make in (("random", lambda s: optuna.samplers.RandomSampler(seed=s)),
 
 ```output
 random   best after 10/20/40/60 trials:  -23.588 /  -20.594 /  -15.703 /  -12.655
-TPE      best after 10/20/40/60 trials:  -23.588 /  -12.786 /   -5.998 /   -2.004
+TPE      best after 10/20/40/60 trials:  -23.588 /   -6.324 /   -1.769 /   -0.099
 ```
+
+After 60 trials random search reaches $-12.655$; TPE reaches $-0.099$, essentially the bottom of
+the bowl. TPE is already far ahead at trial 20 ($-6.324$ against $-20.594$).
 
 The first ten trials are identical by construction — `n_startup_trials` defaults to 10, during
 which TPE samples randomly because it has nothing to model yet.
 
 ### When TPE does not help
+
+A smarter sampler only helps if there is something to be smart about. On an easy space where
+almost every setting is fine, and where each score is a little noisy, smart and random end up
+in the same place.
 
 ```python
 def best_curve(sampler, n=30):
@@ -157,10 +220,13 @@ print(f"TPE    best after 10/20/30 trials: {tpe_c[9]:.4f} / {tpe_c[19]:.4f} / {t
 
 ```output
 random best after 10/20/30 trials: 0.9049 / 0.9189 / 0.9189
-TPE    best after 10/20/30 trials: 0.9049 / 0.9109 / 0.9153
+TPE    best after 10/20/30 trials: 0.9049 / 0.9169 / 0.9169
 ```
 
-On the decision-tree space random search actually finishes ahead, 0.9189 to 0.9153. Do not read
+Both start at 0.9049 after 10 trials (the shared random startup) and both stall after 20. Random
+search finishes slightly ahead, 0.9189 against 0.9169.
+
+On the decision-tree space random search actually finishes ahead, 0.9189 to 0.9169. Do not read
 that as "random beats TPE" — the gap is smaller than the CV noise of a single fold assignment
 (ch. 5), so the correct reading is *no measurable difference*. The reason is structural: the space
 is four-dimensional and forgiving, most trials land within a point or two of the best, and the
@@ -169,8 +235,20 @@ measured precisely** — not on every problem you meet.
 
 ## Pruning: kill hopeless trials early
 
+If a model learns step by step, you can check its score after each step. A trial that is
+already far behind the others after a few steps rarely catches up, so you can stop it and save
+the time.
+
 For any model trained in steps — epochs, boosting rounds, data slices — report the intermediate
 score and let the pruner stop trials that are already behind.
+
+A **pruner** decides when to stop a trial early. An **epoch** is one full pass over the training
+data. The demo uses `SGDClassifier`, a linear model trained by **stochastic gradient descent**
+(small update steps, one batch at a time), whose `partial_fit` runs one epoch per call, so the
+score can be reported after every epoch.
+
+> **Picture it:** a talent show with heats. Contestants who are clearly behind the median after
+> the first few rounds go home; the judges' time goes to those still in the running.
 
 ```python
 from sklearn.linear_model import SGDClassifier
@@ -210,20 +288,35 @@ for pruner, name in ((optuna.pruners.NopPruner(), "no pruner"),
 ```
 
 ```output
-no pruner      best 0.7242 | pruned  0/30 trials |  900 epochs of training
-median pruner  best 0.7252 | pruned 16/30 trials |  484 epochs of training
+no pruner      best 0.7251 | pruned  0/30 trials |  900 epochs of training
+median pruner  best 0.7251 | pruned 17/30 trials |  458 epochs of training
 ```
 
-Same answer — very slightly better, in fact — for 484 epochs instead of 900, a 46% cut in compute
+Both studies find the same best AUC, 0.7251. The pruned study stopped 17 of 30 trials early and
+ran 458 epochs of training instead of 900.
+
+Same answer for 458 epochs instead of 900, a 49% cut in compute
 for an identical trial budget. `MedianPruner` stops a trial
 whose intermediate value is worse than the median of previous trials at the same step;
 `n_warmup_steps=3` protects slow starters for three epochs. The absolute AUC is modest because the
 model is a linear classifier trained for a few epochs; what matters here is the cost column.
+(`n_startup_trials=5` means the first 5 trials always run to the end, so there are medians to
+compare against.)
 
 `SuccessiveHalvingPruner` and `HyperbandPruner` implement the rung schedule you hand-rolled in
 ch. 6. Use those when trials are expensive and the ranking at a small budget is trustworthy.
 
+> **Watch out:** a pruner can only act on what you `report`. If you forget `trial.report` and
+> `trial.should_prune()`, the pruner silently does nothing.
+
 ## Reading a study
+
+After a study, you want to know which knobs mattered. Optuna can estimate this from the
+trial history, and a table of the best trials shows what the winners have in common.
+
+`get_param_importances` fits a small random forest that predicts each trial's score from its
+settings, and reports how much each knob helped that forest — a **hyperparameter importance**.
+`trials_dataframe` turns the study into a pandas table.
 
 ```python
 imp = optuna.importance.get_param_importances(
@@ -238,16 +331,20 @@ print(top[["number", "value", "params_max_depth", "params_min_samples_leaf"]].to
 ```
 
 ```output
-ccp_alpha          0.541  ######################
-max_features       0.242  ##########
-min_samples_leaf   0.144  ######
-max_depth          0.073  ###
+ccp_alpha          0.412  ################
+max_features       0.305  ############
+max_depth          0.183  #######
+min_samples_leaf   0.100  ####
 
  number    value  params_max_depth  params_min_samples_leaf
-     36 0.918284                12                       21
-     32 0.915943                 9                       21
-     28 0.915348                13                       21
+     34 0.917478                26                       30
+     35 0.916926                22                       22
+     16 0.916872                23                       30
 ```
+
+Within the ranges searched, `ccp_alpha` explained the most variation in score (0.412), then
+`max_features` (0.305). The top three trials share deep trees (22 to 26) and leaf sizes of 22 to 30
+rows.
 
 These importances describe **the study**, not the model: they say which knob moved the objective
 *within the ranges you searched*. Narrow a range and its importance collapses; that is a statement
@@ -256,9 +353,21 @@ question entirely.
 
 ## Multi-objective: there is no single best
 
+Sometimes you want two things that fight each other: a model that is accurate *and* small. No
+single setting wins both, so the honest answer is a short list of best trade-offs.
+
 Accuracy against latency, AUC against model size, revenue against complaint rate — with two
 objectives "best" is a set, not a point. Optuna returns the **Pareto front**: trials no other
 trial beats on both objectives at once.
+
+A trial is on the **Pareto front** if no other trial is at least as good on both objectives and
+better on one. The demo maximises AUC and minimises total tree nodes in a random forest, using
+**NSGA-II**, a sampler built for several objectives at once (it breeds new trials from the best
+current trade-offs, like a genetic algorithm).
+
+> **Picture it:** buying a laptop. One is lighter, another has a longer battery life, a third is
+> both heavier and shorter-lived than some other model — that third one is never worth buying.
+> The Pareto front is the list after you cross out every laptop that is beaten on both counts.
 
 ```python
 X2, y2 = make_classification(n_samples=2_000, n_features=25, n_informative=8,
@@ -297,10 +406,24 @@ AUC 0.9489 | 13,698 nodes | n_estimators=42 max_depth=15
 AUC 0.9501 | 20,920 nodes | n_estimators=68 max_depth=12
 ```
 
+Nine of the 24 trials survive. Each row trades size for AUC: 90 nodes buys 0.9083, 120 nodes buys
+0.9148, and the top of the menu, 20,920 nodes, buys 0.9501.
+
 Read the front as a menu with prices. The last 3.5 points of AUC cost about 174x the model size;
 if you serve this at 10k requests per second, that trade is a business decision, not a modelling
 one. Note also that `study.best_value` does not exist for a multi-objective study — Optuna refuses
 to pick for you, which is correct.
+
+## Recap in plain words
+
+- An Optuna study repeats: the sampler suggests settings, your objective trains and returns a score.
+- Define-by-run spaces let `if` statements create conditional knobs, so model choice and tuning
+  become one search.
+- TPE prefers settings that are common among good trials and rare among bad ones; it shines on
+  large, structured spaces and does not help on easy, noisy ones.
+- Pruners stop trials that are behind at an intermediate step; here that halved the training cost.
+- Parameter importances describe your search ranges, not the model.
+- With two objectives, the answer is a Pareto front of trade-offs.
 
 ## Try it Yourself
 
@@ -322,17 +445,23 @@ for n_startup in (5, 10, 20):
 
 ```output
 random   startup= 0 | best  -3.418 | spread of x0 across trials 3.14
-TPE      startup= 5 | best  -6.139 | spread of x0 across trials 2.39
-TPE      startup=10 | best  -3.418 | spread of x0 across trials 2.50
-TPE      startup=20 | best  -3.418 | spread of x0 across trials 2.55
+TPE      startup= 5 | best  -4.439 | spread of x0 across trials 2.28
+TPE      startup=10 | best  -2.319 | spread of x0 across trials 2.09
+TPE      startup=20 | best  -1.204 | spread of x0 across trials 2.71
 ```
 
+`n_startup_trials` is how many random trials TPE runs before it starts modelling. On this single
+seed, `startup=5` ends at $-4.439$, worse than random's $-3.418$, while `startup=10` ($-2.319$) and
+`startup=20` ($-1.204$) both beat random. The spread of `x0` falls from 3.14 (random) to between
+2.09 and 2.71, which shows TPE concentrating its draws.
+
 A short startup phase lets TPE commit early — good if the objective is smooth, risky if the first
-few trials landed in the wrong basin, which is what `startup=5` did here: it ends at -6.139 while
-every other setting reaches -3.418. Note also that at 30 trials none of the TPE settings *beats*
-plain random on this single seed; the five-seed benchmark above needed about 20 trials before the
-advantage showed. One run is never evidence about a sampler. The `x0` spread is the diagnostic
-for what changed: it drops from 3.14 to around 2.5, meaning the sampler concentrated its draws. Change `n_trials`, swap in `hard`'s target vector, or try
+few trials landed in the wrong basin, which is what `startup=5` did here: it ends at -4.439 and is
+the only TPE setting that loses to plain random. A longer startup gives it a broader look first
+and it finishes better. Still, one run is never evidence about a sampler — a different
+seed can reorder these rows; the five-seed benchmark above is the trustworthy comparison.
+The `x0` spread is the diagnostic
+for what changed: it drops from 3.14 to between 2.1 and 2.7, meaning the sampler concentrated its draws. Change `n_trials`, swap in `hard`'s target vector, or try
 `TPESampler(multivariate=True)` to model parameter interactions jointly.
 
 ## Exercise
@@ -341,6 +470,10 @@ Build one study that uses everything: a conditional space over two model familie
 warm start from a configuration you already trust (`study.enqueue_trial`), and a callback that
 stops the study early when it has not improved for N trials. Report the pruning savings and
 whether the warm start was ever beaten.
+
+> **Hint:** a **callback** is a function Optuna calls after every trial with `(study, trial)`;
+> calling `study.stop()` inside it ends the study. `enqueue_trial` forces the next trial to use
+> the settings you pass, so the trusted configuration becomes trial 0.
 
 <details>
 <summary>Solution</summary>
@@ -407,6 +540,10 @@ warm start (trial 0): COMPLETE, value 0.7216
 best: trial 27 value 0.9516 (forest)
 SGD trials 7, epochs actually run 106 (unpruned cost would be 210)
 ```
+
+The study used 36 of its 40 trials before the stale callback stopped it, and pruned 4. The warm
+start scored 0.7216; trial 27, a random forest, scored 0.9516. The 7 SGD trials ran 106 epochs
+instead of 210 — the pruner halved their cost.
 
 Three mechanisms, three different kinds of saving. The **pruner** cuts within-trial cost; the
 **stale callback** cuts across-trial cost when the search has plateaued; the **warm start**

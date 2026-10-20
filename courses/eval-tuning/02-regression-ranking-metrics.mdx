@@ -7,14 +7,39 @@ order: 2
 
 ## Regression metrics differ in what they punish
 
+When a model predicts a number, each prediction misses by some amount. A regression metric is
+a recipe for boiling all those misses down into one score, and the recipes disagree about
+how much one big miss should count compared with many small ones.
+
 Every regression metric aggregates the same residuals $r_i = y_i - \hat{y}_i$; they differ only
-in how they weight big ones.
+in how they weight big ones. A **residual** is the miss on one row: the true value $y_i$
+minus the prediction $\hat{y}_i$.
 
 $$
 \mathrm{MAE} = \frac{1}{n}\sum |r_i|, \quad
 \mathrm{RMSE} = \sqrt{\frac{1}{n}\sum r_i^2}, \quad
 \mathrm{MAPE} = \frac{100}{n}\sum \left| \frac{r_i}{y_i} \right|
 $$
+
+> **In plain words:**
+> - **MAE** (mean absolute error) — the average size of a miss, ignoring its sign. A miss of 10
+>   counts exactly twice as much as a miss of 5.
+> - **RMSE** (root mean squared error) — square every miss, average, then take the square root.
+>   Squaring makes a miss of 10 count *four* times as much as a miss of 5, so big misses dominate.
+> - **MAPE** (mean absolute percentage error) — the average miss as a percentage of the true
+>   value $y_i$. Missing by 10 on a true value of 20 is 50%; on a true value of 1,000 it is 1%.
+
+Two more appear in the code. **MedAE** (median absolute error) is the middle miss when you
+line all misses up by size, so a few huge ones cannot move it. **$R^2$** compares your squared
+error to that of a lazy model that always predicts the average; 1 is perfect, 0 is no better than
+the average.
+
+> **Picture it:** grading archers. MAE is the average distance from the bullseye. RMSE is
+> the same, but a judge who hates wild shots counts every distance squared, so one arrow in the
+> grass ruins the score. MedAE only looks at the archer's typical arrow and ignores the wild ones.
+
+The demo creates 5,000 skewed targets (like prices) and a model with about 15% error, then
+breaks 20 predictions badly (four times too high) and compares the metrics.
 
 ```python
 import numpy as np
@@ -48,6 +73,10 @@ MAPE%           12.049        13.128     1.09x
 R2               0.925         0.849     0.92x
 ```
 
+Read the "change" column. Twenty bad rows out of 5,000 (0.4%) raise RMSE by 1.41x and drop $R^2$
+from 0.925 to 0.849. MAE moves only 1.08x and MAPE 1.09x. MedAE does not move at all (0.99x is
+noise from the different random draw).
+
 Twenty rows out of five thousand moved RMSE far more than MAE, and left the median absolute
 error almost untouched. **RMSE is the metric to use when large errors are disproportionately
 costly** (a delivery estimate off by three hours is much worse than three off by one); MAE when
@@ -55,6 +84,12 @@ every unit of error costs the same; median absolute error when you want a number
 distort.
 
 ### MAPE and its asymmetry
+
+MAPE looks like a fair "percent wrong" score, but it has two hidden traps. It blows up when
+the true value is close to zero, and it treats too-high and too-low predictions unequally.
+
+The demo predicts 50% too high and 50% too low, then also tries **sMAPE** (symmetric MAPE),
+which divides by the average of the truth and the prediction instead of by the truth alone.
 
 ```python
 truth = np.array([10.0, 100.0, 1_000.0])
@@ -78,11 +113,29 @@ under-predict  MAPE   50.0%  sMAPE   66.7%
 MAPE with a near-zero actual: 3,341%  <- one row at y=0.01 dominates everything
 ```
 
+At $\pm 50\%$, MAPE scores both directions at 50.0%. The trap is in the limits: an
+under-prediction can never cost more than 100% (predicting 0 is "100% wrong"), but an
+over-prediction has no ceiling (predicting 10 times too high is 900% wrong). sMAPE, the usual
+"fix", is not symmetric either: it scores the over-prediction 40.0% and the under-prediction
+66.7%. The last line shows the near-zero trap: one row with $y = 0.01$ off by 1 gives that row a
+10,000% error, and the average is 3,341%.
+
 MAPE is popular with stakeholders and treacherous in code: it explodes near zero, and it
 punishes over-prediction more than under-prediction, so **optimizing MAPE biases your model
 low**. Use it for reporting when the audience insists, and optimize something else.
 
+> **Watch out:** if your target can be zero (sales of a slow item on a given day, rainfall),
+> MAPE is undefined on those rows. Many libraries silently drop or clip them, which changes
+> the metric without telling you.
+
 ### The right metric is often on the log scale
+
+Sometimes what matters is the *ratio* of prediction to truth, not the difference. Being off
+by 2x is equally bad whether the item costs 20 or 2,000.
+
+**RMSLE** (root mean squared log error) measures that: it takes $\log(1 + y)$ of the truth and
+of the prediction, then computes RMSE on those logged values. On the log scale, "twice as
+big" is always the same distance.
 
 ```python
 def rmsle(y, pred):
@@ -101,10 +154,31 @@ expensive item   abs error    2,000 | squared    4,000,000 | RMSLE 0.693
 RMSLE treats both as the same mistake: a 2x error is a 2x error
 ```
 
+Both items are predicted at double the true price. The absolute error differs by 100x (20 versus
+2,000) and the squared error by 10,000x, but RMSLE is 0.669 and 0.693 — nearly the same. (They
+are not identical because of the $+1$ inside the log, which matters more for small values.)
+
+RMSLE fits prices, populations, and counts that span orders of magnitude.
+
 ## Choosing a metric is choosing a loss
+
+The score you grade the model with should be the same thing the model was trained to
+minimize. If they differ, the model gets very good at a game you are not scoring.
+
+A **loss** is the quantity the training algorithm minimizes. Ordinary least squares minimizes
+squared error (an **L2** loss, the training twin of RMSE). Minimizing absolute error is an **L1**
+loss (the twin of MAE).
 
 The metric you evaluate on should be the loss you train on. If they disagree, the optimizer
 happily gives you a model that is excellent at the wrong thing.
+
+> **Picture it:** a teacher who grades only spelling but tells students to practise
+> handwriting. The students get very neat, and the spelling scores do not budge.
+
+The demo fits a line to data where the true slope is 3 and the intercept is 0, then corrupts
+2% of the targets by adding about 60. The L1 fit uses **IRLS** (iteratively reweighted least
+squares): repeat a weighted least-squares fit where each row's weight is $1/|r_i|$, so rows
+with big residuals get small weights — after enough rounds, this minimizes absolute error.
 
 ```python
 x = rng.normal(0, 1, 4_000)
@@ -138,15 +212,40 @@ L2 fit (RMSE)    slope  3.164 (true 3.000) intercept  1.266 | MAE on clean rows 
 L1 fit (MAE)     slope  2.996 (true 3.000) intercept  0.005 | MAE on clean rows 0.398
 ```
 
+The L2 fit's slope (3.164) and intercept (1.266) are both pulled toward the corrupted rows; on
+the 98% clean rows its MAE is 1.282. The L1 fit lands almost exactly on the truth (slope 2.996,
+intercept 0.005) and its MAE on clean rows is 0.398, about three times better.
+
 Two percent contamination shifts the squared-error fit's intercept by more than a point, while
 the L1 fit barely notices — squared error lets a handful of extreme residuals drag the whole
 line, which is the same property that made RMSE move 1.4x in the first demo. **Pick the metric
 from the decision, then train on it** — not the other way around.
 
+> **Watch out:** "robust to outliers" is not automatically good. If those 2% of rows are real
+> (big orders that do happen), the L1 model will systematically under-predict them. Decide
+> whether the outliers are errors or customers before picking the loss.
+
 ## Ranking metrics: order matters, magnitude does not
+
+When you show a user a list (search results, recommendations), the user only sees the order.
+A ranking metric asks "are the good items near the top?" and ignores the actual score values.
 
 For search, recommendations, and any "top-k" product surface, the score itself is irrelevant.
 What matters is whether the right items are near the top.
+
+The metrics in the code, each in one line:
+
+- **Precision@k** — of the top $k$ items, what fraction are relevant.
+- **Recall@k** — of all relevant items, what fraction made it into the top $k$.
+- **Average precision (AP)** — compute precision at the position of every relevant item, then
+  average those precisions. It rewards putting each relevant item as high as possible.
+- **DCG@k** (discounted cumulative gain) — add up the relevance of the top $k$ items, dividing each by
+  $\log_2(\text{position} + 1)$, so position 1 counts fully and position 10 counts about 0.29.
+- **NDCG@k** — DCG divided by the DCG of the best possible ordering, so 1.0 means "perfect order".
+
+> **Picture it:** a reader skims a results page from the top and gets bored as they go. DCG
+> is how much useful stuff they find, with each step down the page worth a bit less because
+> fewer readers get that far.
 
 ```python
 def precision_at_k(relevant, k):
@@ -180,9 +279,16 @@ good ranking   P@3 0.667 R@5 0.750 AP 0.799 NDCG@10 0.922
 bad ranking    P@3 0.000 R@5 0.250 AP 0.315 NDCG@10 0.517
 ```
 
+Both lists hold four relevant items out of ten. The good ranking has two of them in the top 3
+(P@3 = 0.667); the bad one has none (P@3 = 0.000). AP drops from 0.799 to 0.315 and NDCG@10 from
+0.922 to 0.517 — the same items, just shuffled down the list.
+
 Both lists contain four relevant items; only the order differs. Precision@k and recall@k see part
 of that, **average precision** sees all of it, and **NDCG** additionally handles *graded*
 relevance — a perfect match ranked third is not the same as a marginal one ranked third.
+
+**Graded relevance** means each item gets a score like 3 (perfect), 2 (good), 1 (marginal),
+0 (useless) instead of a yes/no. The next demo swaps the perfect item (3) with the good one (2).
 
 ```python
 graded = np.array([3, 0, 2, 0, 1, 0, 0, 0, 0, 0], dtype=float)     # 3 = perfect, 1 = marginal
@@ -199,7 +305,16 @@ top two swapped    NDCG@10 0.8162
 binary metrics cannot see this swap at all: P@3 0.667 both ways
 ```
 
+NDCG drops from 0.9212 to 0.8162 when the perfect match moves from position 1 to position 3. P@3
+stays at 0.667 both ways, because to a binary metric "relevant" is relevant, and both items are
+still in the top 3.
+
 ### MRR, and when to use which
+
+Some searches have exactly one right answer: you looked up a specific song, and only the
+position of that song matters. **MRR** (mean reciprocal rank) is built for this: for each query,
+score $1/\text{position}$ of the first relevant item (1 if it is first, 0.5 if second, 0.25 if
+fourth), then average over queries.
 
 ```python
 def mrr(relevant_lists):
@@ -233,7 +348,18 @@ fixed slate the user sees         P@k / R@k   a 10-item carousel
 revenue depends on the position   custom      weight by position value, not by log
 ```
 
+The three queries have their first hit at positions 2, 1, and 4, so the reciprocal ranks are 0.5,
+1, and 0.25; their average is 0.5833. The table after it is a cheat sheet: match the metric to the
+shape of the product, not to whatever the library computes by default.
+
 ## Cutoffs must match the interface
+
+The $k$ in "@k" should be the number of results a user actually sees. Change $k$ and the same
+model gets a very different score.
+
+The demo makes 2,000 queries with 50 candidates each, where every candidate is relevant at
+random with 8% probability (so the ranking is no better than chance), and computes NDCG at
+several cutoffs.
 
 ```python
 rel = (rng.random((2_000, 50)) < 0.08).astype(float)      # 50 candidates per query
@@ -252,8 +378,25 @@ NDCG@20  0.2161
 NDCG@50  0.3916   
 ```
 
+Even for a ranking that knows nothing, NDCG climbs from 0.0760 at $k = 1$ to 0.3916 at $k = 50$.
+Larger cutoffs make every model look better, because more of the relevant items fall inside the
+window. A number like "NDCG = 0.39" means nothing until you say which $k$.
+
 The number in `@k` is not a modelling choice, it is a **product** fact: if the page shows ten
 results, `NDCG@10` is the metric and `NDCG@50` is a fiction about an interface nobody sees.
+
+> **Watch out:** comparing an NDCG@10 from one paper with an NDCG@20 from another is
+> comparing different metrics. Always quote the cutoff.
+
+## Recap in plain words
+
+- All regression metrics summarize residuals; they differ in how hard they punish big misses.
+- RMSE is dominated by large errors, MAE weighs every unit equally, MedAE ignores outliers.
+- MAPE explodes near zero and favors under-prediction; RMSLE scores ratios instead of differences.
+- Train on the loss that matches the metric you will judge by.
+- Ranking metrics care only about order; NDCG also handles graded relevance, MRR fits
+  "one right answer" searches.
+- The cutoff $k$ must match how many items the user really sees.
 
 ## Try it Yourself
 
@@ -287,9 +430,17 @@ wild outliers      6.53    21.33     3.45    10.35   0.742
    MAPE%  winner: unbiased
 ```
 
+Three models, three personalities. "Unbiased" has errors of about 12% in both directions.
+"Biased low" predicts 8% too low on average. "Wild outliers" is more precise (10% error) but blows
+up 30 rows by 5x. Look at RMSE: wild outliers scores 21.33, more than twice the others, and its
+$R^2$ falls to 0.742. Yet it has the *best* MedAE (3.45), because MedAE ignores those 30 rows.
+
 Three models, and the winner changes with the metric. That is the whole point of this chapter:
 **report several metrics, and state which one the decision uses** — because the model you pick is
 determined by that choice long before any tuning happens (ch. 6).
+
+Try this variation: change `occasionally_wild[:30] *= 5` to `*= 1.5`. With milder outliers, see
+whether the wild model now wins on MAE too.
 
 ## Exercise
 
@@ -299,6 +450,10 @@ custom asymmetric metric (a pinball / quantile loss) that penalizes under-predic
 heavily as over-prediction, and show that the model minimizing it is systematically different
 from the one minimizing RMSE. Then report both, plus the fraction of deliveries inside a
 five-minute window, and recommend one.
+
+> **Hint:** the **pinball loss** at level $\tau$ charges $\tau$ per unit of under-prediction
+> and $1 - \tau$ per unit of over-prediction. A 2:1 ratio means $\tau = 2/3$. The constant that
+> minimizes pinball loss is the $\tau$-quantile of the data, not the mean.
 
 <details>
 <summary>Solution</summary>
@@ -351,6 +506,10 @@ intercepts: RMSE fit 11.07, asymmetric fit 11.50 -> the asymmetric model quotes 
 recommendation: report all three, decide on pinball —
 the business cost of a late promise is not the business cost of an early one
 ```
+
+The asymmetric model's RMSE is slightly worse (2.154 versus 2.110), but its pinball loss is lower
+(0.7908 versus 0.8061) and it is late on 33.3% of deliveries instead of 40.5%. That 33.3% is
+exactly $1 - 2/3$, as it should be for a $2/3$-quantile.
 
 The insight: the asymmetric model is *worse* on RMSE and *better* at the thing the business
 actually cares about, which is being late less often. It buys that by quoting about half a minute

@@ -7,14 +7,25 @@ order: 5
 
 ## Building ARIMA from AR and MA
 
+ARIMA is built from two simple ideas. One says "today looks like a mix of the last few days".
+The other says "today still feels the last few surprises". Add a differencing step in front
+(ch. 2) and you can handle series that wander.
+
 **AR(p)** — autoregressive: each value is a linear combination of its $p$ lagged values:
 
 $$
 y_t = c + \phi_1 y_{t-1} + \cdots + \phi_p y_{t-p} + \varepsilon_t
 $$
 
+> **In plain words:** today = a constant $c$ + a weighted sum of the last $p$ values + a new
+> random shock $\varepsilon_t$. The weights are the $\phi$ (phi) coefficients.
+
 Stationarity requires that all roots of $1 - \phi_1 z - \cdots - \phi_p z^p = 0$ lie
 outside the unit circle.
+
+For AR(1) this is the $|\phi| < 1$ rule from ch. 2: the root of $1 - \phi z = 0$ is
+$z = 1/\phi$, which is outside the unit circle exactly when $|\phi| < 1$. For higher orders,
+the condition makes sure every shock eventually fades instead of echoing forever.
 
 **MA(q)** — moving average: each value depends on $q$ past shocks:
 
@@ -22,17 +33,38 @@ $$
 y_t = c + \varepsilon_t + \theta_1\varepsilon_{t-1} + \cdots + \theta_q\varepsilon_{t-q}
 $$
 
+> **In plain words:** today = a constant + today's shock + weighted leftovers of the last $q$
+> shocks. The weights are the $\theta$ (theta) coefficients. A shock affects exactly $q$ future
+> values and then is gone.
+
 MA models are always stationary regardless of $\theta$.
+
+That is because an MA value is a finite sum of shocks, so its mean and variance never change.
+
+> **Picture it:** an AR process is an echo in a canyon — each shout keeps bouncing, getting
+> fainter. An MA process is a ripple from one stone in a pond — it moves a fixed number of
+> waves out and then the water is flat again.
 
 **ARIMA(p, d, q)** combines them: difference the series $d$ times to achieve stationarity,
 then fit ARMA(p, q) to the differenced series.
 
 ## Identification: choosing p, d, q
 
+Picking the three numbers is detective work with the tools from ch. 2. First decide how many
+differences make the series stable, then read the ACF and PACF to guess the sizes, then let
+AIC break ties.
+
 1. **d**: apply ADF test; if p-value > 0.05, apply one difference; repeat until stationary.
 2. **q**: from ACF of the (differenced) stationary series — number of significant lags before cutoff.
 3. **p**: from PACF — number of significant lags before cutoff.
 4. **Confirm**: compare AIC across candidate models; lower AIC is better.
+
+> **Watch out:** when both AR and MA parts are present, neither the ACF nor the PACF cuts off
+> cleanly — both decay (ch. 2). Then the plots only suggest a starting point, and AIC on a few
+> nearby orders does the real choosing.
+
+The code simulates an ARIMA(1,1,1): it builds stationary changes with AR coefficient 0.6 and MA
+coefficient 0.4, then adds them up (**integrates** them, the "I") to get a wandering series.
 
 ```python
 import numpy as np
@@ -67,19 +99,32 @@ print(f"AIC: {fitted.aic:.1f}")
 ```
 
 ```output
-ADF original p=0.8743  →  d=1 needed: True
+ADF original p=0.7487  →  d=1 needed: True
 ADF diff     p=0.000000 →  stationary after 1 diff
 
-AR coeff: 0.541  MA coeff: 0.421
-AIC: 585.3
+AR coeff: 0.571  MA coeff: 0.490
+AIC: 519.2
 ```
 
-Estimated AR ≈ 0.54 (true 0.6) and MA ≈ 0.42 (true 0.4) — close to the true parameters.
+The ADF p-value on the original series is 0.7487, far above 0.05, so one difference is needed.
+After differencing, p is 0.000000 — stationary, so $d = 1$. The fitted AR coefficient is 0.571
+(true 0.6) and the MA coefficient is 0.490 (true 0.4).
+
+Estimated AR $\approx$ 0.57 (true 0.6) and MA $\approx$ 0.49 (true 0.4) — close to the true
+parameters. With 200 points, errors of 0.03 and 0.09 are normal; AR and MA terms partly
+substitute for each other, so their estimates wobble together.
 
 ## Residual diagnostics
 
+A good model leaves nothing predictable behind. If its mistakes still have a pattern, the model
+missed something you could have used.
+
 After fitting, the residuals should be white noise: no remaining autocorrelation, roughly
 Normal. Two checks: Ljung-Box test and the residual ACF.
+
+The **residual** at time $t$ is the actual value minus the model's one-step-ahead forecast.
+The **Ljung-Box test** bundles many residual autocorrelations into one number; its null is "no
+autocorrelation up to lag $k$", so here a *large* p-value is good news.
 
 ```python
 import numpy as np
@@ -97,7 +142,7 @@ for t in range(1, n):
 y = np.cumsum(np.concatenate([[100], diff]))[:n]
 
 fitted = ARIMA(y, order=(1,1,1)).fit()
-resid  = fitted.resid
+resid  = fitted.resid[1:]   # drop t=0: its "residual" is y[0] itself (no past to forecast from)
 
 lb = acorr_ljungbox(resid, lags=[6, 12], return_df=True)
 print("Ljung-Box test on residuals:")
@@ -110,17 +155,33 @@ print(f"Residual std:   {resid.std():.4f}")
 ```output
 Ljung-Box test on residuals:
     lb_stat  lb_pvalue
-6    4.8832     0.5590
-12   9.7143     0.6404
+6    8.8356     0.1830
+12   9.7848     0.6348
 
-Residual mean:  0.0003
-Residual std:   1.0247
+Residual mean:  -0.0333
+Residual std:   0.8776
 ```
 
+The Ljung-Box p-values are 0.1830 at lag 6 and 0.6348 at lag 12, both well above 0.05 — no
+significant autocorrelation remains. The residual mean is $-0.0333$ and the std is 0.8776.
+
 Both Ljung-Box p-values are well above 0.05 — no significant autocorrelation remains.
-Residuals are essentially white noise with mean ≈ 0 and std ≈ 1, matching the true $\sigma$.
+Residuals are essentially white noise with mean $\approx$ 0 and std $\approx$ 1, matching the true $\sigma$.
+
+The std is 0.88 rather than 1.00 because this particular draw of shocks happens to be a bit
+calm: ch. 2 drew its shocks from the same seed (42), and its differenced random walk
+also had std 0.882.
+
+> **Watch out:** drop the first residual. The code uses `fitted.resid[1:]` because at $t = 0$
+> the model has no past to forecast from, so its "residual" is the raw value $y_0 \approx 100$.
+> Leaving it in inflates the std to about 7 and drowns every autocorrelation, which makes
+> Ljung-Box report p $\approx$ 1.0 for any model, good or bad.
 
 ## SARIMA: seasonal extension
+
+SARIMA runs a second, slower ARIMA on top of the first one: the regular part links each month
+to the last few months, and the seasonal part links each month to the same month in previous
+years.
 
 SARIMA(p,d,q)(P,D,Q)$_m$ adds seasonal AR, I, MA components at period $m$:
 
@@ -128,7 +189,19 @@ $$
 \Phi_P(B^m)\phi_p(B)(1-B)^d(1-B^m)^D y_t = \Theta_Q(B^m)\theta_q(B)\varepsilon_t
 $$
 
+- $B$ is the **backshift operator**: $B y_t = y_{t-1}$, and $B^m y_t = y_{t-m}$ (the same
+  month last year when $m = 12$).
+- $(1-B)^d$ is ordinary differencing $d$ times; $(1-B^m)^D$ is **seasonal differencing**
+  ("this January minus last January") $D$ times.
+- $\phi_p(B)$ and $\theta_q(B)$ are the usual AR and MA parts; $\Phi_P(B^m)$ and
+  $\Theta_Q(B^m)$ are the same thing at seasonal lags $m, 2m, \ldots$
+- The parts are multiplied, so short-term and seasonal effects combine.
+
 A common starting point for monthly data: SARIMA(1,1,1)(1,1,1)$_{12}$.
+
+> **Picture it:** predicting this December's toy sales. The regular part looks at
+> October and November. The seasonal part looks at last December and the December before.
+> SARIMA uses both views at once.
 
 ```python
 import numpy as np
@@ -156,17 +229,36 @@ print(fcast.round(1).to_string())
 ```
 
 ```output
-AIC: 489.3
-AR(1): 0.218
+AIC: 441.9
+AR(1): 0.045
 
 6-month forecast:
-2022-01-31    215.3
-2022-02-28    207.4
-2022-03-31    219.8
-2022-04-30    234.2
-2022-05-31    242.5
-2022-06-30    247.1
+2022-01-31    217.7
+2022-02-28    232.5
+2022-03-31    242.2
+2022-04-30    245.0
+2022-05-31    241.4
+2022-06-30    233.7
+Freq: ME
 ```
+
+The forecast keeps the seasonal shape: it climbs from 217.7 in January to a peak of 245.0 in
+April and falls back to 233.7 by June, exactly where the simulated sine wave peaks
+($t = 87$ falls on month 3 of the cycle). The AR(1) coefficient is only 0.045: once the
+seasonal difference removes the yearly wave and the regular difference removes the trend, what
+is left is close to pure noise, so there is little month-to-month memory to model.
+
+> **Watch out:** `SARIMAX.fit()` can be slow and print convergence warnings on short series.
+> Seven years (84 points) of monthly data is about the minimum for seasonal terms: each
+> seasonal parameter is learned from only about 7 same-month pairs.
+
+## Recap in plain words
+
+- AR uses past values, MA uses past shocks, and the "I" in ARIMA differences the series $d$ times first.
+- AR is stationary only when its roots lie outside the unit circle; MA is always stationary.
+- Choose $d$ with the ADF test, guess $p$ and $q$ from the PACF and ACF, then confirm with AIC.
+- Good residuals are white noise: Ljung-Box p-values above 0.05 and no visible pattern.
+- SARIMA adds a seasonal ARIMA at lag $m$ (12 for monthly data) on top of the regular one.
 
 ## Try it Yourself
 
@@ -190,16 +282,28 @@ for order in [(1,1,0), (2,1,0), (1,1,1), (2,1,1)]:
 ```
 
 ```output
-ARIMA(1, 1, 0)  AIC=583.5
-ARIMA(2, 1, 0)  AIC=561.2
-ARIMA(1, 1, 1)  AIC=564.8
-ARIMA(2, 1, 1)  AIC=563.0
+ARIMA(1, 1, 0)  AIC=574.4
+ARIMA(2, 1, 0)  AIC=556.8
+ARIMA(1, 1, 1)  AIC=562.7
+ARIMA(2, 1, 1)  AIC=557.0
 ```
+
+The true model is ARIMA(2,1,0), and it wins with AIC 556.8. ARIMA(2,1,1) is close behind at
+557.0: it contains the true model plus one extra MA term that adds almost nothing, so AIC's
+penalty makes it lose by 0.2. ARIMA(1,1,0) is clearly worst (574.4) — it is missing the
+second AR lag. Differences under about 2 AIC points are a near-tie; a gap of 17 is decisive.
+
+Try changing the true coefficients to 0.5 and $-0.3$, or shortening the series to 60 points,
+and see how often AIC still picks the right order.
 
 ## Exercise
 
 Simulate a SARIMA(0,1,1)(0,1,1)$_{12}$ series (120 observations). Fit it back with
 SARIMAX and verify that AIC is lower than a plain ARIMA(0,1,1) on the same data.
+
+> **Hint:** a trend plus a sine wave with period 12 plus noise has the right shape. Fit
+> `SARIMAX(series, order=(0,1,1), seasonal_order=(0,1,1,12))` and `ARIMA(series, order=(0,1,1))`
+> and compare `.aic`.
 
 <details>
 <summary>Solution</summary>
@@ -227,4 +331,13 @@ print(f"SARIMA(0,1,1)(0,1,1)_12 AIC: {sarima.aic:.1f}")
 print(f"ARIMA(0,1,1)            AIC: {arima.aic:.1f}")
 print("SARIMA wins:", sarima.aic < arima.aic)
 ```
+
+Running it prints AIC 632.1 for the SARIMA and 857.7 for the plain ARIMA, so SARIMA wins by a
+wide margin. The plain ARIMA has no way to know that January resembles last January, so it
+treats the whole seasonal wave as unexplained noise.
+
+> **Watch out:** strictly, AIC is only comparable between models fitted to the *same* data, and
+> the seasonal difference changes the data the likelihood is computed on (it drops the first
+> 12 points). With a 225-point gap the conclusion is safe; for close calls, compare models with
+> the same $d$ and $D$, or compare forecast errors on held-out data (ch. 6).
 </details>

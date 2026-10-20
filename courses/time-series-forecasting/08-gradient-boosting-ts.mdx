@@ -7,15 +7,37 @@ order: 8
 
 ## Why tree models work well for time series
 
+A decision tree learns rules like "if last week was high and it's December, predict high".
+Gradient boosting stacks hundreds of small trees, each fixing the mistakes of the ones before
+it. That lets it learn combinations of clues a straight-line model cannot.
+
 LightGBM and XGBoost naturally capture nonlinear interactions between lags — e.g.,
 "when lag_7 is high AND month is December, the value spikes." Linear models can't express
 this without explicit interaction terms. Trees also handle mixed feature types (lags,
 calendars, categorical IDs) without scaling.
 
+An **interaction** is when the effect of one feature depends on another. **LightGBM** and
+**XGBoost** are two popular, fast gradient-boosting libraries. **Scaling** means rescaling
+features to similar ranges; trees only ask "is this feature above a threshold?", so the units
+don't matter.
+
+> **Picture it:** a team of tutors marking a practice exam. The first tutor gives rough
+> feedback. The second only looks at what the first got wrong, the third at what is still
+> wrong, and so on. Each one is weak alone; together they get very precise.
+
 The lag-feature framework from ch. 7 works directly: build the feature matrix, then
 replace Ridge with LightGBM.
 
+> **Watch out:** trees cannot extrapolate. A tree's prediction is always an average of training
+> targets, so it can never forecast a value above the highest one it has seen. On a strongly
+> trending series, model the change (difference) or remove the trend first, or the forecasts
+> flatten out at the old maximum.
+
 ## Multi-step forecasting strategies
+
+A model trained to predict "tomorrow" doesn't directly tell you "next Thursday". You can train
+a separate model for each day ahead, reuse one model by feeding its own guesses back in, or
+train one model that outputs all days at once.
 
 When you need $h > 1$ step ahead you have three options:
 
@@ -25,9 +47,23 @@ When you need $h > 1$ step ahead you have three options:
   `lag_1` to predict $\hat{y}_{t+2}$, and so on. Simple; accumulates errors for long horizons.
 - **MIMO** (multi-input multi-output): one model outputs all $h$ values simultaneously.
 
+**Error accumulation** means the recursive model's day-2 forecast is built on its own day-1
+guess, so a day-1 mistake gets baked into day 2, then day 3, like a photocopy of a photocopy.
+
+> **Picture it:** giving directions. Direct: you write separate instructions for each turn,
+> each from the starting point. Recursive: you say "go to the next corner, then ask again" —
+> one wrong turn early and every later step is off.
+
 For horizons up to ~12, direct is the most reliable in practice.
 
 ## LightGBM with early stopping
+
+Boosting keeps adding trees, and after a while new trees start memorising noise. **Early
+stopping** watches the error on a validation set and stops when it hasn't improved for a while.
+
+The split has three parts, in time order: 80% to train, the next 10% to **validate** (to decide
+when to stop), the final 10% to **test** (touched once, at the end). `early_stopping(50)` stops
+if 50 rounds pass without a better validation MAE and keeps the best round.
 
 ```python
 import numpy as np
@@ -87,16 +123,29 @@ print(f"MASE:      {mae/naive:.3f}")
 ```
 
 ```output
-Best iteration: 187
-Test MAE:  1.823
-Naive MAE: 4.791
-MASE:      0.381
+Best iteration: 70
+Test MAE:  3.759
+Naive MAE: 5.057
+MASE:      0.743
 ```
 
-Early stopping halted training at iteration 187 — no overfitting past that point. MASE 0.38
-means LightGBM makes errors less than 40% as large as the naive baseline.
+Early stopping kept round 70 of the 500 allowed: after that, the validation MAE stopped
+improving. On the test set the MAE is 3.759 against a naive 5.057, so MASE is 0.743 —
+LightGBM's errors are about 74% of the naive ones.
+
+That is a real gain, but not a huge one. The noise std is 3, so even a perfect model would have
+an MAE near $3 \times 0.8 = 2.4$. On this data a plain Ridge regression with the same features
+reaches an MAE of about 2.51: the series is built from sine waves and a straight trend, which a
+linear model on lags captures almost exactly, while trees approximate every smooth curve with
+steps.
+
+> **Watch out:** gradient boosting is not automatically better. On smooth, nearly linear series
+> a linear model on good features often wins. Backtest both (ch. 6) before choosing.
 
 ## Feature importance
+
+After training, you can ask the model which clues it leaned on most. LightGBM's default answer
+counts how often each feature was used to split a tree.
 
 ```python
 import numpy as np
@@ -134,16 +183,38 @@ for name, score in imp[:6]:
 ```
 
 ```output
-  lag_7            2412
-  roll_mean_7      1893
-  dow_sin          1547
-  lag_1            1231
-  dow_cos           987
-  lag_14            743
+  roll_std_7         694
+  lag_1              652
+  lag_7              628
+  lag_28             549
+  lag_2              541
+  lag_3              527
 ```
 
-`lag_7` dominates — the strong weekly cycle means last week's same-weekday value is the
-best single predictor. The rolling mean and day-of-week signals follow.
+The top feature by this count is `roll_std_7` (694 splits), then `lag_1` (652) and `lag_7`
+(628). That does not mean the rolling std is the most useful feature. The default
+`feature_importances_` is **split importance**: the number of times a feature appears in a
+split. Continuous, noisy features offer many slightly different thresholds, so trees keep
+reaching for them to make small refinements.
+
+Switch to **gain importance** — how much each feature's splits reduced the error,
+`model.booster_.feature_importance('gain')` — and the picture changes: `lag_7` comes first
+by a wide margin (about 1.30 million), then `lag_14` (0.39 million) and `roll_mean_7`
+(0.09 million). With gain, `lag_7` dominates — the strong weekly cycle means last week's
+same-weekday value is the best single predictor. The rolling mean and day-of-week signals
+follow.
+
+> **Watch out:** split counts reward features that are used often, not features that matter.
+> Use gain importance, or better, permutation importance on held-out data, before you drop or
+> keep features based on importance.
+
+## Recap in plain words
+
+- Gradient boosting adds many small trees, each correcting the last, and learns interactions between lags and calendar features.
+- Trees cannot predict outside the range of training targets, so handle trends before you fit.
+- Multi-step forecasts can be direct (one model per horizon), recursive (feed predictions back) or MIMO (all horizons at once).
+- Early stopping on a time-ordered validation set picks the number of trees.
+- Split-count importance is biased toward noisy continuous features; gain importance is a better first look.
 
 ## Try it Yourself
 
@@ -175,14 +246,27 @@ print(f"Test MAE: {mae:.3f}  (naive: {np.mean(np.abs(np.diff(y_arr[split:]))):.3
 ```
 
 ```output
-Test MAE: 1.241  (naive: 5.614)
+Test MAE: 3.665  (naive: 8.478)
 ```
+
+LightGBM's MAE is 3.665 against the naive 8.478 — less than half. Naive suffers here because
+the weekly wave is large ($\pm 15$): yesterday is a poor guess for today. The model is still well
+above the noise floor of about 1.6 (noise std 2), partly because this series trends upward for
+three years: about a quarter of the test values (the last 15% of days) lie above the training maximum,
+which trees cannot reach.
+
+Try removing the trend (`0.0*t`) and re-run: the MAE drops to about 1.72, right at the noise floor. Then
+try modelling the change instead: target `y - lag_1` and add `lag_1` back after predicting.
 
 ## Exercise
 
 Implement the recursive multi-step strategy for 4-step-ahead forecasting: train one model
 for 1-step-ahead, then iteratively feed predictions as lag features. Compare MAE at each
 horizon h=1,2,3,4 vs the direct strategy (four separate models).
+
+> **Hint:** for the direct strategy, pair each feature row at time $t$ with the target
+> $y_{t+h}$ using `df['y'].shift(-h)`. For the recursive strategy, predict one step, write the
+> prediction into a copy of the series, rebuild the lags, and repeat four times.
 
 <details>
 <summary>Solution</summary>
@@ -223,4 +307,17 @@ for h in range(1, 5):
 
 print("Direct strategy MAE by horizon:", [f"{v:.3f}" for v in direct_maes])
 ```
+
+The solution implements the direct half. Running it prints MAEs of 5.823, 7.219, 5.805 and
+2.831 for $h = 1, 2, 3, 4$ — not the steady rise you might expect. Two details explain it.
+First, row $t$'s features are lags of $y_t$ (so $y_{t-1}$, $y_{t-2}$, $y_{t-3}$, $y_{t-7}$),
+and $y_t$ itself is not a feature, so even "$h = 1$" forecasts two steps past the newest value
+used. Second, the series has a 7-day cycle: for $h = 4$ the target $y_{t+4}$ falls on the
+same weekday as the feature $y_{t-3}$, an almost perfect clue, so $h = 4$ is the easiest
+horizon. Adding $y_t$ (a `lag_0` column) to the features would fix the first issue.
+
+For the recursive half: fit one model on $h = 1$, predict $\hat{y}_{t+1}$, append it to the
+series as if it were real, rebuild the four lag features, predict $\hat{y}_{t+2}$, and repeat.
+Its errors usually grow with $h$ as guesses feed on guesses; the direct models avoid that
+by training on real targets at each horizon.
 </details>

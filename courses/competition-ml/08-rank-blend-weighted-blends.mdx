@@ -7,8 +7,22 @@ order: 8
 
 ## Choose the blend operator to match the metric
 
+"Average the models" hides a choice: average *what*? You can average the probabilities, their
+log-odds, or their ranks, and the metric you are scored on decides which one is right.
+
 Averaging is not one operation. Probabilities, log-odds and ranks are three different spaces, and
 the right one is determined by the metric you are scored on — not by habit.
+
+A **blend operator** is the rule for combining predictions. **Log-odds** (also called the
+**logit**) turn a probability $p$ into $\log(p/(1-p))$: 0.5 becomes 0, probabilities near 0 or 1
+become large negative or positive numbers.
+
+> **Picture it:** averaging temperatures in Celsius and in Fahrenheit gives the same day's
+> "average" — but averaging on a log scale does not. Before you average, you choose the ruler,
+> and different rulers give different middles.
+
+The setup builds four models of decreasing skill. C is **badly calibrated** (its probabilities
+are shifted too low) and D is **squashed** (its probabilities are pulled toward the middle).
 
 ```python
 import numpy as np
@@ -45,10 +59,20 @@ C: AUC 0.6793 | log loss 0.7416 | mean 0.174 (actual rate 0.372)
 D: AUC 0.6642 | log loss 0.6417 | mean 0.450 (actual rate 0.372)
 ```
 
+The actual positive rate is 0.372. A and B average about the same (0.375, 0.376). C averages only
+0.174, and its log loss is the worst at 0.7416 even though its AUC (0.6793) is close to B's.
+D averages 0.450, too close to the middle.
+
 Models C and D rank almost as well as A and B but are on wrong scales — C is shifted, D is
 squashed. Watch what each blend operator does with that.
 
 ## Four operators
+
+Every operator follows the same three steps: move the predictions into some space, take the
+average there, move back to probabilities. Only the space differs.
+
+The four spaces: raw **probability**, **rank** (percentile), **log** of the probability (whose
+average, moved back, is the **geometric mean**), and **logit**.
 
 ```python
 # every operator is "transform into a space, take a weighted mean, transform back"
@@ -89,15 +113,25 @@ for name, (fwd, back) in SPACES.items():
 The two columns behave completely differently, and that asymmetry is the practical lesson. On
 **AUC** all four operators land inside 0.0013 of each other — every one of them is close enough to
 monotone in the same underlying score, so the choice barely matters. On **log loss** the spread is
-0.055, nearly ten times the gap between the best and worst single model, and the rank mean is a
+0.055, and almost all of it comes from one operator: the rank mean is a
 disaster at 0.6562 for an obvious reason: its output is a percentile, not a probability, so
 feeding it to a probability metric is a category error.
+
+The other three operators all reach a log loss between 0.6007 and 0.6061, close to or better than
+the best single model (0.6016). Every blend also beats the best single model on AUC (0.7084 to
+0.7097 against 0.6971).
 
 The rule that follows: **for rank metrics pick whichever operator you like and spend your time
 elsewhere; for probability metrics the operator is a real decision** and rank blending is simply
 unavailable unless you map the ranks back to probabilities afterwards.
 
+> **Watch out:** a rank-averaged submission in a log-loss competition is a common, expensive
+> mistake. The file is valid, every value is in [0, 1], and the score is quietly terrible.
+
 ### Why the logit mean behaves differently
+
+A plain average of 1% and 30% lands at 15.5%, far from both. The logit mean lands much closer to
+the confident 1% model.
 
 Averaging probabilities pulls everything toward the middle; averaging log-odds preserves the
 extremes. For two models predicting 0.01 and 0.30:
@@ -105,8 +139,13 @@ extremes. For two models predicting 0.01 and 0.30:
 $$
 \frac{0.01 + 0.30}{2} = 0.155,
 \qquad
-\sigma\!\left(\frac{\mathrm{logit}(0.01) + \mathrm{logit}(0.30)}{2}\right) = 0.055
+\sigma\!\left(\frac{\mathrm{logit}(0.01) + \mathrm{logit}(0.30)}{2}\right) \approx 0.062
 $$
+
+> **In plain words:** the left side is the ordinary average. On the right, convert each
+> probability to log-odds, average those, and convert back with the **sigmoid** $\sigma$ (the
+> inverse of logit). Because 0.01 has very negative log-odds (about -4.6), it pulls the average
+> hard toward zero.
 
 ```python
 for pair in [(0.01, 0.30), (0.40, 0.60), (0.80, 0.99)]:
@@ -123,11 +162,21 @@ for pair in [(0.01, 0.30), (0.40, 0.60), (0.80, 0.99)]:
 (0.80, 0.99) -> probability 0.8950 | logit 0.9522 | geometric 0.8899
 ```
 
-The geometric mean sits between the two and is the one to use when you care about *small*
-probabilities specifically — it punishes any model that says "near zero" less gently than the
-arithmetic mean does.
+The first row confirms the formula: the probability mean is 0.1550 and the logit mean is 0.0617.
+The middle row shows all three agree when the models are near 0.5. The last row is the mirror
+image: near 1, the logit mean (0.9522) moves *toward* the confident 0.99 model.
+
+The geometric mean is always at or below the probability mean, and at the low end it falls even
+below the logit mean (0.0548 against 0.0617). At the high end it stays low (0.8899) while the
+logit mean rises. So the geometric mean leans toward whichever model says "smaller", and it is the
+one to use when you care about *small* probabilities specifically — it takes a model that says
+"near zero" more seriously than the arithmetic mean does. The logit mean leans toward whichever
+model is more extreme, in either direction.
 
 ## Ranking is not free of choices
+
+Turning predictions into ranks sounds mechanical, but ties force a decision. When three rows have
+the same score, which rank does each get?
 
 ```python
 tied = pd.Series([0.2, 0.5, 0.5, 0.5, 0.9])
@@ -137,11 +186,15 @@ for method in ("average", "min", "max", "dense", "ordinal"):
 
 ```output
  average: [1. 3. 3. 3. 5.]
-     min: [1 2 2 2 5]
-     max: [1 4 4 4 5]
-   dense: [1 2 2 2 3]
- ordinal: [1 2 3 4 5]
+     min: [1. 2. 2. 2. 5.]
+     max: [1. 4. 4. 4. 5.]
+   dense: [1. 2. 2. 2. 3.]
+ ordinal: [1. 2. 3. 4. 5.]
 ```
+
+Three rows tie at 0.5 in positions 2, 3 and 4. `average` gives each the middle rank, 3. `min`
+gives them all 2 and `max` gives them all 4. `dense` gives them 2 and then labels the next value
+3, not 5. `ordinal` gives 2, 3, 4 by position.
 
 Use `average` (the default) unless you have a reason. `dense` compresses a model with many ties
 into a few levels, which changes its effective weight in the blend; `ordinal` breaks ties by
@@ -151,6 +204,9 @@ position in the array, which makes your submission depend on row order.
 computed in, so ranking a concatenation of train and test rows leaks the test distribution into
 your training-time blend, and ranking them in one file after a different row order changes the
 result.
+
+The check below ranks 3,000 rows two ways — inside the 3,000 alone, and inside all 12,000 — and
+compares.
 
 ```python
 holdout = np.random.default_rng(5).permutation(len(y))[:3_000]
@@ -169,12 +225,24 @@ ranked in the full frame  : AUC 0.7125
 rank correlation between the two blends: 0.999974
 ```
 
+AUC 0.7126 versus 0.7125, and a rank correlation of 0.999974 between the two blends — for AUC the
+choice makes no measurable difference.
+
 Identical rankings, because a rank transform is monotone and AUC only reads order. The reason to
 still rank separately is procedural: a test set with a different class balance will produce
 different *values*, and any downstream step that uses those values — a threshold, a second-level
 model, a weighted mix with a probability-space model — will silently shift.
 
 ## Fitting weights, four ways
+
+Once you have picked the space, you still need weights. Four methods range from "no fitting at
+all" to "search directly for the best score".
+
+- **Uniform:** every model gets 1/k.
+- **Nelder-Mead:** a search that tries weight vectors and keeps moving toward higher AUC.
+- **NNLS** (non-negative least squares): find non-negative weights that make the blend as close
+  as possible to the 0/1 labels in squared error. It needs no AUC evaluations at all.
+- **Dirichlet:** draw 600 random weight vectors that each sum to 1 and keep the best one.
 
 ```python
 from scipy.optimize import minimize, nnls
@@ -231,14 +299,24 @@ and 0.06 on model D, while Nelder-Mead spreads them almost evenly; the AUC surfa
 When several very different weight vectors score the same, the weights are not identified by the
 data and you should prefer the simplest one.
 
+> **Picture it:** a wide, flat valley floor. Four hikers stopping at different spots are all at
+> nearly the same height. Asking "which spot is the lowest?" has no useful answer, and any of them
+> is fine.
+
 NNLS is the one to reach for first while iterating: no metric evaluations, deterministic, and
 within a whisker of the direct optimiser. Switch to Nelder-Mead only when the metric is not
 squared error — it optimises the thing you are actually scored on.
 
 ## Weight fitting overfits, and you can see exactly when
 
-With four models the fitted weights are safe. With thirty highly correlated models and a small
+Every weight you fit is a knob turned to match your data, including its random noise. With few
+rows and many knobs, the blend learns the noise.
+
+With four models the fitted weights are safe. With many highly correlated models and a small
 evaluation set, the optimiser starts fitting the noise in your OOF predictions.
+
+The simulation fits NNLS weights on one half of the rows ("in-sample") and scores them on the
+other half ("fresh"), next to plain uniform weights on the same fresh rows.
 
 ```python
 def simulate_bank(n_models, n_rows, skill=0.80, seed=0):
@@ -278,14 +356,20 @@ for n_models, rows in ((4, 400), (4, 4_000), (16, 400), (16, 4_000)):
 Compare the first two columns for the overfit and the last two for whether fitting was worth it.
 With 16 models on 400 rows the fitted weights score 0.7153 in-sample and 0.6894 on fresh data — a
 0.0259 illusion — and the uniform weights they were supposed to improve on score 0.6947, *better*
-than the fitted ones. With 4,000 rows the same 16 models overfit by only 0.0014. The ratio of
-models to rows is what governs it.
+than the fitted ones. With 4,000 rows the same 16 models show no overfit at all: the fresh score
+(0.7217) is even 0.0014 above the in-sample one (0.7203). The ratio of models to rows is what
+governs it. Uniform weights (0.7226) still match the fitted ones there, because these simulated
+models are equally good by construction, so there is nothing for the weights to find.
 
 The defence is to shrink toward uniform:
 
 $$
 w_{\text{final}} = (1 - \lambda)\, w_{\text{fitted}} + \lambda \cdot \frac{1}{k}
 $$
+
+> **In plain words:** take a mix of the fitted weights and equal weights. $\lambda = 0$ keeps the
+> fitted weights, $\lambda = 1$ throws them away, and values in between trust them partly. $k$ is
+> the number of models.
 
 ```python
 P, yy = simulate_bank(16, 800, seed=0)
@@ -314,7 +398,25 @@ That is the honest verdict for 16 models on 400 rows — the weights were worth 
 same curve on a competition with enough rows peaks somewhere in the middle, which is why
 $\lambda$ belongs in your cross-validation rather than in your habits.
 
+> **Watch out:** pick $\lambda$ on folds the weights were not fitted on. Picking it on the same
+> rows always says $\lambda = 0$, because the fitted weights are by definition best there.
+
+## Recap in plain words
+
+- The blend space should match the metric: any space for AUC, a probability-like space for log
+  loss.
+- Rank averaging outputs percentiles, so it scored a log loss of 0.6562 against about 0.60 for
+  the others.
+- The logit mean leans toward confident models; the geometric mean leans toward small
+  probabilities.
+- Use `average` for ties, and rank train and test predictions separately.
+- NNLS is a fast first choice for weights; with a flat score surface many weight vectors tie.
+- Fitted weights overfit when models are many and rows are few; shrink them toward uniform.
+
 ## Try it Yourself
+
+`blend_bakeoff` runs every operator twice — with uniform weights and with Nelder-Mead weights —
+and prints the weights it found.
 
 ```python
 def blend_bakeoff(P, y, spaces=SPACES):
@@ -339,6 +441,11 @@ probability mean       0.7094        0.7099 0.29 0.17 0.28 0.26
       logit mean       0.7097        0.7105 0.31 0.18 0.20 0.31
 ```
 
+Fitting the weights adds between 0.0005 (probability mean) and 0.0017 (geometric mean) AUC. Note
+that each space gets a different weight vector: in the geometric space model D gets the most
+weight (0.35), in the rank space model A does (0.38). Weights only mean something together with
+their space.
+
 Swap `roc_auc_score` for `-log_loss` inside `w_nelder_mead` and the weights change, because the
 weights are only optimal for the metric you optimised. Try dropping model D, or adding a fifth
 model that is a copy of A with noise, and watch how the weights redistribute.
@@ -348,7 +455,11 @@ model that is a copy of A with noise, and watch how the weights redistribute.
 Build a blender that chooses both the operator and the weights **honestly**: select them inside
 cross-validation folds so the reported score is not the score you optimised. Compare it against
 the naive version that picks the best operator and weights on all the data, and quantify the
-optimism. Run it with four models and again with thirty.
+optimism. Run it with four models and again with sixteen.
+
+> **Hint:** inside each fold, try every operator on the training part, keep the operator and
+> weights that score best there, and only then score them on the held-out part. Average the
+> per-fold scores; do not pool predictions from different spaces.
 
 <details>
 <summary>Solution</summary>
@@ -417,17 +528,20 @@ for n_models, rows in ((4, 3_000), (16, 3_000)):
 ```
 
 The optimism grows with the number of models, exactly as the weight-fitting table predicted: four
-models leave almost nothing to overfit, thirty leave plenty. That is the number people quote when
-they report "my blend gets X" — it is the in-sample score of a procedure with thirty free
-parameters plus an operator choice, and the honest version is lower.
+models leave almost nothing to overfit (+0.0021), sixteen leave more (+0.0073). That is the number
+people quote when they report "my blend gets X" — it is the in-sample score of a procedure with
+sixteen free parameters plus an operator choice, and the honest version is lower.
 
 Three things worth stealing from this harness. It selects the **operator** inside the fold as well
-as the weights, because choosing between four operators on the full data is itself a selection
+as the weights, because choosing between three operators on the full data is itself a selection
 with its own bias — smaller than the weights' bias, but free to remove. It reports which operators
 were chosen across folds, and disagreement there is a signal in itself: if three folds pick rank
 mean and two pick logit mean, the operators are tied and you should take the simpler one rather
 than the winner. And **shrinkage is a tunable**, not a fixed choice; with many models it recovers
-most of what the naive fit throws away.
+some of what the naive fit throws away — here 0.7055 against 0.7033 for 16 models.
+
+With 16 models, the folds picked all three operators (logit, probability and rank mean) — exactly
+the "operators are tied" signal. With four models every fold picked rank mean.
 
 The practical shape of this in a competition: keep the OOF matrix as your artefact (ch. 7), fit
 weights with NNLS for speed while you iterate, and only run the full honest procedure when you are

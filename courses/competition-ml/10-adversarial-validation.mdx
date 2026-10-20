@@ -7,9 +7,25 @@ order: 10
 
 ## Ask a model whether train and test are the same
 
+If a model can tell training rows from test rows, then the two sets are different — and your CV,
+which only ever looks at training rows, may be measuring the wrong thing. So train exactly that
+model.
+
 Every validation scheme assumes the test set looks like the training set. Adversarial validation
 checks that assumption directly: label training rows 0, test rows 1, and try to tell them apart.
 If a classifier can, the two sets differ — and its feature importances name exactly how.
+
+**Drift** (or **shift**) means the data's distribution changed between the training rows and the
+test rows. **Adversarial validation** is the name for using a "train or test?" classifier to
+detect it.
+
+> **Picture it:** shuffle two decks of cards together and ask a friend to sort them back. If the
+> decks are identical, they can only guess. If one deck has slightly faded backs, they will sort
+> them perfectly — and when you ask how, they will point at the faded backs. That is the
+> classifier and its feature importances.
+
+The dataset has rows arriving over 400 days. `f_drift` grows with the day; `f_stable`, `f_noise`
+and `account_age` do not. The organiser splits by time: the last 30% of rows is the test set.
 
 ```python
 import numpy as np
@@ -45,7 +61,13 @@ train 8,400 rows (days 0-279) | test 3,600 rows (days 279-399)
 positive rate: train 0.390 | test 0.475
 ```
 
+Training covers days 0–279 and test covers days 279–399. Even the positive rate moved: 0.390 in
+training and 0.475 in test, because `f_drift` pushes the target up and it grows over time.
+
 ## The adversarial classifier
+
+The model is an ordinary classifier. Its target is "1 if this row came from the test set". You
+score it out-of-fold with AUC: 0.5 means it cannot tell, 1.0 means it separates them perfectly.
 
 ```python
 def adversarial_auc(train, test, features=None, k=4, seed=0, return_model=False):
@@ -76,6 +98,10 @@ adversarial AUC without 'day'     : 0.7046
 adversarial AUC on stable columns : 0.5043
 ```
 
+With every column the classifier separates the two sets perfectly (1.0000): `day` alone tells
+them apart, since every test row is later than every training row. Without `day` the AUC is
+0.7046, carried by `f_drift`. On the three stable columns it is 0.5043 — a coin flip.
+
 Read the scale, not just the number:
 
 - **0.50–0.55** — train and test are interchangeable. Random k-fold is fine.
@@ -83,7 +109,14 @@ Read the scale, not just the number:
 - **> 0.90** — something separates the sets almost perfectly: usually a date, an ID, or a column
   the organiser generated differently. Treat it as a bug in your feature set, not as drift.
 
+> **Watch out:** the bands are rules of thumb. An AUC of 0.58 on a million rows is a confident,
+> real shift; 0.58 on 300 rows may be noise. Repeat with another fold seed if you are near a
+> boundary.
+
 ## Which features carry the drift?
+
+To find the culprits, run the same classifier on one column at a time. A column that alone can
+tell train from test has a different distribution in the two sets.
 
 ```python
 def drift_by_feature(train, test, k=4):
@@ -107,13 +140,24 @@ account_age                0.5120     443.676    447.351
     f_noise                0.4939       0.003     -0.019
 ```
 
+The ranking matches how the data was built. `day` scores 1.0000 (train mean 139, test mean 340).
+`f_drift` scores 0.7080, with its mean rising from 0.560 to 1.364. The other three sit at
+0.49–0.51, which is chance.
+
 A per-feature adversarial AUC is more useful than a distribution plot because it is a single
 comparable number for every column, whatever its type. Anything above about 0.55 on its own is a
 column whose distribution moved.
 
 ## What to do about it
 
+Finding a drifting column is not the same as knowing what to do with it. Some drifting columns
+are useless and should go; others still predict the target and must stay.
+
 There are four responses, and the right one depends on whether the drifting feature is *useful*.
+
+The four are: drop the feature, re-weight the training rows, build a validation set that looks
+like test, or use the check to find a leak. The first test compares the true test AUC for three
+feature sets.
 
 ```python
 def model_score(features, sample_weight=None):
@@ -139,11 +183,21 @@ for name, feats in (("everything (incl. day)", all_feats),
               drop day and f_drift     0.7127            0.5043
 ```
 
+Dropping `day` *raises* test AUC from 0.7379 to 0.7455. Dropping `f_drift` as well brings the
+adversarial AUC down to chance (0.5043) — and drops the test AUC to 0.7127. A perfect-looking
+"no drift" score bought with a 0.033 loss in real performance.
+
 Dropping a drifting feature is only correct when it is not carrying signal. `day` is pure
 leakage — it identifies the split and cannot generalise forward — so it goes. `f_drift` genuinely
 predicts the target, so dropping it costs you.
 
+> **Watch out:** the goal is a good test score, not a low adversarial AUC. Never drop features
+> only to make the adversarial classifier fail.
+
 ### Importance weighting: train on the rows that look like test
+
+Instead of removing a column, make the training rows that look most like test count more. The
+adversarial model already tells you how test-like each training row is.
 
 Instead of dropping a feature, re-weight the *rows*. If $p(x)$ is the adversarial model's
 probability that a row is from the test set, the density-ratio weight is
@@ -151,6 +205,12 @@ probability that a row is from the test set, the density-ratio weight is
 $$
 w(x) = \frac{p_{\text{test}}(x)}{p_{\text{train}}(x)} \approx \frac{p(x)}{1 - p(x)}
 $$
+
+> **In plain words:** a row's weight is "how common rows like this are in test, divided by how
+> common they are in train". The adversarial model gives you that ratio cheaply: if it says a row
+> is 75% likely to be from test, the odds $p/(1-p)$ are 3, so that row counts three times. (With
+> train and test of different sizes there is also a constant factor, which the code removes by
+> dividing by the mean weight.)
 
 ```python
 auc_adv, oof, _, feats_used = adversarial_auc(train, test, no_day, return_model=True)
@@ -186,10 +246,19 @@ Reach for importance weighting when the adversarial AUC is high *and* the traini
 enough to absorb the variance, and always measure it rather than assuming. Clip in any case: an
 unclipped density ratio can hand one row hundreds of times the influence of its neighbours.
 
+**Clipping** here means capping every weight at a maximum (5 in the code), so no single row can
+dominate.
+
 ### Build a validation set that looks like the test set
+
+Instead of changing the model, change the exam you grade it with: hold out the training rows
+that look most like the test set and validate on those.
 
 The most valuable use of adversarial validation is not fixing the model, it is fixing the
 *validation*. Rank the training rows by how test-like they are and validate on the top slice.
+
+The code compares two 2,000-row validation sets — a random one and the 2,000 most test-like rows —
+by how close their local AUC comes to the true test AUC.
 
 ```python
 order = np.argsort(-p_train)
@@ -231,7 +300,14 @@ building when the adversarial AUC is high enough that a random split is genuinel
 above roughly 0.75 — and is a self-inflicted wound below that. Measure the gap both ways before
 committing, because every decision you make all week is a comparison against this set (ch. 2).
 
+> **Picture it:** you want practice questions like the real exam, so you set aside the hardest
+> past questions for a mock test. If the real exam is only slightly harder than average, you
+> have now studied without your most useful questions — and gained little realism in return.
+
 ## Adversarial validation finds leaks, too
+
+If a single column tells train from test perfectly, ask why. Usually the answer is that the
+column records *how the file was made*, not anything about the world.
 
 A column that separates train from test perfectly is usually not drift — it is an artefact.
 
@@ -250,11 +326,29 @@ adversarial AUC on 'submitted_at' alone: 1.0000
 perfect separation => this column encodes the split itself, not the phenomenon
 ```
 
+A row counter that kept counting from train into test gives a perfect 1.0000. It says nothing
+about the customers; it only says which file a row came from.
+
 This is the same check as ch. 1's leak audit, arrived at from the other direction: there you asked
 whether a column predicts the *target* suspiciously well, here whether it predicts the *split*.
 Run both.
 
+## Recap in plain words
+
+- Train a classifier to tell training rows from test rows; its AUC measures how different they
+  are.
+- Around 0.5 the sets match; 0.55–0.75 is real drift; above 0.9 usually means an artefact like a
+  date or row counter.
+- Score each column alone to find which ones drift.
+- Drop a drifting column only if it does not help predict the target: dropping `day` gained
+  +0.0076, dropping `f_drift` lost 0.033.
+- Importance weights and test-like validation sets both cost score here, because the remaining
+  drift was mild — always measure them.
+
 ## Try it Yourself
+
+`adversarial_report` gives a one-line verdict from the overall adversarial AUC and lists the
+columns above the drift threshold.
 
 ```python
 def adversarial_report(train, test, target_features=None, threshold=0.55):
@@ -290,9 +384,16 @@ f_stable                0.5070       0.013      0.003
  f_noise                0.4939       0.003     -0.019
 ```
 
+The first call flags near-perfect separation and lists `day` and `f_drift` as drifting — exactly
+the two columns built to drift. The second call, on two stable columns, scores 0.5079 and finds
+nothing above the threshold, so it shows the top three instead.
+
 The second call is the control: two stable columns, adversarial AUC at chance, no action needed.
 Run this on every competition before you choose a CV scheme — it takes one minute and it decides
 which chapter of this course you need next.
+
+Variation to try: run `adversarial_report(train.drop(columns=["day"]), test.drop(columns=["day"]))`
+and check that the verdict moves to the "real shift" band.
 
 ## Exercise
 
@@ -300,6 +401,10 @@ Turn the diagnosis into a decision procedure. Given train and test, produce a pl
 drifting features, decides for each whether to drop it or keep it (based on whether it pays on a
 test-like validation set), computes clipped importance weights, and reports the expected effect of
 each decision. Verify the plan against the true test score at the end.
+
+> **Hint:** you are allowed the adversarial model (it uses only test *features*), but not test
+> labels. Build the test-like validation set from training rows, try dropping each drifting column
+> against that set, and test the weights last.
 
 <details>
 <summary>Solution</summary>
@@ -385,6 +490,10 @@ question with an answer you can act on. `day` gets dropped because it is a split
 transferable signal; a drifting feature that still predicts is kept, because moving distributions
 and useless features are different problems that happen to trip the same detector.
 
+In numbers: dropping `day` raises the validation AUC from 0.7149 to 0.7337; dropping `f_drift`
+would lower it to 0.7037, so it stays. Weights lower validation AUC slightly (0.7317) and are
+skipped. On the true test set the plan scores 0.7455 against 0.7379 for the naive model (+0.0076).
+
 Three properties worth preserving if you rebuild this. The validation set is chosen by the
 **adversarial model only** — no test labels are touched, so the whole procedure is legal in a
 competition where you have test features but no test targets. Decisions are made **sequentially
@@ -399,4 +508,7 @@ itself, because it never looks at the labels. If the test period has a different
 the adversarial AUC can sit at a comfortable 0.52 while your model quietly falls apart, and the
 only defences are a time-ordered validation scheme (ch. 2) and the monitoring machinery from
 mlops ch. 7.
+
+Put plainly, covariate shift means the inputs changed (more high-`f_drift` rows) but the
+rule linking inputs to the answer did not.
 </details>

@@ -7,6 +7,12 @@ order: 8
 
 ## Three questions people confuse
 
+"Which inputs matter most?" sounds like one question, but it hides three. They have different
+answers, and mixing them up leads to deleting a column you needed or keeping one you did not.
+
+A **feature** is one input column. **Feature importance** is any score that ranks features by how
+much they matter — but "matter" can mean three things:
+
 "Which features matter?" is three different questions with three different answers:
 
 1. **What did this model use?** — gain/impurity importance, a property of the fitted trees.
@@ -14,6 +20,15 @@ order: 8
 3. **What would I lose by not collecting this?** — drop-column importance, which requires refitting.
 
 Only the third is about the *data*; the first two are about a particular fitted model.
+
+> **Picture it:** a football team. Question 1 is "who touched the ball most?" Question 2 is "how
+> badly does *this* team play if one player suddenly plays blindfolded?" Question 3 is "how well
+> would we play if we had never signed that player and trained without them?" A player can top
+> the first list and barely register on the third.
+
+The test bed has four columns, built so you know the truth: two carry real signal (one
+continuous, one only 0/1), and two are pure noise — one continuous, and one with thousands of
+distinct values (**high cardinality**, like an ID number).
 
 ```python
 import numpy as np
@@ -44,14 +59,24 @@ test AUC 0.8559
 columns: ['useful_cont', 'useful_bin', 'noise_cont', 'noise_id']
 ```
 
+The random forest scores AUC 0.8559 on held-out rows, so it learned something real.
+
 Two of those four columns are noise by construction. Watch what each importance method says about
 them.
 
 ## Gain (impurity) importance is biased by cardinality
 
+Trees come with a free importance score: how much each feature helped the splits during training.
+It is free, and it is biased toward features with many distinct values, even useless ones.
+
 A tree's built-in importance sums the impurity decrease at every split on a feature, weighted by
 the samples reaching it. A feature with many distinct values offers many candidate split points,
 so it wins splits by chance alone — especially deep in the tree where few samples remain.
+
+**Impurity** measures how mixed the labels in a tree node are (a node of all-yes or all-no is
+pure). A split's **impurity decrease** is how much purer its two children are than the parent.
+scikit-learn's `feature_importances_` adds these up per feature; it is also called **gain** or
+**MDI** (mean decrease in impurity).
 
 ```python
 gain = pd.Series(rf.feature_importances_, index=df.columns).sort_values(ascending=False)
@@ -65,6 +90,9 @@ useful_bin   0.3346  ####################
 noise_id     0.1424  #########
 noise_cont   0.1392  ########
 ```
+
+The two real features lead (0.3838 and 0.3346), but `noise_id` (0.1424) and `noise_cont` (0.1392)
+together take 0.28 of the total — for columns that cannot predict anything.
 
 Two columns that contain nothing at all take 28% of the importance mass, and the high-cardinality
 one edges ahead of the continuous one. The effect grows with tree depth, because deep nodes hold
@@ -85,13 +113,23 @@ noise_cont   0.2073
 noise_id     0.2097
 ```
 
+With leaves of a single row allowed, `noise_cont` (0.2073) and `noise_id` (0.2097) sit level with
+the genuinely useful `useful_bin` (0.2160).
+
 Fully grown, the two noise columns draw level with `useful_bin`, a genuinely predictive feature —
 42% of the reported importance goes to columns with no relationship to the target. This is the
 documented cardinality bias of mean-decrease-in-impurity, and it is why `feature_importances_`
 should never be the last word. Gain importance is also computed on the **training** data, so it
 cannot distinguish "this feature helped the model fit" from "this feature helped it generalize".
 
+> **Watch out:** the bar chart of `feature_importances_` is the first thing most tutorials show.
+> On real data with ID-like or timestamp columns, it can rank pure noise in the top half.
+
 ## Permutation importance asks the model to do without
+
+Take one column in the test set and shuffle it, so its values land on random rows. If the
+model's score drops a lot, the model was relying on that column. If the score barely moves, it
+was not.
 
 Shuffle one column in the *held-out* set, breaking its relationship with the target while keeping
 its marginal distribution, and measure how far the score falls:
@@ -102,6 +140,14 @@ $$
 
 where $X^{(j,r)}_{\text{perm}}$ is the data with column $j$ shuffled. No refitting — the same
 fitted model is scored on corrupted inputs.
+
+> **In plain words:** $I_j$, the importance of feature $j$, is the score $s$ on clean data minus the
+> average score over $R$ shuffles of column $j$. The **marginal distribution** — the set of values
+> in that column — stays exactly the same; only which row gets which value changes.
+
+> **Picture it:** to see whether a recipe needs its salt, you do not cook a new dish without salt;
+> you swap the salt for a random ingredient from the cupboard and taste. Same amount of "stuff",
+> wrong information.
 
 ```python
 def permutation_importance(model, X, y, metric=roc_auc_score, repeats=10, seed=0):
@@ -131,11 +177,17 @@ noise_cont   drop +0.0036 +- 0.0023
 noise_id     drop +0.0022 +- 0.0023
 ```
 
+Shuffling `useful_bin` drops AUC by 0.1541; shuffling `useful_cont` drops it by 0.1041. The noise
+columns cost 0.0036 and 0.0022 — about one standard deviation, so effectively zero.
+
 Now the ordering is right: the two real features carry the model, and the two noise columns cost
 nothing to destroy. Read the standard deviations too — an importance smaller than its own spread
 is indistinguishable from zero.
 
 ### Train-set permutation importance detects memorisation
+
+Run the same shuffle test on the *training* rows. A feature the model only used to memorise
+particular rows will look important there and useless on the test set.
 
 ```python
 _, perm_tr = permutation_importance(rf, Xtr, ytr)
@@ -152,14 +204,23 @@ noise_cont      +0.0036    +0.0657
 noise_id        +0.0022    +0.0691
 ```
 
+Both noise columns jump on the training set: `noise_cont` from +0.0036 to +0.0657 and `noise_id`
+from +0.0022 to +0.0691. The real features also rise on train, but they matter on test too.
+
 `noise_id` is worth nothing on the test set but visibly non-zero on the training set: the forest
 memorised individual rows through it. A feature that is important on train and worthless on test
 is a leak or an overfitting handle — that gap is a diagnostic, not a nuisance.
 
 ## Correlated features split the credit
 
+If two columns hold the same information, shuffling one of them hurts little, because the model
+can still read the other. Each looks unimportant on its own, even though together they are vital.
+
 Permutation importance answers "what happens if this column becomes noise *while the others stay
 intact*". If two columns carry the same information, neither is needed.
+
+The demo adds `useful_copy`, a near-duplicate of `useful_cont` with a tiny bit of noise, and
+retrains.
 
 ```python
 df2 = df.copy()
@@ -184,6 +245,8 @@ noise_id       +0.0022       +0.0016
 useful_copy          -       +0.0198
 ```
 
+`useful_cont` falls from +0.1041 to +0.0266, and its twin collects only +0.0198.
+
 Adding a near-duplicate cuts the measured importance of `useful_cont` from 0.1041 to 0.0266, and
 the copy only picks up 0.0198 — the pair together is now worth less than half what the single
 column was worth, because destroying either one leaves the model the other. Nothing about the
@@ -194,6 +257,9 @@ and each deletion looks harmless right up until you make the second one.
 ### Grouped permutation fixes it
 
 Permute correlated columns *together* and the group's true importance reappears.
+
+"Together" means one shared shuffle: both columns move to the same new rows, so they still agree
+with each other but no longer with the label.
 
 ```python
 def group_importance(model, X, y, groups, repeats=10, seed=0):
@@ -224,7 +290,13 @@ binary         +0.1126
 noise_block    +0.0050
 ```
 
+The twin pair as a block is worth +0.1420 — more than `useful_cont` alone was worth before the
+twin existed (+0.1041). The noise block is worth +0.0050, still close to zero.
+
 ## Drop-column importance is the honest, expensive one
+
+The most direct test is also the slowest: retrain the model without the column and see how much
+worse it gets. This is the only method where the model gets a chance to adapt to the missing column.
 
 Refit the model without the column and compare. This answers the business question — *should we
 keep collecting this?* — and it is the only one that lets the model compensate by leaning on
@@ -264,7 +336,13 @@ drop-column table on a small validation set needs repeated splits before you act
 
 The cost is $k+1$ refits. Use it on a shortlist, not on a thousand columns.
 
+> **Watch out:** drop-column importance says "you can drop `useful_cont`" and also "you can drop
+> `useful_copy`". Both are true one at a time. Dropping both at once removes the signal — always
+> re-test after each removal.
+
 ## Which to use when
+
+Each method answers its own question; pick by the question, and know each one's trap.
 
 | Question | Method | Cost | Main trap |
 |----------|--------|------|-----------|
@@ -272,6 +350,17 @@ The cost is $k+1$ refits. Use it on a shortlist, not on a thousand columns.
 | What does this fitted model rely on? | permutation on test | $k \times R$ scorings | splits credit across correlated columns |
 | Do we still need to collect this? | drop-column | $k+1$ refits | slow; single-split noise |
 | Which *block* of features matters? | grouped permutation | cheap | you must define the groups |
+
+Here $k$ is the number of features and $R$ the number of shuffles per feature.
+
+## Recap in plain words
+
+- Gain importance is free but rewards high-cardinality noise and only reflects training data.
+- Permutation importance shuffles one column on held-out data and measures the score drop.
+- A feature important on train but not on test was used for memorising.
+- Correlated features share credit, so each looks unimportant; permute them as a group.
+- Drop-column importance retrains without the feature; it answers "do we need to collect this?"
+- Small importances are often noise — compare them with their spread.
 
 ## Try it Yourself
 
@@ -298,6 +387,10 @@ noise_id       +0.0016   -0.0003    +0.060
 useful_copy    +0.0198   +0.0018    +0.170
 ```
 
+The table puts three views side by side: the forest's permutation importance, the logistic
+regression's permutation importance, and the logistic regression's **coefficients** (its weight
+on each standardized feature).
+
 Two models, same data, different stories. The forest spread its use of the correlated pair almost
 evenly (+0.0266 and +0.0198); the linear model put nearly all its weight on one twin (coefficient
 +0.936 against +0.170) and its permutation importance follows suit (+0.1238 against +0.0018). Same
@@ -313,6 +406,10 @@ Ranking by importance leaves you guessing where to cut. Build a **null-calibrate
 a column of pure noise (a "shadow" feature, as Boruta does), or shuffle the target to build the
 null distribution of importance, then keep only features whose importance exceeds the null by a
 margin. Compare its selection against naive top-k on data where some features are correlated.
+
+> **Hint:** a **shadow feature** is a real column with its rows shuffled, so it has realistic values
+> but no link to the label. The **null distribution** is the importance that meaningless columns
+> get by luck; the best shadow's importance is a natural cutoff.
 
 <details>
 <summary>Solution</summary>
@@ -375,6 +472,10 @@ AUC all 5 columns    : 0.8566
 AUC naive top-2      : 0.8377
 AUC null-calibrated  : 0.8476
 ```
+
+Ten shadows score between $-0.0007$ and $+0.0021$, so the cutoff is +0.0021. The three real
+columns (+0.0912, +0.0271, +0.0200) clear it easily; `noise_cont` ties it and `noise_id` falls
+below. Naive top-2 keeps `useful_bin` and `useful_copy` and throws away `useful_cont`.
 
 The shadow features give you a *scale*: any real feature that cannot beat a deliberately
 meaningless column is not evidence of anything. That is the missing piece in every "top-10

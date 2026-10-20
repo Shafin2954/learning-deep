@@ -7,10 +7,25 @@ order: 6
 
 ## Columns called V1 to V300
 
+Some competitions hide what every column means and give them numbers instead of names. You can
+still work out what most columns are, and often find a hidden "who is this?" key that unlocks the
+best features.
+
 Anonymised competitions hand you numbered columns with no documentation. The winning solutions are
 rarely the ones with the best hyperparameters — they are the ones that worked out *what the
 columns are*, and in particular found the hidden key that groups rows into entities. That
 discovery is what people mean by "the magic".
+
+An **anonymised** column is one whose name and meaning were removed (often to protect customers).
+An **entity** is the real-world thing several rows belong to — a client, a card, a device.
+
+> **Picture it:** a detective handed a box of unlabelled receipts. No names, but some receipts
+> share the same card number and postcode, and their dates line up with one signup date. Group
+> those and you have rebuilt a person — and now you can ask "is this purchase normal for *them*?".
+
+The simulation hides 500 clients behind 9,000 rows. `V1` (card) and `V2` (address) are constant
+per client, `V3` counts days since the client's hidden signup day, `V7` is `V4` times 0.2, and
+`V8`/`V9` come from a second table that is only sometimes joined.
 
 ```python
 import numpy as np
@@ -60,12 +75,22 @@ print(anon.head(3).to_string(index=False))
 1616 511 156 123.56   3 0.4018 24.71       NaN       NaN  213       0
 ```
 
+21.1% of rows are positive. The first three rows already hint at the structure: `V7` is exactly a
+fifth of `V4` (21.90 versus 109.51), and the third row is missing `V8` and `V9` together.
+
 Nothing in that frame says "client". The hidden entity is recoverable anyway.
 
 ## Step 1: profile what each column *is*
 
+Every kind of real-world quantity leaves a fingerprint: counts are small whole numbers, rates sit
+between 0 and 1, money has a long right tail, IDs are big integers with many values. Test for
+those fingerprints.
+
 Integer-valued, bounded, low-cardinality, heavy-tailed — those four properties identify most
 anonymised columns without any documentation.
+
+**Heavy-tailed** means most values are small but a few are very large, like purchase amounts.
+**Low-cardinality** means few distinct values.
 
 ```python
 def column_kind(s):
@@ -112,10 +137,22 @@ day                          integer      350    0.000    2.00  356.00
 That table already tells you V1 is an identifier, V5 is a count, V6 is a rate, and V4 is money.
 None of it required the organiser.
 
+To be exact about V4: the skew test did not fire (it is labelled "continuous"; its skew is about
+1.46, under the threshold of 2). The money reading comes from looking at the row: two-decimal
+values from 0.45 to 539.40, never negative. Use the profile as a starting point, then look. Note
+also that `V8` and `V9` share the same missing share (0.353) and the same number of distinct
+values (5,822) — a first hint they travel together.
+
 ## Step 2: find the relationships between columns
+
+Organisers often include the same information twice in disguise. Find those copies so you do not
+waste features — and so you notice when two columns combine into something meaningful.
 
 Anonymised feature sets are full of redundancy — a column that is another times a constant, a sum
 of two others, a difference of two dates.
+
+The test: for each pair of columns with a near-perfect correlation (above 0.999), compute the
+ratio b/a row by row. If the ratio barely varies, one column is a scaled copy of the other.
 
 ```python
 num = anon.drop(columns=["target"]).select_dtypes("number")
@@ -144,6 +181,9 @@ A ratio with zero standard deviation means one column is exactly a rescaling of 
 it carries no information a tree cannot get from the original. Checking three-column sums is the
 same idea one step further.
 
+Here V7/V4 has median 0.2000 and a spread of 0.000143 (the leftover is rounding to 2 decimals) —
+so V7 is V4 times 0.2.
+
 ```python
 cols = ["V3", "V4", "V5", "V6", "V7"]
 found = []
@@ -165,11 +205,20 @@ exact additive relationships: none
 day = V3 + (something constant per client)? spread of day - V3 = 187 distinct values
 ```
 
+No column is an exact sum of two others. But the second line is the real find: `day - V3` takes
+only 187 distinct values across 9,000 rows.
+
 ## Step 3: reconstruct the hidden entity
+
+If "today's date minus days-since-X" gives the same answer for many rows, those rows share the
+same X — they belong to the same entity. That shared value is a piece of the hidden ID.
 
 `day - V3` takes only a few hundred distinct values in nine thousand rows. That is the fingerprint
 of a **per-entity constant**: V3 counts days since something that happened once per entity.
 Combine it with the identifier-like columns and you have a key.
+
+Call that shared value the **anchor**: the hidden date (here the signup day) that V3 counts from.
+Gluing `V1`, `V2` and the anchor into one string gives a candidate **UID** (unique ID).
 
 ```python
 anon["uid_guess"] = (anon["V1"].astype(str) + "_" + anon["V2"].astype(str) + "_"
@@ -190,9 +239,20 @@ group purity (rows in a group sharing one true client): 1.0000
 client coverage (a client's rows landing in one group): 1.0000
 ```
 
+Two scores check the guess against the truth. **Purity** asks: does each guessed group contain
+only one real client? **Coverage** asks: does each real client land in only one guessed group?
+Both are 1.0000, and there are 500 groups for 500 clients — a perfect reconstruction.
+
 A purity of 1.0 means every reconstructed group contains exactly one real client. The hidden
 entity is now a column you can aggregate over — and aggregation over the true entity is where the
 score is.
+
+> **Watch out:** in a real competition you have no truth column to check purity against. Your
+> evidence is indirect: columns that become constant within the group (Try it Yourself below), and
+> whether aggregations over the group move the CV.
+
+Now use the key exactly as ch. 4 used `customer`: group counts, group mean amount, group spread,
+and each row's amount relative to its group.
 
 ```python
 from sklearn.model_selection import StratifiedKFold
@@ -227,13 +287,23 @@ raw anonymised columns   : AUC 0.5999
 + reconstructed-UID aggs : AUC 0.6238  (+0.0239)
 ```
 
+The raw anonymised columns reach AUC 0.5999. Adding four aggregations over the reconstructed UID
+lifts that to 0.6238 (+0.0239). The target depends on a hidden per-client risk, and the
+aggregations are the only way the model can see which rows share that risk.
+
 That gap is the magic. It came from noticing that one column was a *days since* counter, not from
 a better model.
 
 ## Step 4: missingness blocks reveal the source tables
 
+When several columns are always blank on the same rows, they came from the same place. Treat them
+as one block, and test whether "the block is present" means something.
+
 Columns that go missing together came from the same join. Grouping them tells you which features
 are one logical block, and a single "block present" indicator often beats the columns themselves.
+
+A **join** is merging a second table onto the first by a shared key; rows with no match in the
+second table get blanks in every column it would have added.
 
 ```python
 miss = anon[raw_cols].isna()
@@ -270,7 +340,24 @@ permutation). Here the block's presence carries no target signal at all — 0.21
 which is itself worth knowing before you build features from it. In the competitions where this
 pattern appears, the presence flag is often the strongest single feature in the set.
 
+> **Watch out:** "no signal here" is a measured result, not a reason to skip the check. The
+> simulation joined the block at random; real joins rarely are, and the same three lines of code
+> are how you find out.
+
+## Recap in plain words
+
+- Anonymised columns still have fingerprints: counts, rates, money, and IDs each look different.
+- Exact copies and rescalings (V7 = 0.2 x V4) can be found by checking ratios of highly correlated
+  pairs.
+- A "days since" column subtracted from the date reveals a per-entity anchor.
+- Gluing identifier-like columns and the anchor rebuilt all 500 hidden clients with purity 1.0.
+- Aggregating over the rebuilt entity added +0.0239 AUC — that is "the magic".
+- Columns that go missing together come from one join; treat them as a block.
+
 ## Try it Yourself
+
+`anon_profile` repeats the column profile and adds one test: with a candidate grouping, is each
+column constant inside almost every group (more than 95% of groups)?
 
 ```python
 def anon_profile(frame, target, id_col=None):
@@ -303,9 +390,18 @@ anon_profile(anon[["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "day", 
    day                            integer     350   0.00                
 ```
 
+With the reconstructed `uid` as the grouping, only `V1` and `V2` are marked "yes": card and
+address belong to the client, while amounts, counts and rates change from row to row. That split
+between identity columns and event columns is what a correct key produces.
+
 The `per-row-const?` column is the tool that finds keys: once you have a candidate grouping, any
 column that is constant within it is part of the entity's identity rather than the event's. Try it
-with a deliberately wrong grouping (`V1` alone) and watch the column empty out.
+with a deliberately wrong grouping (`id_col="V5"`, a count rather than an identity) and watch the
+column empty out.
+
+A near-key passes this test too: grouping by `V1` alone still marks `V2` as "yes", because `V1` is
+almost a client ID already (489 card values for 500 clients), so V2 is constant in more than 95% of
+`V1` groups. That is why you combine this test with the evidence from aggregations.
 
 ## Exercise
 
@@ -313,6 +409,10 @@ Write the discovery routine you would run on a fresh anonymised competition: pro
 find exact relationships, search for a hidden entity key among candidate column combinations, and
 score each candidate by whether it produces useful aggregations. Report the winning key and the
 AUC it buys over the raw columns.
+
+> **Hint:** generate candidate keys from combinations of one to three columns (include the derived
+> anchor), skip any key with too few or too many groups, and score each survivor by adding count,
+> mean and deviation features over it and running `cv_auc`.
 
 <details>
 <summary>Solution</summary>
@@ -386,7 +486,7 @@ purity against the true hidden client: 0.8603
 
 Read the result carefully, because it is not the tidy one. The search's winner is `V2` alone, at
 0.6222, and its purity against the true hidden client is 0.8603 — it is *not* the real entity. The
-exact key, `V1+V2+anchor`, has purity 1.0 and scores 0.6131, a full point of AUC lower.
+exact key, `V1+V2+anchor`, has purity 1.0 and scores 0.6182, about 0.004 lower.
 
 That is not a bug in the search, it is a real trade-off. The true key gives 500 groups of 18 rows;
 `V2` gives 366 coarser groups of 25 rows that each mix a couple of clients together. The coarser
@@ -395,6 +495,10 @@ that edges out being exactly right — though by less than the fold-to-fold nois
 reading is that the two are tied and the search cannot tell them apart. The correct conclusion is to keep both — a precise key for
 identity features and a coarse one for stable aggregates — which is what strong solutions
 actually ship.
+
+Notice also that `V1+anchor` (500 groups) scores the same 0.6182 as the full three-column key: in
+this data `V2` adds nothing once card and anchor are known. And `V5+anchor` is the only candidate
+that loses AUC (-0.0035): grouping by a count column produces 1,438 small groups that mean nothing.
 
 The three design decisions that make this work are all about pruning. **Derived anchors** are
 included in the candidate pool, not just raw columns — the `day - V3` difference is the piece
