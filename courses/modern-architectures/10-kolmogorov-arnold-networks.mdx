@@ -7,13 +7,23 @@ order: 10
 
 ## Two universal approximation theorems
 
+Two old mathematical results both say "you can build any reasonable function out of simple
+pieces". They differ in *which* pieces, and that difference is the whole idea behind KANs.
+
 The classic **Universal Approximation Theorem (UAT)** for MLPs says: a single hidden
 layer with enough neurons and a non-linear activation can approximate any continuous
 function on a compact domain. MLPs implement this as:
 
+A **compact domain** is a bounded region that includes its edges, such as the box
+$[-1, 1]^n$. An **activation** is the fixed bend (ReLU, SiLU, $\tanh$) each neuron applies.
+
 $$
 f(x) \approx \sum_j \phi_j\!\left(\sum_i w_{ij} x_i\right)
 $$
+
+> **In plain words:** each hidden neuron $j$ takes a weighted sum of the inputs (weights
+> $w_{ij}$), bends it with an activation $\phi_j$, and the output adds the bent results.
+> The weights are learned; the bend's shape is fixed.
 
 Fixed activations on nodes, learnable scalar weights on edges.
 
@@ -21,19 +31,41 @@ The **Kolmogorov-Arnold Theorem (KAT)** (1957) says something subtly different: 
 continuous multivariate function can be expressed as a finite composition of continuous
 functions of one variable:
 
+**Multivariate** means "of several inputs"; a function **of one variable** takes a single
+number.
+
 $$
 f(x_1, \ldots, x_n) = \sum_{q=0}^{2n} \Phi_q\!\left(\sum_{p=1}^n \phi_{q,p}(x_p)\right)
 $$
+
+> **In plain words:** to compute any $f$ of $n$ inputs, first pass every input $x_p$
+> through its own one-input function $\phi_{q,p}$, add those up, pass the sum through
+> another one-input function $\Phi_q$, and add $2n + 1$ such results. The only way inputs
+> ever combine is by addition; everything else is one-number-in, one-number-out.
 
 KANs (Liu et al., MIT, 2024) build a neural network directly from this theorem. Instead
 of fixed activations on nodes with learnable weights on edges, KANs put **learnable
 1D functions on the edges** and fixed summations on the nodes.
 
+> **Picture it:** an MLP is a set of pipes with adjustable valves (weights) feeding fixed-shape
+> nozzles (activations). A KAN replaces each valve with a piece of bendable wire: every
+> connection can take whatever curved shape fits the data, and the junctions only add.
+
+> **Watch out:** the theorem's inner functions can be extremely rough (nowhere smooth).
+> KANs use smooth splines instead, so they borrow the theorem's *shape*, not its guarantee.
+
 ## KAN architecture
+
+Each connection in a KAN is a small curve that the network learns, drawn by a few adjustable
+control points.
 
 Each edge carries a learnable univariate function $\phi_{ij}$ implemented as a
 **B-spline**: a piecewise polynomial defined by a grid of control points. Given input
 $x$, the B-spline evaluates a smooth interpolation between nearby control points.
+
+A **piecewise polynomial** is a curve made of short polynomial pieces joined smoothly. Here
+each piece is cubic, and the curve is a weighted sum of bump-shaped **basis functions**; the
+learnable coefficients are the weights.
 
 A two-layer KAN from $\mathbb{R}^n \to \mathbb{R}^m$ looks like:
 
@@ -46,32 +78,43 @@ Input x ──φ_{11}──┐
 Every connection is a learnable smooth function, not a scalar weight. The node just sums
 its incoming function outputs — no activation.
 
+The code follows the KAN paper's edge design: each edge outputs a learnable multiple of SiLU
+(the "base" branch) plus a cubic B-spline with 8 coefficients on a uniform grid over
+$[-3, 3]$. The **Cox-de Boor recursion** builds the cubic bumps from step functions in three
+rounds. The network `KAN([1, 5, 1])` has 1 input, 5 hidden nodes, and 1 output, so
+$1 \times 5 + 5 \times 1 = 10$ edges.
+
 ```python
 import torch
 import torch.nn as nn
 import numpy as np
 
 class BSplineEdge(nn.Module):
-    """A single learnable 1D B-spline edge."""
-    def __init__(self, grid_min=-1.0, grid_max=1.0, n_grid=5, spline_order=3):
+    """A single learnable 1D edge: SiLU base + cubic B-spline."""
+    def __init__(self, grid_min=-3.0, grid_max=3.0, n_grid=5, spline_order=3):
         super().__init__()
-        self.register_buffer('grid', torch.linspace(grid_min, grid_max, n_grid + spline_order + 1))
+        self.k = spline_order
+        h = (grid_max - grid_min) / n_grid
+        # n_grid intervals, extended by k knots on each side
+        knots = torch.arange(-spline_order, n_grid + spline_order + 1) * h + grid_min
+        self.register_buffer('grid', knots)
         # learnable coefficients for each basis function
-        self.coeff = nn.Parameter(torch.randn(n_grid + spline_order - 1) * 0.1)
+        self.coeff = nn.Parameter(torch.randn(n_grid + spline_order) * 0.1)
+        self.w_base = nn.Parameter(torch.tensor(1.0))
 
-    def b_spline_basis(self, x, i, k, t):
-        """Recursive Cox-de Boor formula."""
-        if k == 0:
-            return ((t[i] <= x) & (x < t[i+1])).float()
-        denom1 = t[i+k] - t[i]
-        denom2 = t[i+k+1] - t[i+1]
-        left  = (x - t[i]) / denom1 * self.b_spline_basis(x, i, k-1, t) if denom1 != 0 else 0
-        right = (t[i+k+1] - x) / denom2 * self.b_spline_basis(x, i+1, k-1, t) if denom2 != 0 else 0
-        return left + right
+    def b_spline_basis(self, x):
+        """Cox-de Boor recursion, all basis functions at once: (N,) -> (N, n_basis)."""
+        t, x = self.grid, x.unsqueeze(-1)
+        B = ((x >= t[:-1]) & (x < t[1:])).float()          # order 0
+        for k in range(1, self.k + 1):
+            left  = (x - t[:-(k+1)]) / (t[k:-1] - t[:-(k+1)]) * B[:, :-1]
+            right = (t[k+1:] - x) / (t[k+1:] - t[1:-k]) * B[:, 1:]
+            B = left + right
+        return B
 
     def forward(self, x):
-        # Simplified: use SiLU + linear as a fast B-spline proxy
-        return torch.nn.functional.silu(x) * self.coeff.mean()
+        # base SiLU branch (as in the KAN paper) + learnable spline
+        return self.w_base * torch.nn.functional.silu(x) + self.b_spline_basis(x) @ self.coeff
 
 class KANLayer(nn.Module):
     """One layer of a KAN: n_in edges per output node, all learnable."""
@@ -106,6 +149,7 @@ class KAN(nn.Module):
         return x
 
 # Fit y = x^2 + sin(x)
+torch.manual_seed(0)
 model = KAN([1, 5, 1])
 opt   = torch.optim.Adam(model.parameters(), lr=1e-2)
 
@@ -121,18 +165,32 @@ print(f"KAN params: {sum(p.numel() for p in model.parameters())}")
 ```
 
 ```output
-Final MSE: 0.00412
-KAN params: 60
+Final MSE: 0.00973
+KAN params: 90
 ```
 
-60 parameters, 5 hidden nodes — this is far sparser than a comparable MLP.
+After 500 Adam steps the KAN fits $x^2 + \sin x$ on $[-3, 3]$ with an MSE of 0.00973, an
+average error of about 0.1 on targets that range from about $-0.2$ to $9.1$. The count is
+90 parameters: 10 edges, each with 8 spline coefficients and 1 base weight.
+
+90 parameters, 5 hidden nodes — a very small network for a curved 1D target.
+
+> **Watch out:** a B-spline is zero outside its grid. If a hidden value drifts beyond
+> $[-3, 3]$, only the SiLU base branch responds there. Real KAN code updates the grid during
+> training to follow the data's range.
 
 ## The interpretability argument
+
+Because each edge is a curve of one number, you can draw it and look at it. That is the
+main thing KANs offer that MLPs do not.
 
 Because each edge is a 1D function, you can plot it. If you train a KAN on a symbolic
 regression task and then plot the edge functions, they often recover recognizable shapes:
 $\sin$, $x^2$, $\log$ — giving you a human-readable representation of the learned
 computation.
+
+**Symbolic regression** is finding an actual formula (like $y = x^2 + \sin x$) that fits
+data, rather than a black-box predictor.
 
 This is the central claim of the KAN paper: not just "the model works" but "you can
 read the formula the model learned." For scientific discovery (finding the governing
@@ -140,11 +198,17 @@ equation of a physical system), this matters enormously.
 
 ## KAN vs MLP: what the critique gets right
 
+Critics point out that a learnable curve on every edge is itself a small network, so a KAN is
+an MLP in disguise. They are partly right, and the useful question is where the disguise helps.
+
 The sharpest criticism of KANs is: "a KAN is just an MLP where you replace each
 scalar weight with a small MLP (the spline)." This is partly true — any B-spline can
 be approximated by a shallow MLP with enough neurons. The difference is inductive bias:
 KANs constrain each edge to a *univariate* function, which is a strong structural
 assumption that happens to match many real-world data-generating processes.
+
+An **inductive bias** (ch. 2) is a built-in preference for some kinds of solution. Many physics
+formulas are sums of one-variable pieces, which is exactly what a KAN finds easy.
 
 In practice:
 
@@ -159,6 +223,8 @@ In practice:
 
 ## Current limitations
 
+KANs are young, and three practical problems keep them out of mainstream use.
+
 - **Training speed**: B-spline evaluation is slow; KANs train 10–100× slower than
   comparable MLPs per iteration.
 - **Scalability**: no competitive results on standard benchmarks (ImageNet, language
@@ -166,7 +232,23 @@ In practice:
 - **Depth sensitivity**: deeper KANs can over-fit the spline grids; grid refinement
   (coarse → fine) is needed during training.
 
+**Grid refinement** starts each spline with few control points and adds more as training
+goes on, like sketching an outline before adding detail. The slowness comes from the
+recursion and per-edge work, which GPUs handle far less efficiently than one big matrix
+multiply.
+
+## Recap in plain words
+
+- MLPs learn weights and use fixed bends; KANs learn the bends themselves, one curve per edge, and nodes only add.
+- The design comes from the Kolmogorov-Arnold theorem: any continuous function is sums of one-input functions.
+- Each edge is a SiLU base plus a cubic B-spline; here 10 edges and 90 parameters fit $x^2 + \sin x$ to MSE 0.00973.
+- Because edges are 1D curves, you can plot them and sometimes read off the formula.
+- KANs help on small scientific and symbolic tasks; MLPs win on images, language, and speed.
+
 ## Try it Yourself
+
+The "a KAN is just an MLP" test: train a 25-parameter MLP (1 to 8 SiLU units to 1) to play
+the role of a single KAN edge and imitate $x^2$ on $[-3, 3]$.
 
 ```python
 import torch
@@ -180,6 +262,7 @@ class SplineProxy(nn.Module):
     def forward(self, x):
         return self.net(x.unsqueeze(-1)).squeeze(-1)
 
+torch.manual_seed(0)
 edge = SplineProxy()
 x = torch.linspace(-3, 3, 100)
 y = x**2  # target function for this edge
@@ -192,15 +275,27 @@ print(f"Edge params: {sum(p.numel() for p in edge.parameters())}")
 ```
 
 ```output
-Edge MSE on x^2: 0.00021
-Edge params: 17
+Edge MSE on x^2: 0.07346
+Edge params: 25
 ```
+
+The tiny MLP reaches an MSE of 0.07346 on a target that goes up to 9, an average error of
+about 0.27, with 25 parameters. A cubic spline with 8 coefficients represents $x^2$ almost
+exactly, since $x^2$ is itself a polynomial. That is the critique in miniature: an MLP can
+stand in for a spline, but it pays in parameters or accuracy.
+
+Try 32 hidden units instead of 8, or 2,000 training steps, and see how far the MSE drops.
 
 ## Exercise
 
 Build a 2-input KAN `[2, 4, 1]` and train it to fit $f(x_1, x_2) = x_1^2 + \sin(x_2)$
 on 500 random samples in $[-2, 2]^2$. Compare the final MSE and parameter count to an
 MLP `[2, 8, 1]` with ReLU activations trained for the same number of steps.
+
+> **Hint:** a KAN layer with $n_{\text{in}}$ inputs and $n_{\text{out}}$ outputs has
+> $n_{\text{in}} \times n_{\text{out}}$ edges. Any small learnable 1D function works as an
+> edge; a tiny MLP per edge is the quickest to write. Train both models with the same
+> optimizer, learning rate and number of steps.
 
 <details>
 <summary>Solution</summary>
@@ -241,6 +336,7 @@ class SimpleKAN(nn.Module):
         self.l2 = SimpleKANLayer(4, 1)
     def forward(self, x): return self.l2(self.l1(x))
 
+torch.manual_seed(0)
 x, y = make_data()
 for name, model in [("MLP", SimpleMLP()), ("KAN", SimpleKAN())]:
     opt = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -252,11 +348,16 @@ for name, model in [("MLP", SimpleMLP()), ("KAN", SimpleKAN())]:
 ```
 
 ```output
-MLP: MSE=0.00134, params=33
-KAN: MSE=0.00089, params=128
+MLP: MSE=0.02218, params=33
+KAN: MSE=0.00058, params=228
 ```
 
 KAN achieves lower MSE but uses more parameters (each edge is a small network). For
 clean symbolic regression, the inductive bias helps; for general regression, the MLP
 is more parameter-efficient.
+
+The numbers: the KAN reaches MSE 0.00058 against the MLP's 0.02218, about 38 times lower,
+but with 228 parameters against 33, about 7 times more. The target $x_1^2 + \sin(x_2)$ is
+exactly "a function of $x_1$ plus a function of $x_2$", the structure a KAN is built for.
+
 </details>
