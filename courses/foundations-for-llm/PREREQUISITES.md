@@ -8,6 +8,8 @@ deep-learning spine, which is the real depth upgrade for you.
 
 Order matters: each chapter is a prerequisite for the next. Build bottom-up.
 
+**In plain words:** this track builds a language model from the ground up, one idea per chapter. F1–F3 show what a network computes and how it is graded: matrix multiplies, softmax, cross-entropy, backpropagation, and why next-token cross-entropy and perplexity are the natural scores. F4–F7 are about training in practice: optimizers and learning-rate schedules, initialization and normalization, regularization against overfitting, and a full training loop that fits in 8 GB. F8–F13 build the transformer itself: embeddings, why RNNs failed, self-attention, positional encoding and RoPE, the full block with its KV-cache, and the language-model objective with decoding strategies. F14–F15 close with honest measurement: metrics, cross-validation, calibration, and the leakage and validation discipline that decides a competition.
+
 | #  | Chapter | Why it matters for the competition | Feeds |
 |----|---------|-----------------------------------|-------|
 | F1 | The math of a neural layer (matmul, softmax, cross-entropy, log-sum-exp) | An LLM's output layer and loss *are* this. Attention is matmuls. | everything |
