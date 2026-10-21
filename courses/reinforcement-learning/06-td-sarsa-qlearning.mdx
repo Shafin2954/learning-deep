@@ -7,9 +7,19 @@ order: 6
 
 ## The TD Idea
 
-Monte Carlo waits until an episode ends to update value estimates. Temporal-difference
+Instead of waiting until the end of the game to find out how you did, you correct your guess
+after every single move, using your guess about the next position as a stand-in for the final
+answer.
+
+Monte Carlo waits until an episode ends to update value estimates. **Temporal-difference** (TD)
 learning updates at every step, using the current estimate of the next state's value as a
-target — a technique called **bootstrapping**.
+target — a technique called **bootstrapping** (improving a guess using another guess, like
+pulling yourself up by your own bootstraps).
+
+> **Picture it:** predicting your arrival time on a drive home. Monte Carlo waits until you
+> park, then corrects the morning's prediction. TD corrects it at every junction: "I guessed
+> 30 minutes from the office; I've driven 10 and I now guess 25 more from here, so my office
+> guess should have been 35." You learn from each leg of the trip, before you arrive.
 
 TD(0) update for $V$:
 
@@ -17,20 +27,29 @@ $$
 V(S_t) \leftarrow V(S_t) + \alpha\bigl[\underbrace{R_{t+1} + \gamma V(S_{t+1})}_{\text{TD target}} - V(S_t)\bigr]
 $$
 
-The bracketed term is the **TD error** $\delta_t$. It measures how wrong the current
-estimate was. You apply a fraction $\alpha$ of the correction immediately, without waiting
-for the episode to end. This makes TD applicable to continuing tasks and typically faster to
-converge than MC.
+> **In plain words:** look one step ahead. The **TD target** is "the reward you just got plus
+> the discounted value you currently believe the next state has". Move $V(S_t)$ a fraction
+> $\alpha$ toward that target. The "(0)" means you look exactly one step ahead (ch. 7
+> generalizes to more steps).
+
+The bracketed term is the **TD error** $\delta_t$. It measures how wrong the current estimate
+was. You apply a fraction $\alpha$ of the correction immediately, without waiting for the
+episode to end. This makes TD applicable to continuing tasks and typically faster to converge
+than MC.
+
+The test problem is a **random walk**: seven cells in a row, start in the middle, step left or
+right with a coin flip. Exiting on the right pays $+1$, exiting on the left pays 0. The true
+value of each cell is the chance of exiting on the right, which is its position divided by 6.
 
 ```python
 import numpy as np
 
-# Random walk: states 0..6, terminal at 0 (reward -1) and 6 (reward +1)
-# True V(s) is linear: s/6 - 0.5 ... 5/6 - 0.5
+# Random walk: states 0..6, terminal at 0 (reward 0) and 6 (reward +1)
+# True V(s) is linear: s/6 (= probability of exiting on the right)
+np.random.seed(0)
 
 n_states = 7
-V = np.zeros(n_states)
-V[6] = 1.0  # terminal reward
+V = np.zeros(n_states)  # terminals stay at 0
 
 alpha = 0.1
 gamma = 1.0
@@ -41,7 +60,7 @@ for _ in range(n_episodes):
     while s not in (0, 6):
         a = np.random.choice([-1, 1])
         s_next = s + a
-        r = 1.0 if s_next == 6 else (-1.0 if s_next == 0 else 0.0)
+        r = 1.0 if s_next == 6 else 0.0
         V[s] += alpha * (r + gamma * V[s_next] - V[s])
         s = s_next
 
@@ -53,29 +72,50 @@ for s in range(1, 6):
 
 ```output
 TD(0) estimates vs true values (states 1-5):
-  s=1: estimated=0.152  true=0.167
-  s=2: estimated=0.308  true=0.333
-  s=3: estimated=0.479  true=0.500
-  s=4: estimated=0.648  true=0.667
-  s=5: estimated=0.821  true=0.833
+  s=1: estimated=0.182  true=0.167
+  s=2: estimated=0.377  true=0.333
+  s=3: estimated=0.623  true=0.500
+  s=4: estimated=0.821  true=0.667
+  s=5: estimated=0.954  true=0.833
 ```
 
-TD(0) converges toward the true values with 500 episodes of the random walk.
+Every estimate is in the right neighbourhood and in the right order — 0.182, 0.377, 0.623,
+0.821, 0.954 against 0.167 up to 0.833 — but each sits 0.02 to 0.16 too high. That gap is the
+noise of a constant step size: with $\alpha = 0.1$ the estimates keep reacting to the last few
+episodes, and a recent run of right-exits pushes them all up.
+
+TD(0) moves toward the true values over 500 episodes of the random walk; to settle exactly, the
+step size has to shrink over time.
+
+> **Watch out:** the TD target uses your *own* estimate $V(S_{t+1})$, which is wrong at the
+> start. Bootstrapping therefore introduces **bias** (systematic error) early on, in exchange
+> for much lower variance than Monte Carlo's full returns. Terminal states must keep value 0,
+> or that bias never goes away.
 
 ## SARSA: On-Policy TD Control
 
-SARSA extends TD to action values $Q(s,a)$, updating after each $(S, A, R, S', A')$ tuple
-— hence the name. The update:
+Now apply the same one-step correction to "how good is this action here", and you can learn
+to act, not only to predict.
+
+SARSA extends TD to action values $Q(s,a)$, updating after each $(S, A, R, S', A')$ tuple —
+hence the name (State, Action, Reward, next State, next Action). The update:
 
 $$
 Q(S,A) \leftarrow Q(S,A) + \alpha\bigl[R + \gamma Q(S',A') - Q(S,A)\bigr]
 $$
 
-SARSA is **on-policy**: $A'$ is chosen by the same ε-greedy policy that generated $A$.
-This means SARSA learns the value of the behaviour policy — it's cautious because the policy
-it evaluates *includes* random exploration steps.
+> **In plain words:** after taking action $A$ in state $S$ and getting reward $R$, look at the
+> action $A'$ you are *actually going to take* next in $S'$, and use its value as the
+> estimate of the future. Move $Q(S,A)$ a fraction $\alpha$ toward that target.
+
+SARSA is **on-policy**: $A'$ is chosen by the same $\varepsilon$-greedy policy that generated
+$A$. This means SARSA learns the value of the behaviour policy — it's cautious because the
+policy it evaluates *includes* random exploration steps.
 
 ## Q-Learning: Off-Policy TD Control
+
+Q-learning makes one change: when it estimates the future, it assumes you will play perfectly
+from the next step on — even if, in fact, you will sometimes act at random.
 
 Q-learning decouples the action used for exploration from the action used to compute the
 target. The target always uses the *greedy* action in $S'$:
@@ -84,14 +124,25 @@ $$
 Q(S,A) \leftarrow Q(S,A) + \alpha\bigl[R + \gamma \max_{a'} Q(S',a') - Q(S,A)\bigr]
 $$
 
-This is **off-policy**: you're evaluating the greedy policy while following ε-greedy. Q-learning
-directly learns $q_*$, the optimal action-value function.
+> **In plain words:** identical to SARSA, except the next action's value is replaced by the
+> *best* action value available in $S'$, $\max_{a'} Q(S', a')$. Whatever you actually do next
+> does not enter the update.
+
+This is **off-policy**: you're evaluating the greedy policy while following $\varepsilon$-greedy.
+Q-learning directly learns $q_*$, the optimal action-value function.
+
+> **Picture it:** two hikers learning a mountain path with a cliff on one side. Both stumble
+> randomly one step in ten. The SARSA hiker learns values that include the stumbles, so it
+> decides the cliff edge is dangerous *for someone who stumbles* and walks further inland.
+> The Q-learning hiker learns values for a hiker who never stumbles, so it picks the edge —
+> the shortest route — and then keeps falling off while it practises.
 
 ## Cliff Walking
 
-The difference between SARSA and Q-learning is best seen on the cliff walking problem:
-a 4×12 grid with a cliff along the bottom edge. Falling off gives −100 reward and resets to
-start. The optimal path runs along the top of the cliff (risky if ε > 0) or slightly inland.
+The difference between SARSA and Q-learning is best seen on the cliff walking problem: a
+$4 \times 12$ grid with a cliff along the bottom edge. Falling off gives $-100$ reward and resets
+to start. Every other step costs $-1$. The optimal path runs along the top of the cliff (risky if
+$\varepsilon > 0$) or slightly inland.
 
 ```python
 import numpy as np
@@ -127,6 +178,8 @@ n_actions = 4
 alpha, gamma, epsilon = 0.5, 1.0, 0.1
 n_episodes = 500
 
+np.random.seed(0)
+
 def run_td_control(method="sarsa"):
     Q = np.zeros((n_states, n_actions))
     rewards_per_ep = []
@@ -148,7 +201,7 @@ def run_td_control(method="sarsa"):
             Q[state_idx(s)][a] += alpha * (target - Q[state_idx(s)][a])
             s, a = ns, (na if method == "sarsa" else
                         (np.random.randint(n_actions) if np.random.random() < epsilon
-                         else np.argmax(Q[state_idx(s)])))
+                         else np.argmax(Q[state_idx(ns)])))
             if done:
                 break
         rewards_per_ep.append(total_r)
@@ -177,18 +230,32 @@ print(" → ".join(f"({r},{c})" for r, c in path[:8]), "...")
 ```
 
 ```output
-SARSA  avg reward (last 100 eps): -17.3
-Q-learning avg reward (last 100): -13.2
+SARSA  avg reward (last 100 eps): -30.4
+Q-learning avg reward (last 100): -53.4
 
 SARSA greedy path:
-(2,0) → (2,1) → (2,2) → (2,3) → (2,4) → (2,5) → (2,6) → (2,7) ...
+(3,0) → (2,0) → (1,0) → (0,0) → (0,1) → (0,2) → (0,3) → (0,4) ...
 ```
 
-Q-learning achieves better final performance (closer to −13 vs −17) because it learns the
-optimal policy directly. But during training, SARSA's ε-greedy policy explores safely along
-row 2 (above the cliff), while Q-learning's policy tries the cliff edge and falls frequently.
+Two different numbers tell two different stories. During the last 100 training episodes, SARSA
+averaged $-30.4$ per episode and Q-learning $-53.4$: Q-learning falls off the cliff more often
+while exploring. The path shows where SARSA's greedy policy goes: straight up from the start to
+row 0, along the top of the grid, and down at the far end — 17 steps, a return of $-17$.
+Running the same check on Q-learning's greedy policy gives a path along row 2, right next to
+the cliff: 13 steps, a return of $-13$, the optimum.
+
+Q-learning learns the better final greedy policy ($-13$ vs $-17$) because it learns the optimal
+policy directly. But during training, SARSA's $\varepsilon$-greedy policy explores safely along
+the top of the grid (row 0, far from the cliff), while Q-learning's policy walks the cliff edge
+(row 2) and falls frequently whenever an exploratory step points down.
+
+> **Watch out:** in this code, `s, a = ns, (...)` evaluates the right-hand side *before*
+> assigning. Writing `Q[state_idx(s)]` there would pick the next action from the old state —
+> a silent bug that still runs. Always use `ns` for anything about the next state.
 
 ### When to Use Which
+
+The choice is about whether mistakes during learning cost you something real.
 
 | | SARSA | Q-learning |
 |---|---|---|
@@ -197,7 +264,22 @@ row 2 (above the cliff), while Q-learning's policy tries the cliff edge and fall
 | Final performance | Slightly worse (sub-optimal safe path) | Optimal |
 | Use when | Online learning, safety matters | Offline evaluation of optimal policy |
 
+If $\varepsilon$ decays to 0 over training, SARSA's policy also becomes greedy, and both methods
+end up at the optimal path.
+
+## Recap in plain words
+
+- TD updates after every step, using "reward + discounted estimate of the next state" as the target.
+- The gap between that target and the current estimate is the TD error.
+- SARSA uses the next action you will actually take; it learns the value of your exploring self.
+- Q-learning uses the best next action; it learns the value of perfect play.
+- On the cliff, SARSA takes the safe 17-step route; Q-learning finds the 13-step edge route but falls more while learning.
+- Bootstrapping trades a bit of early bias for much lower variance than Monte Carlo.
+
 ## Try it Yourself
+
+**Windy Gridworld**: a $7 \times 10$ grid where some columns push you upward each step (the
+"wind"), so walking straight right overshoots the goal. SARSA learns to aim low.
 
 ```python
 import numpy as np
@@ -220,6 +302,7 @@ def step_windy(state, action):
     ns = (nr, nc)
     return ns, -1, ns == GOAL
 
+np.random.seed(0)
 Q = np.zeros((HEIGHT * WIDTH, 4))
 alpha, gamma, epsilon = 0.5, 1.0, 0.1
 episodes_to_goal = []
@@ -245,22 +328,36 @@ print(f"Best episode: {min(episodes_to_goal)} steps")
 ```
 
 ```output
-Steps per episode (avg over last 50): 17.4
+Steps per episode (avg over last 50): 22.2
 Best episode: 15 steps
 ```
 
+Over the last 50 episodes the agent needs 22.2 steps on average, and its best episode took 15
+steps — which is the shortest possible route in this gridworld. The average stays above 15
+because $\varepsilon = 0.1$ still makes one move in ten random. Try `epsilon = 0.0` after
+training (a separate greedy run) to see whether the learned policy reaches 15 every time, or
+switch the update to Q-learning's `np.max(Q[nsi])` and compare.
+
 ## Exercise
 
-On the cliff walking problem, implement **Expected SARSA**: instead of using $Q(S',A')$ with
-the action $A'$ that was actually taken, use the expected value under the current ε-greedy
+On the cliff walking problem, implement **Expected SARSA**: instead of using $Q(S',A')$ with the
+action $A'$ that was actually taken, use the expected value under the current $\varepsilon$-greedy
 policy:
 
 $$
 Q(S,A) \leftarrow Q(S,A) + \alpha\left[R + \gamma \sum_{a'} \pi(a'|S') Q(S',a') - Q(S,A)\right]
 $$
 
-Run Expected SARSA for 500 episodes and compare its average reward (last 100 episodes) to
-SARSA and Q-learning. Where does it fall on the safe-path vs optimal-path spectrum?
+> **In plain words:** replace "the value of the one next action I happened to sample" by "the
+> average value of all next actions, each weighted by how likely my policy is to pick it".
+> $\pi(a'|S')$ is that probability.
+
+Run Expected SARSA for 500 episodes and compare its average reward (last 100 episodes) to SARSA
+and Q-learning. Where does it fall on the safe-path vs optimal-path spectrum?
+
+> **Hint:** an $\varepsilon$-greedy policy gives every action probability $\varepsilon / 4$
+> and adds $1 - \varepsilon$ to the greedy one. Build that probability vector and take its dot
+> product with `Q[nsi]`.
 
 <details>
 <summary>Solution</summary>
@@ -284,6 +381,7 @@ def step(state, action):
         return START, -100, False
     return ns, (-1 if ns != GOAL else -1), ns == GOAL
 
+np.random.seed(0)
 Q = np.zeros((HEIGHT * WIDTH, n_actions))
 rewards = []
 for ep in range(500):
@@ -308,8 +406,11 @@ for ep in range(500):
 print(f"Expected SARSA avg reward (last 100): {np.mean(rewards[-100:]):.1f}")
 ```
 
-Expected SARSA falls between SARSA and Q-learning: it takes a safer path than Q-learning
-(because it factors in exploratory actions) but slightly more optimal than SARSA (because it
-uses the full policy distribution, not the one sampled action). It also has lower variance
-than SARSA since it averages over all possible next actions.
+Expected SARSA averages $-22.5$ over its last 100 training episodes — better than SARSA ($-30.4$)
+and much better than Q-learning ($-53.4$) on this run. Like SARSA, it learns the value of the
+exploring policy, so it takes a safer path than Q-learning (because it factors in exploratory
+actions). Unlike SARSA, it does not depend on which next action happened to be sampled — it uses
+the full policy distribution — so its updates have lower variance than SARSA's, and with
+$\alpha = 0.5$ that steadier learning shows up directly in the online reward. Its learned path
+falls between the two: safe like SARSA, but learned more efficiently.
 </details>

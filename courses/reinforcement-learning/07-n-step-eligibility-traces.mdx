@@ -7,8 +7,13 @@ order: 7
 
 ## Between MC and TD
 
-TD(0) bootstraps from the very next step. Monte Carlo waits for the whole episode. Between
-them lies a spectrum: n-step methods use the next $n$ actual rewards before bootstrapping.
+You don't have to choose between "look one step ahead" (TD) and "wait for the very end"
+(Monte Carlo). You can look a few steps ahead, use the real rewards from those steps, and
+only then fall back on a guess.
+
+TD(0) bootstraps from the very next step (ch. 6). Monte Carlo waits for the whole episode
+(ch. 5). Between them lies a spectrum: **n-step methods** use the next $n$ actual rewards before
+bootstrapping.
 
 The n-step return from time $t$:
 
@@ -16,8 +21,22 @@ $$
 G_t^{(n)} = R_{t+1} + \gamma R_{t+2} + \cdots + \gamma^{n-1}R_{t+n} + \gamma^n V(S_{t+n})
 $$
 
+> **In plain words:** add up the next $n$ real rewards (each discounted by one more factor of
+> $\gamma$), then add your current estimate of the state you reach after $n$ steps, discounted
+> by $\gamma^n$. Real data for the first $n$ steps, a guess for the rest.
+
 At $n=1$, this is TD(0). At $n=\infty$ (or episode end), this is Monte Carlo.
 The update is: $V(S_t) \leftarrow V(S_t) + \alpha(G_t^{(n)} - V(S_t))$.
+
+> **Picture it:** a weather forecaster scoring yesterday's forecast. TD(0) checks it against
+> today's new forecast. Monte Carlo waits a week for what actually happened. An n-step
+> forecaster waits $n$ days, uses the weather that really happened on those days, and trusts a
+> forecast for the remainder.
+
+The test bed is a **19-state random walk**: start in the middle of a row of 19 cells, step left
+or right by coin flip, get $-1$ for exiting left and $+1$ for exiting right. The true value of
+cell $s$ is $(s - 10)/10$. The score is the **RMS error** (root-mean-square — the typical size
+of the error across all 19 states) after only 10 episodes, averaged over 20 repeats.
 
 ```python
 import numpy as np
@@ -30,10 +49,10 @@ true_V = np.array([(s - 10) / 10 for s in range(21)])
 true_V[0] = -1.0
 true_V[20] = 1.0
 
+np.random.seed(0)
+
 def run_n_step(n, alpha=0.4, n_episodes=10):
-    V = np.zeros(n_states)
-    V[0] = -1.0
-    V[20] = 1.0
+    V = np.zeros(n_states)  # terminals stay 0: their reward is paid on entry
     for _ in range(n_episodes):
         states = [10]  # start middle
         rewards = [0]
@@ -50,7 +69,7 @@ def run_n_step(n, alpha=0.4, n_episodes=10):
                     T = t + 1
             tau = t - n + 1
             if tau >= 0:
-                G = sum(0.0 ** (i - tau - 1) * rewards[i]  # gamma=1
+                G = sum(1.0 ** (i - tau - 1) * rewards[i]  # gamma=1
                         for i in range(tau + 1, min(tau + n, T) + 1))
                 if tau + n < T:
                     G += V[states[tau + n]]
@@ -69,31 +88,54 @@ for n in [1, 2, 4, 8, 16, 32]:
 ```
 
 ```output
-RMS error vs n (10 episodes, alpha=0.4)
-  n= 1: RMS = 0.1821
-  n= 2: RMS = 0.1534
-  n= 4: RMS = 0.1302
-  n= 8: RMS = 0.1198
-  n=16: RMS = 0.1387
-  n=32: RMS = 0.1609
+RMS error vs n (10 episodes, alpha=0.4):
+  n= 1: RMS = 0.3113
+  n= 2: RMS = 0.1601
+  n= 4: RMS = 0.2011
+  n= 8: RMS = 0.3562
+  n=16: RMS = 0.4341
+  n=32: RMS = 0.5382
 ```
 
-The sweet spot is around n=8 for this problem and learning rate. Too small (TD) and you
-bootstrap from bad estimates. Too large (MC) and returns are noisy.
+Read down the column. $n = 1$ (TD) gives 0.3113; $n = 2$ drops to 0.1601, the lowest; $n = 4$
+gives 0.2011; and from there the error climbs to 0.5382 at $n = 32$, which is close to Monte
+Carlo on such short episodes. The curve is U-shaped.
+
+The sweet spot is around $n = 2$ to 4 for this problem and learning rate. Too small (TD) and you
+bootstrap from bad estimates — after only 10 episodes, most estimates are still near 0. Too
+large (MC) and returns are noisy, and with $\alpha = 0.4$ every noisy return yanks the
+estimate hard.
+
+> **Watch out:** the best $n$ depends on $\alpha$ and on how many episodes you have. With a
+> smaller $\alpha$ or more episodes, larger $n$ tends to do better. Always compare $n$ values
+> at the same $\alpha$ and training budget.
 
 ## The λ-Return: Mixing All n-Steps
 
-Instead of picking one $n$, you can mix all n-step returns with exponentially decaying
-weights controlled by $\lambda \in [0,1]$:
+Rather than betting on one horizon, you can average all of them: a lot of weight on short
+look-aheads, a bit less on longer ones, and so on.
+
+Instead of picking one $n$, you can mix all n-step returns with exponentially decaying weights
+controlled by $\lambda \in [0,1]$ (Greek "lambda"):
 
 $$
 G_t^\lambda = (1-\lambda) \sum_{n=1}^{\infty} \lambda^{n-1} G_t^{(n)}
 $$
 
+> **In plain words:** the **λ-return** is a weighted average of the 1-step, 2-step, 3-step, …
+> returns. The 1-step return gets weight $1-\lambda$, the 2-step return $(1-\lambda)\lambda$,
+> the 3-step $(1-\lambda)\lambda^2$, and so on. With $\lambda = 0.5$ that is 0.5, 0.25,
+> 0.125, … — each longer return counts half as much as the one before.
+
 The $(1-\lambda)$ normalises the geometric series so weights sum to 1. At $\lambda=0$ you get
-TD(0). At $\lambda=1$ you get Monte Carlo. In practice, $\lambda$ near 0.9 often works well.
+TD(0). At $\lambda=1$ you get Monte Carlo. In practice, $\lambda$ near 0.9 often works well —
+though, as the experiment below shows, the best value depends on the step size.
 
 ## Eligibility Traces: The Backward View
+
+The λ-return needs future rewards, so it seems you must wait. Eligibility traces turn it
+around: keep a fading memory of which states you visited recently, and when a surprise
+arrives, give the recently visited states a share of the credit.
 
 Computing the $\lambda$-return requires looking forward in time, which means waiting. The
 **eligibility trace** gives an equivalent online algorithm that works backward: for each state
@@ -104,14 +146,28 @@ $$
 e_t(s) = \gamma\lambda\, e_{t-1}(s) + \mathbf{1}[S_t = s]
 $$
 
+> **In plain words:** every step, all traces shrink by a factor $\gamma\lambda$; the state you
+> are in right now gets $+1$. The notation $\mathbf{1}[S_t = s]$ is 1 if you are in $s$ at time
+> $t$ and 0 otherwise.
+
 At each step, spread the TD error $\delta_t$ to *all* states in proportion to their trace:
 
 $$
 V(s) \leftarrow V(s) + \alpha\,\delta_t\, e_t(s) \quad \forall s
 $$
 
-This is TD(λ) — backward view. It's equivalent to the forward λ-return but runs online with
-O(|S|) storage.
+> **In plain words:** when the TD error $\delta_t$ says "that went better (or worse) than
+> expected", every state is nudged in that direction, by an amount proportional to how
+> recently and how often it was visited. The symbol $\forall s$ means "for every state $s$".
+
+This is TD(λ) — backward view. It's equivalent to the forward λ-return (exactly so for offline
+updates at the end of each episode, approximately for online ones) but runs online with $O(|S|)$
+storage — one number per state.
+
+> **Picture it:** a dog gets a treat. Which of the last few things it did earned it? The most
+> recent action gets most of the credit, earlier ones a fading share. The trace is a glow on
+> each recently visited state that dims every step; the reward lights up states in proportion
+> to how brightly they still glow.
 
 ```python
 import numpy as np
@@ -121,10 +177,10 @@ true_V = np.array([(s - 10) / 10 for s in range(21)])
 true_V[0] = -1.0
 true_V[20] = 1.0
 
+np.random.seed(0)
+
 def run_td_lambda(lam, alpha=0.4, n_episodes=10):
-    V = np.zeros(n_states)
-    V[0] = -1.0
-    V[20] = 1.0
+    V = np.zeros(n_states)  # terminals stay 0
     for _ in range(n_episodes):
         s = 10
         e = np.zeros(n_states)  # eligibility traces
@@ -142,30 +198,54 @@ def run_td_lambda(lam, alpha=0.4, n_episodes=10):
 print("TD(λ) RMS error (10 episodes, alpha=0.4):")
 for lam in [0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]:
     rms = np.mean([run_td_lambda(lam) for _ in range(20)])
-    print(f"  λ={lam:.2f}: RMS = {rms:.4f}")
+    print(f"  λ={lam:.2f}: RMS = {rms:.4g}")
 ```
 
 ```output
 TD(λ) RMS error (10 episodes, alpha=0.4):
-  λ=0.00: RMS = 0.1821
-  λ=0.25: RMS = 0.1443
-  λ=0.50: RMS = 0.1285
-  λ=0.75: RMS = 0.1219
-  λ=0.90: RMS = 0.1198
-  λ=0.99: RMS = 0.1374
-  λ=1.00: RMS = 0.1603
+  λ=0.00: RMS = 0.3113
+  λ=0.25: RMS = 0.24
+  λ=0.50: RMS = 0.1545
+  λ=0.75: RMS = 0.2329
+  λ=0.90: RMS = 0.4219
+  λ=0.99: RMS = 1.453e+34
+  λ=1.00: RMS = 8.611e+135
 ```
 
-λ≈0.9 is the sweet spot here, consistent with the n-step results. The trace decays fast
-enough to be stable but holds credit long enough to learn efficiently.
+The error falls from 0.3113 at $\lambda = 0$ (identical to TD(0) and to $n = 1$ above — the
+same seeded walks) to a minimum of 0.1545 at $\lambda = 0.5$, then rises to 0.4219 at
+$\lambda = 0.9$. At $\lambda = 0.99$ and $1.0$ the values explode to $10^{34}$ and $10^{135}$:
+the algorithm has diverged.
+
+$\lambda \approx 0.5$ is the sweet spot here, consistent with the n-step results (where
+$n = 2$ won). The trace decays fast enough to be stable but holds credit long enough to learn
+efficiently.
+
+> **Watch out:** the divergence is a real property of accumulating traces with a large step
+> size. In a random walk the agent revisits the same states many times, so with $\lambda$ near
+> 1 a trace can grow far above 1; then $\alpha \cdot e(s)$ exceeds 1 and each update
+> overshoots more than the last. Lower $\alpha$ or use replacing traces (next).
 
 ### Replacing vs Accumulating Traces
 
-The example above uses **accumulating traces**: $e(s)$ increases by 1 each visit and can
-exceed 1. **Replacing traces** cap at 1: $e(s) \leftarrow 1$ on visit. Replacing traces
-are more stable on tabular problems with loops, since accumulated traces can grow unboundedly.
+Two ways to record "I was here again": add another 1 to the glow, or reset the glow to full
+brightness.
+
+The example above uses **accumulating traces**: $e(s)$ increases by 1 each visit and can exceed
+1. **Replacing traces** cap at 1: $e(s) \leftarrow 1$ on visit. Replacing traces are more stable
+on tabular problems with loops, since accumulated traces can grow unboundedly.
+
+## Recap in plain words
+
+- An n-step return uses $n$ real rewards, then a value estimate for the rest.
+- $n = 1$ is TD(0); $n$ as long as the episode is Monte Carlo; the best $n$ lies in between (here 2).
+- The λ-return averages all n-step returns with weights that shrink by $\lambda$ each step.
+- Eligibility traces get the same effect online: a fading memory of recent states shares each TD error.
+- Accumulating traces with large $\alpha$ and $\lambda$ near 1 can diverge; replacing traces cap the memory at 1.
 
 ## Try it Yourself
+
+**SARSA(λ)** puts traces on state–action pairs instead of states, on the cliff walk from ch. 6.
 
 ```python
 import numpy as np
@@ -185,6 +265,8 @@ def step(s, a):
     ns = (nr,nc)
     if nr==3 and 1<=nc<=10: return START,-100,False
     return ns,-1,ns==GOAL
+
+np.random.seed(0)
 
 def sarsa_lambda(lam, n_episodes=200):
     Q = np.zeros((HEIGHT*WIDTH, n_actions))
@@ -215,17 +297,27 @@ for lam in [0.0, 0.5, 0.9]:
 ```
 
 ```output
-SARSA(λ=0.0) avg reward (last 50): -17.2
-SARSA(λ=0.5) avg reward (last 50): -15.8
-SARSA(λ=0.9) avg reward (last 50): -14.9
+SARSA(λ=0.0) avg reward (last 50): -24.0
+SARSA(λ=0.5) avg reward (last 50): -25.9
+SARSA(λ=0.9) avg reward (last 50): -31.3
 ```
+
+Over the last 50 episodes, plain SARSA ($\lambda = 0$) averages $-24.0$, $\lambda = 0.5$ gives
+$-25.9$, and $\lambda = 0.9$ gives $-31.3$. On this problem traces did not help the online
+reward: with $\alpha = 0.5$ and $\lambda = 0.9$, one fall off the cliff ($-100$) is spread
+back along the whole path at full strength, which makes the learned values jumpy. Traces pay
+off most when rewards are sparse and far away. Try `alpha = 0.1` with $\lambda = 0.9$, or
+switch to replacing traces (`e[si, a] = 1`), and see whether the order changes.
 
 ## Exercise
 
 In TD(λ) above, replace accumulating traces with **replacing traces**: when state $s$ is
 visited, set $e(s) \leftarrow 1$ instead of $e(s) \leftarrow e(s) + 1$.
-Run both on the 19-state random walk for λ=0.9 and compare RMS errors. In which scenario
-do replacing traces help most — many revisits to the same state or few?
+Run both on the 19-state random walk for $\lambda = 0.9$ and compare RMS errors. In which
+scenario do replacing traces help most — many revisits to the same state or few?
+
+> **Hint:** copy `run_td_lambda` and change one line. Then count how often a random walker
+> steps back onto a cell it just left.
 
 <details>
 <summary>Solution</summary>
@@ -237,9 +329,10 @@ n_states = 21
 true_V = np.array([(s-10)/10 for s in range(21)])
 true_V[0], true_V[20] = -1.0, 1.0
 
+np.random.seed(0)
+
 def run_replacing(lam=0.9, alpha=0.4, n_episodes=10):
-    V = np.zeros(n_states)
-    V[0], V[20] = -1.0, 1.0
+    V = np.zeros(n_states)  # terminals stay 0
     for _ in range(n_episodes):
         s = 10
         e = np.zeros(n_states)
@@ -260,8 +353,12 @@ print(f"Accumulating traces λ=0.9: RMS = {acc:.4f}")
 print(f"Replacing traces  λ=0.9: RMS = {rep:.4f}")
 ```
 
-For the random walk (few revisits per episode due to absorbing boundaries), differences are
-small. Replacing traces help most in problems with many loops and frequent state revisits,
-where accumulating traces can grow large and cause overshooting. In practice, replacing traces
-are preferred for tabular problems with repeated states.
+Replacing traces cut the error from 0.4264 to 0.1962 at $\lambda = 0.9$ — less than half. The
+random walk is full of revisits: every step back undoes the previous one, so a walker crosses
+the same cells again and again before it reaches an end. With accumulating traces those cells
+build up traces above 1 and their updates overshoot; replacing traces keep each trace at most 1.
+Replacing traces help most in problems with many loops and frequent state revisits, where
+accumulating traces can grow large and cause overshooting — and this random walk is such a
+problem. With few revisits the two variants behave almost the same. In practice, replacing
+traces are preferred for tabular problems with repeated states.
 </details>

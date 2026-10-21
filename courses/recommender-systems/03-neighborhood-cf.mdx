@@ -7,9 +7,23 @@ order: 3
 
 ## Similar users like similar things
 
+If people who bought A also tend to buy B, and you bought A, you will probably like B. That is
+the whole idea, and it needs nothing but counting.
+
 The oldest working recommender is also the most explainable: score an item by how much it
 resembles the items this user already interacted with. No training loop, no gradients — just a
 similarity matrix and a sparse product.
+
+**Collaborative filtering** means learning from the behaviour of many users together, rather than
+from descriptions of the items. A **neighbourhood** method is the simplest kind: an item's
+**neighbours** are the items most often consumed by the same people.
+
+> **Picture it:** a librarian who has never read a single book but has watched who borrows what for
+> years. "People who borrowed this one usually borrowed those three" is a useful suggestion, and the
+> librarian can always tell you *why*.
+
+The setup is the same synthetic world as ch. 2: 2,500 users, 900 items in 6 genres, a 60-day
+temporal holdout. `X` is the training interaction matrix in CSR form (ch. 1).
 
 ```python
 import numpy as np
@@ -50,6 +64,10 @@ print(f"train matrix {X.shape}, {X.nnz:,} interactions | evaluating {len(users):
 train matrix (2500, 900), 90,508 interactions | evaluating 1,200 users
 ```
 
+The training matrix holds 90,508 distinct user-item pairs, and every metric in this chapter is
+averaged over the same 1,200 evaluation users. Next, a compact recall/NDCG scorer (the same
+definitions as ch. 2) and the popularity baseline to beat.
+
 ```python
 def recall_ndcg(score_fn, k=10):
     rec_scores, ndcgs = [], []
@@ -76,7 +94,13 @@ print(f"popularity baseline: recall@10 {r:.4f} | ndcg@10 {n:.4f}")
 popularity baseline: recall@10 0.0927 | ndcg@10 0.0819
 ```
 
+Popularity scores recall@10 of 0.0927 and NDCG@10 of 0.0819. Every model below is judged
+against those two numbers.
+
 ## Item-item similarity
+
+Two items are similar if the same users touched both. Cosine similarity turns that into a number
+between 0 and 1.
 
 Cosine similarity between item columns, computed on the sparse matrix:
 
@@ -84,11 +108,26 @@ $$
 \mathrm{sim}(i, j) = \frac{\mathbf{x}_i \cdot \mathbf{x}_j}{\|\mathbf{x}_i\| \, \|\mathbf{x}_j\|}
 $$
 
+> **In plain words:** $\mathbf{x}_i$ is item $i$'s column, a list with a 1 for every user who
+> touched it. The top is the number of users who touched *both* items; the bottom divides by the
+> square roots of each item's own user count. With 0/1 data, two items each touched by 100 users,
+> 20 of them shared, have similarity $20 / (10 \times 10) = 0.2$.
+
 and a user's score for item $j$ is the sum of similarities to the items they already have:
 
 $$
 \hat{s}(u, j) = \sum_{i \in I_u} \mathrm{sim}(i, j)
 $$
+
+> **In plain words:** $I_u$ is the set of items user $u$ already has. To score a candidate $j$, add
+> up how similar $j$ is to each of them. A candidate that resembles many of the user's items gets a
+> big total.
+
+> **Picture it:** every item in your history casts a vote for each candidate, and its vote weighs as
+> much as the two items are alike. The candidates with the most weighted votes win.
+
+The block also tries **truncation**: keep only each item's top-$k$ most similar neighbours and set
+the rest to zero.
 
 ```python
 def item_cosine(X):
@@ -135,20 +174,40 @@ Here truncation *costs* accuracy: using all 899 neighbours scores 0.1037 NDCG, a
 truncation lands between 0.0959 and 0.0994. That is what a small catalogue looks like — with 900
 items the far neighbours are weak but not misleading, and throwing them away discards signal.
 
+Item-item with all neighbours already beats popularity clearly: 0.1197 against 0.0927 recall@10.
+
 The picture inverts on a real catalogue. With a million items, the tail of the similarity row is
 mostly noise from items that co-occur once or twice, the full matrix does not fit in memory, and
 truncation becomes both necessary and helpful. Treat $k$ as a parameter you tune per dataset, not
 as a rule, and know that its main job is compute.
 
+> **Watch out:** a full item-item matrix has (number of items)$^2$ cells. At 900 items that is
+> 810,000 floats; at a million items it is $10^{12}$, about 8 TB. Production systems store only the
+> top neighbours per item for that reason.
+
 ## Popularity leaks into similarity
+
+A blockbuster sits in almost everyone's history, so it ends up "similar" to almost everything.
+Two pairs that look equally similar can rest on 2 shared users or on 200, and only the second
+deserves trust.
 
 Raw co-occurrence counts make popular items look similar to *everything*, because they co-occur
 with everything. Two standard fixes: shrink by the co-occurrence count, and down-weight popular
 items before computing similarity.
 
+A **co-occurrence count** $c_{ij}$ is the number of users who touched both items. **Shrinkage**
+pulls a similarity towards zero when it rests on little evidence:
+
 $$
 \mathrm{sim}_{\text{shrunk}}(i,j) = \frac{c_{ij}}{c_{ij} + \lambda}\,\mathrm{sim}(i,j)
 $$
+
+> **In plain words:** multiply the similarity by $c_{ij} / (c_{ij} + \lambda)$. With $\lambda = 5$,
+> a pair backed by 5 shared users keeps half its similarity, and a pair backed by 95 keeps 95%.
+> $\lambda$ is the number of shared users at which you trust a similarity halfway.
+
+> **Picture it:** two restaurant reviews of 5 stars, one from a single reviewer and one averaged
+> over 200. Shrinkage is your instinct to discount the first.
 
 ```python
 C = (X.T @ X).toarray()                            # co-occurrence counts
@@ -187,11 +246,28 @@ niche item 418 (pop 7, genre 2) neighbours: [684, 183, 631, 2, 823]
   their popularity: [5, 5, 9, 40, 11] | genres: [2, 2, 2, 3, 2]
 ```
 
+The grid shows a small but real gain: NDCG goes from 0.0959 with no shrinkage to 0.0976 at
+$\lambda = 5$, then slides back to 0.0965 at $\lambda = 100$, where even well-supported pairs are
+being discounted. The two neighbour lists show the bias directly. The most popular item (1,003
+interactions) has neighbours with 498 to 937 interactions each, from three different genres:
+it is "similar" to other blockbusters, not to its own kind. The niche item (7 interactions) has
+neighbours with 5 to 40 interactions, four of five from its own genre 2. Niche items get
+genuinely topical neighbours; popular items get other popular items.
+
 ## TF-IDF and BM25 weighting
+
+Liking something everybody likes says little about you; liking something obscure says a lot. So
+weight each interaction by how rare the item is, before measuring similarity.
 
 The same idea applied before the similarity: weight each interaction by how informative it is.
 A user's interaction with an obscure item says more about their taste than an interaction with the
 most popular item in the catalogue.
+
+Both schemes come from text search. **IDF** (inverse document frequency) multiplies each item's
+column by roughly $\log(N / \text{df})$, where df is how many users touched the item and $N$ is the number
+of users: rare items get big weights. **BM25** adds a second correction: it shrinks the weight of
+interactions from users with very long histories, using `k1` to cap how much repeats count and `b`
+to set how strongly to normalise by history length.
 
 ```python
 def idf_weight(X):
@@ -233,13 +309,25 @@ BM25 does help (+0.0050 NDCG) because it does something IDF cannot: its `b` term
 similarity they participate in. When you reach for a weighting scheme, check whether it survives
 your similarity function's normalisation before you attribute a gain to it.
 
+> **Watch out:** "we added IDF weighting and nothing changed" usually means the similarity already
+> normalises columns. It is a sign to think about the maths, not to tune the IDF formula.
+
 ## User-user, and when to prefer it
+
+Flip the question around: find the people most like this user, and recommend what they liked.
 
 The transpose of the same algorithm: find users like this one, recommend what they liked.
 
 $$
 \hat{s}(u, j) = \sum_{v \in N(u)} \mathrm{sim}(u, v)\, x_{vj}
 $$
+
+> **In plain words:** $N(u)$ is the set of the user's nearest neighbours (here, the 50 most
+> similar users by cosine). Each neighbour $v$ adds $\mathrm{sim}(u, v)$ to every item they touched
+> ($x_{vj}$ is 1 if $v$ touched $j$). Items liked by many close neighbours score highest.
+
+> **Picture it:** item-item asks "what is like the things you own?"; user-user asks "what do people
+> like you own?". Same table, read across rows instead of down columns.
 
 ```python
 def user_cosine(X):
@@ -280,7 +368,22 @@ item catalogues change slowly while user histories change constantly — a user'
 update the moment they click, with no retraining, because their score is just a fresh sum over the
 same item matrix.
 
+The last line makes the size argument concrete: 810,000 item-item cells against 6,250,000
+user-user cells, almost eight times as many, because there are 2,500 users and only 900 items.
+
+## Recap in plain words
+
+- Neighbourhood CF scores a candidate by adding up its similarity to everything the user already has.
+- Cosine similarity on the interaction matrix needs no training, only counting and a sparse product.
+- Popular items look similar to everything; shrinkage and BM25 weighting counter that.
+- IDF does nothing under cosine, because cosine divides out any per-item constant.
+- User-user and item-item score about the same here; item-item is cheaper when items are fewer than users.
+- Truncating to the top neighbours is mainly a compute saving; tune it per dataset.
+
 ## Try it Yourself
+
+Every score is a sum of per-item contributions, so you can print the top contributors as the
+"because of" explanation. The block does that for two users.
 
 ```python
 def explain(u, k=5, k_neighbours=50):
@@ -329,11 +432,20 @@ honestly that its highest-scoring neighbours are the popular ones, which is the 
 this chapter has been fighting, now visible in the reasons rather than hidden in an aggregate. Try
 a user with a single training item and watch the explanation become fragile as well as biased.
 
+Notice also that the same few items (522, 725, 321) explain recommendations for both users, and
+that user 0's scores near 11 are about double user 1's near 5.5. Scores are sums, so a user with 94
+items gets bigger totals than one with 27; compare scores within a user, never across users.
+
 ## Exercise
 
 Build a configurable item-item recommender — weighting scheme, shrinkage, neighbourhood size — and
 find the combination that works on this data. Then measure what it costs: the score each variant
 achieves, its coverage, and how much of its accuracy is just popularity in disguise.
+
+> **Hint:** write one `build_itemknn(X, weighting, lam, k_neighbours)` that returns the final
+> similarity matrix, then loop over a small grid of 3 weightings, 2 shrinkages and 2 neighbourhood
+> sizes. For "popularity in disguise", correlate each user's score vector with the raw popularity
+> vector.
 
 <details>
 <summary>Solution</summary>
@@ -419,11 +531,14 @@ mean correlation between the model's scores and raw popularity: 0.7115
 ```
 
 Read the table by column, not by row. **Weighting** dominates: every BM25 row sits above every
-non-BM25 row, and raw and IDF are byte-identical for the reason above. **Neighbourhood size** is
-next, with 20 beating 100 everywhere. **Shrinkage** is the smallest effect and, on this data, a
-negative one — `shrink=0` wins in all three weighting families, because a 900-item catalogue has
-enough co-occurrences that few pairs need shrinking. On a sparser catalogue the sign flips, which
-is exactly why it is in the grid rather than in the defaults.
+non-BM25 row, and raw and IDF match each other row for row (up to one floating-point tie in the
+fourth decimal) for the reason above. **Neighbourhood size** is next, with 20 beating 100
+everywhere. **Shrinkage** is the smallest effect, and its sign depends on the weighting: under
+BM25, `shrink=0` wins at both neighbourhood sizes (0.1069 against 0.1055 at $k = 20$), while for
+raw and IDF weighting `shrink=5` wins at both (0.0997 against 0.0987 at $k = 20$). BM25 already
+damps the heavy users whose co-occurrences shrinkage is meant to discount, so the two corrections
+overlap. On a sparser catalogue shrinkage matters more, which is exactly why it is in the grid
+rather than in the defaults.
 
 Notice the tension in the last two columns. The best configuration recommends *less* popular items
 than the baseline (533 against 648 mean popularity) while covering five times as much of the

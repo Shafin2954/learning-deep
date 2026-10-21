@@ -7,19 +7,40 @@ order: 6
 
 ## Matrix factorisation, generalised to any features
 
+What a person clicks depends on more than who they are and what the item is: phone or laptop,
+morning or night matters too. A factorization machine gives *every* such feature its own learned
+vector, so any two of them can interact.
+
 Matrix factorisation learns one vector per user and one per item, which works exactly as long as
 your input is a (user, item) pair. The moment you have context — the hour of day, the device, the
 page the user came from — you need a model that factorises *arbitrary* feature interactions.
 Factorization machines are that model, and they contain MF as a special case.
+
+**Context** means facts about the moment of the impression rather than the user or item. An
+**impression** is one showing of an item to a user, labelled 1 if it was clicked and 0 if not.
 
 $$
 \hat{y}(\mathbf{x}) = w_0 + \sum_{i=1}^{n} w_i x_i
 + \sum_{i=1}^{n}\sum_{j=i+1}^{n} \langle \mathbf{v}_i, \mathbf{v}_j \rangle\, x_i x_j
 $$
 
+> **In plain words:** the input $\mathbf{x}$ is a long list of $n$ features, almost all zero. The
+> prediction is three parts added up:
+> - $w_0$, a global offset (the base click rate);
+> - $\sum w_i x_i$, one weight per active feature: "this item is clicky", "mobile users click more";
+> - the double sum over every *pair* of active features, where the pair's effect is the dot product
+>   $\langle \mathbf{v}_i, \mathbf{v}_j \rangle$ of their two latent vectors.
+
 Every feature gets a weight $w_i$ *and* a latent vector $\mathbf{v}_i$. The interaction between two
 features is their vectors' dot product, so a pair that never co-occurs in training still gets a
 prediction — the vectors were learned from other pairs.
+
+> **Picture it:** every feature is a person at a meeting, carrying a badge with a few numbers on it.
+> How well any two people get along is read off their badges. You can predict how a pair who have
+> never met will get on, because each badge was written from all the other meetings that person
+> attended.
+
+The synthetic data below has 1,500 users, 400 items, 3 devices and 4 times of day (**dayparts**).
 
 ```python
 import numpy as np
@@ -62,10 +83,21 @@ print(f"feature fields: user ({n_users}), item ({n_items}), device ({n_devices})
 feature fields: user (1500), item (400), device (3), daypart (4)
 ```
 
+Out of 60,000 impressions, 34.0% were clicked. The first 80% (48,000 rows) train and the last
+12,000 test.
+
 Note what the generator did: the click depends on **item x device** and **item x daypart**, not
 just on user and item. A matrix factorisation cannot see those terms at all.
 
 ## One-hot encoding and the design matrix
+
+To feed categories to the model, give every possible value its own column: one column per user,
+one per item, one per device, one per daypart. Each row then has a 1 in exactly four columns.
+
+That is **one-hot encoding**, and the resulting table is the **design matrix**. A **field** is one
+group of columns (all the user columns, all the device columns). Instead of storing a mostly-zero
+row, the code stores only the four column numbers that are 1, shifting each field by an **offset**
+so the fields do not overlap.
 
 ```python
 FIELDS = ["user", "item", "device", "daypart"]
@@ -89,10 +121,17 @@ design matrix: 1,907 features, 4 active per row
 first row active indices: [ 388 1845 1900 1903] (user 388, item 345 + 1500, ...)
 ```
 
+There are 1,907 columns ($1500 + 400 + 3 + 4$) and 4 are active per row. The first row's active
+indices are user 388 (offset 0), item 345 shifted by 1,500 to 1845, then a device and a daypart
+column at 1900 and 1903.
+
 Because every row has exactly one active feature per field, the sparse dot products collapse to
 array lookups — which is what makes FMs fast despite the quadratic-looking formula.
 
 ## The $O(kn)$ identity that makes FMs practical
+
+Adding up every pair of features one pair at a time is slow. A short algebra trick gives the same
+total from one sum and one sum of squares.
 
 The double sum over pairs is $O(n^2)$ as written. It is equal to:
 
@@ -101,6 +140,12 @@ $$
 = \frac{1}{2}\sum_{f=1}^{k}\left[\left(\sum_{i=1}^{n} v_{i,f} x_i\right)^{2}
 - \sum_{i=1}^{n} v_{i,f}^{2} x_i^{2}\right]
 $$
+
+> **In plain words:** work one latent dimension $f$ at a time ($k$ is the number of dimensions). Add
+> up all the active features' values in that dimension and square the total; that square contains
+> every pair twice plus every feature with itself. Subtract the "with itself" parts (the sum of
+> squares), halve what is left, and you have every pair exactly once. It is the school identity
+> $(a + b + c)^2 = a^2 + b^2 + c^2 + 2(ab + ac + bc)$, rearranged.
 
 which costs $O(kn)$ — one pass to accumulate the sum, one to accumulate the sum of squares.
 
@@ -130,7 +175,14 @@ row 1: naive -0.0340220224 | fast -0.0340220224 | match True
 row 2: naive +0.1263194906 | fast +0.1263194906 | match True
 ```
 
+All three rows agree to ten decimal places, and `match True` confirms it. With 4 active features
+there are only 6 pairs, so the saving is small here; with hundreds of active features per row
+(text, tags, history), it is the difference between usable and not.
+
 ## Training an FM
+
+Training is the same "predict, compare, nudge" loop as SGD in ch. 4. The prediction goes through
+a sigmoid to become a click probability, and the error is how far that probability is from 0 or 1.
 
 For logistic loss with $p = \sigma(\hat{y})$ and residual $e = p - y$, the gradients are
 
@@ -139,7 +191,16 @@ $$
 \frac{\partial L}{\partial v_{i,f}} = e\left(x_i \sum_{j} v_{j,f}x_j - v_{i,f}x_i^2\right)
 $$
 
+> **In plain words:** **logistic loss** (log loss) punishes confident wrong probabilities heavily.
+> Its gradient is unusually tidy: the error $e$ times the input for each linear weight. For a latent
+> entry $v_{i,f}$, it is $e$ times "the sum of everyone else's values in dimension $f$", because
+> that is what $v_{i,f}$ multiplies in the pairwise term.
+
 and the inner sum is the same $s_f$ you already computed for the forward pass.
+
+The training code reports two numbers on the test set. **Log loss** measures probability quality
+(lower is better; always predicting the 0.34 base rate gives about 0.64). **AUC** is the chance that
+a random clicked row scores above a random unclicked one (0.5 is guessing, 1.0 is perfect).
 
 ```python
 def fm_fit(idx, y, n_features, k=8, epochs=40, lr=2.0, lam=1e-5, batch=2_048,
@@ -201,7 +262,18 @@ print(f"\nFM (k=8, all fields): logloss {fm_logloss(w0, w, V, idx_test, y_test):
 FM (k=8, all fields): logloss 0.5637 | AUC 0.7383
 ```
 
+Log loss drops from 0.6076 at epoch 10 to 0.5619 at epoch 30, then edges back up to 0.5637 at
+epoch 40, while AUC keeps creeping up to 0.7383. The two metrics can disagree slightly near the end:
+the ranking still improves while the probabilities start to become overconfident.
+
+> **Watch out:** the code clips the score to $[-30, 30]$ before the exponential and clips $p$ away from
+> 0 and 1 before taking logs. Without both, one extreme row produces `inf` or `nan` and poisons every
+> parameter it touches.
+
 ## FM with only user and item *is* matrix factorisation
+
+Feed the FM only the user and item columns and the only possible pair is (user, item): that is
+exactly the matrix factorisation from ch. 4. Adding fields one at a time shows what each buys.
 
 ```python
 def fit_on_fields(fields, k=8, epochs=40, seed=0):
@@ -234,7 +306,16 @@ possible interaction is between a user feature and an item feature, and $\langle
 \mathbf{v}_i \rangle$ is exactly $\mathbf{p}_u \cdot \mathbf{q}_i$ from ch. 4. Everything below
 that row is what MF cannot express.
 
+Look closely at the top three rows. User alone gives AUC 0.5103, barely above guessing. Item alone
+gives 0.7154, and adding the user to it (the MF row) gives 0.7134, no better. With 1,500 users and
+only 48,000 rows, the user-item term cannot be learned well, even though the generator put real
+signal there. The context fields are what move the needle: device adds 0.0222 AUC, daypart another
+0.0027.
+
 ## Why the shared vectors matter: unseen pairs
+
+Most (user, item) combinations in the test set never appeared in training. A model that needed to
+have seen a pair to score it would be stuck; an FM is not.
 
 ```python
 observed = set(map(tuple, train[["user", "item"]].values))
@@ -262,7 +343,22 @@ explicit interaction terms would have **no parameter at all** for those pairs. T
 $\mathbf{v}_{\text{device}}$ were each learned from every row they appear in, and their dot
 product is defined whether or not those two ever met.
 
+Only 46,071 of 600,000 possible pairs (under 8%) appear in training, which is why 92.3% of test
+rows are new pairs.
+
+## Recap in plain words
+
+- A factorization machine gives every feature (user, item, device, time) a weight and a latent vector.
+- Any two active features interact through the dot product of their vectors.
+- A one-hot design matrix with one active column per field makes the model a set of array lookups.
+- The sum-of-squares identity makes the pairwise term cost $O(kn)$ instead of $O(n^2)$.
+- An FM restricted to user and item is matrix factorisation; extra fields add context MF cannot see.
+- Shared vectors let the FM score pairs it never saw, here with almost no loss in AUC.
+
 ## Try it Yourself
+
+The sweep compares a plain logistic regression on the same one-hot features (the `lin` row, no
+interactions) with FMs of latent size $k$ = 2, 8 and 24.
 
 ```python
 print(f"{'k':>4} {'logloss':>9} {'AUC':>8} {'params':>10}")
@@ -295,11 +391,14 @@ for k in (0, 2, 8, 24):
 ```
 
 The linear row is the control: same features, no interactions, AUC 0.7039. Two latent dimensions
-already beat it (0.7298), eight is the peak (0.7383), and twenty-four buys nothing while tripling
-the parameter count — the same rank-versus-regularisation trade as ch. 4, on a model with many
+already beat it (0.7298), eight is the peak (0.7383), and twenty-four buys nothing while nearly
+tripling the parameter count — the same rank-versus-regularisation trade as ch. 4, on a model with many
 more feature types. Note that the true generating process used three latent dimensions; the peak
 sits above that because the model must also absorb the item bias and the field-specific effects
 through the same vectors.
+
+Try a variation: change `lam=1e-5` to `1e-3` inside the `k = 24` fit and check whether the extra
+regularisation lets the larger model overtake $k = 8$.
 
 ## Exercise
 
@@ -307,6 +406,10 @@ Extend the FM into something you could deploy: add a numeric feature, verify the
 formula against the naive one on the full design matrix, measure what each field contributes, and
 compare against both a linear model and a matrix factorisation restricted to (user, item). Report
 the per-field contribution in a form a product owner could read.
+
+> **Hint:** an **ablation** drops one field at a time, retrains, and records how much AUC changes;
+> that table is the product-readable answer. For the identity check, compute both forms for all
+> 12,000 test rows at once and report the largest absolute difference.
 
 <details>
 <summary>Solution</summary>
@@ -409,7 +512,13 @@ for exactly this reason.
 The identity check is not ceremony. The fast form is an algebraic rearrangement, so any difference
 beyond floating-point noise means the implementation has drifted from the maths — and the usual
 cause is a subtle indexing bug in the gradient, which this check catches while the loss curve
-still looks plausible.
+still looks plausible. Here the largest difference over 12,000 rows is $7.99 \times 10^{-15}$, pure
+rounding.
+
+The solution does not add the numeric feature itself; it is a one-line change. A numeric feature
+is one extra column whose value is the number (say, a scaled price) instead of 1, so every $x_i$ in
+the formulas above is used as is. The index-lookup shortcut in `fm_fit` assumes all values are 1,
+so you would also carry a value array and multiply each looked-up vector by it.
 
 Three things to carry forward. **FMs subsume the models of the last two chapters**: restrict the
 fields to user and item and you have MF with biases, exactly, which is why the FM row and the MF
@@ -423,5 +532,7 @@ they win CTR competitions and are correspondingly harder to serve.
 The per-row contribution table is the deployment-facing piece. A linear term per field plus one
 pairwise scalar is not a full explanation, but it is enough to answer "why did this ad get
 shown?" with numbers that add up to the prediction — the same reconciliation discipline as
-eval-tuning ch. 9, in a model that was never designed for interpretability.
+(Evaluation, Tuning & Interpretability, ch. 9), in a model that was never designed for interpretability.
+For row 1, the bias of $-2.168$ and the small linear terms are outweighed by a pairwise term of
+2.996, which lifts the click probability to 0.520.
 </details>

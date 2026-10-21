@@ -7,16 +7,28 @@ order: 5
 
 ## Learning Without a Model
 
+When you don't have the rulebook, you play. Monte Carlo learning means: play many complete
+games, write down what you scored from each situation, and average.
+
 Dynamic programming required the transition dynamics $p(s',r|s,a)$. Monte Carlo methods need
 nothing of the sort — they learn purely from experience: complete episodes of interaction.
 You run the agent, observe the sequence of states, actions, and rewards, and then use the
-actual returns to update value estimates.
+actual returns to update value estimates. The name **Monte Carlo** (after the casino) is used
+for any method that estimates an answer by averaging random samples.
 
 The trade-off: MC can only update after a complete episode, so it doesn't work for continuing
 tasks. But it can handle any environment you can simulate, even one with complex stochastic
 dynamics you'd never be able to write down as a model.
 
+> **Picture it:** estimating how long your commute takes. DP would need a map with every
+> traffic light's timing. Monte Carlo just drives to work 100 times with a stopwatch and
+> averages. It never needs the map — but it only learns anything once each trip is over.
+
 ## First-Visit MC Prediction
+
+**Prediction** means estimating how good states are under a fixed policy (no improving yet).
+The Monte Carlo recipe: every time you visit a state, remember the total reward that followed;
+the average of those totals is the state's value.
 
 You want to estimate $v_\pi(s) = \mathbb{E}_\pi[G_t \mid S_t = s]$. The return from time $t$
 is $G_t = R_{t+1} + \gamma R_{t+2} + \gamma^2 R_{t+3} + \cdots$ over the rest of the episode.
@@ -28,14 +40,25 @@ $$
 V(s) \leftarrow V(s) + \alpha\bigl(G_t - V(s)\bigr)
 $$
 
+> **In plain words:** nudge your estimate $V(s)$ toward the return $G_t$ you actually got,
+> by a fraction $\alpha$ of the gap. Same "old + step × error" shape as the bandit update in
+> ch. 2 — but now the target is a whole episode's return instead of one reward.
+
 Using $\alpha = 1/N(s)$ gives the sample mean. Using a fixed small $\alpha$ tracks
-non-stationary problems.
+non-stationary problems. Here $N(s)$ counts how many episodes have visited $s$ so far.
+
+The example uses **Blackjack**: you are dealt cards and try to get a sum close to 21 without
+going over ("busting"). The state is a triple (your sum, the dealer's visible card, whether you
+hold a **usable ace** — an ace you can count as 11 without busting). The reward is $+1$ for a
+win, $-1$ for a loss, 0 for a draw, all at the end. The fixed policy: hit (take a card) until
+your sum is 20 or more, then stick.
 
 ```python
 import numpy as np
 import gymnasium as gym
 
 env = gym.make("Blackjack-v1", sab=True)
+env.reset(seed=0)  # seed the deck once; later resets continue the stream
 
 def generate_episode(env, policy):
     """Returns list of (state, action, reward)."""
@@ -84,26 +107,42 @@ for ps in range(12, 22):
 
 ```output
 V(player_sum, dealer=2, usable_ace=True):
-  player=12: 0.141
-  player=13: 0.196
-  player=14: 0.248
-  player=15: 0.300
-  player=16: 0.358
-  player=17: 0.441
-  player=18: 0.587
-  player=19: 0.751
-  player=20: 0.928
-  player=21: 0.979
+  player=12: -0.176
+  player=13: -0.109
+  player=14: -0.299
+  player=15: -0.339
+  player=16: -0.361
+  player=17: -0.422
+  player=18: -0.415
+  player=19: -0.379
+  player=20: 0.683
+  player=21: 0.975
 ```
 
-Values increase with player sum — exactly what you'd expect. With a usable ace, 20 wins
-about 93% of the time against a dealer showing 2.
+Read the column from top to bottom. Sums 12 through 19 are all negative, between $-0.109$ and
+$-0.422$: this policy keeps hitting on those sums and often busts. Then the jump: 20 is worth
+0.683 and 21 is worth 0.975, because those are the only sums where the policy sticks. A value
+of 0.683 means wins minus losses equals 68.3% of games — for example about 80% wins and 12%
+losses.
+
+Values do not rise smoothly with player sum: they jump at 20, where this policy switches from
+hitting to sticking. With a usable ace, 20 has an expected outcome of $+0.683$ per game against a
+dealer showing 2 — strongly favourable, but not a sure win.
+
+> **Watch out:** the code walks each episode *backwards*, so that `G = reward + G` builds the
+> return from the end. A state's "first visit" is then the last time the backward loop sees
+> it — which is why the code checks `visited` as it goes. Here $\gamma = 1$, so no discounting
+> appears.
 
 ## MC Control: ε-Soft Policy
 
-To find the optimal policy without a model, you need to explore. The **ε-soft** approach
-makes every action available with at least probability ε/|A|, but assigns most probability to
-the current best action:
+**Control** means finding a good policy, not only scoring a fixed one. The catch: if you
+always do what currently looks best, you never learn about the alternatives. So you keep a
+little randomness in every state.
+
+To find the optimal policy without a model, you need to explore. The **ε-soft** approach makes
+every action available with at least probability $\varepsilon/|A|$ (where $|A|$ is the number
+of actions), but assigns most probability to the current best action:
 
 $$
 \pi(a|s) = \begin{cases}
@@ -112,10 +151,21 @@ $$
 \end{cases}
 $$
 
+> **In plain words:** with $\varepsilon = 0.1$ and two actions, the best-looking action is
+> picked with probability $1 - 0.1 + 0.05 = 0.95$, and the other with probability 0.05. Every
+> action keeps a small, non-zero chance, so its value keeps getting updated.
+
+Here the agent learns $Q(s, a)$ — the action value from ch. 3 — instead of $V(s)$. Without a
+model you cannot look one step ahead to compare actions, so you need values for each action
+directly.
+
 ```python
 from collections import defaultdict
 
 env = gym.make("Blackjack-v1", sab=True)
+env.reset(seed=0)
+env.action_space.seed(0)
+np.random.seed(0)
 
 Q = defaultdict(lambda: np.zeros(2))  # 2 actions: stick=0, hit=1
 N = defaultdict(lambda: np.zeros(2))
@@ -126,7 +176,7 @@ def epsilon_greedy(state, eps=epsilon):
         return env.action_space.sample()
     return int(np.argmax(Q[state]))
 
-n_episodes = 500_000
+n_episodes = 300_000
 for ep in range(n_episodes):
     episode = []
     state, _ = env.reset()
@@ -159,7 +209,7 @@ for ps in range(12, 22):
 
 ```output
 Optimal action (0=stick, 1=hit) — no usable ace, dealer=6:
-  player=12: hit
+  player=12: stick
   player=13: stick
   player=14: stick
   player=15: stick
@@ -171,10 +221,20 @@ Optimal action (0=stick, 1=hit) — no usable ace, dealer=6:
   player=21: stick
 ```
 
-With dealer showing 6 (a "bust card"), the learnt policy matches basic strategy: stick from
-13 upward, because the dealer is likely to bust.
+All ten lines say `stick`: with the dealer showing 6, the learned policy never takes a card
+from 12 upward.
+
+With dealer showing 6 (a "bust card"), the learnt policy matches basic strategy, which sticks on
+every sum from 12 upward against a 6, because the dealer is likely to bust. Six is the dealer's
+worst card: the dealer must keep hitting below 17, and from 6 that often goes over 21.
+
+> **Watch out:** states that are rarely visited get few updates, so their learned action can
+> be noise. Check the visit counts in `N` before trusting the policy in an unusual state.
 
 ### Exploring Starts vs ε-Soft
+
+Another way to make sure every action gets tried: start each episode from a random situation
+with a random first move.
 
 An alternative to ε-soft is **exploring starts**: guarantee every (state, action) pair has
 nonzero probability of being the start of an episode. This allows a fully greedy policy but
@@ -183,17 +243,43 @@ requires control over the environment's start distribution — impossible in rea
 
 ## Importance Sampling for Off-Policy MC
 
-To learn about a **target policy** $\pi$ while following a **behavior policy** $b$ (which
-must cover $\pi$: $\pi(a|s) > 0 \Rightarrow b(a|s) > 0$), multiply returns by the
-importance sampling ratio:
+Sometimes you want to learn about one way of playing while actually playing a different way —
+for example, learn the greedy strategy from a cautious player's games. You fix the mismatch by
+re-weighting each game by how much more (or less) likely it was under the strategy you care
+about.
+
+To learn about a **target policy** $\pi$ (the one you want to evaluate) while following a
+**behavior policy** $b$ (the one that generates the data) — which must cover $\pi$:
+$\pi(a|s) > 0 \Rightarrow b(a|s) > 0$ — multiply returns by the importance sampling ratio. This
+is called **off-policy** learning: the data comes "off" a different policy.
 
 $$
 \rho_{t:T-1} = \prod_{k=t}^{T-1} \frac{\pi(A_k|S_k)}{b(A_k|S_k)}
 $$
 
+> **In plain words:** for each step from $t$ to the end $T-1$, divide "how likely the target
+> policy was to take that action" by "how likely the behavior policy was to take it", and
+> multiply all those ratios together. If $\pi$ would have taken these actions twice as often
+> as $b$ did, the episode counts double.
+
 Ordinary IS: $V(s) \leftarrow \frac{\sum \rho G}{\text{count}}$ — unbiased but high variance.
-Weighted IS: $V(s) \leftarrow \frac{\sum \rho G}{\sum \rho}$ — biased but much lower variance
-in practice, and the bias vanishes asymptotically.
+Weighted IS: $V(s) \leftarrow \frac{\sum \rho G}{\sum \rho}$ — biased but much lower variance in
+practice, and the bias vanishes asymptotically. **Unbiased** means right on average;
+**variance** measures how far a single estimate can swing.
+
+> **Watch out:** the ratio is a product over the whole episode, so it can explode. Ten steps
+> where $\pi$ is twice as likely as $b$ give a weight of $2^{10} = 1024$ — one episode then
+> dominates the average. That is why weighted IS is preferred, and why a step where $\pi$ would
+> never act (ratio 0) wipes out the rest of the episode.
+
+## Recap in plain words
+
+- Monte Carlo learns values by averaging the returns of complete episodes; no model needed.
+- First-visit MC counts only the first time a state appears in each episode.
+- Learning $Q(s, a)$ lets you pick the best action without a model.
+- An $\varepsilon$-soft policy keeps every action possible, so exploration never stops.
+- MC must wait until the episode ends before it can update anything.
+- Importance sampling re-weights episodes to learn about a policy you are not following.
 
 ## Try it Yourself
 
@@ -206,6 +292,9 @@ from collections import defaultdict
 # Then evaluate the greedy policy for 10,000 episodes and report win rate
 
 env = gym.make("Blackjack-v1", sab=True)
+env.reset(seed=1)
+env.action_space.seed(1)
+np.random.seed(1)
 Q = defaultdict(lambda: np.zeros(2))
 N = defaultdict(lambda: np.zeros(2))
 epsilon = 0.1
@@ -250,14 +339,25 @@ print(f"Win rate: {wins/100:.1f}%  Draw: {draws/100:.1f}%  Loss: {losses/100:.1f
 ```
 
 ```output
-Win rate: 43.2%  Draw: 9.4%  Loss: 47.4%
+Win rate: 43.0%  Draw: 9.0%  Loss: 48.0%
 ```
+
+The learned greedy policy wins 43.0%, draws 9.0%, and loses 48.0% of 10,000 hands. Losing more
+often than winning is normal: in Blackjack the house has an edge even against perfect basic
+strategy (which wins about 43% and loses about 49%). So this learner is already close to the
+best a player can do.
+
+Try training for 20,000 episodes instead of 200,000 and compare the win rate, or set
+`epsilon = 0.3` to see how heavier exploration during training changes the result.
 
 ## Exercise
 
 Implement **every-visit** MC prediction (not first-visit) on the same Blackjack environment.
 After 100,000 episodes, compare the value estimates for states (18, 6, False) and (20, 10, False)
 between first-visit and every-visit MC. Are they different? Why or why not in the limit?
+
+> **Hint:** before coding, ask whether a Blackjack state can appear twice in one episode. Every
+> card you take changes your sum or your ace status.
 
 <details>
 <summary>Solution</summary>
@@ -267,6 +367,7 @@ import numpy as np
 import gymnasium as gym
 
 env = gym.make("Blackjack-v1", sab=True)
+env.reset(seed=0)  # same deck stream as the first-visit run above
 
 def simple_policy(state):
     return 0 if state[0] >= 20 else 1
@@ -298,8 +399,11 @@ for key in [(18, 6, False), (20, 10, False)]:
     print(f"Every-visit V{key} = {ev:.4f}")
 ```
 
-In the limit, first-visit and every-visit MC both converge to the true $v_\pi(s)$ — the
-difference is variance, not bias. Every-visit uses more updates per episode (less variance
-per episode but correlated within episodes). For Blackjack, each state appears at most once
-per episode anyway, so the two methods give nearly identical results.
+This prints $V(18, 6, \text{False}) = -0.7093$ and $V(20, 10, \text{False}) = 0.4437$ — exactly
+the same values the first-visit loop from the first example gives on the same seeded deck. In
+the limit, first-visit and every-visit MC both converge to the true $v_\pi(s)$. In general the
+difference is variance, not bias: every-visit uses more updates per episode, but those updates
+are correlated within episodes (and every-visit is slightly biased for finite samples). For
+Blackjack, each state appears at most once per episode anyway, so the two methods are not just
+nearly identical here — they do the very same updates.
 </details>

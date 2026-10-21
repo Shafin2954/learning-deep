@@ -7,10 +7,19 @@ order: 2
 
 ## Metrics for lists, not for cells
 
+A good list puts things the user wants near the top, and nobody looks past the end of the list.
+So a scoring rule for recommenders has to count hits, care about where the hits sit, and stop
+counting at the last slot.
+
 A recommender is judged on an ordered list of length $k$. That changes what a metric has to do:
 reward hits, reward them more when they are near the top, and ignore everything past the cutoff.
 Four metrics cover almost every paper and product dashboard, and they disagree in ways worth
 knowing.
+
+A **hit** is a recommended item that turns up in the user's held-out future. The **cutoff** $k$ is
+the list length you score, written as a suffix: recall@10 scores the top 10 only. First, a
+synthetic year of logs like the one in ch. 1, with one twist: items belong to 6 **genres**
+(groups of similar items), and genre 0 is "mainstream", shown four times as often.
 
 ```python
 import numpy as np
@@ -51,11 +60,18 @@ evaluable users (seen in train, have test items): 2,381
 test items per user: median 7
 ```
 
+The data has 126,503 interactions, split by time into 103,416 for training and 23,087 for the
+last 60 days of testing. Of the users with test items, 2,381 also have training history, and the
+median one has 7 items to find.
+
 The `u in seen` filter is not cosmetic. A user with no training history cannot be personalised for,
 so including them measures your cold-start policy (ch. 9), not your model — decide which you are
 reporting.
 
 ## The four metrics, from their definitions
+
+Each metric is a different way of grading the same list against the same answer key. They differ
+in two things: whether position counts, and whether they care about all the hits or only the first.
 
 For a user with relevant set $R$ and a ranked list $\hat{L} = (i_1, \dots, i_k)$:
 
@@ -64,11 +80,34 @@ $$
 \mathrm{Recall@}k = \frac{|\hat{L} \cap R|}{\min(k, |R|)}
 $$
 
+> **In plain words:** **precision** is "what share of my $k$ slots were hits"; **recall** is "what
+> share of the items I could have found did I find". Recall divides by the smaller of $k$ and
+> $|R|$ (the number of relevant items), so a user with 30 relevant items can still reach 1.0 with
+> a 10-slot list.
+
 $$
 \mathrm{AP@}k = \frac{1}{\min(k,|R|)}\sum_{j=1}^{k} \mathbb{1}[i_j \in R]\cdot \mathrm{Precision@}j,
 \qquad
 \mathrm{NDCG@}k = \frac{\sum_{j=1}^{k} \frac{2^{g_j} - 1}{\log_2(j+1)}}{\mathrm{IDCG@}k}
 $$
+
+> **In plain words:**
+> - **AP@k** (average precision) walks down the list and, every time it meets a hit at position
+>   $j$, writes down the precision of the list up to $j$. Then it averages those numbers. Early hits
+>   are written down while precision is still high, so they count more. $\mathbb{1}[i_j \in R]$ is 1
+>   for a hit and 0 otherwise. MAP is AP averaged over users.
+> - **NDCG@k** (normalised discounted cumulative gain) gives each hit a **gain** $2^{g_j} - 1$ ($g_j$
+>   is how relevant the item is; 1 for a plain hit, so the gain is 1) and divides it by
+>   $\log_2(j+1)$, a **discount** that grows with position: 1 at the top, 0.63 at slot 2, 0.36 at
+>   slot 6. IDCG@k is the same sum for the best possible list, so a perfect list scores exactly 1.
+> - **MRR** (mean reciprocal rank) only looks at the first hit: $1/j$ for a first hit at position $j$.
+
+> **Picture it:** precision and recall check *which* answers you got right on a test. AP and NDCG
+> also check *in what order you wrote them down*, like an exam where the first answers carry more
+> marks. MRR is a race: only the first correct answer counts, and earlier is better.
+
+The next block codes all five functions from these definitions and scores four five-item lists
+against the same relevant set $\{a, b, c\}$.
 
 ```python
 def precision_at_k(rec, rel, k):
@@ -125,7 +164,21 @@ product, you need a position-aware metric**, and if it does not — a grid where
 visible at once — recall@k is the honest choice and the rank-aware metrics are measuring something
 the user never experiences.
 
+Row three versus row four tells the same story with a single hit: identical precision (0.200) and
+recall (0.333), but NDCG falls from 0.469 to 0.182 and MRR from 1.000 to 0.200 when the hit moves
+from slot 1 to slot 5. You can check AP for row two by hand: hits at slots 3, 4, 5 give
+precisions $1/3$, $2/4$ and $3/5$, and their average is 0.478.
+
+> **Watch out:** libraries disagree on the AP denominator (some divide by $|R|$, some by the number of
+> hits, some by $\min(k, |R|)$ as here) and on the NDCG gain ($2^g - 1$ or plain $g$). For binary
+> relevance the NDCG variants agree, but AP numbers from two codebases are often not comparable.
+
 ## Choosing $k$, and what happens when you do not
+
+The same model gets very different numbers depending on how long a list you score. So the list
+length has to be chosen before you compare, and chosen to match the product.
+
+The block scores the popularity baseline from ch. 1 at five cutoffs, from a single slot to fifty.
 
 ```python
 def evaluate(recommend, users, k, metrics=("recall", "ndcg", "map", "mrr")):
@@ -168,11 +221,35 @@ for k in (1, 5, 10, 20, 50):
   50     0.2482    0.1411   0.0479   0.1875
 ```
 
+At $k = 1$ all four metrics are the same number, 0.0850: with one slot, "was it a hit" is the
+only question. From there they split. Recall climbs to 0.2482 at $k = 50$ because a longer list
+catches more. MRR only creeps from 0.1681 to 0.1875 between 10 and 50, because it only cares
+about the first hit and that is usually near the top. MAP actually dips from 0.0850 to 0.0390 at
+$k = 10$ before rising slightly.
+
 Recall rises with $k$ by construction and MRR barely moves — they are answering different
 questions. **Fix $k$ to the number of slots your product actually has** before you compare
 anything, and never compare a recall@50 from one experiment to a recall@10 from another.
 
+> **Watch out:** recall dips from 0.0850 at $k = 1$ to 0.0816 at $k = 5$. That is not a bug: the
+> denominator $\min(k, |R|)$ grows from 1 to up to 5 faster than the hits do. Recall is only
+> guaranteed not to fall with $k$ for users with at least $k$ relevant items.
+
 ## Beyond accuracy: coverage, novelty, diversity
+
+A list can be accurate and still be a bad product: the same ten famous items for everybody, all
+of them alike. Three extra numbers catch that.
+
+- **Coverage** is the share of the catalogue shown to at least one user.
+- **Novelty** is how surprising an item is, measured as $-\log_2$ of its share of all interactions,
+  in bits. An item that takes 1 in 1,000 interactions is about 10 bits novel; a blockbuster taking
+  1 in 8 is 3 bits.
+- **Intra-list similarity** is the average cosine similarity between pairs of items in one list,
+  using their style vectors. Lower means a more varied list.
+
+> **Picture it:** a radio station. Coverage asks how many different songs it ever plays; novelty asks
+> how often it plays something you have not heard a hundred times; intra-list similarity asks
+> whether one hour of airtime is all the same genre.
 
 ```python
 def catalogue_metrics(recommend, users, k=10):
@@ -212,10 +289,27 @@ trade-off is the entire reason production systems do not simply ship the popular
 recommender that shows 3% of the catalogue starves the other 97%, which is the feedback loop from
 ch. 1 and the reason chapter 11's bandits exist.
 
+The accuracy numbers come from the previous section and the Try it below: recall@10 is 0.0937 for
+popularity against 0.0143 for random, about 6.5 times higher. Coverage 0.03 means 27 of the 900
+items ever appear; 7.03 bits against 10.98 bits is the "4 bits" gap, so popular items are about
+$2^4 = 16$ times more common than a random pick.
+
 ## Sampled metrics do not preserve the ranking of models
+
+Ranking every item for every user is slow, so people often cheat: they rank the right answer
+against only 100 random wrong ones. That shortcut makes every model look better and can change
+which model looks best.
 
 Scoring every user against all items is expensive, so a common shortcut is to rank the true item
 against 100 random negatives. **That shortcut changes which model wins.**
+
+A **negative** here is an item treated as "not the answer". **HR@10** (hit rate) is 1 if the single
+held-out target item lands in the top 10, else 0, averaged over users. The block compares two
+models: a personalised one that uses the true generating score, and pure popularity.
+
+> **Picture it:** a spelling bee where you only have to beat 100 random people off the street
+> instead of the whole school. Almost every contestant wins their heat, so the heat results tell you
+> little about who is really best.
 
 ```python
 def full_rank_of_truth(scores, u, target):
@@ -262,7 +356,18 @@ Rendle, 2020) is that sampled metrics are not consistent estimators of the full-
 you must sample, sample the same way for every model and never compare across papers that
 sampled differently.
 
+> **Watch out:** "HR@10 = 0.67" from a sampled evaluation and "HR@10 = 0.19" from a full one describe
+> the same model on the same data. When a paper reports a suspiciously high hit rate, check how
+> many negatives it ranked against before comparing.
+
 ## Temporal splitting schemes
+
+There is more than one way to "hold out the future". Each choice of where to cut gives a test
+set with a different meaning.
+
+- A **global time cut** picks one date; everything after it, for every user, is test.
+- **Leave-last-n** holds out each user's own last $n$ interactions, whenever they happened.
+- **Sliding folds** repeat a global cut at several dates, each with the next 30 days as test.
 
 ```python
 def global_cut(events, days=60):
@@ -296,13 +401,36 @@ for i, (tr, te) in enumerate(sliding(events)):
    sliding fold 2: train 114,860 | test 11,643
 ```
 
+The global cut gives 2,382 test users with 9.69 test items each on average. Leave-last-2 tests
+almost every user (2,498) on exactly 2.00 items, and trains on 121,514 interactions, many of them
+later than other users' test items. The three sliding folds each test on about 11,400 interactions
+while the training set grows from 92,081 to 114,860; fold 1's training set is exactly the global
+cut's 103,416, since both cut at day 299.
+
 `global_cut` matches production — one model, one moment, everything after it is the future.
 `leave_last_n` gives every user the same weight and is the standard in sequential-recommendation
 papers (ch. 8), but it trains on some users' futures while testing others' pasts. `sliding` gives
 you several folds and therefore an error bar, which is the only one of the three that lets you say
 whether a difference is real.
 
+> **Watch out:** with leave-last-n, a user whose last purchase was in March is tested on March while
+> the model has trained on everyone's December. Popularity computed that way already "knows" what
+> became popular after the test interaction, the same leak as the random split in ch. 1.
+
+## Recap in plain words
+
+- Recommender metrics grade a top-$k$ list against the items the user touched in the future.
+- Precision and recall ignore order; AP, NDCG and MRR reward hits near the top.
+- Fix $k$ to the real number of slots; numbers at different $k$ are not comparable.
+- Coverage, novelty and diversity catch the "same famous ten for everyone" failure that accuracy misses.
+- Ranking against 100 sampled negatives inflates every score and shrinks the gaps between models.
+- A global time cut matches production; sliding folds give you an error bar.
+
 ## Try it Yourself
+
+`full_report` adds **bootstrap confidence intervals**: it resamples the users with replacement 200
+times, recomputes the mean each time, and reports the middle 95% of those means. That range shows
+how much the number would wobble with a different sample of users.
 
 ```python
 def full_report(recommend, users, k=10, n_boot=200, seed=0):
@@ -336,12 +464,20 @@ The confidence interval is what stops you shipping noise: with 1,200 users the i
 recall@10 spans about 0.020, so a "+0.005 improvement" from a new model is not one.
 Change `k`, or slice `sample_users` down to 200, and watch the interval widen.
 
+Popularity's recall@10 of 0.0937 sits in $[0.0807, 0.1009]$, far above random's whole interval
+$[0.0114, 0.0171]$, so that gap is real. Going from 1,200 to 200 users should make the interval
+about $\sqrt{6} \approx 2.4$ times wider.
+
 ## Exercise
 
 Build the evaluation harness the rest of the course will use: it takes a scoring function, ranks
 the full catalogue with seen-item filtering, and reports recall, NDCG, MAP and MRR at several $k$
 with bootstrap intervals, plus coverage and novelty — and it compares two models with a paired
 test over users, so "better" is a claim you can defend.
+
+> **Hint:** set already-seen items' scores to $-\infty$ before ranking, and use `np.argpartition`
+> to grab the top $k$ without sorting all 900 items. For the comparison, compute each user's NDCG
+> under both models, take the per-user difference, and bootstrap the mean of that difference.
 
 <details>
 <summary>Solution</summary>
@@ -446,10 +582,15 @@ comes from users differing in how predictable they are. The bootstrap interval o
 is what decides the verdict, and the `users_where_a_wins` field is the sanity check: a mean
 improvement driven by a handful of users looks very different from one where 60% of users improve.
 
+Read the win rates carefully. The oracle wins for 46.8% of users and the interval $(0.0474, 0.0619)$
+is far from zero; most of the remaining users are ties at NDCG 0, where neither list found anything.
+Popularity beats its noisy copy for only 7.7% of users, and its interval $(-0.0006, 0.0018)$
+straddles zero, so the harness correctly calls it `indistinguishable`.
+
 Note what the oracle comparison establishes. The oracle scorer uses the exact generating formula —
 taste, style and exposure — so recall@10 of 0.1596 is the ceiling this dataset allows, against
 popularity's 0.0947. Everything the rest of the course builds should be read against that ceiling
-rather than against zero: a model at 0.12 has closed half the available gap, which is a very
+rather than against zero: a model at about 0.127 has closed half the available gap, which is a very
 different statement from "it beat the baseline". And the
 popularity-versus-noisy-popularity comparison is the negative control: two models that differ only
 by noise should come back `indistinguishable`, and if your harness ever says otherwise, the

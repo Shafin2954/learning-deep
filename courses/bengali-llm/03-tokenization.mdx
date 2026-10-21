@@ -7,18 +7,30 @@ order: 3
 
 ## The token tax on Bengali
 
+A model cannot read letters. It reads a list of whole numbers, and a **tokenizer** — the
+program that chops text into pieces and swaps each piece for its ID number — decides how
+long that list is. Bengali text tends to become a much longer list than English text of the
+same meaning.
+
 A tokenizer turns text into the integer IDs a model actually consumes. For English it's
 nearly invisible. For Bengali it's a tax you pay on every single example — and if you
 don't manage it, it quietly halves your effective context and doubles your compute. On an
 8GB card with a one-month clock, that tax is the difference between fitting your data and
-OOM-ing.
+**OOM-ing** (running Out Of Memory on the GPU and crashing).
+
+> **Picture it:** a post office that charges per envelope. English words fit one per
+> envelope. Bengali words get torn into three or four pieces, each in its own envelope.
+> Same message, three times the postage.
 
 ## Why Bengali costs more tokens: fertility
 
-"Fertility" = average tokens per word. English tokenizers (especially byte-level BPE like
-GPT-2's) are tuned on English-dominant corpora, so English words are often 1 token.
-Bengali words get shattered into many subwords or even raw bytes. The root cause is
-encoding: a Bengali character is $\approx 3$ UTF-8 bytes, while an ASCII character is 1.
+The plain idea: count how many pieces the average word is cut into. Fewer is better.
+
+**"Fertility"** = average tokens per word. English tokenizers (especially **byte-level
+BPE** — a tokenizer that starts from raw bytes and merges frequent pairs — like GPT-2's) are
+tuned on English-dominant corpora, so English words are often 1 token. Bengali words get
+shattered into many subwords or even raw bytes. The root cause is encoding: a Bengali
+character is $\approx 3$ UTF-8 bytes, while an ASCII character is 1.
 A byte-level tokenizer that hasn't learned Bengali merges sees $\approx 3\times$ the bytes
 and emits roughly $3\times$ the tokens.
 
@@ -30,6 +42,10 @@ machine     -> 7 chars,  7 bytes
 "আমি পাঁচটি ফাইল ডাউনলোড করব"   -> 73 bytes   (~2.8×)
 ```
 
+Each Bengali code point costs 3 bytes, so মেশিন (5 code points) is 15 bytes, 3 bytes per
+character against 1 for `machine`. Per *word*, the gap is 15 vs 7 bytes, about $2\times$.
+The full sentence pair shows 73 vs 26 bytes for the same meaning.
+
 High fertility hurts four ways:
 
 1. **Shorter effective context** — your 512-token window holds far less Bengali than
@@ -39,6 +55,12 @@ High fertility hurts four ways:
 3. **Harder learning** — meaning is spread across more, smaller pieces.
 4. **Broken graphemes** — a naive tokenizer can split inside a conjunct, so the model
    never sees ক্ষ as a unit.
+
+> **In plain words:** $O(n^2)$ means "cost grows with the square of the length". Double the
+> tokens and attention costs four times as much; triple them and it costs nine times.
+
+The code below computes the byte count as a floor for a byte-level tokenizer: in the worst
+case, with no Bengali merges learned, it emits one token per byte.
 
 ```python
 # Fertility from first principles — no model download needed.
@@ -59,26 +81,46 @@ learning    8   শেখা       12   ratio≈1.5×
 computer    8   কম্পিউটার  27   ratio≈3.4×
 ```
 
+The ratios vary by word: `শেখা` is only 1.5 times `learning`, while `কম্পিউটার` is 3.4 times
+`computer` (27 vs 8 bytes). Long words with conjuncts pay the most.
+
+> **Watch out:** these are lower bounds for a *byte-level* tokenizer that knows no Bengali.
+> A tokenizer trained on Bengali merges those bytes into much bigger pieces. The next
+> sections show the real numbers.
+
 ## The three tokenizer families
+
+Every tokenizer learns a **vocabulary** — the fixed list of pieces it is allowed to emit —
+from a training corpus. The three families differ in what they start from and how they cut.
 
 ### WordPiece (BERT-style)
 
 Used by BanglaBERT. Greedy longest-match against a learned vocab, with `##` continuation
 pieces.
 
+In plain words: at each position, grab the longest piece that is in the vocabulary, then
+continue from where it ended. Pieces that continue a word are marked with `##`.
+
 ### SentencePiece (Unigram or BPE)
 
 Used by BanglaT5, mT5, XLM-R, Llama, Qwen, Gemma. Trains directly on raw text (no
-pre-tokenization needed — good, since Bengali word boundaries via spaces are unreliable),
-treats space as a real symbol (▁). The **Unigram** variant keeps a probabilistic vocab
-and is generally kinder to morphologically rich languages.
+**pre-tokenization** — splitting into words first — needed; good, since Bengali word
+boundaries via spaces are unreliable), treats space as a real symbol (▁). The **Unigram**
+variant keeps a probabilistic vocab and is generally kinder to morphologically rich
+languages, those that build long words from many meaningful parts, as Bengali does.
 
 ### Byte-level BPE (GPT-2/RoBERTa)
 
 Operates on bytes, never produces "unknown," but is the worst offender for Bengali
 fertility unless its training corpus had serious Bengali coverage.
 
+> **Picture it:** WordPiece and SentencePiece are word puzzles cut along lines the maker
+> chose after studying many puzzles. Byte-level BPE is a puzzle that falls back to single
+> tiny squares wherever it has never seen the picture before.
+
 ## Measuring fertility with a real tokenizer
+
+The plain idea: load three real tokenizers, feed them the same Bengali sentence, and count.
 
 ```python
 # Real fertility with an actual tokenizer (run where you can load HF models):
@@ -93,24 +135,59 @@ for name in ["csebuetnlp/banglabert", "google/mt5-base", "xlm-roberta-base"]:
 # Expect BanglaBERT to have the lowest fertility on Bengali; that's your friend.
 ```
 
+```output
+csebuetnlp/banglabert        tokens=  9  fertility=1.80
+google/mt5-base              tokens= 15  fertility=3.00
+xlm-roberta-base             tokens= 10  fertility=2.00
+```
+
+The 5-word sentence becomes 9 tokens for BanglaBERT (fertility 1.80), 10 for XLM-R (2.00),
+and 15 for mT5 (3.00). So the Bengali-specific model is cheapest, as the comment predicted,
+and mT5 needs two-thirds more tokens than BanglaBERT for the same text. These counts include
+each tokenizer's special tokens (such as `[CLS]` and `[SEP]` for BanglaBERT).
+
+> **Watch out:** `tok(text)["input_ids"]` adds special tokens by default. For a fair word
+> fertility, pass `add_special_tokens=False` (as the exercise does). With 5 words, two extra
+> tokens move fertility by 0.4.
+
 ## Practical decision for the competition
 
+You almost never pick a tokenizer on its own; it comes glued to the model. So fertility
+becomes one of your reasons for picking a model.
+
 1. **Match the tokenizer to your model** — you don't choose a tokenizer separately; it
-   ships with the checkpoint. So your real choice is *which model*, and fertility is one
-   criterion. BanglaBERT/BanglaT5 and Indic-focused models (MuRIL, IndicBERT) have
-   Bengali-aware vocabularies and low fertility. General multilingual models (XLM-R, mT5)
-   are decent. English-centric models (vanilla GPT-2, older Llama) are poor for Bengali
-   unless adapted.
+   ships with the **checkpoint** (the saved model files). So your real choice is *which
+   model*, and fertility is one criterion. BanglaBERT/BanglaT5 and Indic-focused models
+   (MuRIL, IndicBERT) have Bengali-aware vocabularies and low fertility. General
+   multilingual models (XLM-R, mT5) are decent. English-centric models (vanilla GPT-2,
+   older Llama) are poor for Bengali unless adapted.
 2. **Measure fertility on your data** before committing. A quick fertility check across
    candidate models predicts truncation pain and training cost.
 3. **Always normalize before tokenizing** (Chapter 2) so the tokenizer sees the canonical
    form it was trained on — un-normalized input inflates fertility (it hits unseen
    variants and backs off to bytes).
 4. **Vocabulary extension** is an advanced lever: if you must use an English-centric base
-   model, you can add Bengali tokens to the tokenizer and resize the embedding matrix,
-   then continue-pretrain. Powerful, but costly — a Week-3 move, not Week-1.
+   model, you can add Bengali tokens to the tokenizer and resize the **embedding matrix**
+   (the table holding one learned vector per token), then **continue-pretrain** (keep
+   training on plain Bengali text so the new rows learn meaning). Powerful, but costly — a
+   Week-3 move, not Week-1.
+
+> **Watch out:** adding tokens without continued pretraining gives the model brand-new rows
+> filled with random numbers. It now splits Bengali into fewer pieces, but it has no idea
+> what those pieces mean.
+
+## Recap in plain words
+
+- Fertility is tokens per word; lower means more text fits and training is cheaper.
+- A Bengali code point is 3 UTF-8 bytes, so tokenizers that know no Bengali pay up to 3 tokens per character.
+- Attention cost grows with the square of token count, so a 3 times longer input costs about 9 times more.
+- On our test sentence, BanglaBERT used 9 tokens, XLM-R 10, and mT5 15.
+- The tokenizer ships with the model, so measuring fertility is part of choosing the model.
+- Normalize before tokenizing, or unseen spellings fall back to bytes.
 
 ## Try it Yourself
+
+This report uses the byte count as a quick, model-free proxy, sentence by sentence.
 
 ```python
 # Build a fertility report over your OWN candidate sentences (CPU, no model needed —
@@ -136,11 +213,23 @@ words= 5  bytes= 88  bytes/word=17.6  | মেশিন লার্নিং �
 words= 4  bytes=102  bytes/word=25.5  | ঢাকা বিশ্ববিদ্যালয়ে পরিসংখ্যান পড়ি
 ```
 
+Bytes per word climbs from 14.6 to 25.5 as words get longer: the third sentence has only 4
+words but 102 bytes, because বিশ্ববিদ্যালয়ে and পরিসংখ্যান are long, conjunct-heavy
+words. That sentence would cost a byte-level model the most despite being the shortest in
+words.
+
+Variation to try: add an English sentence of the same meaning, such as `"I will download
+five files"`, and compare its bytes/word with the first Bengali line.
+
 ## Exercise
 
 Write `fertility_report(model_names, texts)` that loads each tokenizer and prints mean
 fertility (tokens/word) and the max token length over your texts — so you can pick the
 model that both understands Bengali *and* won't truncate your inputs.
+
+> **Hint:** for each model, loop over the texts, count tokens with
+> `add_special_tokens=False`, divide by `len(text.split())`, and keep the token counts so you
+> can take their maximum.
 
 <details>
 <summary>Solution</summary>
@@ -168,4 +257,8 @@ fertility_report(
 Lowest mean fertility with acceptable quality = your default base model. Re-run it on
 the *actual* competition text once you have it; document length distribution (Chapter 15)
 drives your `max_length` choice.
+
+On the kernel, BanglaBERT and MuRIL tie at a mean fertility of 1.32 (longest text 7
+tokens), and XLM-R is at 1.43 (8 tokens). With special tokens removed, the gaps are smaller
+than in the earlier demo, which is why you measure on many real texts before deciding.
 </details>
