@@ -7,6 +7,9 @@ order: 7
 
 ## Self-attention
 
+In ch. 6 the decoder looked back at the encoder. Self-attention lets every word in a sentence
+look at every other word in the same sentence, so "it" can find out which noun it refers to.
+
 In encoder-decoder attention, the query came from the decoder and keys/values from the encoder. **Self-attention** uses the same sequence as both source and target — every position attends to every other position in the same sequence.
 
 Given input $X \in \mathbb{R}^{n \times d}$, project into three spaces:
@@ -17,19 +20,61 @@ $$
 
 where $W_Q, W_K, W_V \in \mathbb{R}^{d \times d_k}$.
 
+Each token's vector is turned into three new vectors by three learned matrices:
+
+- $Q$ — **queries**: "what am I looking for?"
+- $K$ — **keys**: "what do I contain, as seen by others searching?"
+- $V$ — **values**: "what do I hand over if someone picks me?"
+- $n$ is the number of tokens, $d$ the width of each token vector, $d_k$ the width of the
+  query/key space.
+
+> **Picture it:** a speed-networking event. Everyone wears a badge listing their interests
+> (key), carries a question (query), and has a business card to give (value). Each person
+> compares their question with every badge and collects a blend of business cards, most from
+> the best matches.
+
 Then compute:
 
 $$
 \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V
 $$
 
+> **In plain words:** multiply every query with every key to get an $n \times n$ table of
+> match scores, shrink the scores by $\sqrt{d_k}$, softmax each row so it sums to 1, then use
+> each row as weights to average the value vectors.
+
 The output at each position is a weighted sum of all value vectors, where weights come from the query-key dot product.
 
 ## Why divide by $\sqrt{d_k}$?
 
+Adding up more numbers gives bigger totals. A dot product of 512-wide vectors swings far
+more than one of 4-wide vectors, and softmax of huge numbers becomes an all-or-nothing choice
+that cannot learn.
+
 When $d_k$ is large, the dot products $q \cdot k$ grow in magnitude (variance $\propto d_k$), pushing the softmax into regions with near-zero gradients. Dividing by $\sqrt{d_k}$ keeps variance at 1 regardless of dimension.
 
+### Deriving the variance
+
+Let $q$ and $k$ have independent entries with mean 0 and variance 1. Each product $q_i k_i$
+then has mean 0 and variance 1, and the dot product is a sum of $d_k$ such terms:
+
+$$
+\mathrm{Var}(q \cdot k) = \sum_{i=1}^{d_k} \mathrm{Var}(q_i k_i) = d_k
+\quad\Rightarrow\quad
+\mathrm{Var}\!\left(\frac{q \cdot k}{\sqrt{d_k}}\right) = \frac{d_k}{d_k} = 1
+$$
+
+> **In plain words:** the spread of the raw scores grows with the width $d_k$; dividing by
+> the square root of the width (variance scales with the square of the divisor) brings the
+> spread back to 1. With $d_k = 64$, raw scores have a standard deviation of 8; scaled, 1.
+
+> **Watch out:** without the scaling, a single score of 8 next to scores of 0 gets a softmax
+> weight of about 0.9997 — the gradient through the other positions almost vanishes.
+
 ## Implementing scaled dot-product attention
+
+The whole formula is four lines of tensor code. The extra `heads` axis is there so the same
+function can serve multi-head attention later.
 
 ```python
 import torch
@@ -47,6 +92,7 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     weights = F.softmax(scores, dim=-1)
     return torch.matmul(weights, V), weights
 
+torch.manual_seed(0)
 batch, seq, d_k = 2, 6, 16
 Q = torch.randn(batch, 1, seq, d_k)
 K = torch.randn(batch, 1, seq, d_k)
@@ -64,9 +110,19 @@ Weights shape: torch.Size([2, 1, 6, 6])
 Weights row 0 sum: 1.0
 ```
 
+The output has the same shape as $V$: 6 positions of 16 numbers each, now mixed with
+information from the other positions. The weights are a $6 \times 6$ table (every position
+against every position), and row 0 sums to 1.0 as softmax guarantees.
+
 ## Causal masking
 
+When you are predicting the next word, you must not peek at it. A **causal mask** hides every
+later position from every earlier one.
+
 For autoregressive (decoder) self-attention, position $t$ must not attend to positions $> t$. Mask the upper triangle with $-\infty$ before softmax; after softmax those become 0.
+
+Why $-\infty$? Softmax computes $e^{\text{score}}$, and $e^{-\infty} = 0$, so masked positions
+get exactly zero weight while the remaining weights still sum to 1.
 
 ```python
 def causal_mask(seq_len):
@@ -78,6 +134,7 @@ mask = causal_mask(T)
 print("Causal mask:\n", mask.int())
 
 # Apply to attention
+torch.manual_seed(0)
 Q = K = V = torch.randn(1, 1, T, 8)
 out, w = scaled_dot_product_attention(Q, K, V, mask=mask.unsqueeze(0).unsqueeze(0))
 print("\nWeights (should be lower-triangular):")
@@ -90,17 +147,30 @@ Causal mask:
         [0, 0, 1, 1, 1],
         [0, 0, 0, 1, 1],
         [0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 0]])
+        [0, 0, 0, 0, 0]], dtype=torch.int32)
 
 Weights (should be lower-triangular):
-tensor([[1.000, 0.000, 0.000, 0.000, 0.000],
-        [0.534, 0.466, 0.000, 0.000, 0.000],
-        [0.282, 0.355, 0.363, 0.000, 0.000],
-        [0.201, 0.292, 0.268, 0.239, 0.000],
-        [0.166, 0.228, 0.218, 0.213, 0.175]])
+tensor([[1.0000, 0.0000, 0.0000, 0.0000, 0.0000],
+        [0.2730, 0.7270, 0.0000, 0.0000, 0.0000],
+        [0.0090, 0.0120, 0.9800, 0.0000, 0.0000],
+        [0.0820, 0.1850, 0.4320, 0.3010, 0.0000],
+        [0.0070, 0.0150, 0.0680, 0.0260, 0.8840]])
 ```
 
+The mask has 1s (blocked) above the diagonal. In the weights, every entry above the diagonal
+is 0.0000, and every row still sums to 1. Row 0 is exactly 1.0000: the first token can see
+only itself. Here $Q$, $K$, $V$ are the same tensor, so each token's query matches its own
+key well, which is why the diagonal entries are often large (0.98 in row 2, 0.884 in row 4).
+
+> **Watch out:** `masked_fill` blocks where the mask is `True`. Some libraries use the opposite
+> convention ("True means keep"). Flipping it silently lets the model peek at the future —
+> training loss looks great and generation is garbage.
+
 ## Multi-head attention
+
+One attention pattern can only focus on one kind of relationship at a time. Multi-head
+attention runs several smaller attentions side by side, each free to look for something
+different.
 
 A single attention head captures one kind of relationship. Multi-head attention runs $h$ attention heads in **parallel**, each with independent projections $W_Q^i, W_K^i, W_V^i \in \mathbb{R}^{d \times d_k}$ where $d_k = d / h$. Outputs are concatenated and projected:
 
@@ -108,7 +178,15 @@ $$
 \text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h) W^O
 $$
 
+> **In plain words:** run $h$ attentions, each producing $d/h$ numbers per token; glue the
+> results end to end (back to $d$ numbers); mix them with one more matrix $W^O$. Splitting
+> the width keeps the total cost about the same as one full-width head.
+
 Each head can learn different relationships — one head might track syntactic dependencies, another semantic similarities.
+
+> **Picture it:** a panel of eight specialists reading the same sentence — one tracks grammar,
+> one tracks who-did-what, one tracks nearby words. Their notes are stapled together and an
+> editor ($W^O$) writes the final summary.
 
 ```python
 import torch
@@ -145,12 +223,33 @@ print("Total params:", sum(p.numel() for p in mha.parameters()))
 
 ```output
 MHA output shape: torch.Size([3, 10, 64])
-Total params: 16,384
+Total params: 16384
 ```
+
+Same shape in and out: `[3, 10, 64]`. The 16,384 parameters are exactly four $64 \times 64$
+matrices ($W_Q, W_K, W_V, W^O$, no biases): $4 \times 4{,}096$. Using 8 heads instead of 1
+does not change the count — the `view(B, T, self.h, self.dk)` reshape only splits each
+64-wide projection into eight 8-wide pieces.
 
 ## Complexity: $O(n^2)$ in sequence length
 
-The attention score matrix is $n \times n$ — for a sequence of length 1000, that's $10^6$ elements per head. For 8 heads with d=64, the full matrix takes ~0.5 MB per batch. At $n = 100{,}000$ (long documents), this becomes intractable. This is the key limitation that motivated FlashAttention and linear attention variants (covered in ch. 12 Under the Trench).
+Every token compares itself with every other token, so doubling the length quadruples the
+work and the memory for the score table.
+
+The attention score matrix is $n \times n$ — for a sequence of length 1000, that's $10^6$ elements per head. With 8 heads in float32 (4 bytes each), the score tables take about 32 MB per sequence — and the softmax output needs the same again. At $n = 100{,}000$ (long documents), this becomes intractable. This is the key limitation that motivated FlashAttention and linear attention variants (covered in ch. 12 Under the Trench).
+
+At $n = 100{,}000$ a single head's table has $10^{10}$ entries, 40 GB in float32 — more
+than most GPUs hold.
+
+## Recap in plain words
+
+- Self-attention lets every token compare its query with every token's key and blend their
+  values.
+- Scores are divided by $\sqrt{d_k}$ so their spread stays near 1 whatever the width.
+- A causal mask sets future positions to $-\infty$ before softmax, so they get zero weight.
+- Multi-head attention splits the width into several heads that attend independently, then
+  recombines them.
+- The score table is $n \times n$, so memory and compute grow with the square of the length.
 
 ## Try it Yourself
 
@@ -183,6 +282,7 @@ class MultiHeadAttention(nn.Module):
         return self.Wo(out.transpose(1, 2).contiguous().view(B, T, D))
 
 # Compare: encoder self-attention (no mask) vs decoder self-attention (causal)
+torch.manual_seed(0)
 d, h, T = 32, 4, 8
 mha = MultiHeadAttention(d, h)
 x   = torch.randn(2, T, d)
@@ -195,18 +295,29 @@ dec_out = mha(x, causal_mask(T).unsqueeze(0).unsqueeze(0))  # causal
 
 print("Encoder out  (same for all seqs):", enc_out.shape)
 print("Decoder out  (causal):            ", dec_out.shape)
-print("Position 0 same?", torch.allclose(enc_out[:, 0], dec_out[:, 0]))  # should be True
+print("Position 0 same?", torch.allclose(enc_out[:, 0], dec_out[:, 0]))      # causal pos 0 sees only itself
+print("Last position same?", torch.allclose(enc_out[:, -1], dec_out[:, -1]))  # last pos sees everything either way
 ```
 
 ```output
 Encoder out  (same for all seqs): torch.Size([2, 8, 32])
 Decoder out  (causal):             torch.Size([2, 8, 32])
-Position 0 same?: True
+Position 0 same? False
+Last position same? True
 ```
+
+The two outputs have identical shapes; only the mask differs. Position 0 is **not** the same:
+in the encoder it averages all 8 values, while under the causal mask it can see only itself.
+The last position is the same (`True`): it is allowed to see every position in both cases, so
+the mask removes nothing for it. Try checking position 3 — it should be `False`, because the
+causal version hides positions 4–7 from it.
 
 ## Exercise
 
 Implement **cross-attention**: queries come from sequence A (decoder), keys and values come from sequence B (encoder output). This is the second attention block in a transformer decoder. Add a `cross_attention(q_seq, kv_seq)` method to `MultiHeadAttention`.
+
+> **Hint:** the only change is where $K$ and $V$ come from. Project queries from `q_seq` and
+> keys/values from `kv_seq`, and track the two lengths separately in the `view` calls.
 
 <details>
 <summary>Solution</summary>
@@ -243,4 +354,8 @@ print("Cross-attention output:", cross_out.shape)  # (2, 5, 32)
 ```
 
 Cross-attention output has the same length as the query (decoder), attending to the full encoder.
+
+The score table is now $T_q \times T_k$ ($5 \times 10$ here), not square. The solution folds
+cross-attention into `forward` with an optional `kv_seq` (defaulting to self-attention)
+instead of a separate method — same idea, one code path.
 </details>

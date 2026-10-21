@@ -7,7 +7,16 @@ order: 13
 
 ## Float formats: FP32, FP16, BF16
 
+A computer stores each decimal number in a fixed number of bits. Using fewer bits per number
+makes training faster and halves memory, but the numbers get coarser and their range shrinks.
+**Mixed precision** uses the small formats where that is safe and the big one where it is not.
+
 Modern GPUs support multiple floating-point precisions. The tradeoff is between dynamic range (exponent bits) and mantissa precision (significand bits):
+
+A floating-point number is stored like scientific notation, $1.234 \times 2^{5}$. The
+**exponent bits** hold the power (the 5), which sets how large or tiny a number can be — the
+**dynamic range**. The **mantissa bits** hold the digits (the 1.234), which set how finely
+neighbouring values are spaced — the **precision**.
 
 | Format | Exponent bits | Mantissa bits | Max value | Notes |
 |--------|--------------|---------------|-----------|-------|
@@ -15,7 +24,18 @@ Modern GPUs support multiple floating-point precisions. The tradeoff is between 
 | FP16   | 5            | 10            | 65504     | Fast, narrow range |
 | BF16   | 8            | 7             | ~3.4×10³⁸ | Same range as FP32, less precision |
 
+FP32 uses 32 bits per number, FP16 and BF16 use 16. BF16 ("brain float", from Google) spends its
+16 bits on range; FP16 spends more of them on digits.
+
+> **Picture it:** two rulers of the same length. FP16 is a short ruler with fine millimetre marks
+> — precise, but it ends at 65,504. BF16 is a ruler marked only every few centimetres that
+> reaches to the Moon. FP32 is a long ruler with fine marks, and it is twice as heavy to carry.
+
 FP16's problem: the max value is only 65504. Gradients and activations during training easily exceed this, causing overflow (→ `inf`) or underflow (→ 0). BF16 avoids this by keeping FP32's exponent range while reducing mantissa bits — preferred on Ampere/Ada GPUs and TPUs.
+
+**Underflow** is the opposite of overflow: a number too close to zero for the format, which
+rounds to exactly 0. Ampere and Ada are recent NVIDIA GPU generations; TPUs are Google's
+accelerators. All of them compute BF16 natively.
 
 ```python
 import torch
@@ -37,15 +57,30 @@ print(f"Tiny value FP16: {tiny.half().item():.2e}")
 ```output
 FP32: 70000.0
 FP16: inf (overflows to inf at >65504)
-BF16: 70000.0 (same range as FP32)
+BF16: 70144.0 (same range as FP32)
 
 Tiny value FP32: 1.00e-08
 Tiny value FP16: 0.00e+00
 ```
 
+Three lessons in five lines. 70,000 is beyond FP16's maximum, so FP16 prints `inf`. BF16 has the
+range, but only 7 mantissa bits, so 70,000 is stored as the nearest value it can represent,
+70,144 — off by 0.2%. And $10^{-8}$ is below FP16's smallest positive value (about
+$6 \times 10^{-8}$), so it underflows to exactly 0.
+
 ## Mixed precision with autocast and GradScaler
 
+PyTorch can switch precisions for you. Inside an `autocast` block, operations that are safe in
+16 bits (like matrix multiplies) run in 16 bits, and risky ones (like sums and softmax) stay in
+32. A `GradScaler` protects the gradients from underflow by temporarily multiplying the loss by a
+big number.
+
 PyTorch's `torch.cuda.amp` handles mixed precision automatically. `autocast` casts forward-pass ops to FP16/BF16 where safe; the optimizer still runs in FP32 (the "master copy"). `GradScaler` solves the gradient underflow problem by scaling the loss before `backward()` and unscaling before the optimizer step:
+
+The **master copy** is an FP32 version of every weight that the optimizer updates; 16-bit copies
+are made from it for the fast forward pass. Scaling works because the chain rule is linear:
+multiply the loss by 65,536 and every gradient is multiplied by 65,536 too, lifting tiny gradients
+out of the underflow zone. Dividing by the same factor before the update gives back the true values.
 
 ```python
 import torch
@@ -86,16 +121,35 @@ for step in range(3):
 ```
 
 ```output
-Step 0: loss=2.3184, scale=65536
-Step 1: loss=2.3021, scale=65536
-Step 2: loss=2.2876, scale=65536
+Step 0: loss=2.3131, scale=1
+Step 1: loss=2.1048, scale=1
+Step 2: loss=1.9203, scale=1
 ```
 
+This kernel has no GPU, so read the output carefully: `scale=1` on every step means the
+`GradScaler` is *disabled* — it detects that CUDA is missing and passes the loss through
+unscaled, and `torch.cuda.amp.autocast` is likewise inactive on the CPU. The loop therefore ran
+in plain FP32, and the loss fell normally from 2.3131 to 1.9203 (it starts near
+$\log 10 = 2.303$, a uniform guess over 10 classes). On a GPU the same code runs in FP16 with
+scaling, unchanged.
+
 The scale starts at 65536. If a gradient overflows to `inf` or `nan`, the scaler detects it, skips the optimizer step for that iteration, and halves the scale. Over time it recovers the scale when overflows stop.
+
+"Recovers" means the scaler doubles the scale again after a run of successful steps (2000 by
+default), so it keeps hunting for the largest scale that does not overflow.
+
+> **Watch out:** `scaler.unscale_(optimizer)` must come before `clip_grad_norm_`. Otherwise you
+> clip the *scaled* gradients — a norm of 65,536 times the real one — and every step gets clipped
+> to almost nothing. Also, `torch.cuda.amp` is the older spelling; current PyTorch prefers
+> `torch.amp.autocast("cuda")` and `torch.amp.GradScaler("cuda")`, which also accept `"cpu"`.
 
 ### Why gradients need FP32
 
 Activations in the forward pass can safely use FP16 — they're read-once and replaced each forward pass. But gradients accumulate across steps (in optimizer state: $m_t$, $v_t$). If accumulated in FP16, small gradient updates round to zero repeatedly — effective LR becomes zero for those parameters. Keeping optimizer state in FP32 prevents this.
+
+The reason is spacing. Near 1.0, neighbouring FP16 values are about 0.001 apart, so adding
+0.0001 to 1.0 rounds straight back to 1.0. Do that 1000 times and the FP16 total is still exactly
+1.0 instead of 1.1 — the updates vanished. ($m_t$ and $v_t$ are Adam's running averages from ch. 6.)
 
 ```python
 # Demonstrate rounding problem in FP16 accumulation
@@ -112,11 +166,23 @@ print(f"FP32 accumulated: {acc_fp32.item():.4f}  (expected 0.1)")
 ```
 
 ```output
-FP16 accumulated: 0.0977  (expected 0.1)
+FP16 accumulated: 0.1058  (expected 0.1)
 FP32 accumulated: 0.1000  (expected 0.1)
 ```
 
+Starting from 0 the effect is subtler but still visible: the FP16 total is 0.1058 instead of
+0.1, about 6% too high, while FP32 is exact to four decimals. Near 0.1 the FP16 spacing is about
+0.00006, so each $10^{-4}$ step gets rounded — sometimes up, sometimes down — and the errors
+pile up instead of cancelling. Either way, the sum of many tiny updates is wrong in FP16.
+
+> **Picture it:** a piggy bank that only accepts whole coins of 10 cents, and you keep dropping in
+> 1-cent coins. Each one is rounded, either rejected or counted as a full 10. After a thousand
+> deposits, the balance has little to do with what you actually put in.
+
 ## Gradient clipping
+
+Gradient clipping (ch. 12) caps how big one update can be. It belongs in every serious training
+loop, and with mixed precision it has one extra rule: unscale first.
 
 Beyond mixed precision, gradient clipping is essential for transformers and RNNs regardless of precision. Two variants:
 
@@ -140,15 +206,29 @@ print(f"Grad L2 norm after  clip_grad_norm_: {norm_after.item():.4f}")
 ```
 
 ```output
-Grad L2 norm before clip_grad_norm_: 1843.21
+Grad L2 norm before clip_grad_norm_: 438.40
 Grad L2 norm after  clip_grad_norm_: 1.0000
 ```
 
+Setting every weight and the bias to 100 makes the predictions huge and the MSE gradient huge
+with them: the total norm is 438.40. After `clip_grad_norm_` it is exactly 1.0000. All gradients
+were scaled by the same factor, $1/438.40$, so the update direction is unchanged.
+
 `clip_grad_value_` clips each gradient component independently (element-wise clamp to `[-max_val, max_val]`). Less common — it changes gradient directions. `clip_grad_norm_` preserves direction and is almost always preferred.
+
+A **clamp** cuts each number separately to the range: a gradient $(10, 0.5)$ clamped to $\pm 1$
+becomes $(1, 0.5)$, which now points in a different direction. Norm clipping would give
+$(0.999, 0.050)$, which points the same way, only shorter.
 
 ## Gradient accumulation
 
+If a batch of 64 does not fit in memory, run four batches of 16 and add up their gradients
+before taking one step. The update is (nearly) the same as one step on a batch of 64.
+
 When your GPU can't fit a large batch, accumulate gradients over $K$ small batches before stepping:
+
+This uses the very behaviour that was a bug in ch. 12: gradients add up until you call
+`zero_grad()`. Here you skip `zero_grad()` on purpose for $K - 1$ batches.
 
 ```python
 # Effective batch size = batch_size × accumulation_steps
@@ -189,13 +269,25 @@ print(f"This is equivalent to a single forward on batch_size=64")
 ```
 
 ```output
-Effective-batch loss: 0.6921
+Effective-batch loss: 0.7090
 This is equivalent to a single forward on batch_size=64
 ```
 
+The printed 0.7090 is the sum of four losses each divided by 4 — the average loss over all 64
+examples, close to $\log 2 = 0.693$ for an untrained 2-class model. Because each micro-batch's
+loss was divided by `ACCUM_STEPS`, the accumulated gradient equals the gradient of that average,
+which is what a single batch of 64 would give.
+
 The `/ACCUM_STEPS` division is critical: without it, the loss magnitude is $K$ times too large, the gradients are $K$ times too large, and the effective LR is $K$ times too high.
 
+> **Watch out:** accumulation is exactly equivalent to a big batch only for layers that treat
+> examples independently. BatchNorm (ch. 8) computes its statistics on each micro-batch of 16, not
+> on 64, so its behaviour still matches the small batch. Use LayerNorm or GroupNorm if this matters.
+
 ## Complete mixed-precision training loop
+
+Here everything from this chapter and ch. 10 sits in one function: autocast, loss scaling,
+accumulation, unscale-then-clip, scaled step, and a cosine schedule.
 
 ```python
 def train_mixed_precision(model, train_loader, epochs=3, lr=1e-3, max_grad_norm=1.0, accum_steps=1):
@@ -235,12 +327,29 @@ train_mixed_precision(model_mp, ld_mp, epochs=3, accum_steps=2)
 ```
 
 ```output
-Epoch 1: loss=2.3142, lr=0.000750
-Epoch 2: loss=2.2891, lr=0.000250
-Epoch 3: loss=2.2734, lr=0.000010
+Epoch 1: loss=1.1732, lr=0.000750
+Epoch 2: loss=1.1058, lr=0.000250
+Epoch 3: loss=1.0705, lr=0.000000
 ```
 
+The loss falls from 1.1732 to 1.0705 over three epochs while the cosine schedule takes the
+learning rate from $10^{-3}$ down to 0.000750, 0.000250, and finally 0 at the end of epoch 3.
+Two details explain the numbers. The labels are random, so a loss below $\log 10 = 2.30$ means
+the model is memorizing 256 random labels. And the printed loss is the *divided* loss (each term
+over `accum_steps = 2`), so the true average cross-entropy is twice what is shown.
+
+## Recap in plain words
+
+- FP16 is precise but tops out at 65,504; BF16 has FP32's range but coarser digits.
+- `autocast` runs safe operations in 16 bits; the optimizer keeps an FP32 master copy of the weights.
+- `GradScaler` multiplies the loss so small gradients survive FP16, then divides before the step.
+- Sums of many tiny values go wrong in FP16, which is why optimizer state stays in FP32.
+- Clip gradients by norm, after `unscale_`, so the direction is kept.
+- Gradient accumulation adds up $K$ small-batch gradients before one step; divide each loss by $K$.
+
 ## Try it Yourself
+
+This block times 50 training steps in FP32 and 50 with the AMP code path on the same model and data.
 
 ```python
 import torch
@@ -285,16 +394,26 @@ print(f"Speedup:   {t_fp32/t_amp:.2f}x (larger on real GPU)")
 ```
 
 ```output
-FP32 time: 0.234s
-AMP  time: 0.198s
-Speedup:   1.18x (larger on real GPU)
+FP32 time: 0.110s
+AMP  time: 0.122s
+Speedup:   0.91x (larger on real GPU)
 ```
 
-On CPU the speedup is modest. On an A100, AMP delivers 2–4× throughput on large models.
+Timings change from run to run, so your numbers will differ. Here AMP took 0.122 s against FP32's
+0.110 s, a "speedup" of 0.91 — slightly *slower*. On this CPU-only kernel autocast and the scaler
+are disabled, so both loops do the same FP32 work and AMP only adds overhead.
+
+On a CPU there is no speedup to expect from this code path. On an A100, AMP delivers 2 to 4 times the
+throughput on large models, because its tensor cores run 16-bit matrix multiplies far faster than
+32-bit ones and the halved memory traffic matters for big layers. Try making the layers 4096 wide
+on a GPU machine to see it.
 
 ## Exercise
 
 Implement gradient accumulation manually: train a model with effective batch size 128 using actual batches of 32 (4 accumulation steps). Verify the loss matches (approximately) training with batch size 128 directly. Use a fixed seed to compare.
+
+> **Hint:** build both models with the same seed so they start identical, divide each micro-batch
+> loss by 4, and call `step()` and `zero_grad()` only on every fourth micro-batch.
 
 <details>
 <summary>Solution</summary>
@@ -338,6 +457,13 @@ print(f"Direct batch=128:   final loss={loss_direct:.4f}")
 print(f"Accumulate 4×32:    avg loss  ={sum(losses)/len(losses):.4f}")
 print("They should be very close (same data, same effective batch)")
 ```
+
+This prints a final direct loss of 0.7435 and an average accumulated loss of 0.7313. They are
+close but not the same quantity: the first is the loss of the *last* batch of 128, the second is
+the average over all 16 micro-batches, including those seen early when the model was less
+trained. To check the equivalence exactly, compare the gradients after one accumulated step with
+the gradients of one direct step on the same 128 examples — with no dropout or BatchNorm they
+match to floating-point rounding.
 </details>
 
 ## Under the Trench
@@ -345,11 +471,11 @@ print("They should be very close (same data, same effective batch)")
 Rare and advanced topics you should at least know the name of. You won't need them daily,
 but you'll stop being surprised when you meet them.
 
-- **Second-order & natural-gradient methods (K-FAC)** — curvature-aware optimization; impractical at scale but theoretically superior.
-- **Loss landscape & mode connectivity** — why SGD finds flat minima that generalize; linear mode connectivity between solutions.
-- **Lottery ticket hypothesis & pruning** — sparse subnetworks that train as well as the dense original.
-- **Quantization & knowledge distillation** — shrink models for inference; INT8/INT4 with calibration or QAT.
-- **SAM (Sharpness-Aware Minimization)** — perturb weights, then descend; finds flatter minima with better generalization.
-- **Gradient checkpointing** — recompute activations during backward instead of storing; trades compute for memory.
-- **Neural tangent kernel** — the infinite-width limit of a network; connects neural nets to kernel methods.
-- **Hardware: GPU memory, compute kernels, the roofline model** — why your batch size OOMs and how to think about memory bandwidth vs FLOPS.
+- **Second-order & natural-gradient methods (K-FAC)** — curvature-aware optimization; impractical at scale but theoretically superior. (They use how the slope itself bends, not only the slope.)
+- **Loss landscape & mode connectivity** — why SGD finds flat minima that generalize; linear mode connectivity between solutions. (Two separately trained networks can often be joined by a path of equally low loss.)
+- **Lottery ticket hypothesis & pruning** — sparse subnetworks that train as well as the dense original. (A small "winning ticket" was hidden inside the big random network from the start.)
+- **Quantization & knowledge distillation** — shrink models for inference; INT8/INT4 with calibration or QAT. (QAT, quantization-aware training, lets the model practise with low-precision weights during training.)
+- **SAM (Sharpness-Aware Minimization)** — perturb weights, then descend; finds flatter minima with better generalization. (It asks "how bad does the loss get nearby?" and minimizes that.)
+- **Gradient checkpointing** — recompute activations during backward instead of storing; trades compute for memory. (The breadcrumbs of ch. 2, dropped and re-walked on purpose.)
+- **Neural tangent kernel** — the infinite-width limit of a network; connects neural nets to kernel methods. (A very wide network barely moves its weights, so it behaves like a fixed linear model.)
+- **Hardware: GPU memory, compute kernels, the roofline model** — why your batch size OOMs and how to think about memory bandwidth vs FLOPS. (OOM is "out of memory"; the roofline says whether a layer is limited by arithmetic or by moving data.)

@@ -7,11 +7,27 @@ order: 6
 
 ## The bottleneck, revisited
 
+When a human translator writes each word, they glance back at the relevant part of the
+source sentence. The seq2seq model of ch. 5 cannot glance back: it has only one summary
+vector. Attention gives the decoder the ability to look back at every source word, every time.
+
 In the vanilla seq2seq, the decoder sees only $c = h_T^{\text{enc}}$. For a 30-word sentence, all 30 words must squeeze through a vector of size 512. The model must "memorize" everything, but real translation aligns specific source words to specific target words — "chien" aligns with "dog", not with the rest of the sentence.
 
 **Attention** solves this by letting the decoder look at all encoder hidden states $h_1, \ldots, h_T$ and decide which ones are relevant for the current decoding step. The decoder computes a **soft alignment** over the source at every output step.
 
+A **soft alignment** is a set of weights over the source positions that add up to 1 — for
+example 0.8 on "dog", 0.1 on "the", 0.1 spread over the rest — rather than a hard choice of
+exactly one word. "Soft" is what makes it differentiable, so it can be learned by gradient
+descent.
+
+> **Picture it:** a highlighter. For each word the decoder writes, it highlights the source
+> sentence — brightly on the words that matter now, faintly on the rest — and reads a blend
+> of the highlighted words weighted by brightness.
+
 ## Bahdanau (additive) attention
+
+The first attention mechanism used a tiny neural network as a "relevance judge": give it the
+decoder's current state and one encoder state, and it returns a single relevance score.
 
 At decoder step $t$, the decoder has hidden state $s_{t-1}$. For each encoder position $j$:
 
@@ -19,19 +35,33 @@ $$
 e_{tj} = v^\top \tanh(W_s s_{t-1} + W_h h_j)
 $$
 
+> **In plain words:** project the decoder state and the encoder state into the same space,
+> add them, squash with tanh, and dot with a learned vector $v$ to get one number $e_{tj}$:
+> the raw relevance of source word $j$ to output step $t$. "Additive" refers to that plus sign.
+
 This is a small feedforward network scoring how well $s_{t-1}$ aligns with $h_j$. Then:
 
 $$
 \alpha_{tj} = \frac{\exp(e_{tj})}{\sum_{k=1}^{T} \exp(e_{tk})} \quad \text{(attention weights)}
 $$
 
+> **In plain words:** softmax turns the raw scores into weights between 0 and 1 that add up
+> to 1 across all $T$ source positions. A score 2 higher than another gives a weight
+> $e^2 \approx 7.4$ times larger.
+
 $$
 c_t = \sum_{j=1}^{T} \alpha_{tj} h_j \quad \text{(context vector)}
 $$
 
+> **In plain words:** the context for this step is a weighted average of the encoder states,
+> using those weights. Unlike ch. 5's single $c$, this $c_t$ is recomputed at every step $t$.
+
 The decoder then receives $c_t$ alongside $s_{t-1}$ and the previous token.
 
 ## Implementing additive attention
+
+The code follows the three equations line by line: score every source position at once,
+softmax over the source axis, then take the weighted sum.
 
 ```python
 import torch
@@ -55,6 +85,7 @@ class BahdanauAttention(nn.Module):
         context = (weights.unsqueeze(-1) * enc_out).sum(dim=1)    # (batch, enc_H)
         return context, weights
 
+torch.manual_seed(0)
 batch, src_len, dec_H, enc_H = 4, 12, 32, 32
 attn = BahdanauAttention(dec_H, enc_H)
 
@@ -70,16 +101,29 @@ print("Weights sum (should be 1.0):", weights[0].sum().item())
 ```output
 Context shape:  torch.Size([4, 32])
 Weights shape:  torch.Size([4, 12])
-Weights sum (should be 1.0): 1.0
+Weights sum (should be 1.0): 1.0000001192092896
 ```
 
+One context vector of 32 numbers per sentence in the batch, and one weight per source
+position (12). The weights sum to 1.0000001192092896 rather than exactly 1 because float32
+arithmetic has about 7 significant digits; the error is in the 7th decimal place.
+
+> **Watch out:** the softmax must run over the source axis (`dim=-1` on a `(batch, src_len)`
+> tensor). Softmax over the batch axis also runs without error, but mixes sentences together.
+
 ## Luong (multiplicative) attention
+
+The relevance judge does not have to be a network. A dot product — multiply matching entries
+and add them up — already measures how much two vectors point the same way.
 
 Luong et al. (2015) proposed simpler scoring functions:
 
 - **Dot**: $e_{tj} = s_{t-1}^\top h_j$ — no extra parameters; requires equal dimensions.
 - **General**: $e_{tj} = s_{t-1}^\top W h_j$ — one learned matrix.
 - **Concat**: same as Bahdanau but inputs are concatenated rather than added.
+
+`torch.bmm` is a **batched matrix multiply**: one matrix product per sentence in the batch,
+all at once.
 
 ```python
 class LuongAttention(nn.Module):
@@ -117,13 +161,32 @@ Dot context shape: torch.Size([4, 32])   weights: torch.Size([4, 12])
 Gen context shape: torch.Size([4, 32])   weights: torch.Size([4, 12])
 ```
 
+Both variants produce the same shapes as additive attention: a 32-number context and 12
+weights per sentence. Dot attention has no parameters at all; general attention adds one
+$32 \times 32$ matrix (1,024 numbers). Both replace the tanh network with a single
+multiply, which makes them faster on GPUs.
+
 ## Attention as a soft lookup
 
+A Python dictionary finds the one key that exactly matches your query and returns its value.
+Attention does the same thing fuzzily: every key matches a little, and you get a blend of all
+values, weighted by how well each key matched.
+
 Attention is a **differentiable dictionary lookup**: queries are the decoder state $s$, keys and values are the encoder states $h_j$. The score function measures query-key compatibility; weights are the softmax-normalized scores; the context is the value-weighted sum.
+
+**Differentiable** means you can compute gradients through it — a hard "pick the best key"
+has no useful gradient, but a softmax blend does.
+
+> **Picture it:** asking a librarian for "books about fast cats". A strict catalogue returns
+> only titles with exactly those words. The fuzzy librarian hands you a pile: mostly cheetah
+> books, a few on tigers, one on race cars — the pile is the weighted sum of values.
 
 This framing generalizes directly to self-attention (ch. 7) and cross-attention in Transformers.
 
 ## Visualizing the alignment matrix
+
+Stack the weights of every output step into a grid — one row per target word, one column per
+source word — and you can see which source word each output word "looked at".
 
 ```python
 import numpy as np
@@ -151,15 +214,33 @@ for i, row in enumerate(weights):
 
 ```output
 Alignment matrix (rows=target, cols=source):
-        the   cat   sat    on   mat
+          the    cat    sat     on    mat
       le  0.90  0.05  0.02  0.02  0.01
     chat  0.05  0.88  0.04  0.02  0.01
    s'est  0.03  0.05  0.85  0.04  0.03
-  assis  0.02  0.02  0.05  0.85  0.06
+   assis  0.02  0.02  0.05  0.85  0.06
      sur  0.01  0.01  0.03  0.05  0.90
 ```
 
+These numbers are hand-written for illustration, not learned. Each row sums to 1 and its
+largest value sits on the diagonal: "le" puts 0.90 on "the", "chat" puts 0.88 on "cat". A
+trained model's matrix looks like this when the two languages share word order.
+
 The near-diagonal pattern is typical of translation between similar word orders. For languages with very different syntax (SOV vs SVO), the diagonal is disrupted.
+
+**SVO** and **SOV** are word orders: English is subject-verb-object ("I eat apples"),
+Japanese is subject-object-verb ("I apples eat"). Translating between them, the verb's row
+looks toward the end of the source, breaking the diagonal.
+
+## Recap in plain words
+
+- Attention lets the decoder look at all encoder states at every step instead of one summary.
+- A score function rates each source position; softmax turns scores into weights adding to 1.
+- The context is the weighted average of encoder states, recomputed at every output step.
+- Bahdanau scores with a small tanh network; Luong scores with a (possibly weighted) dot
+  product.
+- Attention is a soft, differentiable dictionary lookup: query, keys, values.
+- The alignment matrix shows which source words each output word relied on.
 
 ## Try it Yourself
 
@@ -184,6 +265,7 @@ class BahdanauAttention(nn.Module):
         return context, weights
 
 # Test: verify that context is a weighted sum
+torch.manual_seed(0)
 attn   = BahdanauAttention(16, 16)
 s      = torch.zeros(2, 16)   # neutral decoder state
 enc_out = torch.eye(5).unsqueeze(0).expand(2, -1, -1).float()  # identity-like
@@ -197,13 +279,24 @@ print("Context (batch 0, first 4):", ctx[0, :4].detach().round(decimals=3))
 ```
 
 ```output
-Weights (batch 0): tensor([0.200, 0.197, 0.205, 0.202, 0.196])
-Context (batch 0, first 4): tensor([0.2050, 0.2050, 0.2050, 0.2050])
+Weights (batch 0): tensor([0.1960, 0.1960, 0.2140, 0.1960, 0.1960])
+Context (batch 0, first 4): tensor([0.2140, 0.2140, 0.2140, 0.2140])
 ```
+
+Sentence 0's encoder states are all zeros except position 2, which is all ones. With a zero
+decoder state, only content can change the scores, so position 2 gets a slightly higher
+weight (0.2140) and the other four share the rest (0.1960 each). The context entries are
+exactly 0.2140: $0.214 \times 1$ from position 2 plus $0.196 \times 0$ from the others —
+proof that the context is the weighted sum. (The `torch.eye` line is overwritten right after
+and has no effect.) Try `enc_out[0, 2] = 10.0` and watch position 2's weight grow.
 
 ## Exercise
 
 Implement **location-based attention**: instead of using the encoder hidden states to compute scores, compute $e_{tj} = v^\top \tanh(W_s s_{t-1} + W_p p_j)$ where $p_j$ is a sinusoidal positional encoding for position $j$ (not the encoder output). Compare the resulting alignment to standard content-based attention on a random batch.
+
+> **Hint:** keep `BahdanauAttention`'s structure and swap `enc_out` for a fixed position table
+> of shape `(src_len, d)`. The sine/cosine table is derived in ch. 8; here you only need to
+> build it.
 
 <details>
 <summary>Solution</summary>
@@ -247,4 +340,9 @@ print("Location attention weights:", w[0].detach().round(decimals=3))
 ```
 
 Location-based attention works well for monotonic alignments (e.g., speech synthesis) where the decoder should always advance through the source rather than jumping around.
+
+On untrained weights the result is nearly uniform — about 0.09 to 0.11 on each of the 10
+positions — because the projections are small and random. The important property is that
+these weights would be the same for any source sentence: they depend only on positions and the
+decoder state. **Monotonic** means the alignment only ever moves forward through the source.
 </details>

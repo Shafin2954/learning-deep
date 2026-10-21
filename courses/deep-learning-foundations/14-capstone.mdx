@@ -7,9 +7,22 @@ order: 14
 
 ## The project
 
+In plain words: you rebuild the inside of PyTorch, small. You write the part that computes
+gradients automatically, the layers, the optimizers and the training loop yourself, train a real
+network with them, and then check your results against real PyTorch. If they match, you have
+proved that nothing in `torch.nn` is a black box to you any more.
+
 You will build a working reverse-mode autograd engine and use it to implement a full MLP training pipeline — forward pass, backward pass, optimizers, and regularization — all without touching `torch.autograd` or `torch.nn`. At the end, your hand-rolled network trains on a real dataset and matches a PyTorch baseline within 2% accuracy. This is the proof that you understand what PyTorch is actually doing under the hood.
 
+A **baseline** here is the same network built with ordinary PyTorch, trained with the same
+settings, used as the yardstick. Expect 8–15 hours. Work in this order: engine and gradient
+checks first, then layers, then optimizers, then the training loop, then the comparison.
+
 ## Hard constraints (no vibe coding)
+
+The point of the capstone is that *you* write every piece that matters. The rules below draw the
+line between the plumbing you may borrow (arrays, data loading) and the machinery you must build.
+No AI assistants write the code for you: that is the constraint that makes it educational.
 
 - **No `torch.autograd`** for any differentiation. You define `Value` (or `Tensor`) nodes with a manual `_backward` closure.
 - **No `torch.nn`** for any layer. `nn.Linear`, `nn.ReLU`, `nn.BatchNorm`, `nn.Dropout` — all implemented by you.
@@ -18,10 +31,20 @@ You will build a working reverse-mode autograd engine and use it to implement a 
 - You may use `torch.utils.data.DataLoader` to load batches.
 - You may use PyTorch only to run the baseline comparison, not inside your engine.
 
+The "raw array substrate" rule means arrays are allowed as storage and for fast matrix
+multiplication, but every gradient must flow through *your* `_backward` functions.
+
+> **Watch out:** if you use `torch.Tensor` as storage, create every tensor with
+> `requires_grad=False` (the default) and never call `.backward()` on one. A single stray
+> `requires_grad=True` silently brings PyTorch's autograd back in.
+
 ## What it must contain (and the chapter each tests)
 
+Each item below is one piece of the engine, with the chapter that taught it. Build and test them
+in the order listed: each relies on the ones above it.
+
 - **Scalar or tensor autograd** with support for `+`, `*`, `@` (matmul), `relu`, `sigmoid`, `log`, and `sum` (ch. 3–4). Each op stores a `_backward` closure that propagates `grad` to its inputs.
-- **Topological sort** for correct gradient accumulation order (ch. 3). A node visited from two paths must accumulate, not overwrite.
+- **Topological sort** for correct gradient accumulation order (ch. 4). A node visited from two paths must accumulate, not overwrite.
 - **MLP class** with configurable depth and width, using your own Linear layers (ch. 1–2).
 - **BatchNorm and Dropout** implemented by you, including train/eval mode switching (ch. 8–9).
 - **SGD with momentum and Adam** implemented by you (ch. 6). Parameters are stored as your autograd nodes.
@@ -30,16 +53,58 @@ You will build a working reverse-mode autograd engine and use it to implement a 
 - **Validation accuracy** tracked per epoch; best checkpoint saved as a dict of numpy arrays (ch. 10).
 - **Comparison**: run the exact same architecture and hyperparameters in PyTorch `nn` and confirm your accuracy is within 2% (ch. 10).
 
+What each piece means in practice:
+
+- A **tensor** engine (one node per array) is far faster than a **scalar** one (one node per number,
+  as in ch. 4). A scalar engine is fine for gradient checks but too slow for 1000 samples of
+  20 features; aim for tensor nodes, and derive the `@` backward rule from ch. 3.
+- The topological sort is what makes `x * (x + 1)` give the right gradient: both paths into `x`
+  must finish before `x` passes its gradient further back.
+- Train/eval switching means a `training` flag on your model that BatchNorm (batch statistics
+  versus running statistics) and Dropout (mask versus identity) both read.
+- "Same hyperparameters" for the comparison means same layer sizes, initialization scheme,
+  learning rate, batch size, number of epochs, and data split.
+
+> **Watch out:** the most common capstone bug is a broadcast bias. In `Z = X @ W + b`, `b` has
+> shape `(out,)` but is added to every row, so its gradient must be summed over the batch axis.
+> Forgetting that sum gives a gradient of the wrong shape — or, worse, the right shape by accident
+> when the batch size equals the layer width.
+
 ## Acceptance criteria
 
+These are the tests that decide whether you are done. Each one is measurable: write a small
+script per criterion and keep its printed result.
+
 - Your autograd passes a numerical gradient check on at least 3 different expression graphs (tolerance: absolute error < 1e-5).
-- Your MLP trains to ≥ 80% on a linearly-separable synthetic dataset (20D, 1000 samples) within 50 epochs.
+- Your MLP trains to at least 80% on a linearly-separable synthetic dataset (20D, 1000 samples) within 50 epochs.
 - Your Adam implementation matches `torch.optim.Adam` weight trajectories to within 1% relative error over 100 steps on a convex problem.
 - Your BatchNorm forward output matches `torch.nn.BatchNorm1d` (eval mode) to within 1e-4 on a held-out batch.
 - Your Dropout produces the correct expected value: `E[dropout(x)] ≈ x` (verify with 10,000 samples, tolerance 1e-2).
-- Final val accuracy gap between your engine and PyTorch baseline ≤ 2%.
+- Final val accuracy gap between your engine and PyTorch baseline at most 2%.
+
+How to read them:
+
+- **Gradient check:** use the central difference from ch. 3 with $\varepsilon = 10^{-5}$ in float64.
+  In float32 the rounding error alone can exceed $10^{-5}$, so run the check in double precision.
+- **Linearly separable** means one flat cut (one hyperplane, ch. 1) can split the two classes
+  perfectly — for example labels from the sign of a fixed random weighted sum of the 20 features.
+  80% is a low bar; a working MLP should reach well above 95%.
+- **Adam trajectory:** start your Adam and `torch.optim.Adam` from identical weights on a simple
+  bowl-shaped loss (ch. 6), and compare the weights after every step, not only at the end.
+- **BatchNorm in eval mode** uses running statistics, so copy `running_mean`, `running_var`,
+  $\gamma$ and $\beta$ between the two implementations before comparing, and use the same momentum
+  (PyTorch's default is 0.1) and $\epsilon = 10^{-5}$.
+- **Dropout expectation:** average many dropout outputs of the same input; with inverted scaling
+  (ch. 9) the average should approach the input.
+
+> **Watch out:** PyTorch's `BatchNorm1d` uses the *unbiased* variance (divide by $B - 1$) when it
+> updates `running_var`, but the biased one (divide by $B$) to normalize the batch. If your running
+> statistics drift slightly from PyTorch's, this is usually why.
 
 ## Skills checklist (tick before you claim done)
+
+Tick a box only when you can do it without looking at the chapter. Each item maps to one piece
+above.
 
 - [ ] I can implement reverse-mode autograd for `+`, `*`, `@`, `relu`, `sigmoid`, `log`, `sum`.
 - [ ] I can build a computation graph and run topological sort to get the correct backward order.

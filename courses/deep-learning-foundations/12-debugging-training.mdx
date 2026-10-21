@@ -7,7 +7,22 @@ order: 12
 
 ## The diagnostic mindset
 
+A training run that fails rarely throws an error. It produces a loss that is `nan`, or
+stuck, or good on training data and bad on everything else. Debugging means turning that vague
+symptom into one specific cause, by making the problem as small and repeatable as possible.
+
 Training failures are reproducible given a fixed seed — they follow patterns. The first step is always to isolate the symptom: is the loss NaN from step 1 (initialization/data bug), or does it diverge after N steps (LR/gradient issue)? Shrink the problem: one batch, one layer, one epoch.
+
+A **seed** fixes the random number generator so every run makes the same "random" choices, which
+turns a once-in-a-while failure into one you can replay. **NaN** ("not a number") is what floating
+point produces for undefined results like $0/0$ or $\infty - \infty$; once one appears, it spreads
+to everything it touches.
+
+> **Picture it:** a mechanic with a car that makes a noise "sometimes". The first job is to make
+> it happen on demand — same road, same speed — and then to remove parts until the noise stops.
+> A fixed seed is the same road; one batch and one layer is the stripped-down engine.
+
+The cheapest first check is a single forward pass: are the outputs finite and of a sensible size?
 
 ```python
 import torch
@@ -31,10 +46,16 @@ print(f"Output range: [{out.min():.3f}, {out.max():.3f}]")
 
 ```output
 Model output finite: True
-Output range: [-0.621, 0.841]
+Output range: [-0.388, 0.058]
 ```
 
+Both checks pass: every output is finite (`True`), and the values lie between $-0.388$ and
+0.058 — small logits, as expected from PyTorch's default initialization (ch. 7). Outputs in the
+thousands here would point at initialization or unnormalized input data before any training.
+
 ## NaN loss: causes and fixes
+
+A NaN usually comes from one of four places, and *when* it first appears tells you which.
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
@@ -42,6 +63,11 @@ Output range: [-0.621, 0.841]
 | NaN after N steps | Exploding gradients | Gradient clipping |
 | NaN with log loss | `log(0)` — predictions saturating | Add epsilon: `log(pred + 1e-8)` |
 | NaN only on GPU | Integer overflow in index | Check label range matches num_classes |
+
+**Overflow** means a number grew past the largest value the dtype can hold and became `inf`.
+"Saturating" predictions are probabilities pushed to exactly 0 or 1, where `log` blows up.
+The last row is usually a label like 10 in a 10-class problem (valid labels are 0–9): on CPU it
+gives a clear index error, on GPU often a cryptic one.
 
 ```python
 # Reproduce: NaN from log(0)
@@ -54,13 +80,34 @@ print(f"With epsilon:    {loss_good.item():.4f}")
 ```
 
 ```output
-Without epsilon: nan
-With epsilon:    18.4207
+Without epsilon: inf
+With epsilon:    6.3713
 ```
+
+The second prediction is exactly 0.0 for a true label of 1, so its term is $-\log 0 = \infty$
+and the loss prints `inf`. It turns into `nan` at the next step, when the gradient
+($1/0$) is multiplied into the weights. With the epsilon the loss is finite: $-\log(10^{-8})
+\approx 18.42$, plus $-\log 0.5 \approx 0.69$, divided by 3 gives 6.3713.
+
+> **Watch out:** `0 * log(0)` is `nan`, not 0, in floating point. Masking by multiplying with
+> the label does not save you — the first entry here only survived because its prediction was
+> 1.0, not 0.0. The real fix is to compute losses from logits with `BCEWithLogitsLoss` or
+> `CrossEntropyLoss` (ch. 5), which never take `log(0)`.
 
 ## Exploding gradients and clipping
 
+When each layer multiplies the backward signal by more than 1, the gradient at the first layers
+can become enormous, and one giant step wrecks the weights. **Gradient clipping** puts a ceiling
+on the step: if the gradient is too long, shrink it to the allowed length, keeping its direction.
+
 Gradients compound multiplicatively through layers. In deep or recurrent nets, a single large gradient can cascade. `clip_grad_norm_` rescales the gradient vector so its L2 norm doesn't exceed a threshold:
+
+The **L2 norm** of all gradients together is the square root of the sum of every gradient entry
+squared — the "length" of one long vector made of all of them. If it exceeds `max_norm`, every
+gradient is multiplied by `max_norm / norm`.
+
+> **Picture it:** a speed limiter on a car. You can still steer in any direction, but the
+> speedometer never goes past the limit. Clipping keeps the gradient's direction and caps its speed.
 
 ```python
 # Simulate exploding gradients
@@ -86,13 +133,28 @@ print(f"Gradient norm after clipping:  {total_norm_after.item():.4f}")
 ```
 
 ```output
-Gradient norm before clipping: 847.32
+Gradient norm before clipping: 763.80
 Gradient norm after clipping:  1.0000
 ```
 
+With every parameter drawn at std 2.0 — about 45 times He's $\sqrt{2/512} \approx 0.0625$ for the
+512-wide layers — the total gradient norm is 763.80. After `clip_grad_norm_` with
+`max_norm=1.0` it is exactly 1.0000: every gradient was multiplied by $1/763.80$.
+
+> **Watch out:** clipping hides the symptom; it does not fix the cause. If you clip at 1.0 and
+> the pre-clip norm is in the hundreds on every step, the real problem is initialization, learning
+> rate, or missing normalization. `clip_grad_norm_` returns the pre-clip norm — log it.
+
 ## Dead ReLUs: using hooks to inspect activations
 
+A dead ReLU unit (ch. 1) outputs 0 for every input, so no gradient ever reaches its weights. You
+cannot see this from the loss. You have to look inside the network while data flows through it.
+
 A dead ReLU fires zero for all inputs — its gradient is always zero, so it never recovers. You can detect this with forward hooks that record activation statistics:
+
+A **forward hook** is a function you attach to a layer; PyTorch calls it with the layer's input
+and output every time the layer runs, without you changing the model's code. The hook below
+records the fraction of outputs above 0.
 
 ```python
 activation_stats = {}
@@ -128,10 +190,18 @@ for h in handles: h.remove()
 ```
 
 ```output
-  1: 48.6% alive [OK]
-  3: 51.2% alive [OK]
-  5: 49.9% alive [OK]
+  1: 50.3% alive [OK]
+  3: 50.5% alive [OK]
+  5: 38.7% alive [OK]
 ```
+
+The names `1`, `3`, `5` are the positions of the three ReLUs inside the `nn.Sequential`. The first
+two have about 50% of outputs positive, the healthy value for a freshly initialized network
+(ch. 7). The third has 38.7% — lower, but well above the 10% "DEAD" threshold.
+
+> **Watch out:** this hook averages over all units and all examples. A layer can be "50% alive"
+> while half its units are permanently dead and the other half always on. To find truly dead
+> units, compute `(output > 0).any(dim=0)` per unit over a large batch.
 
 Now simulate bad initialization to see dead units:
 
@@ -149,12 +219,22 @@ for h in handles: h.remove()
 ```
 
 ```output
-  1: 0.0% alive [DEAD]
+  1: 38.3% alive [OK]
   3: 0.0% alive [DEAD]
   5: 0.0% alive [DEAD]
 ```
 
+Setting every weight and bias to $-0.5$ is a deliberately bad choice. The first ReLU still has
+38.3% alive, because its inputs are random data that can be negative, and a negative input times
+$-0.5$ is positive. But the first ReLU's outputs are all $\ge 0$, so in layer 2 every
+pre-activation is (non-negative values) $\times (-0.5)$, minus 0.5 — always negative. Layers 3
+and 5 are 0.0% alive: dead for every input, with zero gradient for their weights.
+
 ## Loss not decreasing: checklist
+
+When the loss will not go down, check the boring bugs first. The most common one in PyTorch is
+forgetting `optimizer.zero_grad()`, so that each step's gradient is added to all the old ones
+(ch. 4, ch. 10).
 
 ```python
 # Common bug: forgetting zero_grad — gradients accumulate
@@ -185,11 +265,31 @@ print("Fixed:                  ", [f"{l:.3f}" for l in losses_fixed])
 ```
 
 ```output
-With bug (no zero_grad): ['1.234', '5.891', '28.34', '143.2', '724.1']
-Fixed:                   ['1.234', '0.891', '0.612', '0.401', '0.259']
+With bug (no zero_grad): ['4.468', '2.051', '0.365', '1.426', '3.548']
+Fixed:                   ['1.432', '0.711', '0.414', '0.282', '0.219']
 ```
 
+The fixed loop falls smoothly: 1.432, 0.711, 0.414, 0.282, 0.219. The buggy loop starts at a
+different value (a different random initialization) but then bounces: down to 0.365, then up to
+1.426 and 3.548. Without `zero_grad`, the step-5 update uses the sum of all five gradients, so
+the effective step keeps growing until it overshoots.
+
+> **Watch out:** the rest of the checklist — in order of how often they bite: labels shuffled
+> separately from inputs; learning rate off by a factor of 10 or more; `model.eval()` left on
+> (dropout off, BatchNorm frozen) or `model.train()` during validation; a final activation
+> (`softmax`, `sigmoid`) applied before a loss that expects logits; and data not normalized. A
+> quick test for most of them: can the model drive the loss to near 0 on a *single* batch? If
+> not, the bug is in the code, not the data.
+
 ## Overfitting vs underfitting
+
+Once the loss does go down, compare training and validation results (ch. 9). A model that is
+much better on training data than on held-out data has memorized; a model that is bad on both is
+too weak or not trained enough (**underfitting**).
+
+The experiment below trains a large network ($8 \to 256 \to 256 \to 2$, about 68,000 parameters)
+on only 150 examples. The labels depend on the first feature plus random noise, so some labels
+are "wrong" in a way no rule can predict — exactly what a model should not memorize.
 
 ```python
 def train_and_track(model, X_tr, y_tr, X_va, y_va, epochs=50, lr=1e-2):
@@ -208,7 +308,7 @@ def train_and_track(model, X_tr, y_tr, X_va, y_va, epochs=50, lr=1e-2):
 
 torch.manual_seed(1)
 X_all = torch.randn(200, 8)
-y_all = (X_all[:, 0] > 0).long()
+y_all = ((X_all[:, 0] + 0.5*torch.randn(200)) > 0).long()   # noisy labels
 X_tr, y_tr = X_all[:150], y_all[:150]
 X_va, y_va = X_all[150:], y_all[150:]
 
@@ -223,14 +323,34 @@ for ep in [10, 25, 50]:
 
 ```output
 Epoch | Train  | Val
-  10  | 73.33% | 66.00%
-  25  | 89.33% | 68.00%
-  50  | 98.67% | 64.00%
+  10  | 91.33% | 78.00%
+  25  | 98.67% | 78.00%
+  50  | 100.00% | 82.00%
 ```
+
+Training accuracy rises to 91.33% by epoch 10, 98.67% by epoch 25, and 100% by epoch 50. Since
+the labels contain random noise, 100% training accuracy is impossible without memorizing that
+noise. Validation accuracy stays far behind: 78%, 78%, then 82%. The 18-point gap between
+training and validation is the signature of overfitting.
 
 High train accuracy + falling val accuracy = overfitting. Fix: add dropout, weight decay, or reduce model size.
 
+Validation accuracy does not fall here, but it does not need to: a gap that keeps widening while
+training accuracy goes to 100% is already the warning. Early stopping (ch. 9) would have stopped
+around epoch 10–25.
+
+## Recap in plain words
+
+- Fix the seed and shrink the problem — one batch, one layer — before guessing at causes.
+- When NaN first appears points to the cause: step 1 means init or data, later means gradients or learning rate.
+- Compute log-losses from logits; `log(0)` gives `inf`, and `0 * log(0)` gives `nan`.
+- Clip gradients to cap their size, but log the pre-clip norm to find the real problem.
+- Forward hooks let you measure activations inside the model, which is how you find dead ReLUs.
+- Training accuracy far above validation accuracy means overfitting.
+
 ## Try it Yourself
+
+This loop has a bug: it never calls `opt.zero_grad()`. Run it, then fix it, and compare.
 
 ```python
 import torch
@@ -256,18 +376,31 @@ for step in range(10):
 ```
 
 ```output
-Step 0: loss=0.7012
-Step 2: loss=3.4521
-Step 4: loss=18.234
-Step 6: loss=94.123
-Step 8: loss=487.34
+Step 0: loss=0.6874
+Step 2: loss=0.6409
+Step 4: loss=0.5781
+Step 6: loss=0.5336
+Step 8: loss=0.4777
 ```
 
+Surprise: the buggy loss still goes down (0.6874 to 0.4777 by step 8). With the fix added, the
+same 10 steps give 0.6874, 0.6554, 0.6316, 0.6125, 0.5963 — *slower*. Accumulated gradients act
+like a step size that grows every step — on this easy, separable problem that behaves like
+very strong momentum and happens to help, while in the checklist example above the same bug made
+the loss bounce up to 3.548. A falling loss does not prove the loop is correct.
+
 Add `opt.zero_grad()` before the forward pass. The loss should decrease, not explode.
+
+After the fix the loss decreases steadily at the rate the learning rate actually sets, which is
+what makes learning-rate tuning meaningful. Try the buggy version with `lr=0.5`, or on the noisy
+labels from the overfitting section, and see whether it still behaves.
 
 ## Exercise
 
 Write a `DebugTrainer` class that: (1) logs gradient norms per layer using hooks, (2) detects dead ReLUs (< 5% alive) after each epoch, (3) raises a warning if loss is NaN, and (4) implements early stopping with patience=5. Test it on a deliberately bad model (all-zero init, no normalization).
+
+> **Hint:** register ReLU forward hooks inside a helper, run one batch, then remove the hooks so
+> they do not slow down training. Read gradient norms from `p.grad.norm()` after `backward()`.
 
 <details>
 <summary>Solution</summary>
@@ -348,4 +481,13 @@ for ep in range(1, 4):
     _, stop = trainer.train_epoch(ld, opt, nn.CrossEntropyLoss(), vl)
     if stop: break
 ```
+
+Run as written, the trainer prints four gradient norms per epoch (for example, 0.2490 for
+`0.weight` in epoch 1) and no dead-ReLU or NaN warnings, and three epochs are too few to trigger
+early stopping. The all-zero first-layer weight is not as bad as it sounds here: the first
+layer's *biases* are still random, so each hidden unit outputs a different constant, and the
+second layer's random weights send each unit a different gradient. That breaks the symmetry
+(ch. 7) — note the nonzero gradient for `0.weight`. Zeroing `model[0].bias` and `model[2].weight`
+as well would show the real failure: every hidden output and every gradient into the hidden
+layer is exactly 0, and only the output bias can learn.
 </details>

@@ -7,11 +7,26 @@ order: 8
 
 ## The permutation-invariance problem
 
+Self-attention compares every token with every other token, but nothing in that comparison
+says where a token sits. Shuffle the words and each word gets the same result as before, only
+in the shuffled place. To the model, "dog bites man" and "man bites dog" look alike.
+
 Self-attention computes $\text{softmax}(QK^\top/\sqrt{d_k})V$ — if you permute the tokens in the input, the output is permuted by the same permutation. The model has no way to tell position 3 from position 7. This is unlike RNNs, where the hidden state at step 3 is literally computed after step 2.
+
+To **permute** is to reorder. This property is called **permutation equivariance**: reorder
+the input and the output is reordered the same way, with no other change.
+
+> **Picture it:** a pile of Scrabble tiles. Attention can see which tiles are in the pile and
+> how they relate, but not the order they were laid on the board. A positional encoding
+> writes a small seat number on each tile.
 
 Positional information must be **injected** explicitly. There are three mainstream approaches.
 
 ## Sinusoidal positional encoding
+
+The original Transformer stamps each position with a pattern of waves: many sine and cosine
+waves of different speeds, read off at that position. Fast waves tell nearby positions apart;
+slow waves tell far-apart regions apart.
 
 The original Transformer (Vaswani et al., 2017) adds a fixed, deterministic vector to each token embedding:
 
@@ -19,6 +34,15 @@ $$
 PE_{pos, 2i} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \quad
 PE_{pos, 2i+1} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)
 $$
+
+- $pos$ — the token's position (0, 1, 2, ...).
+- $2i$ and $2i+1$ — an even/odd pair of dimensions; $i$ runs from 0 to $d/2 - 1$.
+- $10000^{2i/d}$ — the wavelength stretch for pair $i$: 1 for $i = 0$, growing toward 10000.
+- Even dimensions get the sine, odd dimensions the cosine of the same angle.
+
+> **In plain words:** dimension pair $i$ is a clock hand turning at its own speed. Pair 0 turns
+> 1 radian per position; the last pair barely moves over thousands of positions. Reading all
+> the hands at once gives a unique timestamp for each position.
 
 where $pos$ is the position and $i$ indexes the dimension. The base $10000$ controls the wavelengths — each dimension oscillates at a different frequency.
 
@@ -41,21 +65,32 @@ def sinusoidal_pe(max_len, d_model):
 
 pe = sinusoidal_pe(max_len=50, d_model=16)
 print("PE shape:", pe.shape)
-print("PE[0, :4]:", pe[0, :4].round(decimals=4).tolist())
-print("PE[1, :4]:", pe[1, :4].round(decimals=4).tolist())
-print("PE[49,:4]:", pe[49,:4].round(decimals=4).tolist())
+print("PE[0, :4]:", [round(v, 4) for v in pe[0, :4].tolist()])
+print("PE[1, :4]:", [round(v, 4) for v in pe[1, :4].tolist()])
+print("PE[49,:4]:", [round(v, 4) for v in pe[49, :4].tolist()])
 ```
 
 ```output
 PE shape: torch.Size([50, 16])
 PE[0, :4]: [0.0, 1.0, 0.0, 1.0]
-PE[1, :4]: [0.8415, 0.5403, 0.0999, 0.995]
-PE[49,:4]: [-0.9258, -0.3780, -0.9999, 0.0108]
+PE[1, :4]: [0.8415, 0.5403, 0.311, 0.9504]
+PE[49,:4]: [-0.9538, 0.3006, 0.2112, -0.9774]
 ```
+
+Row 0 is `[0.0, 1.0, 0.0, 1.0]`: sines of 0 and cosines of 0. Row 1 starts with 0.8415 and
+0.5403, which are $\sin(1)$ and $\cos(1)$ — pair 0 turns exactly 1 radian per position. The
+next pair turns slower: $\sin(1/10000^{2/16}) = \sin(0.3162) = 0.311$.
 
 Position 0 starts at 0 and 1 alternating (sin(0)=0, cos(0)=1). At higher dimensions the wavelengths are much longer.
 
+> **Watch out:** "in principle" matters in the extrapolation bullet. The vectors exist for
+> position 5,000, but a model trained only on 512 positions has never seen those patterns
+> and usually degrades well before that.
+
 ## Visualizing the pattern
+
+Printing a grid of the encoding shows the different speeds directly: the left columns flip
+sign quickly as you go down, the right columns creep.
 
 ```python
 import numpy as np
@@ -64,7 +99,7 @@ pe = sinusoidal_pe(32, 32).numpy()
 print("Heatmap (rows=positions, cols=dimensions):")
 print(f"{'':>5}", end="")
 for d in range(0, 32, 4):
-    print(f"  d{d:>2}", end="")
+    print(f"  {'d' + str(d):>5}", end="")
 print()
 for pos in range(0, 32, 4):
     print(f"p{pos:>3} ", end="")
@@ -76,20 +111,31 @@ for pos in range(0, 32, 4):
 
 ```output
 Heatmap (rows=positions, cols=dimensions):
-       d 0   d 4   d 8  d12  d16  d20  d24  d28
-p  0   0.00  0.00  0.00  0.00  0.00  0.00  0.00  0.00
-p  4   0.76  0.98  0.39  0.04  0.00  0.00  0.00  0.00
-p  8  -0.99  0.91  0.72  0.08  0.01  0.00  0.00  0.00
-p 12  -0.54  0.66  0.93  0.12  0.01  0.00  0.00  0.00
-p 16   0.29  0.28  0.98  0.16  0.02  0.00  0.00  0.00
-p 20   0.91 -0.16  0.89  0.20  0.02  0.00  0.00  0.00
-p 24   0.99 -0.58  0.67  0.24  0.02  0.00  0.00  0.00
-p 28   0.27 -0.88  0.34  0.27  0.03  0.00  0.00  0.00
+          d0     d4     d8    d12    d16    d20    d24    d28
+p  0    0.00   0.00   0.00   0.00   0.00   0.00   0.00   0.00
+p  4   -0.76   0.95   0.39   0.13   0.04   0.01   0.00   0.00
+p  8    0.99   0.57   0.72   0.25   0.08   0.03   0.01   0.00
+p 12   -0.54  -0.61   0.93   0.37   0.12   0.04   0.01   0.00
+p 16   -0.29  -0.94   1.00   0.48   0.16   0.05   0.02   0.01
+p 20    0.91   0.04   0.91   0.59   0.20   0.06   0.02   0.01
+p 24   -0.91   0.97   0.68   0.69   0.24   0.08   0.02   0.01
+p 28    0.27   0.54   0.33   0.77   0.28   0.09   0.03   0.01
 ```
+
+The printed columns are every 4th dimension, all even, so all sines — row 0 is all zeros
+because $\sin(0) = 0$. Column d0 jumps around (−0.76, 0.99, −0.54, ...), since 4 positions are
+4 radians, more than half a turn. Column d28 has only reached 0.01 by position 28: it would
+need thousands of positions to complete one wave.
 
 Low dimensions oscillate fast (complete period over ~6 positions); high dimensions barely move at this scale — they encode coarse position.
 
+The "~6" is exact: dimension 0 turns 1 radian per position, and one full turn is $2\pi \approx 6.28$
+radians.
+
 ## Learned positional embeddings
+
+The other option is to stop designing patterns and let the model learn one vector per
+position, the same way it learns one vector per word.
 
 Instead of fixed sinusoids, simply look up a position in an embedding table:
 
@@ -108,6 +154,7 @@ class LearnedPE(nn.Module):
         positions = torch.arange(T, device=x.device)
         return x + self.pe(positions)  # broadcast over batch
 
+torch.manual_seed(0)
 pe_module = LearnedPE(max_len=512, d_model=64)
 x = torch.randn(4, 20, 64)
 out = pe_module(x)
@@ -120,9 +167,20 @@ Output shape: torch.Size([4, 20, 64])
 PE table shape: torch.Size([512, 64])
 ```
 
+The output keeps the input's shape, `[4, 20, 64]`: each of the 20 positions added its own
+row of the table to every sentence in the batch. The table has 512 rows, one per position the
+model can ever handle, so it costs $512 \times 64 = 32{,}768$ parameters.
+
 The downside: learned PE cannot extrapolate beyond `max_len`. If your model was trained with max length 512 and you pass 513 tokens, position 513 has no embedding. GPT-2 uses learned PE; BERT uses learned PE.
 
+> **Watch out:** in code this shows up as an `IndexError` (or a CUDA "device-side assert")
+> from `nn.Embedding` the first time a sequence is longer than `max_len`. Truncate inputs or
+> pick a method that extrapolates.
+
 ## ALiBi: attention with linear biases
+
+ALiBi skips position vectors entirely. It changes the attention scores instead: the farther
+apart two tokens are, the more their score is marked down.
 
 ALiBi (Press et al., 2022) adds a position-dependent bias to attention **scores** rather than token embeddings:
 
@@ -130,7 +188,15 @@ $$
 \text{score}_{ij} = q_i k_j^\top / \sqrt{d_k} - m \cdot |i - j|
 $$
 
+> **In plain words:** the usual scaled dot-product score, minus a penalty that grows by $m$ for
+> every step of distance between token $i$ and token $j$. A neighbour loses $m$; a token 10
+> away loses $10m$.
+
 where $m$ is a head-specific slope. This penalizes attention to distant positions linearly. No parameters added; extrapolates naturally because the bias formula is defined for any position.
+
+> **Picture it:** shouting across a room. Everyone can still hear everyone, but voices fade
+> with distance, and each head has its own room acoustics: steep slopes make a head focus on
+> neighbours, gentle slopes let it listen far away.
 
 ```python
 def alibi_bias(seq_len, n_heads):
@@ -138,7 +204,7 @@ def alibi_bias(seq_len, n_heads):
     i = torch.arange(seq_len)
     j = torch.arange(seq_len)
     dist = (i.unsqueeze(1) - j.unsqueeze(0)).abs()  # |i - j|
-    bias = -slopes[:, None, None] * dist[None]      # (heads, T, T)
+    bias = -slopes[:, None, None] * dist[None] + 0.0  # (heads, T, T); + 0.0 turns -0.0 into 0.0
     return bias
 
 bias = alibi_bias(seq_len=6, n_heads=4)
@@ -151,7 +217,15 @@ ALiBi bias shape: torch.Size([4, 6, 6])
 Head 0 bias row 3: [-0.75, -0.5, -0.25, 0.0, -0.25, -0.5]
 ```
 
+The bias table has one $6 \times 6$ grid per head. Head 0's slope is $2^{-8/4} = 0.25$, so
+row 3 reads 0.0 at its own position and loses 0.25 per step of distance in either direction:
+−0.25, −0.5, −0.75. The other heads use slopes 0.0625, 0.0156, 0.0039.
+
 ## RoPE: Rotary Position Embedding
+
+RoPE marks position by turning vectors. The query and key of a token at position $m$ are
+rotated by an angle proportional to $m$. When you compare two rotated vectors, only the
+difference between their angles matters — which is their distance.
 
 RoPE (Su et al., 2021; used in Llama, Mistral, GPT-NeoX) encodes position by **rotating** the query and key vectors. For a 2D pair $(q_{2i}, q_{2i+1})$ at position $m$:
 
@@ -159,7 +233,25 @@ $$
 \begin{pmatrix} q'_{2i} \\ q'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i \end{pmatrix} \begin{pmatrix} q_{2i} \\ q_{2i+1} \end{pmatrix}
 $$
 
+> **In plain words:** treat each pair of query numbers as an arrow in a plane and rotate it by
+> angle $m\theta_i$ — the 2-by-2 matrix of cosines and sines is the standard rotation matrix.
+> Different pairs rotate at different speeds $\theta_i$, like the clock hands of the
+> sinusoidal encoding.
+
 with $\theta_i = 10000^{-2i/d}$. The inner product $q'_m \cdot k'_n$ then depends only on the **relative** position $m - n$. No additional parameters; naturally encodes relative positions; extrapolates gracefully.
+
+### Why only the distance survives
+
+For one pair, write the rotation by angle $\phi$ as $R(\phi)$. Rotations satisfy
+$R(a)^\top R(b) = R(b - a)$, so
+
+$$
+q'_m \cdot k'_n = (R(m\theta) q)^\top (R(n\theta) k) = q^\top R((n - m)\theta)\, k
+$$
+
+> **In plain words:** rotating both arrows and then comparing them is the same as rotating
+> only one of them by the angle between them. Positions 3 and 5 give the same score as
+> positions 10 and 12 for the same query and key.
 
 ```python
 def apply_rope(x, base=10000):
@@ -169,25 +261,54 @@ def apply_rope(x, base=10000):
     theta = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) * 2 / dk))
     pos   = torch.arange(T, dtype=torch.float32)
     freqs = torch.outer(pos, theta)             # (T, half)
-    cos   = freqs.cos()[None, None]             # (1, 1, T, half)
+    freqs = torch.cat([freqs, freqs], dim=-1)   # (T, dk): pair i with i + half
+    cos   = freqs.cos()[None, None]             # (1, 1, T, dk)
     sin   = freqs.sin()[None, None]
 
     x1, x2 = x[..., :half], x[..., half:]
     x_rot = torch.cat([-x2, x1], dim=-1)       # 90° rotation trick
     return x * cos + x_rot * sin
 
+torch.manual_seed(0)
 Q = torch.randn(2, 4, 8, 16)  # (batch, heads, seq, d_k)
 Q_rope = apply_rope(Q)
 print("RoPE Q shape:", Q_rope.shape)
-# Verify: dot product between position 0 and position 2 is position-relative
-q0 = Q_rope[0, 0, 0]; q2 = Q_rope[0, 0, 2]
-print("dot(pos0, pos2):", (q0 @ q2).item():.4f})
+# Verify: put the SAME vector at every position; after RoPE the dot product
+# depends only on the distance between positions, not on where they are
+v = torch.randn(1, 1, 1, 16).expand(1, 1, 8, 16)
+r = apply_rope(v)[0, 0]
+print(f"dot(pos0, pos2): {(r[0] @ r[2]).item():.4f}")
+print(f"dot(pos3, pos5): {(r[3] @ r[5]).item():.4f}")
+print(f"dot(pos0, pos5): {(r[0] @ r[5]).item():.4f}")
 ```
 
 ```output
 RoPE Q shape: torch.Size([2, 4, 8, 16])
-dot(pos0, pos2): -1.2847
+dot(pos0, pos2): 13.1583
+dot(pos3, pos5): 13.1583
+dot(pos0, pos5): 13.9122
 ```
+
+This is the relative property, measured. The same random vector sits at every position; after
+rotation, positions 0 and 2 have dot product 13.1583, and positions 3 and 5 — also 2 apart —
+give exactly 13.1583. Positions 0 and 5 (5 apart) give a different value, 13.9122.
+
+The code pairs dimension $i$ with dimension $i + d_k/2$ (the "rotate half" layout used by
+GPT-NeoX and Llama code) instead of neighbours $2i, 2i+1$ as in the formula. Both are valid
+rotations; they only differ in which numbers form a pair.
+
+> **Watch out:** the two pairing layouts are not interchangeable. Loading weights trained with
+> one into code using the other silently scrambles the positions — a classic bug when porting
+> checkpoints.
+
+## Recap in plain words
+
+- Attention alone cannot tell positions apart; reordering the input reorders the output.
+- Sinusoidal encodings add waves of many speeds to each embedding, a unique stamp per position.
+- Learned position embeddings are a lookup table and cannot go past their `max_len`.
+- ALiBi leaves embeddings alone and subtracts a distance penalty from attention scores.
+- RoPE rotates queries and keys by position, so their dot products depend only on distance.
+- For sinusoids too, the dot product of two encodings depends only on how far apart they are.
 
 ## Try it Yourself
 
@@ -216,13 +337,22 @@ print(f"dot(PE[5], PE[15]) = {dot_far:.2f}  (distance 10)")
 
 ```output
 dot(PE[5], PE[5])  = 32.00  (same position)
-dot(PE[5], PE[6])  = 30.91  (distance 1)
-dot(PE[5], PE[15]) = 16.83  (distance 10)
+dot(PE[5], PE[6])  = 30.92  (distance 1)
+dot(PE[5], PE[15]) = 21.05  (distance 10)
 ```
+
+Same position gives 32.00, which is exactly $d/2$: each of the 32 sine/cosine pairs contributes
+$\sin^2 + \cos^2 = 1$. One step away the dot product drops a little (30.92); ten steps away it
+drops more (21.05). In fact $PE_p \cdot PE_q = \sum_i \cos((p - q)\,\omega_i)$, where
+$\omega_i = 10000^{-2i/d}$ is pair $i$'s speed, so it depends only on the distance $p - q$.
+Try `pe[9] @ pe[19]` — it gives the same 21.05 as `pe[5] @ pe[15]`.
 
 ## Exercise
 
 Implement a `SinusoidalPE` module that takes a token embedding tensor `x` of shape `(batch, seq, d_model)` and adds the sinusoidal positional encoding in-place. Then verify that for a batch of identical embeddings, the output differs only in the positional encoding — i.e., `output[0, i] - output[0, j]` equals `PE[i] - PE[j]`.
+
+> **Hint:** build the table once in `__init__` and store it with `register_buffer`, so it moves
+> to the GPU with the module but is not trained. In `forward`, slice it to the input's length.
 
 <details>
 <summary>Solution</summary>
@@ -257,9 +387,16 @@ out = pe_mod(x)
 # out[0, i] - out[0, j] should equal PE[i] - PE[j]
 diff_out = out[0, 2] - out[0, 4]
 diff_pe  = pe_mod.pe[2] - pe_mod.pe[4]
-print("Difference matches PE delta:", torch.allclose(diff_out, diff_pe))
+print("Difference matches PE delta:", torch.allclose(diff_out, diff_pe, atol=1e-6))
 print("Max error:", (diff_out - diff_pe).abs().max().item())
 ```
 
 Since `x` is constant, `out[0,i] - out[0,j] = (x + PE[i]) - (x + PE[j]) = PE[i] - PE[j]` exactly.
+
+It prints `True` with a max error of about $1.2 \times 10^{-7}$. That error is float32 rounding,
+not a flaw in the maths: $(x + PE_i) - (x + PE_j)$ is not computed bit-for-bit like
+$PE_i - PE_j$, which is why the check passes `atol=1e-6` (with the default tolerance of
+$10^{-8}$ it would print `False`). One honest note: the
+solution returns `x + pe` as a new tensor rather than modifying `x` in place. That is the
+better choice — an in-place `x += ...` breaks autograd when `x` is needed for a backward pass.
 </details>

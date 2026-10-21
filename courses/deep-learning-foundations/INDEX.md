@@ -4,6 +4,16 @@ Build the machinery first, then reach for the library.
 
 Every chapter starts with a from-scratch NumPy implementation, then shows the equivalent in PyTorch. By the end you will have written reverse-mode autograd, backpropagation, BatchNorm, Dropout, and a full training loop yourself — and you will know exactly what `torch.nn` is doing underneath.
 
+**In plain words:** this course teaches how a neural network actually learns, by having you build
+every part of it yourself before using the library version. Chapters 1–4 go from a single neuron to
+a full network, then show how gradients are computed by hand (backpropagation) and automatically (a
+small autograd engine you write). Chapters 5–9 are the training toolkit: what to measure (loss
+functions), how to step (optimizers and schedules), how to start (initialization), and how to keep
+training stable and honest (normalization and regularization). Chapters 10–11 move everything into
+PyTorch, including data loading and augmentation. Chapters 12–13 cover what to do when training
+breaks and how to train faster and in less memory, and the capstone (ch. 14) has you rebuild the
+engine and an MLP from scratch and match PyTorch.
+
 ---
 
 ## Part 1 — The neuron to the network (ch. 1–4)
