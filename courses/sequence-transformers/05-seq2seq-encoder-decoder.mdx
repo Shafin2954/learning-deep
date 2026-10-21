@@ -7,10 +7,21 @@ order: 5
 
 ## The encoder-decoder architecture
 
+Translation needs two jobs: understand the input sentence, then write a new sentence that can
+have a different length. Seq2seq gives each job its own network — one reads, one writes —
+and passes a summary vector between them.
+
 Seq2seq maps a variable-length input sequence to a variable-length output sequence. The classic design (Sutskever et al., 2014) uses two RNNs:
 
 - **Encoder**: reads the source sequence $x_1, \ldots, x_T$ and compresses it into a fixed-size **context vector** $c = h_T^{\text{enc}}$.
 - **Decoder**: generates the target sequence $y_1, \ldots, y_{T'}$ autoregressively, conditioned on $c$.
+
+The **context vector** is the encoder's final hidden state: one fixed-length list of numbers
+that must hold everything the decoder needs to know about the source. $T$ and $T'$ are the
+source and target lengths, which can differ.
+
+> **Picture it:** an interpreter listens to a whole French sentence, forms a thought in their
+> head (the context vector), then speaks the English sentence word by word from that thought.
 
 The decoder hidden state updates as:
 
@@ -18,23 +29,52 @@ $$
 s_t = f(s_{t-1}, y_{t-1}, c)
 $$
 
+> **In plain words:** the decoder's new memory $s_t$ depends on its old memory, the word it
+> produced last ($y_{t-1}$), and the context vector. $f$ is the decoder's RNN cell.
+
 and the output distribution at each step:
 
 $$
 p(y_t | y_1, \ldots, y_{t-1}, x) = \text{softmax}(g(s_t, c))
 $$
 
+> **In plain words:** the probability of each possible next word, given all words written so
+> far and the whole source $x$, comes from scoring the current memory (with function $g$) and
+> applying softmax. In the code below, $c$ enters only as the decoder's initial state.
+
 ## The bottleneck problem
+
+A single fixed-size vector has room for only so much. A five-word sentence fits; a fifty-word
+sentence gets squeezed until details fall out.
 
 Compressing an entire source sentence into a single vector $c$ breaks down for long sequences. All information must pass through this bottleneck. This motivated the **attention mechanism** (ch. 6), which lets the decoder access all encoder hidden states rather than just $h_T$.
 
+A **bottleneck** is the narrowest point that everything must pass through — like the neck of
+a bottle. Here, a 32-number vector must carry the meaning of a sentence of any length.
+
+> **Picture it:** describing a whole film in one tweet. You keep the plot, but lose the
+> names of minor characters. Attention is like letting the writer rewatch any scene while
+> writing.
+
 ## Teacher forcing
+
+When the decoder learns, should it build on its own (often wrong) earlier words, or on the
+correct ones? Teacher forcing hands it the correct previous word during training.
 
 During training you feed the **ground-truth** previous token as input to the decoder at each step, not the predicted token. This stabilizes training — errors don't cascade — but creates a **train/inference mismatch**: at inference the decoder must consume its own (potentially wrong) predictions.
 
+**Ground truth** means the correct answer from the dataset. The mismatch is also called
+**exposure bias**: the model is never exposed to its own mistakes during training.
+
 **Scheduled sampling** gradually mixes in the model's own predictions during training to close this gap.
 
+> **Picture it:** a piano student who always practises with the teacher's hands guiding theirs
+> plays well in lessons, then stumbles alone. Scheduled sampling slowly lets go of the hands.
+
 ## Building a seq2seq model
+
+The encoder returns its final `(h, c)` LSTM states; the decoder starts from them and runs one
+token at a time, turning each hidden state into vocabulary scores with a linear layer.
 
 ```python
 import torch
@@ -74,17 +114,26 @@ print("Decoder params:", sum(p.numel() for p in dec.parameters()))
 ```
 
 ```output
-Encoder params: 1,584
-Decoder params: 3,012
+Encoder params: 6880
+Decoder params: 7380
 ```
 
+The decoder is larger (7,380 vs 6,880) even though its vocabulary is smaller, because it has
+an extra output layer: $32 \times 20 + 20 = 660$ parameters to turn hidden states into
+scores. The encoder's embedding is bigger ($30 \times 16 = 480$ vs $20 \times 16 = 320$), and
+the two LSTMs are identical ($4 \cdot 32 \cdot (16 + 32) + 2 \cdot 128 = 6{,}400$).
+
 ## Training loop with teacher forcing
+
+Each training step encodes the source, then walks the decoder along the target: at step $t$
+it is given the correct token $t$ and asked to predict token $t + 1$.
 
 ```python
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+torch.manual_seed(0)
 SRC_V, TGT_V = 30, 20
 BOS, EOS, PAD = 1, 2, 0
 
@@ -126,14 +175,29 @@ print(f"Loss step 299: {losses[299]:.3f}")
 ```
 
 ```output
-Loss step   0: 2.968
-Loss step 100: 2.891
-Loss step 299: 2.844
+Loss step   0: 3.023
+Loss step 100: 2.862
+Loss step 299: 2.840
 ```
+
+The loss starts at 3.023, close to $\ln 20 \approx 2.996$ — a uniform guess over 20 target
+tokens. It ends at 2.840, near $\ln 17 \approx 2.833$, because targets are drawn uniformly
+from 17 tokens (IDs 3–19). That floor is the best any model can do on random targets.
 
 The loss drops slowly because there's no real signal — the toy dataset has random source-target pairs. On a real translation task with consistent mappings the decoder converges much faster.
 
+In other words, the model learned only "never predict IDs 0–2" and nothing about the source;
+there is nothing else to learn. Ignore the code comment about digits and words — the data
+here is pure noise on purpose.
+
+> **Watch out:** a loss that settles at $\ln(\text{number of choices})$ is a red flag on real
+> data: it means the model is guessing uniformly and the inputs carry no usable signal (or
+> are not being fed in correctly).
+
 ## Greedy decoding at inference
+
+At inference there are no correct answers to lean on, so the decoder must feed back its own
+outputs. **Greedy decoding** picks the single most likely token at every step.
 
 ```python
 def decode_greedy(enc_model, dec_model, src, max_len=10, bos=1, eos=2):
@@ -149,6 +213,7 @@ def decode_greedy(enc_model, dec_model, src, max_len=10, bos=1, eos=2):
                 break
     return torch.stack(generated, dim=1)  # (batch, steps)
 
+torch.manual_seed(1)
 src = torch.randint(3, SRC_V, (2, 5))
 output = decode_greedy(enc, dec, src)
 print("Decoded output shape:", output.shape)
@@ -157,14 +222,48 @@ print("Sample output (batch 0):", output[0].tolist())
 
 ```output
 Decoded output shape: torch.Size([2, 10])
-Sample output (batch 0): [17, 3, 17, 3, 17, 3, 17, 3, 17, 3]
+Sample output (batch 0): [6, 10, 10, 10, 10, 10, 10, 10, 10, 10]
 ```
+
+The output is 10 tokens long because the loop never saw `<EOS>` (ID 2) and stopped at
+`max_len`. After one token (6), the model repeats 10 nine times.
 
 The untrained model repeats — it finds a local minimum of predicting a high-probability token repeatedly. Beam search and trained weights cure this.
 
+Strictly, this model is the one trained above on random pairs, so it has learned nothing
+about the source; its best guess is a frequent target token, and feeding that token back in
+makes the same guess likely again. Repetition is a classic symptom of greedy decoding on a
+weak model (ch. 11 has the fixes).
+
 ## BLEU score concept
 
+To grade a translation automatically, count how many of its word chunks also appear in a
+human reference translation.
+
 BLEU (Bilingual Evaluation Understudy) measures n-gram overlap between hypothesis and reference. $\text{BLEU} = BP \cdot \exp\left(\sum_{n=1}^{N} w_n \log p_n\right)$ where $p_n$ is the precision of $n$-grams and $BP$ is a brevity penalty. You won't compute this from scratch here — `sacrebleu` handles it — but it's the standard metric for translation.
+
+Reading the formula piece by piece:
+
+- An **n-gram** is a run of $n$ consecutive words; "the cat sat" has the 2-grams "the cat"
+  and "cat sat".
+- $p_n$ — of the n-grams in your output, the fraction that appear in the reference.
+- $w_n$ — weights, usually $\frac{1}{4}$ each for $N = 4$; the exponential of a weighted
+  sum of logs is a geometric mean.
+- $BP$ — the brevity penalty, below 1 when your output is shorter than the reference, so
+  writing only "the" cannot score perfect precision.
+
+> **Watch out:** BLEU rewards matching words, not meaning. "The feline rested" scores near zero
+> against "the cat sat" even though a human would accept it.
+
+## Recap in plain words
+
+- An encoder reads the source into a context vector; a decoder writes the target from it.
+- One fixed-size vector becomes a bottleneck for long inputs, which motivated attention.
+- Teacher forcing trains the decoder on correct previous tokens, causing a train/inference
+  gap.
+- A loss stuck at $\ln(\text{choices})$ means the model is learning nothing from the input.
+- Greedy decoding takes the top token each step and can get stuck repeating itself.
+- BLEU scores a translation by n-gram overlap with a reference, plus a length penalty.
 
 ## Try it Yourself
 
@@ -195,6 +294,7 @@ class Decoder(nn.Module):
         return self.proj(out.squeeze(1)), h, c
 
 # Toy: learn to copy source to target (same vocab)
+torch.manual_seed(0)
 V = 15; enc = Encoder(V, 8, 16); dec = Decoder(V, 8, 16)
 opt = torch.optim.Adam(list(enc.parameters())+list(dec.parameters()), lr=1e-3)
 
@@ -213,16 +313,26 @@ for step in range(500):
 ```
 
 ```output
-Step   0  loss=2.683
-Step 100  loss=1.421
-Step 200  loss=0.743
-Step 300  loss=0.312
-Step 400  loss=0.147
+Step   0  loss=2.651
+Step 100  loss=2.606
+Step 200  loss=2.366
+Step 300  loss=1.975
+Step 400  loss=1.785
 ```
+
+The copy task is learnable, so unlike the random task the loss keeps falling: 2.651 at
+step 0 to 1.785 at step 400, well below $\ln 12 \approx 2.48$ (the inputs use 12 token IDs,
+3–14). It is still far from zero — copying through a 16-number bottleneck takes longer than
+500 small steps. Try `lr=1e-2`, or 2,000 steps, and watch the loss approach 0. Then try
+`src` of length 12 to feel the bottleneck: the loss stays higher for longer sequences.
 
 ## Exercise
 
 Extend greedy decoding to **beam search with beam width 3**. At each step, maintain the top-3 partial sequences by cumulative log-probability and expand each. Return the highest-scoring complete sequence.
+
+> **Hint:** store each beam as `(score, tokens, h, c)`. At every step expand each live beam into
+> its top 3 next tokens, add their log-probabilities to the score, then keep the best 3 of all
+> candidates. Beams that end in `<EOS>` move to a `completed` list.
 
 <details>
 <summary>Solution</summary>
@@ -260,4 +370,10 @@ print("Beam result:", result)
 ```
 
 Beam search consistently outperforms greedy on translation tasks when the model has learned diverse output paths.
+
+The key insight is that the sum of log-probabilities is the log of the whole sequence's
+probability, so beam search ranks complete paths, not single tokens. It can keep a token that
+is second-best now if it leads to a much better continuation. "Consistently" is too strong:
+with width 1 beam search is greedy, and very wide beams can prefer short, bland outputs, so
+practice uses small widths (4–5) plus a length penalty (ch. 11).
 </details>
