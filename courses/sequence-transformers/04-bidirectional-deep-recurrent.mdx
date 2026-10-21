@@ -7,7 +7,15 @@ order: 4
 
 ## Why one direction isn't enough
 
+Sometimes you can only understand a word once you have heard the rest of the sentence. An
+RNN that reads left to right has not seen the rest yet. The fix is to read the sentence a
+second time from the right, and combine both readings.
+
 A unidirectional RNN at position $t$ sees only $x_1, \ldots, x_t$. For tasks where future context matters — tagging "bank" in "I deposited money at the bank" vs "the river bank" — the word "bank" is ambiguous without what follows. Named entity recognition and POS tagging both benefit from full context.
+
+**Unidirectional** means reading in one direction only. In "the river bank" the clue
+("river") comes before "bank", but in "the bank of the river" it comes after — a
+left-to-right reader at "bank" has not seen it yet.
 
 **Bidirectional RNNs** run two independent RNNs on the same sequence: one left→right (forward), one right→left (backward). Their hidden states are concatenated at each position:
 
@@ -19,14 +27,26 @@ $$
 h_t = [\overrightarrow{h}_t; \overleftarrow{h}_t] \in \mathbb{R}^{2H}
 $$
 
+> **In plain words:** the forward RNN's memory at step $t$ (arrow pointing right) has read
+> everything up to $t$; the backward RNN's memory (arrow pointing left) has read everything
+> from the end back to $t$. Glue the two vectors end to end, and position $t$ has a summary
+> of the whole sentence, twice as long ($2H$ numbers).
+
+> **Picture it:** two proofreaders mark the same page, one starting at the top, one at the
+> bottom. For any word, you staple together the notes both of them wrote when they reached it.
+
 The cost: you need the entire sequence before processing anything — bidirectional RNNs cannot run in a streaming/online setting.
 
 ## Building a bidirectional LSTM in PyTorch
+
+PyTorch builds both directions for you with one flag, `bidirectional=True`. The two
+directions get separate weights.
 
 ```python
 import torch
 import torch.nn as nn
 
+torch.manual_seed(0)
 batch, seq_len, input_size, hidden_size = 4, 10, 8, 16
 
 bilstm = nn.LSTM(
@@ -51,11 +71,25 @@ Output shape (all timesteps): torch.Size([4, 10, 32])
 h_n shape (final hidden):      torch.Size([2, 4, 16])
 ```
 
+The output's last dimension is 32 = 2 × 16: forward and backward states side by side, at
+every one of the 10 positions. `h_n` has shape `[2, 4, 16]`: 2 directions, 4 sentences, 16
+numbers each.
+
 `h_n[0]` is the forward final state (from position $T$); `h_n[1]` is the backward final state (from position $1$). To get a single context vector for the whole sequence, concatenate them: `torch.cat([h_n[0], h_n[1]], dim=-1)` → shape `(batch, 32)`.
+
+> **Watch out:** `out[:, -1, :]` is not the same as that concatenation. At the last position
+> the backward half has read only one token. The backward direction's full summary lives at
+> `out[:, 0, 16:]` (and in `h_n[1]`).
 
 ## Stacking layers: deep RNNs
 
+Stacking means running a second RNN over the outputs of the first, like reading a summary of
+a summary. Each layer can build bigger ideas out of the previous layer's small ones.
+
 A deep RNN feeds the hidden states of one RNN layer as inputs to the next. The $l$-th layer sees $h_t^{(l-1)}$ (the output of the layer below) instead of $x_t$. Depth lets lower layers extract local features; higher layers build longer-range abstractions.
+
+**Dropout** randomly zeroes a fraction of values during training so the network cannot lean
+on any single one; here it is applied between layers.
 
 ```python
 deep_bilstm = nn.LSTM(
@@ -77,34 +111,68 @@ Deep BiLSTM output shape: torch.Size([4, 10, 32])
 h_n shape (layers×dirs, batch, H): torch.Size([6, 4, 16])
 ```
 
+The output shape is unchanged at `[4, 10, 32]`: only the top layer's states come out. `h_n`
+now holds 6 final states, one for every layer and direction.
+
 `h_n` has 6 rows: 3 layers × 2 directions. The final layer's forward+backward states are at indices 4 and 5.
 
+> **Watch out:** `dropout=0.3` here only acts between layers; PyTorch never applies it after
+> the last layer, and with `num_layers=1` it does nothing (and warns).
+
 ## Parameter count
+
+Counting parameters by hand is the best test that you know exactly what a layer contains.
 
 ```python
 total = sum(p.numel() for p in deep_bilstm.parameters())
 print(f"Total parameters (3-layer BiLSTM): {total:,}")
 
-# Manual breakdown: each layer has 4 * (input + hidden + hidden) * hidden weights per direction
-# Layer 0 fwd/bwd: 4 * (8+16) * 16 * 2 = 3,072
-# Layer 1 fwd/bwd: 4 * (32+16) * 16 * 2 = 6,144
-# Layer 2 fwd/bwd: 4 * (32+16) * 16 * 2 = 6,144
-# Plus biases: 4*16*2 per layer direction
-manual = (4*(8+16)*16 + 4*16)*2 + 2*(4*(32+16)*16 + 4*16)*2
+# Manual breakdown, per layer and direction: 4 gates * hidden * (input + hidden) weights
+# plus TWO bias vectors (PyTorch keeps b_ih and b_hh), each 4 * hidden
+# Layer 0 fwd/bwd: (4*16*(8+16)  + 2*4*16) * 2 = 3,328
+# Layer 1 fwd/bwd: (4*16*(32+16) + 2*4*16) * 2 = 6,400   (input = 2H = 32)
+# Layer 2 fwd/bwd: (4*16*(32+16) + 2*4*16) * 2 = 6,400
+manual = (4*16*(8+16) + 2*4*16)*2 + 2*(4*16*(32+16) + 2*4*16)*2
 print(f"Manual count: {manual:,}")
 ```
 
 ```output
-Total parameters (3-layer BiLSTM): 15,552
-Total parameters (3-layer BiLSTM): 15,552
+Total parameters (3-layer BiLSTM): 16,128
+Manual count: 16,128
 ```
 
+Both lines say 16,128, so the hand count matches PyTorch. Two details make it work. First,
+PyTorch keeps two bias vectors per gate block (`b_ih` and `b_hh`), so each direction has
+$2 \times 4 \times 16 = 128$ biases, not 64. Second, layers 1 and 2 take inputs of size 32,
+not 16, because the layer below is bidirectional.
+
+### Deriving the per-direction count
+
+Each LSTM direction computes four blocks (three gates and a candidate) of size $H$ from an
+input of size $D$ and a previous state of size $H$:
+
+$$
+\underbrace{4H(D + H)}_{\text{weights}} + \underbrace{2 \cdot 4H}_{\text{two biases}}
+$$
+
+> **In plain words:** four blocks, each with one weight per (output, input) pair, where the
+> inputs are the $D$ new features plus the $H$ old memory values; then two bias numbers per
+> output. For $D = 8, H = 16$: $64 \times 24 + 128 = 1{,}664$ per direction, 3,328 for both.
+
 ## A minimal BiLSTM sentiment classifier
+
+A classifier squeezes a whole sentence into one vector and turns it into class scores. The
+BiLSTM's two final states make a natural sentence vector.
+
+An **embedding** layer (`nn.Embedding`) is a lookup table that turns each token ID into a
+learned vector (ch. 1). `padding_idx=0` keeps the vector for `<PAD>` fixed at zero.
 
 ```python
 import torch
 import torch.nn as nn
 import numpy as np
+
+torch.manual_seed(0)
 
 class BiLSTMClassifier(nn.Module):
     def __init__(self, vocab_size, embed_dim, hidden_size, num_classes):
@@ -137,14 +205,43 @@ print("Predicted classes:", probs.argmax(dim=-1).tolist())
 
 ```output
 Logits shape: torch.Size([8, 2])
-Predicted classes: [1, 0, 1, 0, 1, 0, 0, 1]
+Predicted classes: [1, 0, 1, 1, 1, 1, 1, 0]
 ```
+
+You get 2 scores per sentence for 8 sentences. The predicted classes are meaningless — the
+model is untrained, so `[1, 0, 1, 1, 1, 1, 1, 0]` is whatever the random weights happen to
+prefer. What matters is that sentence 3, with only 5 real tokens, goes through the same code
+as the full-length ones.
 
 `pack_padded_sequence` tells the LSTM to ignore padded positions, so padding doesn't corrupt the hidden state.
 
+**Packing** stores the batch as a list of real tokens plus each sentence's length, so the
+LSTM stops each sentence at its true end. Without it, the backward direction would start
+reading sentence 3 from ten `<PAD>` tokens.
+
+> **Watch out:** `lengths` must describe the data. Here `x[3, 5:] = 0` and `lengths[3] = 5`
+> agree; if they disagree, the model silently reads padding or drops real words.
+
 ## When bidirectional is inappropriate
 
+When you are writing a sentence, you cannot read words you have not written yet. Any task
+that produces text one token at a time must stay one-directional.
+
 You **cannot** use bidirectional RNNs for autoregressive generation — generating token $t$ requires conditioning only on tokens $1..t-1$, not the future. Bidirectional models are suitable only for tasks where the full sequence is available at inference time (classification, NER, machine translation encoding).
+
+**Autoregressive** means each output is fed back as input for the next step. A backward
+reader would need the future tokens — which do not exist yet. The same idea returns as the
+causal mask in ch. 7.
+
+## Recap in plain words
+
+- A forward RNN only knows the past; a bidirectional RNN adds a backward pass and concatenates
+  both states at every position.
+- Bidirectional models need the whole sequence first, so they cannot stream or generate.
+- Deep RNNs stack layers; each layer reads the hidden states of the one below.
+- In a stacked BiLSTM, layers above the first take inputs of size $2H$.
+- PyTorch's LSTM has two bias vectors per direction, which a hand count must include.
+- Packing padded sequences stops the LSTM from reading padding.
 
 ## Try it Yourself
 
@@ -169,14 +266,22 @@ for num_layers in [1, 2, 4]:
 ```
 
 ```output
-Layers=1  params=49,664  out_shape=(4, 20, 128)
-Layers=2  params=115,200  out_shape=(4, 20, 128)
-Layers=4  params=246,272  out_shape=(4, 20, 128)
+Layers=1  params=50,176  out_shape=(4, 20, 128)
+Layers=2  params=149,504  out_shape=(4, 20, 128)
+Layers=4  params=348,160  out_shape=(4, 20, 128)
 ```
+
+Look at the growth: 50,176 for one layer, then about 99,000 more for each extra layer. The
+first layer is cheaper because its input has 32 features; every later layer's input is the
+128-wide bidirectional output. The output shape never changes, because only the top layer is
+returned. Try `bidirectional=False` and check that one layer drops to exactly half (25,088).
 
 ## Exercise
 
 Implement `extract_context_vector(model, x, lengths)` that, given the `BiLSTMClassifier` above, returns the sentence context vector (shape `(batch, 2H)`) without the final classification head. This is the representation you'd use for downstream tasks.
+
+> **Hint:** copy the classifier's `forward` and stop one line early, before `self.head`. Wrap it
+> in `torch.no_grad()` because you only need values, not gradients.
 
 <details>
 <summary>Solution</summary>
@@ -199,4 +304,8 @@ print("Context shape:", ctx.shape)  # (4, 64)
 ```
 
 The context vector captures the full sequence summary. Notice `enforce_sorted=False` handles arbitrary ordering without pre-sorting.
+
+With hidden size 32, the context is $2 \times 32 = 64$ numbers per sentence, so the shape is
+`(4, 64)`. These vectors are what you would feed to a different classifier, cluster, or
+compare with cosine similarity.
 </details>

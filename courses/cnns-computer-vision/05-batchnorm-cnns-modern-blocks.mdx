@@ -7,6 +7,10 @@ order: 5
 
 ## BatchNorm in convolutional networks
 
+**BatchNorm** (batch normalization) rescales a layer's outputs so that each channel has mean 0
+and spread 1 across the current batch. Keeping every channel on the same scale makes deep
+networks train faster and more stably.
+
 In a fully-connected BatchNorm, you normalize over the batch dimension $N$. In a conv net, feature maps have shape $(N, C, H, W)$. BatchNorm normalizes over $(N, H, W)$ **separately for each channel** $c$:
 
 $$
@@ -14,6 +18,18 @@ $$
 $$
 
 where $\mu_c$ and $\sigma_c^2$ are computed over all elements $(n, h, w)$ for channel $c$. Two learned parameters $\gamma_c$ and $\beta_c$ then rescale and shift.
+
+> **In plain words:**
+> - $x_{n,c,h,w}$ is one number: image $n$, channel $c$, row $h$, column $w$.
+> - $\mu_c$ is the average of channel $c$ over every image and every pixel in the batch.
+> - $\sigma_c^2$ is that channel's variance; $\epsilon$ is a tiny constant (default $10^{-5}$)
+>   that stops division by zero.
+> - After this step each channel has mean 0 and variance 1; then $\gamma_c$ and $\beta_c$ let
+>   the network pick a new scale and centre if it wants one.
+
+> **Picture it:** grading on a curve, one subject at a time. Every channel is a subject; BN
+> rescales that subject's scores across the whole class (the batch and all pixels) so the
+> average is 0 and the spread is 1. Maths scores are never mixed with art scores.
 
 ```python
 import torch
@@ -38,11 +54,22 @@ Output:  torch.Size([8, 64, 28, 28])
 Running mean shape: torch.Size([64])
 ```
 
+The shape is unchanged, and $\gamma$, $\beta$, and the running mean each have 64 entries: one per
+channel, not one per pixel. With $N = 8$ and $28 \times 28$ maps, each channel's mean is taken
+over $8 \times 784 = 6{,}272$ numbers.
+
 BatchNorm keeps a running mean/variance for inference (no batch statistics available then).
+
+> **Watch out:** forgetting `model.eval()` at test time makes BN use the statistics of the
+> test batch instead of the running averages. Predictions then change with batch size —
+> with a batch of 1, they can be badly wrong.
 
 ### BN before or after activation?
 
-The original ResNet paper places BN between conv and activation: `conv → BN → ReLU`. The pre-activation (v2) variant does `BN → ReLU → conv`. Empirically, v2 gives better gradient flow in very deep nets, but for typical ≤50-layer nets the difference is small. Most standard architectures use the original ordering.
+There are two common orders for the trio conv, BN, ReLU, and both work. The choice mostly matters
+for very deep networks.
+
+The original ResNet paper places BN between conv and activation: `conv → BN → ReLU`. The pre-activation (v2) variant does `BN → ReLU → conv`. Empirically, v2 gives better gradient flow in very deep nets, but for typical networks of 50 layers or fewer the difference is small. Most standard architectures use the original ordering.
 
 ```python
 # Original ordering
@@ -69,14 +96,28 @@ Original: torch.Size([2, 64, 14, 14])
 Pre-act:  torch.Size([2, 64, 14, 14])
 ```
 
+Both orderings give the same shape, `[2, 64, 14, 14]`; the difference is only in *what* is
+normalised. The original normalises the conv's output; pre-activation normalises the conv's
+input.
+
 ## Depthwise separable convolution
 
-A standard 3×3 conv on $C_{in}$ channels to $C_{out}$ channels uses $C_{in} \times C_{out} \times 9$ parameters. You can factor this into two steps:
+A normal conv does two jobs at once: it looks at a spatial neighbourhood and it mixes channels.
+Doing those two jobs in separate, cheap steps saves most of the weights.
 
-1. **Depthwise conv** — apply one 3×3 filter per input channel independently (groups = $C_{in}$).
-2. **Pointwise conv** — 1×1 conv to mix channels.
+A standard $3 \times 3$ conv on $C_{in}$ channels to $C_{out}$ channels uses $C_{in} \times C_{out} \times 9$ parameters. You can factor this into two steps:
+
+1. **Depthwise conv** — apply one $3 \times 3$ filter per input channel independently (groups = $C_{in}$).
+2. **Pointwise conv** — $1 \times 1$ conv to mix channels.
 
 Parameter cost: $C_{in} \times 9 + C_{in} \times C_{out}$ vs $C_{in} \times C_{out} \times 9$.
+
+> **Picture it:** a kitchen. A standard conv is one chef who, for every dish, chops every
+> ingredient *and* mixes them. Depthwise-separable is an assembly line: one prep cook per
+> ingredient chops (depthwise), then a mixer combines the bowls (pointwise).
+
+The `groups=in_c` argument is what makes a conv depthwise: it splits the channels into
+`in_c` groups of one, so each filter only sees its own channel.
 
 ```python
 C_in, C_out = 128, 256
@@ -103,13 +144,20 @@ print(f"Reduction: {std_params / dws_params:.1f}×")
 
 ```output
 Standard  params: 294,912  output: torch.Size([2, 256, 28, 28])
-DWS       params: 34,176   output: torch.Size([2, 256, 28, 28])
-Reduction: 8.6×
+DWS       params: 33,920  output: torch.Size([2, 256, 28, 28])
+Reduction: 8.7×
 ```
+
+The standard conv has $128 \times 256 \times 9 = 294{,}912$ weights; the DWS version has
+$128 \times 9 + 128 \times 256 = 1{,}152 + 32{,}768 = 33{,}920$. Same output shape, about 8.7 times
+fewer parameters — and almost all of the remaining weights are in the $1 \times 1$ step.
 
 MobileNetV1 replaces all standard convs with DWS, cutting parameters by ~8–9× with modest accuracy loss.
 
 ## Inverted residual block (MobileNetV2)
+
+MobileNetV2 flips the ResNet bottleneck around: it keeps the information on a *thin* path
+between blocks, widens it only inside the block for the depthwise step, and squeezes it back.
 
 MobileNetV2 adds a twist: **expand → depthwise → project** with a skip connection on the narrow (bottleneck) features. This is the opposite of ResNet bottleneck (which compresses then expands).
 
@@ -118,6 +166,10 @@ x \xrightarrow{\text{1×1 expand}} \xrightarrow{\text{3×3 DW}} \xrightarrow{\te
 $$
 
 The expansion ratio $t$ (typically 6) increases channels before the depthwise step, giving the DW conv more channels to mix, then projects back down.
+
+> **In plain words:** read the arrow left to right. A $1 \times 1$ conv widens $x$ from $C$ to
+> $tC$ channels, a $3 \times 3$ depthwise conv filters each wide channel, a $1 \times 1$ conv
+> projects back to $C$, and the result is added to the original $x$.
 
 ```python
 class InvertedResidual(nn.Module):
@@ -145,16 +197,34 @@ print("Params:", sum(p.numel() for p in blk.parameters()))
 
 ```output
 Output: torch.Size([2, 32, 28, 28])
-Params: 6,528
+Params: 14848
 ```
 
+With 32 channels and $t = 6$, the middle is 192 channels wide. The count works out as
+$32 \cdot 192 + 9 \cdot 192 + 192 \cdot 32 = 14{,}016$ conv weights plus 832 BatchNorm weights,
+14,848 in total. **ReLU6** is ReLU capped at 6; it behaves well in low-precision arithmetic on
+phones.
+
+> **Watch out:** the projection layer has no ReLU after it, on purpose. A ReLU on a thin
+> 32-channel output would zero out negative values and destroy information that the skip
+> path cannot recover.
+
 ## Squeeze-and-Excite (SE) block
+
+An SE block lets a layer turn its own channels up or down, like a mixing desk. It looks at
+the whole image to decide which channels are useful right now, then scales them.
 
 SE blocks add **channel attention**: after a conv, pool the spatial dimensions to a vector, run two FC layers to predict channel weights (sigmoid gate), and re-scale the feature map channel-wise.
 
 $$
 s = \sigma(W_2 \cdot \text{ReLU}(W_1 \cdot \text{GAP}(F))) \quad;\quad \tilde{F}_c = s_c \cdot F_c
 $$
+
+> **In plain words:**
+> - $F$ is the feature map; $\text{GAP}(F)$ averages each channel to one number (ch. 3).
+> - $W_1$ squeezes those $C$ numbers down to $C/16$; $W_2$ expands back to $C$.
+> - $\sigma$ (sigmoid) turns each result into a gate $s_c$ between 0 and 1.
+> - $\tilde{F}_c = s_c \cdot F_c$ multiplies every pixel of channel $c$ by its gate.
 
 ```python
 class SEBlock(nn.Module):
@@ -181,14 +251,28 @@ print("SE params:", sum(p.numel() for p in se.parameters()))
 
 ```output
 SE output: torch.Size([2, 256, 14, 14])
-SE params: 8,192
+SE params: 8192
 ```
 
-SENet won ImageNet 2017. Adding SE blocks to ResNet-50 costs ~2.5M extra parameters but lifts top-1 accuracy by ~1–2%.
+The SE block is cheap: two linear layers, $256 \times 16 + 16 \times 256 = 8{,}192$ weights, and
+the output shape is unchanged. It never changes *where* things are, only how loud each channel is.
+
+SENet won ImageNet 2017. Adding SE blocks to ResNet-50 costs ~2.5M extra parameters but lifts top-1 accuracy by ~1–2%. (**Top-1 accuracy** = how often the model's single best guess is right.)
 
 ## DropBlock
 
+Ordinary dropout on a feature map is too easy to cheat: neighbouring pixels carry nearly the
+same information, so the network fills in a missing pixel from its neighbours. DropBlock hides
+whole squares instead.
+
 Dropout applied to conv features drops individual pixels — spatially adjacent units share the same activation and information "leaks" around dropped units. **DropBlock** drops contiguous $k \times k$ regions of the feature map, forcing the network to use global information.
+
+> **Picture it:** studying a jigsaw with a few single pieces missing is easy — you guess
+> them from their neighbours. Remove whole $3 \times 3$ chunks, and you must understand the
+> full picture to know what was there.
+
+The code picks random "seed" pixels, grows each into a $3 \times 3$ square with max pooling,
+and rescales the survivors so the average activation stays about the same.
 
 ```python
 class DropBlock2d(nn.Module):
@@ -209,6 +293,7 @@ class DropBlock2d(nn.Module):
         mask = mask.expand_as(x)
         return x * mask / (mask.mean() + 1e-6)
 
+torch.manual_seed(0)
 drop = DropBlock2d(block_size=3, p=0.1)
 drop.train()
 x   = torch.ones(2, 64, 8, 8)
@@ -217,10 +302,30 @@ print("Fraction dropped:", (out == 0).float().mean().item())
 ```
 
 ```output
-Fraction dropped: 0.0820
+Fraction dropped: 0.140625
 ```
 
+With this seed, about 14% of the values are zero. The seed probability is
+$p / k^2 = 0.1 / 9 \approx 0.011$, so an $8 \times 8$ map gets fewer than one seed on average,
+and each seed blanks up to 9 cells. On such a tiny map the dropped fraction swings a lot from
+draw to draw (another seed gives under 5%); on large maps it settles near $p$.
+
+> **Watch out:** the `if not self.training` line matters. DropBlock, like dropout, must be
+> off at evaluation time, or your validation scores will be randomly damaged.
+
+## Recap in plain words
+
+- BatchNorm in a CNN normalises each channel over the batch and all pixels, with one $\gamma$ and $\beta$ per channel.
+- In eval mode BN uses running averages, so `model.eval()` is not optional.
+- Depthwise-separable convs split spatial filtering and channel mixing, saving 8–9 times the weights.
+- Inverted residuals widen inside the block and keep a thin skip path; the last projection has no ReLU.
+- SE blocks scale whole channels with gates learned from a global average.
+- DropBlock drops square regions instead of single pixels so the network cannot cheat from neighbours.
+
 ## Try it Yourself
+
+This counts parameters for three building blocks at 64 channels. It reuses `DepthwiseSepConv`
+and `SEBlock` from earlier on this page (the notebook session remembers them).
 
 ```python
 import torch
@@ -249,16 +354,24 @@ print(f"SE block (overhead): {sum(p.numel() for p in se_blk.parameters()):,} par
 ```
 
 ```output
-Standard block:      74,112 params
+Standard block:      73,984 params
 DWS block:           4,672 params
-SE block (overhead): 256 params
+SE block (overhead): 512 params
 ```
+
+The standard two-conv block costs 73,984 parameters; one DWS conv costs 4,672 ($64 \times 9 + 64 \times 64$);
+an SE block adds only 512 ($2 \times 64 \times 4$). SE is nearly free, which is why so many modern
+networks sprinkle it everywhere.
 
 Try wrapping a `DepthwiseSepConv` in a skip connection (add input to output) and verify the output shape. Then add an `SEBlock` on top of that. Stack 5 such blocks and count total params.
 
 ## Exercise
 
 Build a `MobileBlock` that combines an inverted residual (expansion=4) with a squeeze-and-excite block after the depthwise convolution. Use `in_c = out_c = 64`. Count the total parameters and compare to a standard `ResidualBlock(64)` from chapter 4.
+
+> **Hint:** the SE block goes on the wide middle (256 channels), so build it as
+> `SEBlock(channels * t)`. A `ResidualBlock(64)` has two $3 \times 3$ convs of
+> $9 \times 64 \times 64$ weights each plus two BatchNorms.
 
 <details>
 <summary>Solution</summary>
@@ -289,5 +402,10 @@ print("Output:", mb(x).shape)
 print("MobileBlock params:", sum(p.numel() for p in mb.parameters()))
 ```
 
-The MobileBlock uses ~12,000 parameters versus ~74,000 for a standard ResBlock at the same channel width — a 6× reduction while keeping a skip connection and channel attention.
+Running it prints a `[2, 64, 28, 28]` output and 44,416 parameters, versus 73,984 for
+`ResidualBlock(64)` — about 1.7 times fewer, while adding a skip connection and channel
+attention. The cost breakdown: the two $1 \times 1$ convs dominate ($2 \times 64 \times 256 = 32{,}768$),
+the depthwise conv is tiny ($9 \times 256 = 2{,}304$), and the SE block on 256 channels adds
+8,192. The saving looks modest here because the expansion makes the $1 \times 1$ convs wide; the
+real win is compute, since the expensive $3 \times 3$ step is depthwise.
 </details>

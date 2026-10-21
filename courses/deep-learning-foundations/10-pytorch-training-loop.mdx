@@ -7,7 +7,15 @@ order: 10
 
 ## Tensors
 
+Everything you built by hand in ch. 1–9 — arrays, autograd, layers, optimizers — PyTorch
+provides ready-made and fast. Its basic object is the **tensor**: a NumPy-style array that can
+also live on a GPU and remember how it was computed.
+
 A PyTorch tensor is an n-dimensional array that lives on a device (CPU or CUDA) and tracks gradient computations.
+
+A **device** is where the numbers are stored and computed: `cpu` for the main processor, `cuda`
+for an NVIDIA GPU. "n-dimensional" means any number of axes — a vector has 1, a matrix 2, a
+batch of colour images 4.
 
 ```python
 import torch
@@ -26,10 +34,18 @@ print(f"c mean={c.mean():.4f}, std={c.std():.4f}")
 ```output
 a shape=torch.Size([2, 2]), dtype=torch.float32, device=cpu
 b shape=torch.Size([3, 4])
-c mean=0.0821, std=0.9934
+c mean=0.1806, std=0.8526
 ```
 
+Each tensor reports its shape, its **dtype** (the kind of number in every slot — here
+`float32`, 4 bytes each, PyTorch's default) and its device (`cpu`). `torch.randn` draws from a
+standard normal, but with only 10 values the sample mean (0.1806) and std (0.8526) are some way
+from the true 0 and 1.
+
 Key tensor ops: `.view()` / `.reshape()` for shape changes, `.permute()` for axis reordering, `.squeeze()` / `.unsqueeze()` for singleton dims, `.to(device)` / `.cuda()` for device transfer.
+
+A **singleton dim** is an axis of length 1, such as the 1 in shape `(32, 1)`. `squeeze` removes
+it and `unsqueeze` adds one.
 
 ```python
 x = torch.randn(4, 3, 32, 32)  # batch of 4 RGB 32×32 images
@@ -47,9 +63,25 @@ Before: torch.Size([4, 3, 32, 32])  →  After: torch.Size([4, 3072])
 In-place add: tensor([6., 6., 6.])
 ```
 
+Four images of $3 \times 32 \times 32$ flatten to 4 rows of $3 \cdot 32 \cdot 32 = 3072$ numbers;
+the `-1` tells `view` to work out that size itself. `add_` changed `t` in place, from ones to
+sixes, without making a new tensor.
+
+> **Watch out:** `.view()` only works when the tensor's memory is laid out contiguously; after
+> `.permute()` or `.transpose()` it raises an error. `.reshape()` always works (copying if it must).
+> And in-place ops like `add_` on a tensor that autograd needs for backward raise an error at
+> `.backward()` time.
+
 ## Autograd
 
+PyTorch's autograd is the engine you built in ch. 4, scaled up to whole tensors. Mark a tensor
+as "I want gradients for this", compute with it, call `.backward()`, and the gradients appear
+in `.grad`.
+
 PyTorch builds a computation graph on the fly. Every tensor with `requires_grad=True` records which operations produced it; calling `.backward()` walks the graph in reverse to compute gradients.
+
+"On the fly" means the graph is recorded while ordinary Python runs, exactly like ch. 4's
+`Value` class. Loops and `if` statements just work: each run records whatever actually happened.
 
 ```python
 x = torch.tensor([2.0, 3.0], requires_grad=True)
@@ -61,6 +93,9 @@ print(f"dy/dx = {x.grad}")  # should be [2*x0, 2*x1] = [4, 6]
 ```output
 dy/dx = tensor([4., 6.])
 ```
+
+For $y = x_0^2 + x_1^2$ the gradient is $(2x_0, 2x_1)$, and at $x = (2, 3)$ that is $(4, 6)$ —
+exactly what printed.
 
 `torch.no_grad()` disables gradient tracking — use it for validation and inference to save memory and compute:
 
@@ -76,9 +111,25 @@ Computed without tracking: 35.0
 x.grad unchanged: tensor([4., 6.])
 ```
 
+The value $2^3 + 3^3 = 35$ was computed, but no graph was recorded, so `x.grad` is still the
+$[4, 6]$ from before. Without `no_grad`, PyTorch would keep every intermediate needed for a
+backward pass you never run (ch. 2's memory cost).
+
+> **Watch out:** `.grad` accumulates. A second `y.backward()` would make `x.grad` equal
+> $[8, 12]$, not $[4, 6]$ — the same `+=` behaviour as ch. 4. That is why every training step
+> starts with `optimizer.zero_grad()`.
+
 ## nn.Module
 
+An `nn.Module` is a container that holds a model's learnable weights and describes how input
+turns into output. You declare the layers once, write the forward computation, and PyTorch
+handles finding every parameter for the optimizer.
+
 Every neural network component subclasses `nn.Module`. Define `__init__` (layers) and `forward` (computation). PyTorch calls your `forward` automatically when you call the module like a function.
+
+`nn.Sequential` chains layers so the output of one is the input of the next. The MLP below
+stacks the pieces from earlier chapters: `Linear` layers, `BatchNorm1d` (ch. 8), `ReLU`, and
+`Dropout` (ch. 9).
 
 ```python
 class MLP(nn.Module):
@@ -107,9 +158,30 @@ Parameters: 5,506
 Trainable:  5,506
 ```
 
+Count the 5,506 parameters by hand: the first `Linear` has $16 \cdot 64 + 64 = 1088$,
+BatchNorm adds $64 + 64 = 128$ ($\gamma$ and $\beta$), the second `Linear` has
+$64 \cdot 64 + 64 = 4160$, and the last has $64 \cdot 2 + 2 = 130$. All of them are trainable.
+BatchNorm's running mean and variance are not in this count: they are **buffers**, saved with
+the model but not updated by the optimizer.
+
 `model.parameters()` yields all leaf tensors with `requires_grad=True`. `model.state_dict()` returns an ordered dict of all parameter tensors — used for saving/loading.
 
+(`state_dict()` also includes the buffers, such as BatchNorm's running statistics, which is
+why loading a state dict restores evaluation behaviour exactly.)
+
 ## The canonical training loop
+
+Every PyTorch training run, from this toy to a large language model, repeats the same five
+lines per batch: clear old gradients, predict, score, backprop, step. Around them you add a
+validation pass each epoch.
+
+> **Picture it:** a basketball practice drill. Wipe the scoreboard (zero_grad), shoot (forward),
+> see how far you missed (loss), work out what to adjust (backward), adjust your stance (step).
+> Then, once per session, play a practice match without coaching (validation).
+
+A `TensorDataset` wraps tensors so that indexing returns `(x, y)` pairs, `random_split` cuts
+it into training and validation parts, and a `DataLoader` serves shuffled mini-batches
+(ch. 11 goes deeper). `CrossEntropyLoss` takes raw logits and applies softmax internally (ch. 5).
 
 ```python
 import torch
@@ -154,16 +226,28 @@ for epoch in range(1, 6):
 ```
 
 ```output
-Epoch 1: loss=0.6847  val_acc=61.50%
-Epoch 2: loss=0.6312  val_acc=68.00%
-Epoch 3: loss=0.5891  val_acc=72.50%
-Epoch 4: loss=0.5534  val_acc=74.00%
-Epoch 5: loss=0.5201  val_acc=76.00%
+Epoch 1: loss=0.6930  val_acc=67.00%
+Epoch 2: loss=0.6368  val_acc=73.00%
+Epoch 3: loss=0.5784  val_acc=82.50%
+Epoch 4: loss=0.5063  val_acc=84.50%
+Epoch 5: loss=0.4038  val_acc=87.00%
 ```
+
+The training loss starts at 0.6930 — essentially $\log 2 = 0.693$, the loss of a 50/50 guess —
+and falls to 0.4038 by epoch 5. Validation accuracy climbs from 67% to 87%. The label depends
+only on the first two of the 16 features, so the network must learn to ignore 14 of them; five
+epochs at $\eta = 10^{-3}$ are not enough to finish, and more epochs would keep improving it.
 
 The five-step loop (`zero_grad → forward → loss → backward → step`) is universal — everything else (schedulers, mixed precision, gradient clipping) wraps around it.
 
+> **Watch out:** `model.train()` and `model.eval()` switch Dropout and BatchNorm between their
+> two behaviours (ch. 8–9). They do *not* turn off gradient tracking — that is
+> `torch.no_grad()`'s job. Validation needs both.
+
 ## Moving to GPU
+
+A GPU does thousands of multiplications at once, so moving a model there can make training
+tens of times faster. The rule is simple: the model and the data must be on the same device.
 
 ```python
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -181,9 +265,19 @@ Using device: cpu
 Output shape: torch.Size([32, 2]), device: cpu
 ```
 
+This kernel has no GPU, so `device` is `cpu` and the output lives there too. The same code runs
+unchanged on a machine with CUDA — that is the point of the `device` variable.
+
 The pattern is always: move model to device once, then move each batch to device inside the loop with `xb = xb.to(device)`.
 
+> **Watch out:** "Expected all tensors to be on the same device" is the error you get when one
+> batch or one freshly created tensor (like a mask made with `torch.ones`) stays on the CPU.
+> Create new tensors with `device=xb.device` to avoid it.
+
 ## Saving and loading checkpoints
+
+A **checkpoint** is a snapshot of training saved to disk so you can stop and resume later, or
+keep the best model you have seen (ch. 9's early stopping).
 
 ```python
 import os, tempfile
@@ -208,9 +302,28 @@ print(f"Loaded from epoch {checkpoint['epoch']}, loss={checkpoint['loss']}")
 Loaded from epoch 5, loss=0.5201
 ```
 
+The epoch number and loss came back from disk. Here the stored `loss` (0.5201) is a value typed
+into the dictionary, not one computed by this run. `weights_only=True` tells `torch.load` to
+accept only tensors and plain containers, which is safer than unpickling arbitrary Python objects.
+
 Always save both model state and optimizer state — optimizer contains momentum buffers and the adaptive learning rates, and resuming without them changes the training trajectory.
 
+Add the LR scheduler's `state_dict()` too: otherwise a resumed run restarts its warmup or
+cosine schedule from step 0 (ch. 6).
+
+## Recap in plain words
+
+- A tensor is an array with a dtype and a device, and it can record how it was computed.
+- `requires_grad=True` plus `.backward()` fills `.grad`; gradients accumulate until you zero them.
+- An `nn.Module` holds layers and parameters; `nn.Sequential` chains them.
+- Every training step is `zero_grad`, forward, loss, `backward`, `step`.
+- Validation uses `model.eval()` and `torch.no_grad()` together.
+- Checkpoints should hold model, optimizer, and scheduler state.
+
 ## Try it Yourself
+
+This block trains a 3-layer MLP to predict the sum of the first three of 8 inputs, plus a little
+noise, using Adam and MSE.
 
 ```python
 import torch
@@ -249,18 +362,24 @@ for epoch in range(1, 11):
 ```
 
 ```output
-Epoch 2: MSE=3.4821
-Epoch 4: MSE=1.2341
-Epoch 6: MSE=0.5612
-Epoch 8: MSE=0.2134
-Epoch 10: MSE=0.1023
+Epoch 2: MSE=1.5954
+Epoch 4: MSE=0.2875
+Epoch 6: MSE=0.0872
+Epoch 8: MSE=0.0493
+Epoch 10: MSE=0.0276
 ```
 
+The MSE drops from 1.5954 at epoch 2 to 0.0276 at epoch 10. The noise added to the target has
+std 0.1, so the best possible MSE is about $0.1^2 = 0.01$; the network is approaching that floor.
 Try replacing `nn.ReLU()` with `nn.Tanh()` or adding `nn.BatchNorm1d(32)` between linear and activation.
 
 ## Exercise
 
 Modify the training loop above to add: (1) gradient clipping at norm 1.0, (2) a cosine annealing LR schedule over 20 epochs, (3) save the best checkpoint (lowest val loss) and reload it at the end. Use the MLP from earlier with 20% of the data as validation.
+
+> **Hint:** `clip_grad_norm_` goes between `loss.backward()` and `opt.step()`; `sched.step()`
+> goes once per epoch, after the batch loop; save `model.state_dict()` whenever the validation
+> loss beats the best so far.
 
 <details>
 <summary>Solution</summary>
@@ -300,4 +419,10 @@ for epoch in range(1, 21):
 model.load_state_dict(torch.load(ckpt, weights_only=True))
 print(f"Best val MSE: {best:.4f}")
 ```
+
+This prints a best validation MSE of 0.0166, close to the noise floor of about 0.01. The order
+of the three additions matters: clipping must see the gradients after `backward()` and before
+`step()`; the cosine scheduler steps per epoch here because `T_max=20` counts epochs; and the
+final `load_state_dict` replaces the last-epoch weights with the best ones. Gradient clipping is
+covered in depth in ch. 13.
 </details>

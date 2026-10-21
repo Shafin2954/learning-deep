@@ -7,9 +7,21 @@ order: 11
 
 ## Dataset and DataLoader
 
+A training loop (ch. 10) needs a steady stream of mini-batches. PyTorch splits that job in two:
+one object knows how to fetch *one* example, and a second object groups examples into
+shuffled batches and serves them up.
+
 PyTorch separates *what* data to load (`Dataset`) from *how* to batch and shuffle it (`DataLoader`).
 
 A map-style `Dataset` requires two methods: `__len__` and `__getitem__`. The DataLoader calls `__getitem__` on multiple indices in parallel (via `num_workers`) and collates the results into a batch.
+
+**Map-style** means the dataset works like a lookup table: give it an index, get back one
+example. **Collating** means stacking the individual examples into batch tensors — 64 vectors of
+length 16 become one $64 \times 16$ tensor.
+
+> **Picture it:** the `Dataset` is a librarian who can fetch any single book by its shelf
+> number. The `DataLoader` is the delivery van that decides which numbers to request, in what
+> random order, and packs 64 books per box. More `num_workers` means more librarians fetching at once.
 
 ```python
 import torch
@@ -42,7 +54,15 @@ Dataset size: 1000
 First item: x shape=torch.Size([16]), label=1
 ```
 
+The dataset reports 1000 examples, and `ds[0]` returns one feature vector of 16 numbers and its
+label (1, because $x_0 + x_1 > 0$ for this row). Note the dtypes chosen in `__init__`:
+`float32` for features (PyTorch's default for weights) and `long` (64-bit integers) for class
+labels, which is what `CrossEntropyLoss` expects.
+
 ## DataLoader options
+
+The `DataLoader` has a handful of switches that control order, batch size, and speed. Most
+runs only change `batch_size`, `shuffle`, and `num_workers`.
 
 ```python
 loader = DataLoader(
@@ -64,9 +84,26 @@ Batch x: torch.Size([64, 16]), batch y: torch.Size([64])
 Batches per epoch: 16
 ```
 
+One batch has 64 rows of 16 features and 64 labels. There are 16 batches per epoch:
+$1000 / 64 = 15.6$, rounded up, because `drop_last=False` keeps the final short batch of
+$1000 - 15 \cdot 64 = 40$ examples.
+
 `num_workers > 0` spawns worker processes that prefetch data in parallel with the GPU. On Windows, always use `if __name__ == "__main__":` guards for multiprocessing — otherwise worker spawning fails. `pin_memory=True` allocates batches in pinned (page-locked) CPU memory so the CUDA DMA engine can transfer them faster.
 
+**Prefetching** means preparing the next batches while the GPU is still busy with the current
+one, so it never waits. **Pinned memory** is RAM the operating system promises not to move, so
+the GPU's **DMA engine** (hardware that copies memory without the CPU's help) can read it directly.
+
+> **Watch out:** with `num_workers > 0`, every worker gets a copy of the dataset object and of
+> the random number generator state. Random augmentations that use NumPy's global RNG can then
+> repeat identically across workers. Use `torch` random functions inside `__getitem__`, or seed
+> each worker with `worker_init_fn`.
+
 ## Image Dataset from files
+
+Real image data usually sits in files on disk, far too big to load all at once. The dataset
+then stores only the *paths*, and opens, decodes and transforms one image each time
+`__getitem__` is called.
 
 ```python
 import os
@@ -107,9 +144,28 @@ Transform pipeline defined (Resize → CenterCrop → ToTensor → Normalize)
 Output tensor range after Normalize: approximately [-2.1, 2.6]
 ```
 
+This block defines the class and the pipeline without real files, so both printed lines are
+fixed messages. The range in the second line is still correct, and you can check it:
+`ToTensor` gives values in $[0, 1]$, and `Normalize` subtracts the channel mean and divides by
+the std. The lowest value is $(0 - 0.485)/0.229 \approx -2.12$ (red channel) and the highest is
+$(1 - 0.406)/0.225 \approx 2.64$ (blue channel).
+
+A **transform** is a function applied to each example as it is loaded; `T.Compose` chains
+several. `ToTensor` also reorders the axes from height-width-channel (how images are stored) to
+channel-height-width, written **CHW**, which is what PyTorch's image layers expect. The
+"ImageNet stats" are the per-channel mean and std of the ImageNet photo collection, standard
+when you reuse a model pretrained on it.
+
 ## Augmentation transforms
 
+**Augmentation** shows the model slightly altered copies of each training image — flipped,
+cropped, recoloured — so it learns that a cat is still a cat when mirrored or in dim light.
+It is a regularizer (ch. 9): the model cannot memorize exact pixels that keep changing.
+
 Data augmentation applies random perturbations during training to synthetically expand the dataset and regularize the model. Use `T.RandomHorizontalFlip`, `T.RandomCrop`, `T.ColorJitter`, etc. Crucially, use different transforms for train vs validation:
+
+Validation must measure the model on data as it really is, so its transform is deterministic:
+resize, center-crop, normalize — the same result every time.
 
 ```python
 train_transform = T.Compose([
@@ -138,13 +194,30 @@ print(f"Val tensor:   {tensor_val.shape},   mean={tensor_val.mean():.3f}")
 ```
 
 ```output
-Train tensor: torch.Size([3, 224, 224]), mean=0.012
-Val tensor:   torch.Size([3, 224, 224]), mean=0.011
+Train tensor: torch.Size([3, 224, 224]), mean=0.212
+Val tensor:   torch.Size([3, 224, 224]),   mean=0.229
 ```
+
+Both pipelines produce the same shape, $3 \times 224 \times 224$, which is what lets you swap
+them freely. The means differ (0.212 versus 0.229) because the training pipeline randomly
+cropped and recoloured the image (a flip alone would not change the mean); rerun the block and the training mean will
+change while the validation mean stays at 0.229.
+
+> **Watch out:** pick augmentations that keep the label true. A horizontal flip is fine for
+> cats; for handwritten digits it turns a 2 into something that is no longer a 2, and for text
+> or road signs with arrows it changes the meaning.
 
 ## Handling class imbalance
 
+If 90% of examples are class 0, a model can score 90% accuracy by always saying 0. One fix is
+to change how often each example is *drawn*, so batches come out roughly balanced.
+
 When classes are imbalanced, `WeightedRandomSampler` oversamples minority classes so each batch sees a balanced distribution:
+
+**Oversampling** means drawing minority-class examples more often than they appear. Each
+example's draw weight is 1 divided by its class size, so each *class* gets the same total weight.
+`replacement=True` allows the same example to be drawn more than once per epoch, which is
+required: there are only 100 class-1 examples to fill about 500 slots.
 
 ```python
 from torch.utils.data import WeightedRandomSampler
@@ -168,13 +241,28 @@ print(f"Ratio: {counts[1]/counts[0]:.2f} (close to 1.0 if balanced)")
 ```
 
 ```output
-Balanced loader — class 0: 512, class 1: 488
-Ratio: 0.95 (close to 1.0 if balanced)
+Balanced loader — class 0: 482, class 1: 518
+Ratio: 1.07 (close to 1.0 if balanced)
 ```
+
+The original data was 900 to 100, a ratio of 0.11. After sampling one epoch of 1000 draws, it
+is 482 to 518, a ratio of 1.07 — balanced up to random noise. Each class-1 example was drawn
+about 5 times on average; each class-0 example about half the time.
+
+> **Watch out:** oversampling repeats the same few minority examples, so the model can memorize
+> them. Combine it with augmentation, or use a weighted loss (`CrossEntropyLoss(weight=...)`) or
+> focal loss (ch. 5) instead.
 
 ## Custom collate_fn for variable-length inputs
 
+Sentences and audio clips come in different lengths, and a tensor must be rectangular. The fix
+is **padding**: fill every short sequence with zeros up to the longest one in the batch, and
+remember the true lengths so the model can ignore the padding.
+
 When inputs have different lengths (sequences, documents), the default collator can't stack them into a tensor. Supply a custom `collate_fn`:
+
+A `collate_fn` is the function the `DataLoader` uses to turn a list of examples into a batch;
+you pass yours with `DataLoader(..., collate_fn=pad_collate)`.
 
 ```python
 def pad_collate(batch):
@@ -196,11 +284,30 @@ print(f"Lengths: {lengths.tolist()}")
 ```
 
 ```output
-Padded tensor: torch.Size([8, 19])
-Lengths: [7, 16, 14, 19, 9, 11, 18, 6]
+Padded tensor: torch.Size([8, 18])
+Lengths: [18, 5, 17, 17, 16, 16, 18, 8]
 ```
 
+The eight sequences have lengths between 5 and 18, so the batch is padded to width 18. The
+sequence of length 5 is now 13 zeros longer than its real content. Keeping `lengths` lets a
+later model build a **mask** that hides those zeros (attention and RNN layers both need one).
+
+> **Picture it:** packing different-length baguettes into a rectangular box. You fill the gaps
+> with foam (zeros) and write each baguette's real length on the label, so nobody tries to eat the foam.
+
+## Recap in plain words
+
+- A `Dataset` returns one example by index; a `DataLoader` shuffles, batches, and prefetches.
+- Batches per epoch is the dataset size divided by the batch size, rounded up unless `drop_last=True`.
+- Image datasets store paths and decode and transform one image at a time.
+- Training uses random augmentations; validation uses a fixed, deterministic transform.
+- `WeightedRandomSampler` balances classes by drawing rare examples more often.
+- A custom `collate_fn` pads variable-length inputs and returns their true lengths.
+
 ## Try it Yourself
+
+This block defines a small dataset of 500 points on a noisy sine wave and iterates over one
+shuffled epoch.
 
 ```python
 import torch
@@ -229,15 +336,26 @@ print(f"Total batches: {len(loader)}, total samples: {len(ds)}")
 ```
 
 ```output
-First batch: x range=[0.00, 1.98], y shape=torch.Size([32, 1])
+First batch: x range=[0.00, 1.83], y shape=torch.Size([32, 1])
 Total batches: 16, total samples: 500
 ```
 
+The first batch's $x$ values range from 0.00 to 1.83, scattered across the whole $[0, 2]$
+interval — proof that `shuffle=True` mixed the order (without shuffling, the first batch
+would cover only $[0, 0.12]$). Each target has shape $(32, 1)$, and 500 samples need 16
+batches.
+
 Try increasing `num_workers=2` (on Linux/Mac) and measuring how long one epoch takes vs `num_workers=0`.
+
+For a dataset this tiny, expect workers to be *slower*: starting processes costs more than the
+work saved. Workers pay off when `__getitem__` does real work, such as decoding JPEGs.
 
 ## Exercise
 
 Build an `AugmentedTensorDataset` that wraps a tensor `(N, C, H, W)` and applies random horizontal flip and Gaussian noise during `__getitem__` (training mode) but returns clean tensors in eval mode. Verify that the augmented and clean versions have different pixel values.
+
+> **Hint:** keep a `self.training` flag, `clone()` the example before changing it, flip with
+> `torch.flip(x, dims=[-1])` (the width axis), and add `torch.randn_like(x) * noise_std`.
 
 <details>
 <summary>Solution</summary>
@@ -277,4 +395,10 @@ print(f"Max pixel diff: {(x_aug - x_clean).abs().max():.4f}")
 ```
 
 Set `ds.training = True` before creating the train DataLoader and `False` before the val DataLoader.
+
+The script prints `Augmented same as clean: False` and a max pixel difference of 0.1705, about
+three times the noise std of 0.05 — the largest of 192 noisy pixels. The `clone()` matters:
+without it, `x + noise` is safe, but an in-place change would corrupt the stored dataset for
+every later epoch. Using two separate dataset objects that share `X` is cleaner than flipping
+one flag back and forth.
 </details>

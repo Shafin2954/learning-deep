@@ -7,17 +7,38 @@ order: 4
 
 ## The lineage of convolutional architectures
 
+The famous CNNs are a family tree: each one kept what worked in the last and fixed one
+problem. Knowing the tree tells you why today's networks look the way they do.
+
 Every modern CNN inherits decisions made across thirty years of architecture search. Understanding the lineage stops you from reinventing solved problems.
 
 **LeNet-5 (1998):** Two conv layers, average pooling, then fully-connected layers for digit recognition. First proof that spatial weight-sharing beats fully-connected networks on images.
 
-**AlexNet (2012):** Won ImageNet with an 8-layer network trained on two GPUs. Contributions: ReLU activation (faster than tanh/sigmoid), dropout for regularization, data augmentation at training time, and max pooling instead of average pooling.
+**AlexNet (2012):** Won ImageNet with an 8-layer network trained on two GPUs. Contributions: ReLU activation (faster than tanh/sigmoid), dropout for regularization, data augmentation at training time, and max pooling instead of average pooling. (**ImageNet** is the 1.2-million-photo, 1,000-class benchmark that most of these models competed on.)
 
-**VGGNet (2014):** Showed that depth beats width. Used only 3×3 convs stacked deep — a 3×3 conv twice has a 5×5 effective receptive field with fewer parameters ($2 \times 3^2 C^2$ vs $5^2 C^2$). VGG-16 and VGG-19 dominated until ResNet.
+**VGGNet (2014):** Showed that depth beats width. Used only $3 \times 3$ convs stacked deep — a $3 \times 3$ conv twice has a $5 \times 5$ effective receptive field with fewer parameters ($2 \times 3^2 C^2$ vs $5^2 C^2$). VGG-16 and VGG-19 dominated until ResNet.
+
+> **In plain words:** with $C$ channels in and out, one $5 \times 5$ conv has $25C^2$ weights,
+> while two $3 \times 3$ convs have $18C^2$ — 28% fewer — and sneak an extra ReLU in between.
 
 ## The degradation problem
 
-Adding more layers should never hurt — at worst the extra layers can learn identity maps. But in practice, after 20+ layers, accuracy degrades even on the training set. This is not overfitting (train loss also rises); it's an optimization difficulty: the gradient signal becomes too weak to learn even the identity function through many layers.
+You would expect a deeper network to be at least as good as a shallow one: the extra layers
+could pass their input through unchanged. In practice, plain deep networks get *worse*, even on
+the data they train on.
+
+Adding more layers should never hurt — at worst the extra layers can learn identity maps (an
+**identity map** returns its input unchanged). But in practice, after 20+ layers, accuracy
+degrades even on the training set. This is not overfitting (train loss also rises); it's an
+optimization difficulty: the gradient signal becomes too weak to learn even the identity
+function through many layers.
+
+> **Picture it:** a game of telephone. Each player (layer) slightly garbles the message. With
+> 2 players the message survives; with 16, the person at the end hears mush — and when the
+> correction travels back down the line (backpropagation), it gets garbled the same way.
+
+The code below builds plain stacks of conv + ReLU of depth 2, 8, and 16 and measures the
+average size (norm) of the gradient on each layer's weights.
 
 ```python
 import torch
@@ -40,19 +61,27 @@ def measure_grad_norm(depth: int) -> float:
     norms = [p.grad.norm().item() for p in net.parameters() if p.grad is not None]
     return sum(norms) / len(norms)
 
+torch.manual_seed(0)
 for d in [2, 8, 16]:
     print(f"depth={d:2d}  mean |grad| = {measure_grad_norm(d):.4f}")
 ```
 
 ```output
-depth= 2  mean |grad| = 0.0521
-depth= 8  mean |grad| = 0.0089
-depth=16  mean |grad| = 0.0012
+depth= 2  mean |grad| = 0.1328
+depth= 8  mean |grad| = 0.0159
+depth=16  mean |grad| = 0.0067
 ```
+
+Going from 2 to 16 layers, the average gradient drops from 0.1328 to 0.0067 — about 20 times
+smaller. Small gradients mean small weight updates, so the early layers barely learn.
 
 Gradient norm collapses. A 16-layer plain net barely updates.
 
 ## ResNet: the skip connection
+
+ResNet's idea: let each block add a *correction* to its input instead of producing a brand-new
+output. If nothing needs correcting, the block outputs (almost) zero and the input passes
+through untouched.
 
 He et al. (2015) proposed a simple fix: instead of learning the full mapping $H(x)$, let the layer learn the **residual** $F(x) = H(x) - x$, and add $x$ back:
 
@@ -60,7 +89,15 @@ $$
 y = F(x, \{W_i\}) + x
 $$
 
+> **In plain words:** $x$ is what comes into the block; $F(x, \{W_i\})$ is what the block's
+> layers (with weights $W_i$) compute; $y$ is the output. The block only has to learn the
+> *difference* between what it receives and what it should send on.
+
 If the optimal mapping is the identity, $F \to 0$ is easier to learn than $H \to x$. More importantly, the gradient now flows directly through the skip path regardless of depth — the additive shortcut is a **gradient highway**.
+
+> **Picture it:** editing a document with "track changes" instead of retyping it. A block
+> that has nothing to add leaves the page as it is; the original text (the skip path) always
+> reaches the end of the pipeline.
 
 ```python
 class ResidualBlock(nn.Module):
@@ -89,7 +126,14 @@ print("Input:", x.shape, "  Output:", y.shape)
 Input: torch.Size([2, 64, 28, 28])   Output: torch.Size([2, 64, 28, 28])
 ```
 
+Input and output shapes match exactly, `[2, 64, 28, 28]`. They have to: you can only add $x$ to
+$F(x)$ if they are the same shape. `BatchNorm2d` here normalises each channel (ch. 5); it is why
+the convs use `bias=False` — BN's own shift makes a conv bias redundant.
+
 ### Projection shortcut when dimensions change
+
+When a block halves the image or changes the channel count, $x$ no longer has the same shape
+as $F(x)$. The fix is a cheap layer on the skip path that reshapes $x$ to match.
 
 When a block changes channels or strides, the skip must be projected to match:
 
@@ -97,7 +141,10 @@ $$
 y = F(x) + W_s x
 $$
 
-where $W_s$ is a 1×1 conv (no spatial operations, just channel mixing).
+where $W_s$ is a $1 \times 1$ conv (no spatial operations, just channel mixing).
+
+> **In plain words:** $W_s x$ is the input pushed through a $1 \times 1$ conv with the same
+> stride as the block, so it ends up with the same channels and size as $F(x)$.
 
 ```python
 class ResidualBlockDown(nn.Module):
@@ -128,13 +175,27 @@ print("Input:", x.shape, "  Output:", y.shape)
 Input: torch.Size([2, 64, 28, 28])   Output: torch.Size([2, 128, 14, 14])
 ```
 
+The main path goes from 64 to 128 channels and from $28 \times 28$ to $14 \times 14$ (stride 2);
+the projection `self.proj` does the same to $x$, so the addition works.
+
+> **Watch out:** forgetting the projection gives a shape error at the `+`. Forgetting its
+> `stride=stride` is subtler: channels match, but sizes do not, and the error only appears
+> when the first downsampling block runs.
+
 ## Bottleneck blocks
 
-Deep ResNets (50, 101, 152 layers) use bottleneck blocks: 1×1 to compress, 3×3 to mix spatially, 1×1 to expand. This cuts FLOPs substantially while increasing representational depth.
+A **bottleneck** block squeezes the channels down, does the expensive $3 \times 3$ work on the
+thin version, and then expands back. It is the same trick as summarising a long report before
+discussing it.
+
+Deep ResNets (50, 101, 152 layers) use bottleneck blocks: $1 \times 1$ to compress, $3 \times 3$ to mix spatially, $1 \times 1$ to expand. This cuts FLOPs substantially while increasing representational depth. (**FLOPs** = floating-point operations, the usual measure of compute.)
 
 $$
 \text{Block: } 1\times1 \to 3\times3 \to 1\times1 \quad \text{channels: } C \to C/4 \to C/4 \to C
 $$
+
+> **In plain words:** a block with $C = 256$ channels runs its $3 \times 3$ conv on only
+> $C/4 = 64$ channels, then a $1 \times 1$ conv restores all 256.
 
 ```python
 class BottleneckBlock(nn.Module):
@@ -159,10 +220,18 @@ print("Output:", y.shape, "  Params:", params)
 ```
 
 ```output
-Output: torch.Size([2, 256, 14, 14])   Params: 70,400
+Output: torch.Size([2, 256, 14, 14])   Params: 70400
 ```
 
+The block has 70,400 parameters. A pair of plain $3 \times 3$ convs at 256 channels would have
+$2 \times 9 \times 256^2 \approx 1.18$ million — about 17 times more. The count is
+$256 \cdot 64 + 9 \cdot 64^2 + 64 \cdot 256 = 69{,}632$ conv weights plus $2 \times (64 + 64 + 256) = 768$
+BatchNorm weights.
+
 ## Building a small ResNet
+
+Now you stack the pieces: a stem, three stages of residual blocks (each later stage halves the
+image and doubles the channels), and a global-average-pool head (ch. 3).
 
 ```python
 class SmallResNet(nn.Module):
@@ -190,10 +259,17 @@ print(f"Total params: {total:,}")
 
 ```output
 Output: torch.Size([2, 10])
-Total params: 1,178,634
+Total params: 2,777,674
 ```
 
+A $32 \times 32$ image (CIFAR-sized) comes out as 10 class scores. The model has about 2.78
+million parameters, most of them in `layer3`, where each $3 \times 3$ conv has
+$9 \times 256^2 \approx 590{,}000$ weights.
+
 ## Why gradients flow through ResNets
+
+The skip connection guarantees that part of the gradient reaches every layer unchanged, no
+matter how deep the network is.
 
 With skip connections, the gradient at layer $l$ contains a direct additive term:
 
@@ -201,15 +277,42 @@ $$
 \frac{\partial \mathcal{L}}{\partial x_l} = \frac{\partial \mathcal{L}}{\partial x_L} \cdot \left(1 + \frac{\partial \sum_{i=l}^{L-1} F_i}{\partial x_l}\right)
 $$
 
+> **In plain words:**
+> - $\mathcal{L}$ is the loss; $x_l$ is the input to layer $l$; $x_L$ is the final layer's output.
+> - $\partial \mathcal{L} / \partial x_L$ is the error signal at the top.
+> - The "1" comes from the skip paths: the top error is copied straight down.
+> - The sum term is the extra signal that flows through the blocks' own layers $F_i$.
+
 The $1$ means the gradient from the loss always reaches every layer, regardless of what $F_i$ are doing. ResNets with 1000+ layers are trainable.
+
+> **Watch out:** this assumes a clean identity path. A ReLU *after* the addition (as in the
+> original block above) slightly breaks it; that is the motivation for the pre-activation
+> block in this chapter's exercise.
 
 ## DenseNet and EfficientNet
 
-**DenseNet** extends the idea: each layer receives feature maps from *all* preceding layers (not just the previous one). This extreme reuse lets DenseNet reach high accuracy with fewer parameters, at the cost of memory (you must cache all intermediate maps).
+Two later families pushed the ResNet idea in different directions: one by connecting more
+layers, the other by growing a network in a balanced way.
+
+**DenseNet** extends the idea: each layer receives feature maps from *all* preceding layers (not just the previous one). This extreme reuse lets DenseNet reach high accuracy with fewer parameters, at the cost of memory (you must cache all intermediate maps). DenseNet joins maps by stacking them along the channel axis (concatenation) instead of adding them.
 
 **EfficientNet** found that scaling depth, width, and resolution together with a fixed ratio (compound scaling) gives the best accuracy/FLOPs tradeoff. EfficientNet-B0 to B7 covers the full accuracy frontier.
 
+> **Picture it:** scaling a recipe for more guests. Doubling only the flour (depth) or only
+> the sugar (width) ruins the cake; compound scaling grows every ingredient by a fixed ratio.
+
+## Recap in plain words
+
+- LeNet proved weight sharing works, AlexNet made deep CNNs win with ReLU, dropout, and GPUs, and VGG showed stacks of $3 \times 3$ convs beat big kernels.
+- Plain deep nets get worse even on training data because gradients fade layer by layer.
+- A residual block outputs input plus a learned correction, so a "do nothing" block is easy.
+- When shapes change, a $1 \times 1$ strided conv on the skip path makes the addition fit.
+- Bottleneck blocks do the $3 \times 3$ work on a quarter of the channels to save compute.
+
 ## Try it Yourself
+
+This puts 10 plain conv layers and 10 residual blocks side by side and compares the average
+gradient on their weights.
 
 ```python
 import torch
@@ -222,6 +325,7 @@ def avg_grad_norm(model, x):
     norms = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
     return sum(norms) / len(norms)
 
+torch.manual_seed(0)
 plain = nn.Sequential(*[nn.Sequential(
     nn.Conv2d(32, 32, 3, padding=1), nn.ReLU()) for _ in range(10)])
 resnet = nn.Sequential(*[ResidualBlock(32) for _ in range(10)])
@@ -234,15 +338,22 @@ print(f"ResNet     avg |grad|: {avg_grad_norm(resnet, x):.5f}")
 ```
 
 ```output
-Plain net  avg |grad|: 0.00041
-ResNet     avg |grad|: 0.02183
+Plain net  avg |grad|: 0.01784
+ResNet     avg |grad|: 0.11576
 ```
+
+The residual stack's average gradient (0.11576) is about 6.5 times the plain stack's (0.01784),
+with the same depth and the same input size. That is the gradient highway at work.
 
 Try making the plain net 20 layers deep and compare. Then try removing `bias=False` from ResNet's convolutions and check if the gradient norm changes.
 
 ## Exercise
 
 Implement a pre-activation residual block (He et al. 2016 v2) where BN and ReLU come *before* the convolutions rather than after. Check that a 5-layer pre-activation ResNet produces larger average gradient norms than the post-activation version.
+
+> **Hint:** the block is BN, ReLU, conv, BN, ReLU, conv — and then add $x$ with no ReLU after
+> the sum. To compare, build a 5-block stack of `ResidualBlock(32)` and use the same
+> gradient-measuring code on both.
 
 <details>
 <summary>Solution</summary>
@@ -268,4 +379,9 @@ print("Pre-act avg |grad|:", sum(norms)/len(norms))
 ```
 
 Pre-activation blocks place BN before each conv, so activations are normalized before the non-linearity. This improves gradient flow and regularization in very deep networks.
+
+The key insight is the clean skip path: with nothing after the `+`, each block's output is
+exactly $x + F(x)$, so the "1" in the gradient formula above is exact. Running this, the
+pre-activation stack's average gradient norm is about 0.21, versus about 0.09 for a 5-block
+stack of the post-activation `ResidualBlock(32)` on the same input size.
 </details>
