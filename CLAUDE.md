@@ -18,7 +18,7 @@ real Python against the local backend (already built and tested).
 
 The full curriculum is 20 courses, basic → advanced, in PLAN.md §2. Existing fast-track
 courses (`foundations-for-llm`, `bengali-llm`, `tabular-kaggle`) live alongside the full-depth
-courses and are never modified. New courses follow PLAN.md §5 build order, one course per pass.
+courses; they follow the same authoring rules, including the ELI5 layer (rule 12). New courses follow PLAN.md §5 build order, one course per pass.
 
 ---
 
@@ -30,9 +30,9 @@ mlforge/
 ├── environment/      # Python stack the kernel imports.
 ├── web/              # Next.js frontend (done). Only edit content files below + courseNames.ts / NavBar.tsx / page.tsx when registering.
 ├── courses/          # CONTENT: one subdirectory per course.
-│   ├── foundations-for-llm/   # fast-track (do not edit)
-│   ├── bengali-llm/           # fast-track (do not edit)
-│   ├── tabular-kaggle/        # fast-track (do not edit)
+│   ├── foundations-for-llm/   # fast-track
+│   ├── bengali-llm/           # fast-track
+│   ├── tabular-kaggle/        # fast-track
 │   └── <new-course-slug>/     # ← your work goes here
 └── docs/PLAN.md      # full curriculum: chapter lists, Under the Trench items, capstone specs
 ```
@@ -357,7 +357,7 @@ cd web && npm i && npm run dev      # site on :3000
 - `sessionId = course/chapter`. No browser storage except `sessionStorage` in `NotebookStore.tsx`.
 - Code blocks never wrap (scroll). Math never renders as a code box. Headings are real `<h*>`.
 - Outputs are real — run the kernel, paste actual stdout.
-- The existing three fast-track courses are frozen; do not edit their content.
+- The three fast-track courses are maintained like the others: same rules, real outputs, ELI5 layer.
 
 ---
 
