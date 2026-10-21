@@ -7,15 +7,30 @@ order: 2
 
 ## The recurrent update
 
+A recurrent network reads a sequence the way you read a sentence: one word at a time, keeping
+a running memory of what came before. After each word it updates that memory, using the same
+rule every time.
+
 An RNN processes a sequence one step at a time, carrying a hidden state $h_t$ that summarizes everything seen so far:
 
 $$
 h_t = \tanh(W_{hh} h_{t-1} + W_{xh} x_t + b)
 $$
 
+> **In plain words:** new memory = squash( (old memory, mixed by one weight matrix) + (new
+> input, mixed by another) + a bias ). The squash keeps every number between −1 and 1.
+
 $x_t \in \mathbb{R}^d$ is the input at step $t$. $h_t \in \mathbb{R}^h$ is the hidden state. $W_{hh} \in \mathbb{R}^{h \times h}$ connects the previous hidden state to the new one. $W_{xh} \in \mathbb{R}^{h \times d}$ projects the input. $\tanh$ squashes values into $(-1, 1)$.
 
+An **RNN** (recurrent neural network) is a network whose output at one step is fed back in as
+input at the next. The **hidden state** is that fed-back vector — the network's short-term
+memory, $h$ numbers long.
+
 The same weights $W_{hh}$, $W_{xh}$, and $b$ are reused at every timestep — this is weight sharing across time.
+
+> **Picture it:** a clerk with a notepad. At each step the clerk reads one new word, glances
+> at the notepad, and rewrites the notepad. The clerk follows the same instructions (the
+> weights) for every word; only the notepad changes.
 
 For language modeling, the output at each step predicts the next token:
 
@@ -23,7 +38,17 @@ $$
 \hat{y}_t = \text{softmax}(W_{hy} h_t + b_y)
 $$
 
+> **In plain words:** read the current memory $h_t$ through one more weight matrix $W_{hy}$
+> to get one score per vocabulary token, then **softmax** turns those scores into
+> probabilities that add up to 1. $\hat{y}_t$ is the model's guess for the next token.
+
+Weight sharing is why an RNN can read a sequence of any length with a fixed number of
+parameters: 10 steps or 10,000 steps use the same three weight tensors.
+
 ## Implementing an RNN cell from scratch
+
+A **cell** is the one-step rule: take (input, old memory), return new memory. Loop the cell
+over the sequence and you have the whole RNN.
 
 ```python
 import numpy as np
@@ -43,7 +68,7 @@ class RNNCell:
 input_size, hidden_size, seq_len = 5, 8, 6
 cell = RNNCell(input_size, hidden_size)
 
-x_seq = np.random.randn(seq_len, input_size)
+x_seq = np.random.default_rng(0).standard_normal((seq_len, input_size))
 h = np.zeros(hidden_size)
 hidden_states = []
 
@@ -58,14 +83,33 @@ print("h_T norm:", np.linalg.norm(hidden_states[-1]).round(4))
 
 ```output
 Hidden states shape: (6, 8)
-h_T norm: 0.0378
+h_T norm: 0.0365
 ```
+
+You get 6 hidden states (one per step), each 8 numbers long. The final memory $h_T$ has norm
+0.0365 — small, because the weights were initialised with scale 0.01, so each step adds only
+a tiny signal. Note that `forward` multiplies `x @ self.Wxh`, so in code `Wxh` has shape
+(input, hidden): the row-vector transpose of the $W_{xh}$ in the formula.
 
 ## Unrolling in time
 
+Unrolling means drawing the loop out flat, one copy of the cell per step, so you can see the
+whole computation as an ordinary deep network.
+
 Unrolling means drawing the RNN as a feed-forward network with one copy per timestep. The computational graph has $T$ layers (one per step), all sharing the same weights. This is how autodiff sees the RNN.
 
+**Autodiff** (automatic differentiation) is the machinery in PyTorch and friends that
+computes gradients by walking a recorded computation backwards. A **computational graph** is
+that record: which operations happened, on which values.
+
+> **Picture it:** a flip-book. Each page is the same clerk at a different moment. Unrolling
+> lays all the pages side by side on the table, so you can trace how page 1 influenced page 6.
+
 ## Backpropagation Through Time (BPTT)
+
+To learn, the network must ask: "if I nudge my weights, how does the total error change?"
+Because step 6 depends on step 5, which depends on step 4, the answer has to trace blame
+backwards through every step. That is BPTT — ordinary backpropagation on the unrolled graph.
 
 Given a sequence loss $L = \sum_t L_t$, we need $\partial L / \partial W_{hh}$. Since $h_t$ depends on $h_{t-1}$, which depends on $h_{t-2}$, and so on, the gradient flows backward through every timestep:
 
@@ -73,9 +117,25 @@ $$
 \frac{\partial L}{\partial W_{hh}} = \sum_{t=1}^{T} \frac{\partial L_t}{\partial h_t} \cdot \frac{\partial h_t}{\partial W_{hh}}
 $$
 
+> **In plain words:** the total gradient for the recurrent weights is the sum, over every
+> step, of "how much this step's loss cares about its hidden state" times "how much that
+> hidden state depends on the weights".
+
 The tricky part: $\partial h_t / \partial W_{hh}$ involves $\partial h_t / \partial h_{t-1}$, which is $W_{hh}^T \cdot \text{diag}(1 - h_t^2)$ (the Jacobian of tanh). So gradients at early timesteps require multiplying this Jacobian $T$ times.
 
+A **Jacobian** is the matrix of "how much does each output wiggle when each input wiggles".
+Multiplying many of them together is the root of the vanishing and exploding gradient
+problem you will meet in ch. 3.
+
+> **Watch out:** $h_t$ depends on $W_{hh}$ both directly and through $h_{t-1}$, $h_{t-2}$, ...
+> The sum above hides that each term $\partial h_t / \partial W_{hh}$ is itself a chain over
+> all earlier steps. In code, this is the `dh_next` variable carrying gradient backward.
+
 ## Training a character-level language model
+
+A **language model** predicts the next token from the ones before it. Here the tokens are
+characters and the text is "hello world" repeated, so the model must learn which letter
+follows which.
 
 ```python
 import numpy as np
@@ -156,21 +216,65 @@ print(f"Loss at step 199: {losses[199]:.3f}")
 ```
 
 ```output
-Loss at step   0: 2.485
-Loss at step  50: 1.934
-Loss at step 100: 1.712
-Loss at step 199: 1.438
+Loss at step   0: 2.080
+Loss at step  50: 1.984
+Loss at step 100: 1.625
+Loss at step 199: 0.129
 ```
+
+The text has 8 distinct characters (space, d, e, h, l, o, r, w). A model that knows nothing
+assigns each a probability of 1/8, which costs $\ln 8 \approx 2.079$ per character — and
+step 0 shows 2.080, exactly that. By step 199 the loss is 0.129, so the model gives the right
+next character a probability of about $e^{-0.129} \approx 0.88$ on average.
 
 The loss decreases as the RNN learns character transitions in "hello world".
 
+Look at the backward loop: it runs over `reversed(range(seq_len))`, and `dh_next` carries the
+gradient from step $t$ back to step $t-1$. `np.clip(dp, -5, 5)` is **gradient clipping**
+— capping every gradient entry so one bad step cannot blow the weights up.
+
+> **Watch out:** most of the drop happens late (1.984 at step 50, then 0.129 at step 199).
+> RNNs with tiny initial weights often sit on a plateau before they "discover" the pattern;
+> stopping early would make you think training failed.
+
 ## Truncated BPTT
+
+Backpropagating through a whole book would be slow and unstable, so in practice you cut the
+text into short windows and only trace blame back inside each window.
 
 Full BPTT through 1000 steps is expensive and numerically unstable. Truncated BPTT splits the sequence into chunks of length $k$, runs BPTT for each chunk but carries forward the hidden state from the previous chunk. Gradients only flow back $k$ steps, not $T$. The code above already does this implicitly — each 25-step window is one BPTT pass.
 
+One correction to that last sentence: the code above truncates the gradient at 25 steps, but
+it does **not** carry the hidden state across windows — it restarts each window from
+`h = np.zeros((1, H))`. Proper truncated BPTT would start each window from the previous
+window's last hidden state (detached from the gradient), so the forward pass still remembers
+more than 25 characters even though gradients stop at 25.
+
+> **Picture it:** reading a novel chapter by chapter. Truncated BPTT keeps your memory of the
+> earlier chapters (the carried hidden state) but only lets you revise your reading habits
+> based on the current chapter (the truncated gradient).
+
 ## Time complexity
 
+An RNN cannot skip ahead: step 10 needs the result of step 9. That forced one-at-a-time
+order is its main speed limit on modern hardware.
+
 The RNN processes steps sequentially: step $t$ depends on $h_{t-1}$, so you cannot parallelize across time. This is the key weakness that attention-based models overcome. Total cost: $O(T \cdot d \cdot h)$ for forward pass, $O(T \cdot h^2)$ for the recurrent weight gradient.
+
+To be exact, the forward pass also multiplies $h_{t-1}$ by $W_{hh}$ each step, so its full
+cost is $O(T \cdot (d \cdot h + h^2))$; the input part is the $O(T \cdot d \cdot h)$ term.
+The key point is the factor $T$ done in strict order: a GPU can do one big matrix multiply
+fast, but here it must wait for each step before starting the next. Transformers (ch. 7–9)
+process all positions at once.
+
+## Recap in plain words
+
+- An RNN reads one token at a time and keeps a hidden state as its running memory.
+- The same weights are used at every step, so any sequence length works with a fixed model.
+- Unrolling turns the loop into a deep feed-forward graph, one layer per step.
+- BPTT is backpropagation on that unrolled graph; gradients pass back through every step.
+- Truncated BPTT limits how far gradients travel; clipping caps gradient size.
+- Steps must run in order, which makes RNNs slow to train on long sequences.
 
 ## Try it Yourself
 
@@ -201,6 +305,7 @@ by  = np.zeros((1, V))
 
 data = [c2i[c] for c in text]
 seq_len = 9
+lr = 0.1
 
 for step in range(300):
     start = (step * seq_len) % (len(data) - seq_len - 1)
@@ -219,17 +324,41 @@ for step in range(300):
         loss -= np.log(p[0, tgt] + 1e-8)
     if step % 100 == 0:
         print(f"Step {step:3d}  loss={loss/seq_len:.4f}")
+
+    # Backward (BPTT) + update — without this, the loss never moves
+    dWxh, dWhh, dWhy = np.zeros_like(Wxh), np.zeros_like(Whh), np.zeros_like(Why)
+    dbh, dby = np.zeros_like(bh), np.zeros_like(by)
+    dh_next = np.zeros((1, H))
+    for t in reversed(range(seq_len)):
+        dy = ps[t].copy(); dy[0, targets[t]] -= 1
+        dWhy += hs[t].T @ dy; dby += dy
+        dtanh = (1 - hs[t]**2) * (dy @ Why.T + dh_next)
+        dbh += dtanh; dWxh += xs[t].T @ dtanh; dWhh += hs[t-1].T @ dtanh
+        dh_next = dtanh @ Whh.T
+    for p, dp in [(Wxh,dWxh),(Whh,dWhh),(Why,dWhy),(bh,dbh),(by,dby)]:
+        np.clip(dp, -5, 5, out=dp)
+        p -= lr * dp
 ```
 
 ```output
-Step   0  loss=1.1014
-Step 100  loss=0.3821
-Step 200  loss=0.1902
+Step   0  loss=1.0987
+Step 100  loss=0.0051
+Step 200  loss=0.0015
 ```
+
+The pattern "abc" has 3 characters, so an untrained model's loss is $\ln 3 \approx 1.0986$
+— the 1.0987 at step 0. After 100 steps the loss is 0.0051: the model is almost certain of
+every next character, because "abc" repeating is perfectly predictable from the current
+letter alone. The block includes the full backward pass and update, the same as the
+"hello world" model. Try `lr = 0.01` and see how much slower it learns, or change the text
+to `"aab" * 60`, where the letter after an `a` depends on the letter before it.
 
 ## Exercise
 
 Modify the RNN above to **sample** a sequence from the model after training. Starting from `<BOS>` (or any seed character), at each step: compute the softmax distribution over the next character, then sample from it (use `np.random.choice` with the probabilities). Generate 30 characters.
+
+> **Hint:** sampling uses only the forward rule. Feed the sampled index back in as the next
+> input, and carry `h` from one step to the next — never reset it inside the loop.
 
 <details>
 <summary>Solution</summary>
@@ -257,4 +386,10 @@ print("Sampled:", "".join(i2c[i] for i in sampled))
 ```
 
 After 300 steps on "abcabc...", the model should reliably sample "abcabcabc..." since the pattern is perfectly regular.
+
+Run after the Try it block, it prints `abcabcabcabcabcabcabcabcabcabca` (the seed plus 30
+sampled characters). With a loss near 0.001 the predicted probabilities are close to 1 for
+the right character, so random sampling almost never picks a wrong one. On a messier text you
+would see variety — that randomness is what makes sampling different from always taking the
+most likely token (ch. 11).
 </details>
