@@ -7,15 +7,32 @@ order: 10
 
 ## The learning rate warmup schedule
 
+A freshly built Transformer knows nothing, so its first gradients point in fairly random
+directions. Taking big steps on random directions can wreck it. Warmup starts with tiny steps,
+grows them as the gradients become trustworthy, then shrinks them again for fine-tuning.
+
 Transformers initialized randomly have noisy gradients early in training. Starting with a large learning rate amplifies this noise and can diverge. The original Transformer (Vaswani et al., 2017) uses a warmup schedule:
 
 $$
 \text{lr}(t) = d_{\text{model}}^{-0.5} \cdot \min\!\left(t^{-0.5},\ t \cdot t_{\text{warmup}}^{-1.5}\right)
 $$
 
+> **In plain words:** take the smaller of two curves — a straight line rising with $t$, and a
+> curve falling like $1/\sqrt{t}$ — and scale the result down for wider models ($d_{\text{model}}^{-0.5}$).
+> The two curves cross exactly at $t = t_{\text{warmup}}$, which is the peak.
+
 This linearly ramps up from 0 to the peak rate during the first $t_{\text{warmup}}$ steps, then decays as $t^{-0.5}$.
 
+A **learning rate schedule** is a rule for the step size at each training step $t$. To
+**diverge** means the loss grows or turns into `nan` instead of shrinking.
+
 Modern practice often uses a **cosine schedule with linear warmup**: ramp linearly for the first few percent of training steps, then decay as $\frac{1}{2}(1 + \cos(\pi t / T))$.
+
+> **In plain words:** after warmup, the rate follows half a cosine wave from its peak down to
+> 0 at the last step $T$ — slow decline at first, faster in the middle, gently landing at 0.
+
+> **Picture it:** driving out of a car park. You creep at first (warmup), speed up on the open
+> road, then brake smoothly as you approach your destination (decay).
 
 ```python
 import numpy as np
@@ -27,7 +44,7 @@ def transformer_schedule(step, d_model=64, warmup=4000):
 def cosine_with_warmup(step, max_lr=1e-3, warmup=200, total=2000):
     if step < warmup:
         return max_lr * step / warmup
-    t = (step - warmup) / (total - warmup)
+    t = min((step - warmup) / (total - warmup), 1.0)  # stay at 0 after the end
     return max_lr * 0.5 * (1 + np.cos(np.pi * t))
 
 steps = [1, 100, 500, 1000, 2000, 4000, 8000]
@@ -40,18 +57,34 @@ for s in steps:
 
 ```output
   step     vaswani      cosine
-     1    0.000195    0.000005
-   100    0.001953    0.000500
-   500    0.001043    0.001000
-  1000    0.000347    0.000985
-  2000    0.000245    0.000500
-  4000    0.000174    0.000003
-  8000    0.000123    0.000003
+     1    0.000016    0.000005
+   100    0.001563    0.000500
+   500    0.005590    0.000933
+  1000    0.003953    0.000587
+  2000    0.002795    0.000000
+  4000    0.001976    0.000000
+  8000    0.001398    0.000000
 ```
+
+In the Vaswani column (here with warmup 400), the rate rises from 0.000016 at step 1 to
+0.005590 at step 500 — just past the peak of $64^{-0.5} \times 400^{-0.5} = 0.00625$ at step
+400 — then falls slowly: 0.001398 at step 8,000. The cosine column hits its peak of 0.001 at
+step 200, is 0.000587 at step 1,000, and reaches 0 at step 2,000 (`total`), where it stays.
+
+> **Watch out:** a cosine schedule must be clamped at the end. Without the `min(..., 1.0)`,
+> $\cos(\pi t)$ for $t > 1$ climbs back up and the learning rate rises again after the planned
+> end of training.
 
 ## Label smoothing
 
+Training with one-hot targets tells the model "be 100% sure". It can never fully get there,
+so it keeps pushing its scores to extremes. Label smoothing asks for "90% sure" instead,
+which is reachable and leaves room for doubt.
+
 Standard cross-entropy targets a one-hot distribution: probability 1 on the correct class, 0 everywhere else. This encourages the model to be overconfident — log-softmax saturates near $\pm \infty$ for well-classified examples, which can hurt generalization.
+
+**Overconfident** means the predicted probabilities are more extreme than the model's real
+accuracy: it says 99.9% when it is right 90% of the time.
 
 **Label smoothing** (Szegedy et al., 2016) replaces the one-hot with a soft distribution:
 
@@ -59,7 +92,15 @@ $$
 q_k = \begin{cases} 1 - \varepsilon + \varepsilon/V & k = \text{correct} \\ \varepsilon/V & k \neq \text{correct} \end{cases}
 $$
 
+> **In plain words:** take a fraction $\varepsilon$ of the probability away from the correct
+> class and spread it evenly over all $V$ classes (the correct one included). With
+> $\varepsilon = 0.1$ and $V = 100$, the target is 0.901 on the right answer and 0.001 on each
+> of the other 99.
+
 Typical $\varepsilon = 0.1$: 90% probability on the true class, 10% distributed over all others. Reduces overconfidence and improves calibration.
+
+**Calibration** is how well predicted probabilities match real frequencies (see Probability &
+Statistics, ch. 15).
 
 ```python
 import torch
@@ -73,6 +114,7 @@ def label_smoothed_nll(logits, targets, eps=0.1):
     return (1 - eps) * nll + eps * smooth_loss
 
 # Compare standard vs smoothed loss
+torch.manual_seed(0)
 logits  = torch.randn(4, 100)        # batch=4, vocab=100
 targets = torch.randint(0, 100, (4,))
 
@@ -84,12 +126,24 @@ print(f"Label-smoothed loss:      {smooth_loss.item():.4f}")
 ```
 
 ```output
-Standard CE loss:         4.5423
-Standard CE loss:         4.5423
-Label-smoothed loss:      4.5193
+Standard CE loss:         4.7171
+Label-smoothed loss:      4.7597
 ```
 
+The smoothed loss (4.7597) is higher than the plain one (4.7171). That is expected on random
+logits: the code mixes 90% of the normal loss with 10% of the average loss over all 100
+classes, and for random scores the average class is a bit worse than this target class. The
+two losses also have different minima — smoothed loss can never reach 0, because the target
+itself is not one-hot.
+
+> **Watch out:** with label smoothing, a training loss that stops falling above zero is
+> normal. Compare models with plain cross-entropy (or perplexity) on held-out data, not with the
+> smoothed training loss.
+
 ## Causal attention mask
+
+A language model learns to predict each next token, so during training it must never see the
+token it is about to predict. The causal mask from ch. 7 enforces that.
 
 For language modeling, position $t$ should only attend to positions $\leq t$. The mask is an upper-triangular boolean matrix filled before the softmax:
 
@@ -111,10 +165,17 @@ tensor([[0, 1, 1, 1, 1],
         [0, 0, 1, 1, 1],
         [0, 0, 0, 1, 1],
         [0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 0]])
+        [0, 0, 0, 0, 0]], dtype=torch.int32)
 ```
 
+Row $t$ blocks (1) every column to its right: row 0 sees only position 0, row 4 sees all five.
+One sequence of length 5 thus gives 5 training examples at once, each predicting the next
+token from its own prefix.
+
 ## Padding mask
+
+Padding (ch. 1) fills short sentences to a common length. The model must treat those filler
+slots as if they were not there.
 
 When batching variable-length sequences, pad tokens should not contribute to attention or loss. A padding mask marks which positions are real:
 
@@ -134,17 +195,34 @@ print(pmask.int())
 Padding mask (True=padded):
 tensor([[0, 0, 0, 0, 0, 1, 1, 1],
         [0, 0, 0, 1, 1, 1, 1, 1],
-        [0, 0, 0, 0, 0, 0, 0, 1]])
+        [0, 0, 0, 0, 0, 0, 0, 1]], dtype=torch.int32)
 ```
+
+Sentence 0 has 5 real tokens, so its last three slots are 1 (padded). Sentence 1, with 3 real
+tokens, has five padded slots, and sentence 2 has only one. Comparing a position index with each
+length builds the whole mask in one line, without a loop.
 
 For cross-attention in translation, the decoder should not attend to padding positions in the source. Expand the padding mask to `(B, 1, 1, T_src)` to broadcast over decoder positions and heads.
 
+> **Watch out:** mask the loss too. `F.cross_entropy(..., ignore_index=PAD)` drops pad
+> targets; without it, the model gets rewarded for predicting `<PAD>` after `<PAD>`.
+
 ## Training a tiny char-level language model
+
+Now put it all together: embeddings, positions, a causal Transformer, and next-character
+prediction. PyTorch's `nn.TransformerEncoderLayer` stands in for the block from ch. 9.
+
+**Perplexity** is $e^{\text{loss}}$ when the loss is in natural-log units: the number of
+equally likely choices the model is effectively guessing among. Perplexity 27 means "as unsure
+as picking at random from 27 characters"; perplexity 1 means certain.
 
 ```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import math
+torch.manual_seed(0)
 
 text = ("the quick brown fox jumps over the lazy dog " * 30).strip()
 chars = sorted(set(text))
@@ -199,31 +277,74 @@ for step in range(400):
     opt.zero_grad(); loss.backward(); opt.step()
     losses.append(loss.item())
 
-perplexity = lambda l: 2 ** l
+perplexity = lambda l: math.exp(l)  # cross_entropy is in nats (natural log)
 print(f"Step   0: loss={losses[0]:.3f}  ppl={perplexity(losses[0]):.1f}")
 print(f"Step 100: loss={losses[99]:.3f}  ppl={perplexity(losses[99]):.1f}")
 print(f"Step 399: loss={losses[399]:.3f}  ppl={perplexity(losses[399]):.1f}")
 ```
 
 ```output
-Step   0: loss=3.178  ppl=9.0
-Step 100: loss=2.012  ppl=4.0
-Step 399: loss=1.241  ppl=2.4
+Step   0: loss=3.450  ppl=31.5
+Step 100: loss=0.136  ppl=1.1
+Step 399: loss=0.032  ppl=1.0
 ```
 
-Perplexity drops from 9 (near-random for a ~9-char alphabet) toward ~2.4 — the model starts capturing the common English letter patterns.
+The text has 27 distinct characters (26 letters and the space), and a uniform guess has
+perplexity 27; step 0 shows 31.5, about that. By step 100 the perplexity is 1.1, and at step
+399 the loss is 0.032. (The `stderr` warning about nested tensors from
+`nn.TransformerEncoder` is harmless.)
+
+Perplexity drops from about 31 (near-random for a 27-character alphabet) toward 1.0 — the model has memorized the sentence.
+
+The training text is one sentence repeated 30 times, so once the model has seen a few
+characters of context it knows exactly what comes next. This shows that the pipeline works;
+it does not show that the model learned English.
+
+> **Watch out:** `2 ** loss` is a common bug. PyTorch's `cross_entropy` uses natural logs, so
+> perplexity is `math.exp(loss)`; `2 ** loss` is only right if the loss is in bits.
 
 ## Gradient clipping
+
+One unlucky batch can produce a huge gradient and throw the weights far off. Clipping caps
+the total size of the gradient before each step (ch. 3).
 
 Large gradients — common in early training and on long sequences — cause destructive parameter updates. Clip them before stepping:
 
 ```python
 # In your training loop, after loss.backward():
-nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+x, y = get_batch(data, block_size)
+loss = F.cross_entropy(model(x).view(-1, V), y.view(-1))
+opt.zero_grad(); loss.backward()
+total_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # returns norm BEFORE clipping
 opt.step()
+print(f"Gradient norm before clipping: {total_norm.item():.4f}")
 ```
 
+```output
+Gradient norm before clipping: 0.0773
+```
+
+The total gradient length on this batch is 0.0773, well under 1.0, so clipping changes
+nothing here: the model is already trained and its gradients are small. Clipping only acts when
+the norm exceeds `max_norm`, which is typical in the first few hundred steps.
+
+`clip_grad_norm_` measures the length of all gradients together, as one long vector, and
+scales them down only if that length exceeds `max_norm`. The direction is unchanged.
+
 A max norm of 1.0 is standard; 0.5 is more conservative for large models.
+
+## Recap in plain words
+
+- Warmup starts with tiny learning rates and grows them before decaying, to survive noisy
+  early gradients.
+- Cosine decay with linear warmup is the modern default; clamp it so it stays at 0 after the
+  end.
+- Label smoothing moves a little target probability off the correct class to curb
+  overconfidence.
+- The causal mask hides future tokens; the padding mask hides filler tokens in attention and
+  loss.
+- Perplexity is $e^{\text{loss}}$: the effective number of choices the model is unsure between.
+- Gradient clipping caps the total gradient length before each update.
 
 ## Try it Yourself
 
@@ -232,6 +353,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
+torch.manual_seed(0)
 
 text = ("abcdefg " * 60).strip()
 chars = sorted(set(text)); c2i = {c:i for i,c in enumerate(chars)}
@@ -266,18 +389,27 @@ for step in range(300):
     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
     if step % 100 == 0:
-        print(f"Step {step:3d}  loss={loss.item():.3f}  ppl={2**loss.item():.2f}")
+        print(f"Step {step:3d}  loss={loss.item():.3f}  ppl={math.exp(loss.item()):.2f}")
 ```
 
 ```output
-Step   0  loss=2.089  ppl=4.26
-Step 100  loss=0.631  ppl=1.55
-Step 200  loss=0.189  ppl=1.14
+Step   0  loss=2.133  ppl=8.44
+Step 100  loss=0.000  ppl=1.00
+Step 200  loss=0.000  ppl=1.00
 ```
+
+The text "abcdefg " has 8 distinct characters, so step 0's perplexity of 8.44 is a near-uniform
+guess. By step 100 the loss prints as 0.000: the next character is fully determined by the
+current one, which one block learns in under 100 steps at `lr=1e-2`. Try a less predictable
+text, for example `"the cat sat on the mat " * 30`, and see the perplexity stop above 1 — after
+"the " the next letter can be `c` or `m`.
 
 ## Exercise
 
 Implement the Vaswani learning rate schedule as a PyTorch `LambdaLR` scheduler. Train the MiniLM above for 300 steps with this schedule and a `warmup_steps=50`. Plot (or print) the learning rate at steps 1, 25, 50, 100, 200, 300.
+
+> **Hint:** `LambdaLR` multiplies the optimizer's base learning rate by your function's
+> value, so set the base `lr=1.0` and let the function return the actual rate.
 
 <details>
 <summary>Solution</summary>
@@ -305,4 +437,11 @@ for step in range(300):
 ```
 
 The LR ramps from near-0 to peak at step 50 then decays. Training with this schedule requires no manual LR tuning for the architecture's scale.
+
+Running it after the Try it block prints a rate of 0.001414 at step 1, 0.018385 at step 25,
+0.035007 at step 50 (the peak, $16^{-0.5} \times 51^{-0.5}$), then 0.024876, 0.017634 and
+0.014434. `get_last_lr()` after `scheduler.step()` gives the rate for the *next* step, which is
+why step 1 shows the value for $t = 2$. The loss is 0.000 throughout because this model was
+already trained. "No manual tuning" is an overstatement: the schedule still has two knobs,
+$d_{\text{model}}$ scaling and the warmup length.
 </details>

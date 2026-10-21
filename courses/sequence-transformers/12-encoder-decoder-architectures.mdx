@@ -7,15 +7,33 @@ order: 12
 
 ## Three ways to build a transformer
 
+Every famous Transformer model is built from the same parts you made in ch. 7–9. They differ
+in two choices: which blocks they stack (encoder, decoder, or both), and what game they were
+trained to play before you got them.
+
 All modern transformer-based models share the same attention mechanism you built in ch. 7–9.
 What differs is how the blocks are arranged and what training objective shapes the weights.
 There are three families: encoder-only (BERT), decoder-only (GPT), and encoder-decoder (T5).
 Understanding which family to reach for is more important than memorizing hyperparameters.
 
+A **training objective** is the task the model is graded on during training — "fill in the
+blank" or "predict the next word". **Pretraining** is the first, long training on huge
+unlabeled text; **fine-tuning** is later, short training on your own labeled task.
+
+> **Picture it:** three kinds of language expert. The encoder is a careful reader who sees
+> the whole page at once. The decoder is a writer who only sees what is already written. The
+> encoder-decoder is an interpreter: a reader and a writer working as a pair.
+
 ## Encoder-only: BERT
+
+BERT is a stack of encoder blocks: every word can look at every other word, left and right.
+That makes it good at understanding text, and unable to write it.
 
 BERT stacks $N$ encoder blocks. Each block has bidirectional self-attention — every position
 attends to every other position — followed by a feed-forward sublayer. There is no causal mask.
+
+The examples below download pretrained weights with Hugging Face `transformers`. The first
+run needs network access; later runs read the local cache.
 
 ```python
 from transformers import AutoTokenizer, AutoModel
@@ -36,12 +54,19 @@ print("Pooler output shape:    ", outputs.pooler_output.shape)
 ```
 
 ```output
-Input IDs shape:         torch.Size([1, 9])
-Last hidden state shape: torch.Size([1, 9, 768])
+Input IDs shape:         torch.Size([1, 8])
+Last hidden state shape: torch.Size([1, 8, 768])
 Pooler output shape:     torch.Size([1, 768])
 ```
 
+The sentence becomes 8 token IDs: `[CLS]`, the 5 words, the full stop, and `[SEP]` — BERT adds
+the first and last markers itself. Each of the 8 positions comes out as a 768-number vector
+(BERT-base's width). The pooler output is one 768-vector for the whole sentence, built from
+the `[CLS]` position.
+
 ### Pretraining objectives
+
+BERT learned by playing fill-in-the-blank on billions of words.
 
 **Masked Language Modeling (MLM)**: mask 15% of tokens at random; predict the original tokens
 from the surrounding context. Because both left and right context are visible, BERT learns
@@ -51,11 +76,20 @@ to produce tokens one at a time without seeing future positions.
 **Next Sentence Prediction (NSP)**: given two sentence segments, predict whether the second
 follows the first in the original document. RoBERTa showed NSP does not help and dropped it.
 
+> **Watch out:** "mask" means two things in this course. The MLM mask replaces input tokens
+> with `[MASK]`; the attention mask (ch. 7, ch. 10) hides positions from attention. BERT uses
+> the first and, apart from padding, not the second.
+
 ### The [CLS] token and fine-tuning
+
+To classify a whole sentence, you need one vector for it. BERT reserves a special first token
+whose output plays that role.
 
 BERT prepends a special `[CLS]` token. After pretraining, the final hidden state of `[CLS]`
 is a pooled representation of the whole sequence. Fine-tuning for classification adds a linear
 layer on top of `[CLS]` and trains on labeled examples.
+
+**SST-2** is a movie-review sentiment dataset with two labels: 0 = negative, 1 = positive.
 
 ```python
 from transformers import AutoModelForSequenceClassification
@@ -75,11 +109,21 @@ print("Logits:", logits.round(decimals=2))
 ```
 
 ```output
-Predicted label: POSITIVE
-Logits: tensor([[-3.82,  3.91]])
+Predicted label: LABEL_1
+Logits: tensor([[-4.2400,  3.9800]])
 ```
 
+The model scores class 1 at 3.98 and class 0 at −4.24, a gap of 8.2, so it is very sure the
+review is positive. It prints `LABEL_1` rather than `POSITIVE` because this checkpoint's config
+has no human-readable label names; for SST-2, label 1 means positive.
+
+> **Watch out:** always check `model.config.id2label` on a downloaded classifier. Generic names
+> like `LABEL_0`/`LABEL_1` tell you nothing, and some checkpoints order the classes the other
+> way round.
+
 ### BERT family
+
+Later models kept BERT's shape and changed the training recipe or the internals.
 
 | Model | Change from BERT |
 |---|---|
@@ -88,7 +132,14 @@ Logits: tensor([[-3.82,  3.91]])
 | DistilBERT | 6-layer student distilled from 12-layer BERT; 97% of BERT performance at 60% size |
 | DeBERTa | Disentangled attention (content + position separate), virtual adversarial training |
 
+**Distillation** trains a small "student" model to copy a big "teacher" model's outputs.
+**SOP** (sentence-order prediction) asks whether two segments are in the right order — a
+harder replacement for NSP.
+
 ## Decoder-only: GPT
+
+GPT is a stack of decoder blocks with the causal mask: each word sees only the words before
+it. That is exactly what you need to write text one word at a time.
 
 GPT stacks $N$ decoder blocks, each with **causal (masked) self-attention** — position $i$
 can only attend to positions $\leq i$. There is no cross-attention because there is no
@@ -114,19 +165,34 @@ with torch.no_grad():
 ```
 
 ```output
-Logits shape: torch.Size([1, 9, 50257])
-Next token:   ' 2017'
+Logits shape: torch.Size([1, 6, 50257])
+Next token:   ' the'
 ```
 
+The logits have shape `[1, 6, 50257]`: the 6-token prompt, one score per vocabulary entry (GPT-2
+has 50,257 tokens) at every position. Only the last position's scores predict what comes next,
+and their argmax is `' the'` — a likely continuation of "was introduced in". GPT-2 tokens carry
+their leading space.
+
 ### Pretraining objective
+
+The decoder's training game is "predict the next token", graded at every position at once.
 
 Causal language modeling: predict the next token given all previous tokens.
 $\mathcal{L} = -\sum_t \log p(x_t | x_{<t})$.
 This is simple and scales: the entire sequence is a valid training signal.
 
+> **In plain words:** add up, over every position $t$, how surprised the model was by the real
+> token $x_t$ given everything before it ($x_{<t}$). Every token of every document is a free
+> training example — no labels needed.
+
 ### Generating with sampling
 
+`model.generate` runs the decoding loop of ch. 11 for you, with the same temperature and
+top-p knobs.
+
 ```python
+torch.manual_seed(0)
 inputs = tokenizer("Once upon a time", return_tensors="pt")
 with torch.no_grad():
     output_ids = model.generate(
@@ -141,13 +207,24 @@ print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
 ```
 
 ```output
-Once upon a time there was a small village nestled between two mountains where people lived in peace for centuries.
+Once upon a time, when the world was in turmoil, we were in the midst of an era of peace, and
 ```
+
+The 20 new tokens are fluent English but drift in meaning ("in turmoil ... an era of peace"), and
+the text stops mid-sentence because `max_new_tokens=20` ran out. That is typical of the small
+124M-parameter GPT-2 with sampling. With `torch.manual_seed(0)` the same text comes back each
+run; remove the seed and every run differs.
 
 The GPT family (GPT-2, GPT-3, GPT-4, LLaMA, Mistral, Phi) all share this decoder-only
 architecture. Scaling laws have shown it to be extremely data- and compute-efficient.
 
+**Scaling laws** are measured rules for how loss falls as you grow model size, data, and
+compute — smooth, predictable curves that let labs plan very large training runs.
+
 ## Encoder-decoder: T5
+
+T5 keeps both halves of the original Transformer: an encoder that reads the input in full,
+and a decoder that writes the output while looking back at the encoder.
 
 T5 uses a full encoder-decoder: the encoder reads the input with bidirectional attention; the
 decoder generates the output with causal self-attention plus **cross-attention** to the encoder
@@ -169,12 +246,19 @@ print(t5_tok.decode(out[0], skip_special_tokens=True))
 ```
 
 ```output
-The cat sat on the mat near the window.
+the cat sat on the mat near the window.
 ```
+
+The "summary" is the input lowercased: `the cat sat on the mat near the window.` A one-sentence
+input has nothing to remove, so the small model copies it. On a long paragraph the same call
+gives a real summary.
 
 T5's text-to-text framing means every task — translation, summarization, classification,
 question answering — uses the same interface: a string in, a string out. The task is specified
 in the input prefix (`translate English to French:`, `summarize:`, `sst2 sentence:`).
+
+> **Watch out:** the prefix is part of the input T5 was trained on. Leave out `summarize:` and
+> t5-small may translate, copy, or ramble instead.
 
 ### Cross-attention in the decoder
 
@@ -187,10 +271,17 @@ The cross-attention is what lets the decoder "read" the full source sequence whi
 target tokens one at a time. This is the standard seq2seq pattern from ch. 5, now with
 transformers instead of LSTMs.
 
+Compared with ch. 5, the bottleneck is gone: the decoder attends to every encoder position
+(ch. 6) instead of one context vector, and the encoder runs once per input, not once per
+output token.
+
 ## Choosing the right architecture
 
+Choose by the shape of the task: understand the whole input (encoder), write freely
+(decoder), or turn one text into another (encoder-decoder).
+
 ```python
-# Decision summary (not runnable — just a comparison table)
+# Decision summary, printed as a comparison table
 comparison = {
     "Task": ["Sentence classification", "Token labeling (NER)", "Text generation",
              "Translation / summarization", "Open QA / chat"],
@@ -210,42 +301,77 @@ for row in zip(*comparison.values()):
 ```
 
 ```output
-Sentence classification              BERT (encoder-only)       Bidirectional context → richer CLS
-Token labeling (NER)                 BERT (encoder-only)       Bidirectional context over full span
-Text generation                      GPT (decoder-only)        Causal LM scales best; RLHF-friendly
-Translation / summarization          T5 (encoder-decoder)      Enc-dec: dedicated read/write phases
-Open QA / chat                       GPT (decoder-only)        Instruction-tuned GPT; KV cache efficient
+Sentence classification             BERT (encoder-only)       Bidirectional context → richer CLS
+Token labeling (NER)                BERT (encoder-only)       Bidirectional context over full span
+Text generation                     GPT (decoder-only)        Causal LM scales best; RLHF-friendly
+Translation / summarization         T5 (encoder-decoder)      Enc-dec: dedicated read/write phases
+Open QA / chat                      GPT (decoder-only)        Instruction-tuned GPT; KV cache efficient
 ```
 
+Read the table by rows: classification and tagging go to an encoder because each output needs
+both sides of the context; generation and chat go to a decoder; translation and summarization
+fit the encoder-decoder's separate read and write phases.
+
 The modern trend is toward decoder-only models even for tasks that look like understanding
-tasks. LLMs fine-tuned with instruction tuning (ch. 9 of NLP course) handle classification
+tasks. LLMs fine-tuned with instruction tuning (NLP & Large Language Models, ch. 9) handle classification
 prompts well, and the unified architecture is simpler to serve at scale.
+
+**Instruction tuning** fine-tunes a language model on many (instruction, answer) pairs so it
+follows requests like "Classify this review as positive or negative".
+
+## Recap in plain words
+
+- All three families use the same blocks; they differ in masking and training objective.
+- Encoder-only (BERT) sees both directions, learns by fill-in-the-blank, and suits
+  classification and tagging.
+- Decoder-only (GPT) sees only the past, learns by next-token prediction, and generates text.
+- Encoder-decoder (T5) reads with an encoder and writes with a cross-attending decoder; it
+  suits translation and summarization.
+- Pretrained checkpoints come with quirks — label names, task prefixes, tokenizers — that you
+  must check.
+- Decoder-only models are increasingly used for everything, because one architecture is simpler
+  to scale and serve.
 
 ## Try it Yourself
 
 ```python
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 
 # Three families, same task
 classifier = pipeline("text-classification",
                       model="distilbert-base-uncased-finetuned-sst-2-english")
 generator  = pipeline("text-generation", model="gpt2",
                       max_new_tokens=20, do_sample=False)
-summarizer = pipeline("summarization", model="t5-small",
-                      max_length=30, min_length=5)
+
+# transformers v5 removed the "summarization" pipeline, so call T5 directly
+t5_tok = AutoTokenizer.from_pretrained("t5-small")
+t5     = AutoModelForSeq2SeqLM.from_pretrained("t5-small")
+def summarize(text):
+    ids = t5_tok("summarize: " + text, return_tensors="pt")
+    out = t5.generate(**ids, max_length=30, min_length=5)
+    return t5_tok.decode(out[0], skip_special_tokens=True)
 
 text = "Despite the rain, the match was played and ended in a thrilling draw."
 
 print("BERT family sentiment:", classifier(text)[0])
 print("GPT2 completion:      ", generator(text)[0]["generated_text"])
-print("T5 summary:           ", summarizer(text)[0]["summary_text"])
+print("T5 summary:           ", summarize(text))
 ```
 
 ```output
-BERT family sentiment: {'label': 'POSITIVE', 'score': 0.9987}
-GPT2 completion:       Despite the rain, the match was played and ended in a thrilling draw. The result was
-T5 summary:            the match was played and ended in a thrilling draw.
+BERT family sentiment: {'label': 'POSITIVE', 'score': 0.9998260140419006}
+GPT2 completion:       Despite the rain, the match was played and ended in a thrilling draw.
+
+The match was played in the second half of the match and the score was 2-1
+T5 summary:            the match ended in a thrilling draw.
 ```
+
+One input, three families. DistilBERT reads the sentence as positive with score 0.9998 — the
+"thrilling draw" wins over the rain. GPT-2 (greedy, `do_sample=False`) does not answer
+anything: it continues the text, adding a new paragraph (the blank line) and a sentence that
+repeats "the match". T5 shortens the sentence to `the match ended in a thrilling draw.` — it
+drops the rain clause. Try a negative sentence ("The match was cancelled after an hour of
+rain.") and see which outputs change.
 
 ## Exercise
 
@@ -254,6 +380,10 @@ Load `bert-base-uncased` and encode the word "bank" in two contexts:
 the "bank" token from each sentence and compute their cosine similarity. Then do the same with
 a static GloVe or Word2Vec embedding (use `gensim` or a lookup table). Show that BERT's
 contextual embeddings are more different than the static embeddings.
+
+> **Hint:** `tok.convert_ids_to_tokens` gives you the word pieces, so you can find the index
+> of `"bank"`. Take that row of `last_hidden_state`. A static embedding gives "bank" one fixed
+> vector, so you can predict its similarity before running anything.
 
 <details>
 <summary>Solution</summary>
@@ -292,9 +422,13 @@ cos_static = F.cosine_similarity(static.unsqueeze(0), static.unsqueeze(0)).item(
 print(f"Static cosine similarity for 'bank': {cos_static:.4f}")
 ```
 
-BERT produces similarity around 0.6–0.75 for these two senses; a static embedding gives 1.0
+BERT produces a similarity of about 0.56 (0.5587 when run) for these two senses; a static embedding gives 1.0
 because it is context-independent. The gap demonstrates why contextual representations matter
 for disambiguation and downstream tasks.
+
+The random vector stands in for a real GloVe vector; any fixed vector gives exactly 1.0 against
+itself, which is the whole point. Separating the full stop with a space (`bank .`) makes sure
+"bank" is a token of its own in both sentences.
 
 </details>
 
@@ -303,10 +437,10 @@ for disambiguation and downstream tasks.
 Rare and advanced topics you should at least know the name of. You won't need them daily,
 but you'll stop being surprised when you meet them.
 
-- **Efficient attention (Performer, Linformer, sparse, sliding-window)** — beat the O(n²) wall for long sequences.
-- **FlashAttention** — IO-aware exact attention; same math as standard but 2–4× faster via tiling.
-- **Grouped-query / Multi-query attention (GQA/MQA)** — share K/V heads to shrink the KV cache; used in Llama 3, Mistral.
-- **ALiBi & long-context positional schemes** — linear bias that lets models extrapolate beyond training length.
-- **Pointer networks & CTC** — copy mechanisms / alignment-free sequence labeling.
-- **Memory-augmented & recurrent-memory transformers** — carry state across document segments.
-- **Speculative & assisted decoding** — draft with a small model, verify in parallel; 2–3× speedup.
+- **Efficient attention (Performer, Linformer, sparse, sliding-window)** — beat the $O(n^2)$ wall for long sequences, by approximating attention or letting each token see only part of the sequence.
+- **FlashAttention** — IO-aware exact attention; same math as standard but 2–4$\times$ faster via tiling: it computes attention in blocks that fit in fast on-chip memory and never stores the full $n \times n$ table.
+- **Grouped-query / Multi-query attention (GQA/MQA)** — share K/V heads to shrink the KV cache; used in Llama 3, Mistral (ch. 11).
+- **ALiBi & long-context positional schemes** — linear bias that lets models extrapolate beyond training length (ch. 8); RoPE scaling tricks play the same role for rotary models.
+- **Pointer networks & CTC** — copy mechanisms / alignment-free sequence labeling: a pointer network outputs positions in its input, and CTC trains speech models without knowing which audio frame matches which letter.
+- **Memory-augmented & recurrent-memory transformers** — carry state across document segments, like truncated BPTT's carried hidden state (ch. 2).
+- **Speculative & assisted decoding** — draft with a small model, verify in parallel; 2–3$\times$ speedup, with exactly the big model's output distribution.

@@ -7,13 +7,27 @@ order: 4
 
 ## The Problem with Fixed SSMs
 
+The SSMs of ch. 3 treat every token the same way: the same fade, the same write strength,
+whatever the token says. A model that cannot decide "this token matters, that one doesn't"
+is badly handicapped on language.
+
 S4 is powerful but has a fundamental limitation: its parameters $A$, $B$, $C$, and $\Delta$ are **fixed for all inputs**. The same kernel is convolved with any input. This means the model cannot choose to selectively focus on or ignore specific tokens based on their content.
 
 Consider the task: "Copy the last occurrence of the letter 'X' in this sequence." A fixed-parameter SSM treats every token the same — it can't decide to "pay attention" to X and ignore everything else.
 
+> **Picture it:** a note-taker who must write the same amount about every sentence in a
+> lecture, including "um" and "can everyone hear me?". A good note-taker skips the filler and
+> writes a lot when the key formula appears. Mamba gives the SSM that judgement.
+
 Transformers handle this naturally via content-dependent attention weights. The Mamba innovation: make the SSM parameters input-dependent.
 
+**Content-dependent** means the numbers are computed from the token itself, so they change
+from token to token.
+
 ## The Selective SSM
+
+The fix is direct: compute the write strength, read-out, and step size *from each token* with
+small linear layers. Then each token decides how much to remember and how much to forget.
 
 In Mamba (Gu & Dao, 2023), $B$, $C$, and $\Delta$ become functions of the input:
 
@@ -24,13 +38,31 @@ $$
 \Delta_t = \text{softplus}(\text{Linear}(x_t)) \in \mathbb{R}^{D}
 $$
 
+> **In plain words:**
+> - $B_t$ (how to write token $t$ into memory) and $C_t$ (how to read memory out at step $t$) are each produced by a linear layer from $x_t$, giving $N$ numbers;
+> - $\Delta_t$ (token $t$'s step size) is produced the same way, one per channel ($D$ channels), and passed through **softplus**, a smooth function that keeps it positive;
+> - only $A$ stays fixed.
+
 Now $A$ (and hence $\bar{A}_t = \exp(\Delta_t A)$) also varies per token via $\Delta_t$. The state update:
 
 $$
 h_t = \bar{A}_t h_{t-1} + \bar{B}_t x_t, \quad y_t = C_t h_t
 $$
 
+> **In plain words:** the same update as ch. 3, but every coefficient now has a subscript
+> $t$: the fade, the write and the read change with every token.
+
 When $\Delta_t$ is large, $\bar{A}_t \approx 0$ — the model forgets the past and focuses on $x_t$. When $\Delta_t$ is small, $\bar{A}_t \approx I$ — the model preserves memory and ignores the current input.
+
+Why does a small $\Delta_t$ also ignore the input? Because $\bar{B}_t$ is roughly
+$\Delta_t B_t$: a tiny step writes in almost nothing. So $\Delta_t$ acts as a single dial
+between "keep the old memory" and "replace it with this token". That dial is what people
+mean by **selectivity**.
+
+The block below is a readable, slow version of one Mamba layer. Besides the SSM, it has an
+input projection that splits into two branches, a short **depthwise convolution** (each
+channel mixes only its own last 4 values) for local context, a **SiLU** activation (a smooth
+cousin of ReLU), and a **gate** $z$ that multiplies the output.
 
 ```python
 import numpy as np
@@ -72,7 +104,7 @@ class SelectiveSSM(nn.Module):
         bcd = self.x_proj(x_conv)         # (B, L, N+N+1)
         B_t = bcd[..., :N]               # (B, L, N)
         C_t = bcd[..., N:2*N]            # (B, L, N)
-        delta_raw = bcd[..., 2:]         # (B, L, 1)
+        delta_raw = bcd[..., 2*N:]       # (B, L, 1)
         delta = F.softplus(self.dt_proj(delta_raw))  # (B, L, D)
 
         # Discretize A: A_bar_t = exp(-exp(A_log) * delta_t)
@@ -106,14 +138,42 @@ print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 ```output
 Input:  torch.Size([2, 16, 32])
 Output: torch.Size([2, 16, 32])
-Params: 6,273
+Params: 4,096
 ```
 
+The shapes match: 2 sequences of 16 tokens with 32 channels go in, and the same shape
+comes out, so the block can be stacked like a transformer layer. The 4,096 parameters break
+down as 2,048 for the input projection ($32 \times 64$), 1,024 for the output projection,
+544 for the B/C/$\Delta$ projection ($32 \times 17$), 256 for $A$, 160 for the convolution and
+64 for the $\Delta$ projection.
+
+> **Watch out:** the slice `bcd[..., 2*N:]` picks the single $\Delta$ column after the $N$
+> columns of $B$ and $N$ of $C$. An off-by-$N$ slice here silently grabs the wrong numbers
+> (or crashes with a shape error), a classic bug when packing several outputs into one
+> linear layer.
+
 ## The Selective Scan Algorithm
+
+The loop above must go token by token, which wastes a GPU. A trick from computer science, the
+**scan**, lets you compute all the states of a linear recurrence in a few parallel rounds.
 
 The recurrence above is sequential — $h_t$ depends on $h_{t-1}$. But Mamba's paper shows this can be parallelized using a **parallel prefix scan** (also called scan or prefix sum):
 
 Given $a_1, \ldots, a_T$ and $b_1, \ldots, b_T$, compute all $h_t = a_t h_{t-1} + b_t$ in $O(\log T)$ parallel steps.
+
+It works because two steps can be merged into one step of the same form. Applying
+$(a_1, b_1)$ then $(a_2, b_2)$ equals one step with $(a_2 a_1, \, a_2 b_1 + b_2)$. This
+merge is **associative** (you can group merges in any order), so you can merge neighbours in
+pairs, then pairs of pairs, and finish in about $\log_2 T$ rounds.
+
+> **Picture it:** adding up a long list of numbers in a classroom. One student adding one by
+> one takes $T$ steps. If everyone pairs up and adds, then pairs of pairs, the class finishes
+> in about $\log_2 T$ rounds. The scan does that with "fade-then-add" steps instead of plain
+> additions.
+
+The function below documents the merge rule in its docstring but, for clarity, computes the
+answer with the plain sequential loop. The parallel version gives exactly the same numbers;
+only the schedule changes.
 
 ```python
 def parallel_scan(a, b):
@@ -144,11 +204,18 @@ print("Note: production uses log-space parallel scan on GPU for numerical stabil
 ```
 
 ```output
-h (state over time): [-1.102 -0.265  0.316 -0.091 -0.085  0.406  0.081 -0.381]
+h (state over time): [-0.704 -1.703 -1.506 -0.723 -2.951 -2.906 -3.493 -3.625]
 Note: production uses log-space parallel scan on GPU for numerical stability
 ```
 
+Each value builds on the one before. From step 1 to step 2 the state goes from $-0.704$ to
+$-1.703$: the old state was faded by a factor between 0.5 and 0.95, then the new input was
+added. The last state, $-3.625$, carries a faded trace of all eight inputs.
+
 ## Hardware-Aware Implementation
+
+The algorithm alone is not fast enough. Mamba is fast because its code is written around the
+GPU's tiny-but-fast memory, the same idea as FlashAttention (ch. 1).
 
 Mamba's speed comes from a fused CUDA kernel that:
 
@@ -156,38 +223,55 @@ Mamba's speed comes from a fused CUDA kernel that:
 2. Processes in tiles that fit in SRAM (registers + L1/L2 cache)
 3. **Recomputes** the scan states during backward pass instead of storing them (gradient checkpointing inside the kernel)
 
+A **fused kernel** does several steps in one GPU program, so intermediate results never leave
+the chip. **HBM** is the big, slow GPU memory; **SRAM** is the small, fast on-chip memory. To
+**materialize** a tensor is to actually write it out in memory. **Recomputing** in the backward
+pass trades a little extra math for a lot less memory traffic.
+
 This makes Mamba's compute bound on memory bandwidth similar to FlashAttention.
 
+The table lists the headline speed claims reported in the Mamba paper. They are printed from
+the paper, not measured on this machine.
+
 ```python
-# Throughput comparison (conceptual — from the Mamba paper)
+# Headline speed claims reported in the Mamba paper (not measured here)
 comparisons = [
-    ("Transformer (no flash)", 512,  "2.4x baseline"),
-    ("Transformer (FlashAttn)", 512, "1.0x baseline"),
-    ("H3 (SSM w/o selectivity)", 512, "1.8x"),
-    ("Mamba", 512,               "4.8x"),
-    ("Mamba (2K context)", 2048, "4.1x"),
-    ("Mamba (8K context)", 8192, "3.7x"),
+    ("Fused scan vs naive PyTorch scan", "kernel speed",   "20-40x faster"),
+    ("Fused scan vs FlashAttention-2",   "seq len > 2K",   "faster"),
+    ("Mamba vs Transformer, same size",  "generation",     "~5x throughput"),
 ]
-print(f"{'Model':<30} {'Seq len':>8} {'Throughput':>14}")
-print("-" * 55)
-for name, seq, tp in comparisons:
-    print(f"{name:<30} {seq:>8} {tp:>14}")
+print(f"{'Comparison':<34} {'Setting':<15} {'Reported'}")
+print("-" * 65)
+for name, setting, tp in comparisons:
+    print(f"{name:<34} {setting:<15} {tp}")
 ```
 
 ```output
-Model                          Seq len     Throughput
--------------------------------------------------------
-Transformer (no flash)             512  2.4x baseline
-Transformer (FlashAttn)            512  1.0x baseline
-H3 (SSM w/o selectivity)          512           1.8x
-Mamba                              512           4.8x
-Mamba (2K context)                2048           4.1x
-Mamba (8K context)                8192           3.7x
+Comparison                         Setting         Reported
+-----------------------------------------------------------------
+Fused scan vs naive PyTorch scan   kernel speed    20-40x faster
+Fused scan vs FlashAttention-2     seq len > 2K    faster
+Mamba vs Transformer, same size    generation      ~5x throughput
 ```
+
+Three numbers to remember: the fused scan runs 20-40 times faster than a plain PyTorch scan;
+it beats FlashAttention-2 once sequences pass 2K tokens; and in generation Mamba reaches
+about 5 times the throughput of a same-size transformer, because it keeps no growing cache.
+
+> **Watch out:** the slow Python loop in the block above is for understanding only. Timing it
+> against a transformer will make Mamba look terrible; real comparisons need the fused kernel.
 
 ## Mamba-2: Structured State Spaces (SSD)
 
+Mamba-2 shows that a selective SSM and linear attention (ch. 2) are two views of the same
+computation, and uses that to run much faster on GPUs.
+
 Mamba-2 (Dao & Gu, 2024) unifies SSMs and linear attention under a single framework called **State Space Duality (SSD)**. The key change: allow the state to be matrix-valued ($h_t \in \mathbb{R}^{N \times d_v}$ instead of $\mathbb{R}^N$).
+
+A **matrix-valued state** is the same as linear attention's summary $S$ from ch. 2: an
+$N \times d_v$ table built from keys and values. The "duality" is that you can compute the
+model either as a recurrence over that table or as a masked attention-like matrix product,
+whichever is faster for the hardware.
 
 This enables:
 - Larger states with structured (not fully-diagonal) $A$
@@ -195,6 +279,10 @@ This enables:
 - Better hardware utilization via tensor parallelism
 
 Mamba-2 also uses multi-head architecture similar to attention, with **grouped heads** for the state — roughly analogous to GQA.
+
+**Tensor parallelism** splits one layer's matrices across several GPUs. Matrix products are
+what GPUs are built for, so recasting the scan as matrix products uses their **tensor cores**
+(dedicated matrix-multiply units) much better.
 
 ```python
 # Mamba-2: key architectural differences vs Mamba-1
@@ -223,7 +311,15 @@ Linear attn link          Indirect                  Direct (SSD = linear attn)
 Throughput vs v1          Baseline                  ~2x (larger d_state, better GPU util)
 ```
 
+Read the "A structure" row: Mamba-2 actually makes $A$ *simpler*, one scalar per head times
+the identity. Giving up per-channel fades is what lets the computation become plain matrix
+products. That buys the roughly 2 times speedup in the last row, and room for much larger
+states.
+
 ## When Mamba Wins
+
+Mamba's fixed-size state is a strength when contexts are long and a weakness when the task
+needs to look up exact details from far back.
 
 Mamba outperforms transformers when:
 - **Sequence length > 2K** — KV cache savings dominate
@@ -235,7 +331,25 @@ Where transformers still win:
 - **In-context learning** — attention can copy and retrieve from context more precisely
 - **Very long-range associative recall** — "what was the word at position 3?" is hard for SSMs
 
+**In-context learning** is picking up a task from examples placed in the prompt.
+**Associative recall** is retrieving a value given its key ("the phone number of Alice was
+…"). Both need exact lookups, and a compressed state blurs exact details. That weakness is
+why hybrids (ch. 8) keep a few attention layers.
+
+## Recap in plain words
+
+- Fixed SSMs treat every token the same, so they cannot pick out important tokens.
+- Mamba computes $B$, $C$ and $\Delta$ from each token, so each token chooses how much to write and how much to forget.
+- A big $\Delta_t$ resets the memory to the current token; a small one keeps the memory and ignores the token.
+- The linear recurrence can be computed with a parallel scan in about $\log_2 T$ rounds.
+- The speed comes from a fused, hardware-aware kernel that keeps the state in fast on-chip memory.
+- Mamba-2 recasts the SSM as structured linear attention with a matrix state, to use GPU matrix units.
+- Mamba wins on long, streaming contexts; attention still wins on exact recall.
+
 ## Try it Yourself
+
+The demo feeds ten 1s into a one-number SSM and sets the step size $\Delta$ by hand: tiny
+(0.01) everywhere except a single big value (10.0) at $t = 5$.
 
 ```python
 import torch
@@ -266,14 +380,27 @@ selective_gating_demo()
 
 ```output
 Delta:   [0.01, 0.01, 0.01, 0.01, 0.01, 10.0, 0.01, 0.01, 0.01, 0.01]
-A_bar:   [0.9900, 0.9900, 0.9900, 0.9900, 0.9900, 0.0, 0.9900, 0.9900, 0.9900, 0.9900]
-State h: [0.01, 0.0199, 0.0297, 0.0394, 0.049, 1.0, 0.99, 0.98, 0.9702, 0.9605]
+A_bar:   [0.99, 0.99, 0.99, 0.99, 0.99, 0.0, 0.99, 0.99, 0.99, 0.99]
+State h: [0.01, 0.0198, 0.0296, 0.0392, 0.0488, 1.0, 1.0, 1.0, 1.0, 1.0]
 At t=5: high delta → A_bar≈0 → state resets to current input
 ```
 
+Follow the third line. For $t = 0$ to $4$, with $\bar{A} = 0.99$, each step writes in only 1%
+of the input, so the state creeps up: 0.01, 0.0198, … 0.0488. At $t = 5$, $\bar{A}$ drops to
+0.0 and the state jumps straight to 1.0, the current input. After that, the tiny $\Delta$
+keeps it there: 99% of 1.0 plus 1% of an input of 1.0 is still 1.0.
+
+Change `x` so it is 1 before $t = 5$ and 0 after (`x = torch.tensor([1.0]*6 + [0.0]*4)`).
+You will see the memory of the reset value fade very slowly, at 1% per step, because $\Delta$
+is small again.
+
 ## Exercise
 
-Implement a minimal 1D SSM scan that takes input $x$ (length $T$), a scalar forget factor $a$ (constant, not input-dependent), and a scalar $b$ — and returns outputs $y_t = C \cdot h_t$ where $h_t = a \cdot h_{t-1} + b \cdot x_t$ and $C = 1.0$. Then modify it to make $a$ and $b$ input-dependent (functions of $x_t$). Verify both produce the same output on constant inputs.
+Implement a minimal 1D SSM scan that takes input $x$ (length $T$), a scalar forget factor $a$ (constant, not input-dependent), and a scalar $b$ — and returns outputs $y_t = C \cdot h_t$ where $h_t = a \cdot h_{t-1} + b \cdot x_t$ and $C = 1.0$. Then modify it to make $a$ and $b$ input-dependent (functions of $x_t$). Run both on the same constant input and compare how their outputs evolve.
+
+> **Hint:** the fixed version is a three-line loop. For the selective version, compute `a`
+> and `b` inside the loop from `xt`. A sigmoid squeezed into $[0.5, 0.99]$ is a safe choice
+> for $a$, because it keeps the state from blowing up.
 
 <details>
 <summary>Solution</summary>
@@ -310,11 +437,16 @@ print("Different dynamics from same input — content-dependence matters")
 ```
 
 ```output
-Fixed SSM (constant input): [0.1   0.19  0.271 0.344 0.41  0.469 0.522 0.57  0.613 0.652]
-Selective SSM (constant input): [0.369 0.601 0.742 0.828 0.884 0.919 0.942 0.958 0.969 0.976]
+Fixed SSM (constant input): [0.1   0.19  0.271 0.344 0.41  0.469 0.522 0.57  0.613 0.651]
+Selective SSM (constant input): [0.5   0.929 1.297 1.613 1.885 2.117 2.317 2.489 2.636 2.762]
 Different dynamics from same input — content-dependence matters
 ```
 
-The selective SSM saturates faster because $a$ is higher (near 0.87) for positive inputs — it's more retentive for strong inputs.
+The selective SSM rises faster and higher: for $x_t = 1$ it uses $a \approx 0.86$ and $b = 0.5$, so it writes in 5 times more input per step and settles towards $b/(1-a) \approx 3.5$ instead of 1.
+
+That steady-state value comes from setting $h_t = h_{t-1}$: then $h = a h + b$, so
+$h = b/(1 - a)$. For the fixed version that is $0.1 / 0.1 = 1$, and its output reaches 0.651
+after 10 steps; the selective one is already at 2.762. Same input, different dynamics,
+because the coefficients now depend on what the input is.
 
 </details>

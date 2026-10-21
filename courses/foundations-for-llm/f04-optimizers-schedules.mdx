@@ -7,6 +7,10 @@ order: 4
 
 ## Why the optimizer matters
 
+Knowing which way is downhill is not the same as knowing how far to step. The optimizer and the
+schedule are the rules for turning "which way" into an actual move, and they decide whether
+training is fast, slow, or explodes.
+
 Backprop (F2) gives you gradients. The *optimizer* decides how to turn gradients
 into weight updates — and the **learning-rate schedule** decides how big those steps
 are over time. When you fine-tune a Bengali LLM (Bengali ch. 9), almost every knob
@@ -14,7 +18,18 @@ you touch lives here: learning rate, warmup, the schedule, weight decay. Getting
 these wrong is the #1 reason a fine-tune diverges or learns nothing. So understand
 them, don't copy them blindly.
 
+The **learning rate** is the step size: how far the weights move per update. A training run
+**diverges** when the loss grows instead of shrinking, usually ending in `inf` or `nan`.
+
+> **Picture it:** driving down a winding mountain road at night. The gradient is the direction
+> your headlights show. The optimizer is how you steer (smoothly, or jerking the wheel at every
+> bend). The schedule is your speed over the trip: slow while your eyes adjust, fastest on the
+> open stretch, slow again as you pull into the parking spot.
+
 ## SGD and the ill-conditioning problem
+
+The simplest rule takes a fixed-size step straight downhill. It breaks down when the valley is
+steep in one direction and nearly flat in another, because one step size cannot suit both.
 
 Plain SGD takes a step opposite the gradient:
 
@@ -22,13 +37,29 @@ $$
 w \leftarrow w - \eta \cdot g
 $$
 
+> **In plain words:** new weight = old weight minus (learning rate $\eta$) times (gradient $g$).
+> **SGD** (stochastic gradient descent) is this rule applied with gradients computed on small
+> random batches.
+
 The catch: the largest safe $\eta$ is bounded by the *steepest* direction of the loss.
 But deep networks are wildly **ill-conditioned** — some directions are steep, others
 nearly flat. A single $\eta$ that's safe for the steep directions is painfully slow in
 the flat ones. (Verified below: on a problem with curvatures 1 and 200, SGD crawls
 while adaptive methods finish.)
 
+**Curvature** is how fast the slope itself changes along a direction: a narrow canyon wall has
+high curvature, a broad plain has low curvature. The **condition number** is the ratio of the
+steepest to the flattest curvature, 200 in the example below. On a bowl with curvature $c$, a
+step is only stable while $\eta < 2/c$, so curvature 200 caps $\eta$ below 0.01 for *every*
+direction.
+
+> **Picture it:** a long, narrow canyon. A big step across the narrow way slams you into the
+> opposite wall. A step small enough to avoid that moves you along the canyon floor at a crawl.
+
 ## Momentum: accumulate velocity
+
+Momentum lets the weights pick up speed in directions where the gradient keeps agreeing with
+itself, like a ball rolling downhill.
 
 Momentum keeps a velocity vector $v$ and updates:
 
@@ -36,34 +67,65 @@ $$
 v \leftarrow \beta v - \eta g, \qquad w \leftarrow w + v \qquad (\beta \approx 0.9)
 $$
 
+> **In plain words:** the new velocity keeps 90% of the old velocity ($\beta = 0.9$) and adds
+> the new downhill push. Then the weights move by the velocity. A steady push in one direction
+> keeps adding up, to about $1/(1 - 0.9) = 10$ times a single step.
+
 Momentum averages recent gradients, so directions where the gradient consistently
 points the same way build up speed, while oscillating directions cancel out. It's a
 big, cheap win over SGD on ill-conditioned losses — exactly the regime nets live in.
 
+> **Picture it:** a heavy ball rolling along the canyon. Pushes from the left and right walls
+> alternate and mostly cancel, while the gentle slope along the floor pushes the same way every
+> time, so the ball keeps accelerating down the canyon.
+
 ## Adam: a per-parameter learning rate
+
+Adam gives every weight its own step size. Weights whose gradients have been big get smaller
+steps, and weights whose gradients have been tiny get bigger ones, so every direction moves at a
+similar pace.
 
 Adam keeps a running mean of gradients ($m$, like momentum) *and* a running mean of
 squared gradients ($v$), then scales each parameter's step by $1/\sqrt{v}$. Every
 parameter gets its own effective learning rate — large where gradients have been
 small, small where they've been large.
 
+A **running mean** (here an **exponential moving average**) is an average that gives the most
+weight to recent values and lets old values fade away by a constant factor at each step.
+
 ### Adam update rule
+
+Four lines, applied element by element to every weight.
 
 $$
 m \leftarrow \beta_1 m + (1 - \beta_1) g \qquad (\beta_1 \approx 0.9)
 $$
 
+> **In plain words:** $m$ is the running average of the gradient, its typical direction. It
+> keeps 90% of its old value and mixes in 10% of the new gradient.
+
 $$
 v \leftarrow \beta_2 v + (1 - \beta_2) g^2 \qquad (\beta_2 \approx 0.999)
 $$
+
+> **In plain words:** $v$ is the running average of the *squared* gradient, its typical size.
+> It forgets much more slowly: 99.9% old, 0.1% new.
 
 $$
 \hat{m} = \frac{m}{1 - \beta_1^t}, \qquad \hat{v} = \frac{v}{1 - \beta_2^t} \qquad \text{(bias correction)}
 $$
 
+> **In plain words:** both averages start at 0, so early on they are too small. Dividing by
+> $1 - \beta^t$ fixes that. At step $t = 1$ with $\beta_1 = 0.9$, $m$ is divided by $0.1$, which
+> recovers the gradient itself. As $t$ grows, $\beta^t \to 0$ and the correction fades away.
+
 $$
 w \leftarrow w - \eta \cdot \frac{\hat{m}}{\sqrt{\hat{v}} + \varepsilon}
 $$
+
+> **In plain words:** step by the learning rate times "typical direction divided by typical
+> size". The ratio is about $\pm 1$ when gradients are steady, whatever their raw scale, so
+> each weight moves roughly $\eta$ per step. The tiny $\varepsilon$ only prevents division by 0.
 
 This adaptivity is why Adam (and its variant **AdamW**, which decouples weight decay)
 is the **default optimizer for transformers**: it's robust to the per-parameter scale
@@ -71,6 +133,13 @@ differences that are everywhere in attention blocks, and it needs far less
 learning-rate babysitting than SGD. Use **AdamW** in practice. For LLM fine-tuning,
 typical $\eta$ is small: `1e-4` to `2e-5` for full/LoRA fine-tuning (Bengali ch. 9
 gives concrete numbers).
+
+**Weight decay** shrinks every weight a little at each step, pulling the model toward smaller
+weights (F6). **LoRA** is a fine-tuning method that trains small add-on matrices instead of the
+full weights (Bengali ch. 9).
+
+The block below races the three optimizers on the canyon from the previous section: curvature 1
+in one direction, 200 in the other, starting from $(5, 5)$, for 300 steps each.
 
 ```python
 import numpy as np
@@ -110,7 +179,22 @@ SGD stays stuck at $5 \times 10^{-2}$; both momentum and Adam reach near-zero. O
 real transformer, where condition numbers are far worse, this gap is what separates
 "trains" from "crawls."
 
+Look at the exponents. SGD ends at $5.5 \times 10^{-2}$, momentum at $5.6 \times 10^{-11}$, and
+Adam at $3.4 \times 10^{-10}$: both are at least a hundred million times lower than SGD. SGD's
+learning rate of 0.009 sits just under the stability limit $2/200 = 0.01$ for the steep
+direction, so in the flat direction each step only shrinks $w_0$ by a factor of $0.991$. After
+300 steps $w_0$ is still about $5 \times 0.991^{300} \approx 0.33$, which is exactly the leftover
+loss $0.5 \times 0.33^2 \approx 0.055$.
+
+> **Watch out:** this race is not perfectly fair. SGD and momentum use $\eta = 0.009$, while
+> Adam uses a step of 0.1 (hard-coded in the `adam` branch). That is normal: Adam's step is
+> measured in "units per step" rather than "units per gradient", so its good learning rates
+> live on a different scale. Never copy a learning rate from SGD to Adam or back.
+
 ## Warmup: don't take big steps before the optimizer knows the landscape
+
+At the very start of training, Adam's averages hold almost no history, so its steps are based
+on guesswork. Warmup starts with tiny steps and grows them, so no early guess can do much damage.
 
 At step 0, Adam's running averages ($m$, $v$) are basically empty, so its step
 directions are unreliable — and transformer activations are fragile early in
@@ -119,7 +203,16 @@ $\eta$ linearly from 0 to its target over the first few hundred/thousand steps. 
 transformers this is not optional folklore; skipping it is a classic way to make
 fine-tuning diverge.
 
+**Activations** are the intermediate values computed inside the network during the forward
+pass. **NaN** means "not a number", the value that appears after an overflow and then spreads
+to everything it touches.
+
+> **Picture it:** stepping onto a frozen lake. You test the ice with small steps first and only
+> stride out once you know it holds. The optimizer's statistics are your knowledge of the ice.
+
 ## Linear warmup → cosine decay schedule
+
+The full recipe is a ramp up, then a smooth slide down to almost zero by the end of training.
 
 After warmup, you *decay* the learning rate so the model can settle into a good
 minimum instead of bouncing around it. The standard recipe is **linear warmup →
@@ -131,6 +224,13 @@ $$
 \dfrac{\eta_{\max}}{2}\!\left(1 + \cos\!\left(\pi \cdot \dfrac{t - T_{\text{warmup}}}{T_{\text{total}} - T_{\text{warmup}}}\right)\right) & t \ge T_{\text{warmup}}
 \end{cases}
 $$
+
+> **In plain words:**
+> - $t$ is the current step, $T_{\text{warmup}}$ the length of the ramp, and $T_{\text{total}}$
+>   the total number of steps.
+> - During warmup the rate grows in a straight line from 0 to $\eta_{\max}$.
+> - After warmup, the fraction inside the cosine goes from 0 to 1, so the cosine goes from 1
+>   to $-1$, and the rate slides smoothly from $\eta_{\max}$ down to 0.
 
 ```python
 import numpy as np
@@ -154,11 +254,35 @@ step  600: lr = 8.26e-05
 step 1000: lr = 0.00e+00
 ```
 
+Check the landmarks. Step 0 gives 0, step 50 (halfway through warmup) gives exactly half the
+peak, $1.00 \times 10^{-4}$, and step 100 hits the peak $2.00 \times 10^{-4}$. Then the decay is
+gentle at first (still $1.77 \times 10^{-4}$ at step 300), fastest in the middle ($8.26 \times
+10^{-5}$ at step 600), and gentle again as it reaches 0 at step 1000.
+
 **Mental model:** optimizer = *how* to step (direction/scale per parameter);
 schedule = *how big* to step over time (warmup up, then decay down). Both matter;
 neither rescues a broken loss or bad data.
 
+> **Watch out:** the schedule's `total` must match the real number of training steps. If you
+> set `total=1000` but train for 3,000 steps, the formula's cosine starts rising again after
+> step 1000 and the learning rate climbs back up. Libraries usually clamp or warn, but check.
+
+## Recap in plain words
+
+- The optimizer turns gradients into weight updates; the schedule sets the step size over time.
+- Plain SGD uses one step size for every direction, so a steep direction forces slow progress in
+  every flat one.
+- Momentum builds up speed in directions where the gradient keeps agreeing.
+- Adam divides each weight's step by the typical size of its gradient, giving every weight its
+  own learning rate.
+- AdamW is Adam with weight decay applied directly to the weights; it is the default for
+  transformers.
+- Warmup ramps the learning rate up from 0 so early, poorly informed steps stay small.
+- Cosine decay then eases the rate down to 0 so the model settles into a minimum.
+
 ## Try it Yourself
+
+This draws the warmup-plus-cosine schedule as a text bar chart, one row every 100 steps.
 
 ```python
 import numpy as np
@@ -189,6 +313,13 @@ for s in range(0, 1001, 100):
 1000 |
 ```
 
+The bars grow from nothing at step 0 to a full 30 blocks at step 100, then shrink: 26 blocks at
+step 300, 12 at step 600, 3 at step 800. Steps 900 and 1000 show empty bars because the rate there
+is under $1/30$ of the peak, so it rounds down to zero blocks.
+
+Try a variation: set `warmup=300` and see the peak move right, or replace the cosine line with a
+straight line, `base_lr * (1 - p)`, to compare **linear decay**, another common schedule.
+
 ## Exercise
 
 Implement an `AdamW` step in NumPy: standard Adam, but apply weight decay *directly
@@ -196,8 +327,11 @@ to the weights* (`w ← w − lr·wd·w`) rather than adding it to the gradient.
 fit the logistic-regression weights for a small dataset. (Decoupled weight decay is
 the "W" in AdamW and the correct way to regularize transformers.)
 
+> **Hint:** start from the four Adam lines above. The only change is one extra term in the
+> final update, `self.wd * w`, which uses the weights, not the gradient.
+
 <details>
-<summary>Solution sketch</summary>
+<summary>Solution</summary>
 
 ```python
 import numpy as np
@@ -216,4 +350,26 @@ class AdamW:
 
 Key line: weight decay multiplies `w`, not `g`. Coupling it into the gradient (plain
 "L2") interacts badly with Adam's per-parameter scaling — decoupling fixes it.
+
+The problem with the coupled version: an L2 term added to the gradient is then divided by
+$\sqrt{\hat{v}}$ like everything else, so weights with large gradients get almost no decay and
+weights with small gradients get a lot. Decoupling gives every weight the same shrink rate.
+
+Using it on a logistic regression with 200 points:
+
+```python
+np.random.seed(0)
+X = np.random.randn(200, 2)
+y = (X @ np.array([2.0, -3.0]) + 0.5 * np.random.randn(200) > 0).astype(float)
+w = np.zeros(2); opt = AdamW(2, lr=0.05, wd=0.01)
+for _ in range(500):
+    p = 1 / (1 + np.exp(-(X @ w)))
+    w = opt.step(w, X.T @ (p - y) / len(y))      # gradient of mean log-loss
+print("weights:", w.round(2), " accuracy:", ((X @ w > 0) == y).mean())
+```
+
+This prints weights of about $(4.6, -6.12)$ and a training accuracy of 0.955. The weights are
+larger than the $(2, -3)$ used to make the labels because logistic regression keeps sharpening
+its probabilities on nearly separable data; what matters is the direction, and the ratio
+$-6.12 / 4.6 \approx -1.33$ is close to the true $-1.5$.
 </details>

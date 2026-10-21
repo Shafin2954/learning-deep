@@ -7,11 +7,30 @@ order: 7
 
 ## Why augmentation matters
 
+**Data augmentation** makes new training images by changing old ones in ways that do not change
+the answer: a flipped cat is still a cat. The network sees more variety and learns to ignore
+details that should not matter.
+
 A CNN trained on 1000 images of cats all facing left will fail on cats facing right. Augmentation generates plausible variants of training images at runtime, expanding effective dataset size and teaching invariances explicitly. Augmentation is the single highest-leverage intervention for small datasets.
+
+> **Picture it:** learning to recognise a friend. You have seen them in sunlight, at night,
+> from the side, wearing a hat. Augmentation shows the network the "hat and night" versions
+> of every photo it already has, so a new photo of the same thing is never a surprise.
+
+> **Watch out:** an augmentation is only safe if it keeps the label true. A vertical flip is
+> harmless for satellite images but turns a "6" into a "9" in digit recognition, and a
+> colour shift can destroy the signal in tasks where colour is the label (ripe vs unripe fruit).
 
 ## Geometric transforms
 
+Geometric transforms move pixels around — flip, crop, rotate, tilt — without changing their
+colours.
+
 Flips, crops, rotations, and perspective warp change spatial layout without changing semantics.
+
+`torchvision.transforms.v2` applies them to whole batches. `RandomResizedCrop` picks a random
+region covering 70% to 100% of the area and resizes it to $224 \times 224$; that is why the
+output is smaller than the input.
 
 ```python
 import torch
@@ -35,9 +54,19 @@ print("Input:", x.shape, "  Output:", y.shape)
 Input: torch.Size([4, 3, 256, 256])   Output: torch.Size([4, 3, 224, 224])
 ```
 
+The batch of 4 goes in at $256 \times 256$ and comes out at $224 \times 224$, the size most
+ImageNet models expect. Every other transform here keeps the size.
+
+> **Watch out:** when you pass a batch tensor, v2 transforms draw *one* set of random
+> parameters for the whole batch — all 4 images get the same flip and crop. For per-image
+> randomness, apply the transform inside your `Dataset`, one image at a time.
+
 ## Color transforms
 
-Color jitter randomizes brightness, contrast, saturation, and hue. Grayscale conversion removes color entirely, which can regularize models relying on colour cues.
+Colour transforms leave every pixel where it is but change how bright, contrasty, or colourful
+it is — the same scene under different lighting or cameras.
+
+Color jitter randomizes brightness, contrast, saturation, and hue. Grayscale conversion removes color entirely, which can regularize models relying on colour cues. (**Hue** is the colour itself — red vs green; **saturation** is how vivid it is.)
 
 ```python
 color_transforms = T.Compose([
@@ -55,9 +84,19 @@ print("Output shape:", y.shape, " dtype:", y.dtype)
 Output shape: torch.Size([4, 3, 224, 224])  dtype: torch.uint8
 ```
 
+The shape and the `uint8` type (whole numbers 0 to 255) are unchanged. Colour transforms only
+rewrite pixel values, so they never need to touch labels or boxes.
+
 ## Random Erasing (Cutout)
 
+**Random erasing** blanks out a random rectangle of the image. The network can no longer
+rely on one tell-tale spot, so it must learn from the whole object.
+
 Randomly zero out a rectangular region of the image, forcing the network to use contextual information rather than a single discriminative patch.
+
+> **Picture it:** covering part of a face with your hand and asking "who is this?". If the
+> network only ever looked at the eyes, covering the eyes leaves it lost; erasing teaches it
+> to use the nose, hair, and outline too.
 
 ```python
 import torch
@@ -65,9 +104,10 @@ import torchvision.transforms.v2 as T
 
 erase = T.Compose([
     T.ToImage(), T.ToDtype(torch.float32, scale=True),
-    T.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+    T.RandomErasing(p=1.0, scale=(0.02, 0.2), ratio=(0.3, 3.3)),  # always erase for demo
 ])
 
+torch.manual_seed(0)
 x = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
 y = erase(x)
 zeros_pct = (y == 0).float().mean().item()
@@ -75,10 +115,17 @@ print(f"Zeroed fraction: {zeros_pct:.2%}")
 ```
 
 ```output
-Zeroed fraction: 6.25%
+Zeroed fraction: 12.75%
 ```
 
+About 12.75% of the values are now 0. The rectangle's area is drawn between 2% and 20% of the
+image (`scale=(0.02, 0.2)`), and a few of the zeros (about 0.4%) were already 0 in the random
+input. The demo sets `p=1.0` so it always erases; in training you would use around 0.5.
+
 ## MixUp: interpolate images and labels
+
+**MixUp** makes a "ghost" image by blending two images, and it blends their labels in the
+same proportion. A picture that is 70% cat and 30% dog gets the answer "70% cat, 30% dog".
 
 MixUp creates a new training sample by linearly blending two images and their one-hot labels:
 
@@ -88,19 +135,27 @@ $$
 
 where $\lambda \sim \text{Beta}(\alpha, \alpha)$ (typically $\alpha = 0.4$).
 
+> **In plain words:**
+> - $x_i$, $x_j$ are two images from the batch; $y_i$, $y_j$ are their labels as **one-hot**
+>   vectors (all zeros except a 1 at the true class).
+> - $\lambda$ is a mixing weight between 0 and 1, drawn fresh every batch.
+> - $\tilde{x}$ is the blended image and $\tilde{y}$ the blended label.
+> - With $\alpha = 0.4$, the Beta distribution puts most of its weight near 0 and 1, so most
+>   mixes are mostly one image with a little of the other.
+
 ```python
 import torch
 import torch.nn.functional as F
 import numpy as np
 
-def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
+def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4,
+                num_classes: int = 10):
     """
     x: (B, C, H, W) float tensor
     y: (B,) long tensor — class indices
     returns mixed_x (B, C, H, W), mixed_y (B, num_classes)
     """
     B = x.size(0)
-    num_classes = int(y.max().item()) + 1
     lam = float(np.random.beta(alpha, alpha))
 
     idx  = torch.randperm(B)
@@ -112,6 +167,7 @@ def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
     mixed_y = lam * y_a + (1 - lam) * y_b
     return mixed_x, mixed_y
 
+torch.manual_seed(0); np.random.seed(0)
 x = torch.randn(8, 3, 32, 32)
 y = torch.randint(0, 10, (8,))
 mx, my = mixup_batch(x, y)
@@ -121,12 +177,22 @@ print("Mixed labels:", my.shape, "  row0:", my[0].numpy().round(2))
 
 ```output
 Mixed images: torch.Size([8, 3, 32, 32])
-Mixed labels: torch.Size([8, 10])  row0: [0.   0.   0.   0.34 0.   0.   0.66 0.   0.   0.  ]
+Mixed labels: torch.Size([8, 10])   row0: [0.   0.   0.   0.   0.   0.   0.   0.66 0.   0.34]
 ```
+
+The labels now have 10 columns, one per class. Row 0 reads 0.66 for class 7 and 0.34 for
+class 9: this sample is two-thirds one image and one-third its partner, so $\lambda \approx 0.66$.
+
+> **Watch out:** infer the number of classes from your dataset, never from `y.max() + 1` on
+> one batch. If a batch happens to miss the highest class, the one-hot vectors come out too
+> narrow and the shapes will not match the model's 10 outputs.
 
 The label is a soft blend — you use cross-entropy with soft targets (or KL divergence) when training with MixUp.
 
 ## CutMix: paste region + blend labels
+
+**CutMix** keeps images crisp: instead of blending everywhere, it pastes a rectangle from one
+image onto another, and the label is split by area.
 
 CutMix cuts a region from one image and pastes it into another, blending labels proportional to the patch area:
 
@@ -134,10 +200,18 @@ $$
 \tilde{x}[r] = x_j[r], \quad \tilde{x}[\bar{r}] = x_i[\bar{r}], \quad \lambda = 1 - \frac{\text{area}(r)}{H \times W}
 $$
 
+> **In plain words:** inside the rectangle $r$, the pixels come from image $x_j$; everywhere
+> else ($\bar{r}$, the complement) they stay from $x_i$. The weight $\lambda$ is the share of the
+> image that still belongs to $x_i$: if the pasted patch covers 25% of the area,
+> $\lambda = 0.75$.
+
+The code clips the box at the image border, so it recomputes $\lambda$ from the area actually
+pasted (`lam_adj`) rather than trusting the sampled one.
+
 ```python
-def cutmix_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0):
+def cutmix_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0,
+                 num_classes: int = 10):
     B, C, H, W = x.shape
-    num_classes = int(y.max().item()) + 1
     lam = float(np.random.beta(alpha, alpha))
 
     # Sample a random box
@@ -165,9 +239,19 @@ print("CutMix output:", mx.shape, my.shape)
 CutMix output: torch.Size([8, 3, 32, 32]) torch.Size([8, 10])
 ```
 
+The images keep their shape, and the soft labels are again `[8, 10]`. Each row's two non-zero
+entries add to 1, with the split set by the pasted patch's area.
+
 ## AutoAugment and RandAugment
 
-**AutoAugment** learns an augmentation policy (which operations, magnitudes, probabilities) using RL on a proxy task. **RandAugment** simplifies: sample $N$ operations uniformly at random from a fixed list, apply each with magnitude $M$.
+Choosing which augmentations to use, and how strong, is itself a design problem. These two
+methods automate it.
+
+**AutoAugment** learns an augmentation policy (which operations, magnitudes, probabilities) using RL on a proxy task. **RandAugment** simplifies: sample $N$ operations uniformly at random from a fixed list, apply each with magnitude $M$. (**RL**, reinforcement learning, is trial-and-error search guided by a reward — here, validation accuracy.)
+
+> **Picture it:** AutoAugment is a chef who tested thousands of spice combinations to write
+> one recipe. RandAugment is "pick any 2 spices from the rack, use strength 9" — and it
+> turns out to work about as well with only two knobs to tune.
 
 ```python
 auto_aug  = T.AutoAugment(policy=T.AutoAugmentPolicy.IMAGENET)
@@ -183,9 +267,19 @@ AutoAugment output: torch.Size([3, 224, 224])
 RandAugment output: torch.Size([3, 224, 224])
 ```
 
+Both return a $3 \times 224 \times 224$ image: the policies change content, not size. RandAugment
+has only two settings to tune (`num_ops=2`, `magnitude=9`), which is why it is the common default.
+
 ## Test-time augmentation (TTA)
 
-At inference, run each image through $k$ augmentations, average the predictions. This consistently boosts accuracy by 0.5–2%.
+**Test-time augmentation** applies augmentation at prediction time: you show the model a few
+slightly different versions of the same image and average its answers.
+
+At inference, run each image through $k$ augmentations, average the predictions. This often boosts accuracy by 0.5–2%.
+
+> **Picture it:** asking five friends to look at a blurry photo, each from a slightly
+> different angle, and going with the average opinion. One friend's odd mistake gets
+> outvoted.
 
 ```python
 import torch.nn as nn
@@ -212,12 +306,23 @@ print("TTA probs shape:", preds.shape, "  sum:", preds[0].sum().item())
 ```
 
 ```output
-TTA probs shape: torch.Size([2, 1000])   sum: 1.0000001192092896
+TTA probs shape: torch.Size([2, 1000])   sum: 1.0
 ```
+
+Each of the 2 images gets 1,000 class probabilities, and each row still sums to 1.0: an average
+of probability vectors is itself a probability vector. TTA costs $k$ times the compute — here 5
+forward passes per image.
+
+> **Watch out:** only use augmentations at test time that are safe for *every* image, such as
+> horizontal flips and mild crops. Heavy augmentation (big rotations, erasing) adds noise to
+> the average instead of removing it.
 
 ## Augmentation for detection and segmentation
 
-When you augment a detection image, **you must transform the bounding boxes too**. torchvision.transforms.v2 handles this natively when you pass a `BoundingBoxes` tensor.
+In detection, a label is a box with coordinates. Flip or crop the image and the box must move
+the same way, or your labels point at empty background.
+
+When you augment a detection image, **you must transform the bounding boxes too**. torchvision.transforms.v2 handles this natively when you pass a `BoundingBoxes` tensor. (Boxes here use the **XYXY** format: left, top, right, bottom in pixels.)
 
 ```python
 from torchvision import tv_tensors
@@ -231,6 +336,7 @@ aug = T.Compose([
     T.RandomHorizontalFlip(p=1.0),  # always flip for demo
     T.RandomResizedCrop((224, 224), scale=(0.8, 1.0)),
 ])
+torch.manual_seed(0)
 aug_img, aug_boxes = aug(img, boxes)
 print("Original boxes:", boxes.data)
 print("Augmented boxes:", aug_boxes.data)
@@ -239,11 +345,28 @@ print("Augmented boxes:", aug_boxes.data)
 ```output
 Original boxes: tensor([[ 50.,  50., 150., 150.],
         [200., 100., 280., 250.]])
-Augmented boxes: tensor([[ 42.,  38., 155., 133.],
-        [  0.,  73.,  61., 187.]])
+Augmented boxes: tensor([[ 99.8450,  35.7778, 186.6667, 113.5556],
+        [  0.0000,  74.6667,  56.4341, 191.3333]])
 ```
 
+Look at the second box. It started on the right side (x from 200 to 280); after the flip it is
+on the left, and its left edge is 0.0 because the crop cut it off at the border — v2 clamps
+coordinates to the new $224 \times 224$ canvas. The first box moved and shrank the same way the
+pixels did.
+
+## Recap in plain words
+
+- Augmentation creates label-preserving variants so the model learns what to ignore.
+- Geometric transforms move pixels; colour transforms change their values; erasing hides parts.
+- MixUp blends whole images and labels; CutMix pastes a patch and splits the label by area.
+- RandAugment picks random operations with one strength knob and is a strong default.
+- TTA averages predictions over several augmented copies at test time.
+- For detection and segmentation, boxes and masks must be transformed with the image.
+
 ## Try it Yourself
+
+A complete training-time pipeline: flip, crop, colour jitter, erasing, then conversion to
+floats and ImageNet normalisation.
 
 ```python
 import torch
@@ -259,20 +382,30 @@ pipeline = T.Compose([
     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
+torch.manual_seed(0)
 batch = torch.randint(0, 256, (16, 3, 256, 256), dtype=torch.uint8)
 out   = pipeline(batch)
 print("Augmented batch:", out.shape, " mean:", out.mean().item())
 ```
 
 ```output
-Augmented batch: torch.Size([16, 3, 224, 224])  mean: 0.04231
+Augmented batch: torch.Size([16, 3, 224, 224])  mean: -0.4430654048919678
 ```
+
+The batch comes out at $224 \times 224$ with a mean of about $-0.44$. **Normalisation**
+subtracts the ImageNet channel means (about 0.45) and divides by their spreads (about 0.23).
+This batch's average pixel after jitter and erasing was about 0.35, below the ImageNet mean,
+so the normalised mean lands below 0.
 
 Try adding `T.RandAugment(num_ops=2, magnitude=9)` to the pipeline and compare the variance in pixel values across 10 repeated passes on the same batch.
 
 ## Exercise
 
 Implement MixUp inside a training loop. Given a batch of images `x` (B, 3, H, W) and integer labels `y` (B,), apply MixUp with $\alpha=0.4$, compute the cross-entropy loss against the soft blended labels, and return the loss. The loss must be a scalar tensor with `requires_grad=True` flowing back to the model.
+
+> **Hint:** you do not need one-hot vectors. Cross-entropy is linear in the target, so a loss
+> against the soft label equals $\lambda$ times the loss against $y_i$ plus $(1 - \lambda)$
+> times the loss against $y_j$.
 
 <details>
 <summary>Solution</summary>
@@ -293,7 +426,7 @@ def mixup_loss(model: nn.Module, x: torch.Tensor, y: torch.Tensor, alpha: float 
     loss = lam * F.cross_entropy(logits, y) + (1 - lam) * F.cross_entropy(logits, y[idx])
     return loss
 
-model = models.resnet18(pretrained=False)
+model = models.resnet18(weights=None)
 x = torch.randn(4, 3, 224, 224)
 y = torch.randint(0, 1000, (4,))
 loss = mixup_loss(model, x, y)
@@ -301,4 +434,8 @@ print(f"MixUp loss: {loss.item():.4f}  requires_grad: {loss.requires_grad}")
 ```
 
 Using `lam * CE(logits, ya) + (1-lam) * CE(logits, yb)` is mathematically equivalent to CE with soft labels but numerically cheaper (avoids explicit one-hot construction and log-sum interactions).
+
+The key insight is that the image mix happens *before* the model and the label mix happens
+in the loss. Because `x_mix` is computed from `x` and passed through `model`, the loss's
+`requires_grad` is `True` and gradients flow to every weight.
 </details>

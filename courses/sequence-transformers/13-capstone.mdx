@@ -7,13 +7,29 @@ order: 13
 
 ## The project
 
+You are going to build a working Transformer out of basic parts, teach it to write text (or
+translate), and make it generate fast. If you can do this without copying a library's
+Transformer, you understand every idea in this course.
+
 You will build a complete Transformer from scratch — multi-head self-attention, positional
 encoding, a full encoder or decoder block — train it on a real sequence task (char-level
 language model or toy translation), and implement a KV cache for fast generation. The goal is
 a working, trained model whose internals you built and understand, not a wrapper around
 `nn.Transformer`.
 
+> **Picture it:** this is building a car from an engine block, gears, and wheels you are
+> allowed to buy, rather than buying the car. You may use the bolts and the dashboard
+> (linear layers, embeddings, a training loop); the engine (attention, blocks, cache) has to be
+> yours.
+
+A sensible size for a laptop: $d_{\text{model}} = 128$ to 256, 4 to 6 blocks, 4 to 8 heads,
+context length 256, a dataset of about 1 MB of text (for example the "tiny Shakespeare"
+corpus). That trains in well under an hour on a single GPU and still produces readable text.
+
 ## Hard constraints (no vibe coding)
+
+The rule is simple: every piece the course taught you to build, you build. Plain building
+blocks are allowed; ready-made Transformer components are not.
 
 - You MAY NOT use `torch.nn.Transformer`, `torch.nn.TransformerEncoder`, or
   `torch.nn.TransformerDecoder` for the core. These are off-limits.
@@ -26,30 +42,60 @@ a working, trained model whose internals you built and understand, not a wrapper
 - You MAY use a standard training loop from any tutorial — the constraint is on the
   model architecture, not the training boilerplate.
 
+"No vibe coding" also means no AI assistant writes the model code for you. You may look up an
+API; you may not paste in an attention implementation.
+
+> **Watch out:** `torch.nn.functional.scaled_dot_product_attention` is also off-limits inside
+> your model. You use it only once, as the reference your own function is tested against.
+
 ## What it must contain (and the chapter each tests)
+
+Each item below is one component, the chapter that teaches it, and the check that proves it
+works. Build them in this order; each one only needs the ones before it.
 
 - **Scaled dot-product attention with masking** (ch. 6–7): implement
   $\text{Attention}(Q,K,V) = \text{softmax}(QK^T/\sqrt{d_k})V$ from scratch; apply
   causal mask for decoder; verify output shape matches expected $(B, T, d_v)$.
+  In plain words: the score table, the scaling, the $-\infty$ mask, and the weighted sum of
+  values — four lines, tested on random tensors before anything else.
 - **Multi-head attention** (ch. 7): split into $h$ heads, attend in parallel, project
   back; verify that using $h=1$ with $d_k = d_{model}$ gives the same result as
   single-head attention.
+  In plain words: reshape, don't loop. The $h = 1$ test catches most reshape and transpose
+  bugs.
 - **Positional encoding** (ch. 8): implement sinusoidal PE; add an option for learned
   embeddings; plot the encoding matrix and verify the pattern.
-- **Full Transformer block** (ch. 9): pre-norm or post-norm LayerNorm, FFN with 4×
+  In plain words: fast stripes in the low dimensions, slow ones in the high dimensions; a
+  config flag switches to a learned table.
+- **Full Transformer block** (ch. 9): pre-norm or post-norm LayerNorm, FFN with $4\times$
   expansion, residual connections; stack at least 2 blocks.
+  In plain words: attention then FFN, each wrapped in "normalize, compute, add back".
 - **Training** (ch. 10): train on a char-level language model (Shakespeare, Python code,
   or similar) or a toy translation task; reach perplexity below 3.0 on char-LM or
   BLEU > 10 on translation; log loss per epoch.
+  In plain words: use warmup plus decay, gradient clipping, and a held-out split. Perplexity
+  is $e^{\text{loss}}$ in nats, so 3.0 means a validation loss below about 1.10.
 - **Decoding** (ch. 11): implement temperature sampling and greedy decoding; generate
   at least 200 characters of coherent (not random) text.
+  In plain words: show both, side by side, from the same prompt.
 - **KV cache** (ch. 11): implement a KV cache that stores past keys and values;
   verify it produces identical output to the uncached forward pass for the same inputs;
   measure the speedup at sequence length 512.
+  In plain words: one cache entry per layer, appended each step; time generation with and
+  without it.
 - **Architecture comparison** (ch. 12): train both an encoder-only and a decoder-only
   variant on the same task; note the differences in how masking is applied.
+  In plain words: the same blocks with and without the causal mask. Note that an encoder-only
+  model cannot generate left to right, so compare them on a task both can do, or explain why
+  one cannot.
+
+> **Watch out:** a perplexity far below 3.0 on the *training* set proves nothing — a small
+> model can memorize 1 MB. The target is on held-out text (ch. 10's repeated-sentence demo
+> reached 1.0 by memorizing).
 
 ## Acceptance criteria
+
+These are the numbers and checks you report. Each is pass/fail; "close" counts as fail.
 
 - Scaled dot-product attention output matches PyTorch's
   `torch.nn.functional.scaled_dot_product_attention` on the same inputs to 1e-5
@@ -57,16 +103,27 @@ a working, trained model whose internals you built and understand, not a wrapper
 - Causal mask correctly prevents attention to future positions: attention weight matrix
   is lower-triangular (verified by inspection).
 - Sinusoidal PE is unique per position and smooth: visualized as a heatmap.
-- Model trains to perplexity ≤ 3.0 on a char-level dataset within 20 epochs (or
+- Model trains to perplexity $\le 3.0$ on a char-level dataset within 20 epochs (or
   BLEU > 10 if translation task).
 - Generated text is coherent: not a random character sequence and follows the training
   distribution visibly.
-- KV cache produces byte-for-byte identical logits vs the uncached model on the same
-  prefix (verified with `torch.allclose`).
-- KV cache provides measurable speedup (≥ 1.5×) at sequence length ≥ 256 vs
+- KV cache produces identical logits to the uncached model on the same prefix, up to float
+  rounding (verified with `torch.allclose`, for example `atol=1e-5`).
+- KV cache provides measurable speedup ($\ge 1.5\times$) at sequence length $\ge 256$ vs
   recomputing from scratch each step.
 
+"Verified by inspection" is good; an assertion is better: check that every entry above the
+diagonal is exactly 0. For the cache, bit-for-bit equality is not a fair test — the cached and
+uncached paths add numbers in a different order, so float32 results differ in the last digits
+(ch. 8's exercise showed the same effect). For timing, warm up once, then measure several runs
+and report the median.
+
+> **Watch out:** measure the speedup on generation (one new token per step), not on a single
+> forward pass. The cache only helps when you produce tokens one at a time.
+
 ## Skills checklist (tick before you claim done)
+
+Tick a box only when you could do it on a blank page, without your project open.
 
 - [ ] I can implement scaled dot-product attention with an arbitrary mask in fewer than
   15 lines of PyTorch.

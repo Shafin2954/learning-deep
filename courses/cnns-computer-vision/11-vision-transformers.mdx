@@ -7,9 +7,17 @@ order: 11
 
 ## From tokens to patches
 
-Transformers operate on sequences of tokens. ViT (Dosovitskiy 2020) applies this directly to images by cutting the image into non-overlapping patches and treating each patch as a token.
+A **transformer** is a network built for sequences, like the words of a sentence: every item
+can look at every other item and decide which ones matter. A Vision Transformer cuts a photo
+into little square tiles and treats the tiles like words.
 
-A 224×224 image with 16×16 patches → $(224/16)^2 = 196$ tokens, each a 768-dimensional vector (from a linear projection of the flattened 16×16×3 = 768 pixel values).
+Transformers operate on sequences of tokens. ViT (Dosovitskiy 2020) applies this directly to images by cutting the image into non-overlapping patches and treating each patch as a token. (A **token** is one item of the sequence, stored as a vector.)
+
+A $224 \times 224$ image with $16 \times 16$ patches → $(224/16)^2 = 196$ tokens, each a 768-dimensional vector (from a linear projection of the flattened $16 \times 16 \times 3 = 768$ pixel values).
+
+> **Picture it:** cutting a photo into a $14 \times 14$ grid of stamps and laying them out in
+> one long row. The transformer reads the row like a sentence. On its own the row has no idea
+> which stamp was top-left — that is what position embeddings (below) put back.
 
 $$
 z_0 = [x_\text{cls}; x_p^1 E; x_p^2 E; \ldots; x_p^N E] + E_\text{pos}
@@ -17,7 +25,17 @@ $$
 
 where $E \in \mathbb{R}^{(P^2 C) \times D}$ is the patch embedding matrix and $E_\text{pos}$ are learnable position embeddings.
 
+> **In plain words:**
+> - $x_p^i$ is patch number $i$, flattened into $P^2 C$ numbers ($P$ = patch side, $C$ = colour channels).
+> - Multiplying by $E$ turns each patch into a $D$-dimensional token.
+> - $x_\text{cls}$ is an extra learned token placed in front; at the end, its vector is used for the class decision.
+> - $E_\text{pos}$ adds a learned "where am I" vector to every token.
+> - $z_0$ is the resulting sequence of $N + 1$ tokens fed into the transformer.
+
 ## Patch embedding from scratch
+
+Cutting into patches and multiplying each by $E$ is exactly what a conv does when its kernel
+size equals its stride: each kernel position covers one patch, with no overlap.
 
 ```python
 import torch
@@ -50,7 +68,13 @@ Tokens: torch.Size([2, 196, 768])
 Patches per image: 196
 ```
 
+The conv turns `[2, 3, 224, 224]` into `[2, 768, 14, 14]`; flatten and transpose give
+`[2, 196, 768]`: 2 images, 196 tokens each, 768 numbers per token.
+
 ## Adding CLS token and position embeddings
+
+Two small additions finish the input: a blank "summary" token at the front, which will collect
+information from all patches, and a position vector added to every token.
 
 ```python
 class ViTEmbedding(nn.Module):
@@ -82,9 +106,28 @@ Embedding output: torch.Size([2, 197, 768])
 
 197 = 1 CLS token + 196 patch tokens.
 
+The CLS token starts as zeros and is shared by all images (`expand` copies it per image without
+using extra memory). The position embeddings are one learned vector per slot, 197 of them.
+
+> **Watch out:** learned position embeddings are tied to the training grid. Feed a $384 \times 384$
+> image to a model trained at 224 and there are 576 patches but only 196 position vectors;
+> the standard fix is to interpolate the position embeddings to the new grid size.
+
 ## Standard transformer encoder blocks
 
+Each encoder block lets every token look at every other token (attention) and then thinks about
+what it saw on its own (a small MLP). Stack several blocks and read the answer off the CLS token.
+
 After embedding, ViT runs $L$ standard transformer encoder blocks (Multi-Head Self-Attention + FFN with LayerNorm and residuals). The final CLS token representation is passed to a linear head.
+
+(**Self-attention** computes, for each token, a weighted average of all tokens, with weights set
+by how relevant they are; **multi-head** runs several of these in parallel. The **FFN**
+(feed-forward network) is a two-layer MLP applied to each token separately. **LayerNorm**
+normalises each token's vector on its own, unlike BatchNorm in ch. 5.)
+
+> **Picture it:** a meeting of 197 people. In the attention step, everyone listens to everyone
+> and takes notes weighted by who seemed relevant. In the FFN step, each person thinks alone
+> about their notes. After several rounds, the chairperson (CLS) summarises.
 
 ```python
 class ViT(nn.Module):
@@ -117,10 +160,19 @@ print(f"Tiny ViT params: {params:,}")
 
 ```output
 Logits: torch.Size([2, 10])
-Tiny ViT params: 370,954
+Tiny ViT params: 208,074
 ```
 
+The tiny ViT ($32 \times 32$ images, $4 \times 4$ patches, so 64 tokens + CLS) outputs 10 class
+scores per image. Of its 208,074 parameters, 199,936 are in the 4 encoder blocks
+(49,984 each); the patch embedding, CLS token, position embeddings, final norm, and head add
+the remaining 8,138.
+
 ## ViT variants and data hunger
+
+ViTs come in sizes, and the big ones are excellent — but only after seeing a huge amount of
+data. CNNs come with built-in assumptions about images (locality, weight sharing, ch. 1);
+ViTs must learn those from examples.
 
 | Model | Image size | Patch | Depth | Heads | Params | ImageNet top-1 |
 |---|---|---|---|---|---|---|
@@ -128,11 +180,24 @@ Tiny ViT params: 370,954
 | ViT-L/16 | 224 | 16 | 24 | 16 | 307M | 82.6% |
 | ViT-H/14 | 224 | 14 | 32 | 16 | 632M | 83.6% |
 
+The name "B/16" means Base size with $16 \times 16$ patches. The accuracies are for models
+pretrained on far more data than ImageNet and then fine-tuned; exact figures vary with the
+pretraining set and image resolution.
+
 ViT-B trained on ImageNet-1k alone gets only ~77%, while ResNet-50 gets ~80%. ViT needs either a huge dataset (JFT-300M) or knowledge distillation (DeiT).
+
+> **Watch out:** "transformers beat CNNs" is only true with enough data or strong training
+> tricks. On a few thousand images, a pretrained CNN (ch. 6) is usually the better start.
 
 ## DeiT: distillation token
 
-DeiT adds a third token — the **distillation token** — that is trained to match a CNN teacher's hard predictions. At inference, the distillation token is discarded.
+**Knowledge distillation** trains a student model to copy a stronger teacher's answers. DeiT
+gives the ViT a special token whose only job is to listen to a CNN teacher.
+
+DeiT adds a third token — the **distillation token** — that is trained to match a CNN teacher's hard predictions. At inference, DeiT keeps it: the predictions of the class head and the distillation head are averaged.
+
+("Hard predictions" means the teacher's top class only, not its full probability list. The
+CLS token is still trained on the true labels.)
 
 ```python
 # Conceptual DeiT addition
@@ -162,9 +227,20 @@ print("DeiT tokens:", d(x).shape)   # 1 CLS + 1 dist + 64 patches
 DeiT tokens: torch.Size([2, 66, 128])
 ```
 
+With $64 \times 64$ images and $8 \times 8$ patches there are 64 patch tokens; add CLS and the
+distillation token and you get 66 tokens of 128 numbers each.
+
 ## Swin Transformer: hierarchical windows
 
-ViT has quadratic attention over all patches — expensive for large images. **Swin** uses **shifted window attention**: attention is computed inside small $M \times M$ windows (e.g. 7×7), then windows shift to allow cross-window information flow. Swin is hierarchical (merges patches deeper, like a CNN), making it efficient and usable as a backbone for detection/segmentation.
+Letting every patch talk to every other patch gets very expensive as images grow. Swin only
+lets patches talk inside small local windows, and shifts the windows between layers so
+information still spreads.
+
+ViT has quadratic attention over all patches — expensive for large images. **Swin** uses **shifted window attention**: attention is computed inside small $M \times M$ windows (e.g. $7 \times 7$), then windows shift to allow cross-window information flow. Swin is hierarchical (merges patches deeper, like a CNN), making it efficient and usable as a backbone for detection/segmentation.
+
+> **Picture it:** a big party. ViT makes every guest chat with every other guest. Swin seats
+> guests at tables of 49; after each round, the tables are reshuffled by half a table so news
+> spreads between neighbouring tables.
 
 ```python
 # Conceptual window attention complexity
@@ -181,13 +257,25 @@ print(f"Reduction: {total_attention_ops_vit / total_attention_ops_swin:.0f}×")
 
 ```output
 ViT   attention ops: 9,834,496
-Swin  attention ops: 388,864
-Reduction: 25×
+Swin  attention ops: 153,664
+Reduction: 64×
 ```
+
+On a $56 \times 56$ token grid (3,136 tokens), full attention compares $3{,}136^2 \approx 9.8$
+million pairs. Swin's 64 windows of 49 tokens compare only $64 \times 49^2 = 153{,}664$. The
+reduction is $3{,}136 / 49 = 64$ times, and it grows linearly as the image grows.
 
 ## ConvNeXt: a CNN that thinks like a transformer
 
-Liu et al. (2022) asked: what if you modernized a ResNet using transformer design choices? ConvNeXt adopts large kernels (7×7), layer normalization, inverted bottleneck, GELU, and depthwise conv — but keeps a pure CNN structure. Result: ConvNeXt-B matches Swin-B with faster inference and simpler code.
+ConvNeXt asked the reverse question: if you give an ordinary CNN all the small design habits of
+transformers, does it catch up? It does.
+
+Liu et al. (2022) asked: what if you modernized a ResNet using transformer design choices? ConvNeXt adopts large kernels ($7 \times 7$), layer normalization, inverted bottleneck, GELU, and depthwise conv — but keeps a pure CNN structure. Result: ConvNeXt-B matches Swin-B with faster inference and simpler code.
+
+The block mirrors a transformer block: the $7 \times 7$ depthwise conv plays the role of
+attention (mixing across space), and the two linear layers are the FFN (mixing channels, with a
+$4\times$ inverted bottleneck from ch. 5). **Layer scale** (`gamma`, starting at $10^{-6}$)
+makes each new block start out almost as an identity, which stabilises deep training.
 
 ```python
 # ConvNeXt block (simplified)
@@ -219,7 +307,21 @@ print("ConvNeXt output:", blk(x).shape)
 ConvNeXt output: torch.Size([2, 96, 32, 32])
 ```
 
+Same shape in and out, `[2, 96, 32, 32]`, as a residual block requires. The `permute` calls
+exist because `nn.LayerNorm` and `nn.Linear` act on the last dimension, so channels must move
+to the end and back.
+
+## Recap in plain words
+
+- ViT cuts an image into patches, turns each into a token with one linear map, and runs a standard transformer.
+- A CLS token collects a summary for classification; position embeddings tell tokens where they came from.
+- ViTs lack CNN assumptions, so they need huge pretraining data or distillation (DeiT) to win.
+- Swin limits attention to local, shifted windows, making cost grow linearly with image size.
+- ConvNeXt shows a CNN with transformer-style choices matches transformers.
+
 ## Try it Yourself
+
+The same `ViT` class with only 2 encoder blocks.
 
 ```python
 import torch
@@ -234,14 +336,21 @@ print("Params:", sum(p.numel() for p in vit.parameters()))
 
 ```output
 ViT output: torch.Size([4, 10])
-Params: 370,954
+Params: 108106
 ```
+
+Going from 4 blocks to 2 drops the parameter count from 208,074 to 108,106 — exactly
+$2 \times 49{,}984$ fewer. Everything outside the encoder stays the same size.
 
 Try increasing `depth` from 2 to 8 and re-counting parameters. Then try changing `patch_size` from 4 to 2 (more, smaller patches) and observe how the number of tokens and training time scale.
 
 ## Exercise
 
 Implement a ViT positional encoding that uses **2D sinusoidal encodings** instead of learnable parameters. For a grid of $H \times W$ patches, encode row position with dimensions $0..D/2-1$ and column position with dimensions $D/2..D-1$, each using the standard sinusoidal formula. The output should have shape $(1, H \times W, D)$.
+
+> **Hint:** write a 1-D helper that turns a list of positions into sin/cos features. Patch $k$ in
+> reading order sits at row $k // W$ and column $k \% W$; `repeat_interleave` and `repeat`
+> build those two lists.
 
 <details>
 <summary>Solution</summary>
@@ -277,4 +386,9 @@ print("Min:", enc.min().item(), " Max:", enc.max().item())
 ```
 
 The first D/2 dimensions encode row position and the second D/2 encode column position, both using the standard sin/cos frequency schedule. This is non-learned and generalizes to unseen resolutions.
+
+It prints a `[1, 196, 256]` encoding with values between about $-1$ and $1$ (sines and cosines).
+Each pair of dimensions oscillates at a different frequency, so nearby positions get similar
+vectors and far ones get different vectors. Because the formula works for any position,
+a larger grid needs no interpolation.
 </details>

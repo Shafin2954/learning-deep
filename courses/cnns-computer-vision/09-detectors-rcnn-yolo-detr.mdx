@@ -7,14 +7,25 @@ order: 9
 
 ## The two-stage vs one-stage split
 
+Every detector must decide *where* to look before it can say *what* it sees. Some do that in
+two steps (first "here are some interesting spots", then "this spot is a dog"); others do both
+at once.
+
 Detection architectures split on how they find regions to classify:
 
 - **Two-stage** (R-CNN family): first propose candidate regions, then classify each. Higher accuracy, slower.
 - **One-stage** (YOLO, SSD): predict class and box jointly in a single pass. Much faster, slightly lower accuracy on small objects.
 
+> **Picture it:** two ways to find typos in a book. Two-stage: a quick skim marks suspicious
+> pages, then a careful reader checks each marked page. One-stage: one reader reads every
+> line once and fixes as they go — faster, but easier to miss a tiny error.
+
 ## R-CNN (2014)
 
-R-CNN used **selective search** (a CPU-based region proposal algorithm based on hierarchical grouping of superpixels) to extract ~2000 region proposals per image, warped each to 227×227, ran it through AlexNet, and classified with an SVM.
+The first deep detector was the slow, obvious version: cut out about 2,000 candidate patches
+and run a full CNN on each one.
+
+R-CNN used **selective search** (a CPU-based region proposal algorithm based on hierarchical grouping of superpixels) to extract ~2000 region proposals per image, warped each to $227 \times 227$, ran it through AlexNet, and classified with an SVM. (A **region proposal** is a candidate box that might contain an object; **superpixels** are small clumps of similar-coloured pixels; an **SVM** is a classic linear classifier.)
 
 Problems: slow (CNN runs 2000 times), can't train end-to-end, selective search is not learnable.
 
@@ -32,11 +43,23 @@ print("R-CNN: 2000 CNN forward passes per image — bottleneck.")
 R-CNN: 2000 CNN forward passes per image — bottleneck.
 ```
 
+The cost is the point: 2,000 full forward passes per image. At AlexNet speeds of the time, that
+meant tens of seconds per image even on a GPU.
+
 ## Fast R-CNN (2015)
 
-The fix: run the **full image** through the backbone once, then extract features for each region from the shared feature map using **RoI Pooling**. RoI Pooling divides each proposed region into a fixed grid (e.g. 7×7) and max-pools each cell.
+Fast R-CNN's fix: run the CNN once on the whole image, then cut each candidate region out of the
+*feature map* instead of the photo. Cutting out of a feature map is nearly free.
+
+The fix: run the **full image** through the backbone once, then extract features for each region from the shared feature map using **RoI Pooling**. RoI Pooling divides each proposed region into a fixed grid (e.g. $7 \times 7$) and max-pools each cell. (**RoI** = region of interest.)
 
 Training is now end-to-end: the backbone, classifier, and box regressor share gradients.
+
+> **Picture it:** instead of photocopying 2,000 pieces of a map and studying each from scratch,
+> you study the whole map once and then point at areas on your notes.
+
+**RoI Align**, used in the code, is the improved version: it samples the feature map at
+exact fractional positions with interpolation instead of rounding the box to whole cells.
 
 ```python
 import torch
@@ -59,22 +82,38 @@ print("Pooled features:", pooled.shape)   # (2 regions, 256 ch, 7, 7)
 Pooled features: torch.Size([2, 256, 7, 7])
 ```
 
+Two regions of different sizes ($20 \times 20$ and $30 \times 25$ cells) both come out as
+$256 \times 7 \times 7$. That fixed size is what lets one classifier head handle every region.
+
+> **Watch out:** `spatial_scale` must convert image coordinates to feature-map coordinates.
+> With a stride-16 backbone and boxes in pixels, use `spatial_scale=1/16`. The demo uses 1.0
+> because its boxes are already in feature-map units; a wrong scale silently pools the wrong area.
+
 ## Faster R-CNN (2016): the Region Proposal Network
 
-Faster R-CNN replaced selective search with a learnable **Region Proposal Network (RPN)** that slides over the backbone feature map and predicts objectness scores and box offsets for $k$ anchors at every location.
+Faster R-CNN removed the last slow part: the hand-made proposal algorithm. A small network
+now proposes the regions, using the same features as the classifier.
+
+Faster R-CNN replaced selective search with a learnable **Region Proposal Network (RPN)** that slides over the backbone feature map and predicts objectness scores and box offsets for $k$ anchors at every location. (**Objectness** is the probability that an anchor contains *some* object, any class.)
 
 The RPN and the detection head **share the same backbone**, so proposals cost almost nothing.
+
+The demo loads a COCO-trained Faster R-CNN with an **FPN** (feature pyramid network — a neck
+that combines feature maps at several resolutions so small and large objects both get suitable
+features) and runs it on a random-noise image.
 
 ```python
 import torchvision
 import torch
 
 model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
-    weights=torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+    weights=torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT,
+    box_score_thresh=0.0,   # keep low-confidence boxes: a noise image has no real objects
 )
 model.eval()
 
 # Run inference on a dummy image
+torch.manual_seed(0)
 x = [torch.rand(3, 300, 400)]
 with torch.no_grad():
     out = model(x)
@@ -87,12 +126,24 @@ print("First score:", out[0]["scores"][0].item())
 
 ```output
 Keys: ['boxes', 'labels', 'scores']
-Num boxes detected: 8
-First box: [  4.2  12.6 278.9 295.7]
-First score: 0.9834
+Num boxes detected: 100
+First box: [  0.    7.3 400.  294. ]
+First score: 0.030816316604614258
 ```
 
+The model returns a dictionary with `boxes`, `labels`, and `scores`. Because the image is noise,
+nothing in it looks like an object: the best score is only about 0.031. The demo sets
+`box_score_thresh=0.0` so you still see output — with the default threshold of 0.05 you would
+get zero boxes. The 100 boxes are the cap set by `box_detections_per_img`, and the first box
+spans almost the whole $400 \times 300$ image.
+
+> **Watch out:** a pretrained detector always outputs *something* if you lower the threshold
+> enough. Always look at the scores before you trust a box.
+
 ## YOLO: You Only Look Once (2015 → modern)
+
+YOLO skips proposals entirely: it chops the image into a grid and asks every cell, in one pass,
+"is there an object centred here, where exactly, and what is it?".
 
 YOLO divides the image into an $S \times S$ grid. Each cell predicts $B$ bounding boxes and $C$ class probabilities in a single forward pass. The loss combines box regression (MSE on coordinates) and classification (cross-entropy).
 
@@ -100,7 +151,13 @@ $$
 \mathcal{L} = \lambda_\text{coord} \sum_\text{responsible} \left[(x-\hat x)^2 + (y-\hat y)^2 + (\sqrt w - \sqrt{\hat w})^2 + (\sqrt h - \sqrt{\hat h})^2\right] + \ldots
 $$
 
-YOLOv5/v8 improvements: CSP (cross-stage partial) backbones, PANet neck for multi-scale features, mosaic augmentation.
+> **In plain words:** for each box "responsible" for an object (the one that overlaps it best),
+> add the squared errors of its centre $(x, y)$ and of the square roots of its width and height.
+> The square roots make a 10-pixel error count more on a small box than on a large one.
+> $\lambda_\text{coord}$ (5 in the original paper) weights box errors against the
+> confidence and class terms hidden in "$\ldots$".
+
+YOLOv5/v8 improvements: CSP (cross-stage partial) backbones, PANet neck for multi-scale features, mosaic augmentation. (**Mosaic** stitches 4 training images into one, so each batch shows objects at many scales and positions.)
 
 ```python
 # Loading a YOLO model conceptually (ultralytics package)
@@ -122,7 +179,15 @@ YOLO output shape (S=7, B=2, C=20): torch.Size([1, 7, 7, 30])
 Predictions per image: 98 boxes (before NMS)
 ```
 
+Each of the $7 \times 7 = 49$ cells outputs 30 numbers: 2 boxes $\times$ 5 values (4 coordinates +
+1 confidence) + 20 class scores. That makes $49 \times 2 = 98$ candidate boxes per image, which NMS
+(ch. 8) then thins out.
+
 ## DETR: Detection Transformer (2020)
+
+DETR treats detection like filling in a fixed number of answer slots: it asks 100 learned
+"questions" of the image, and each question answers either "a box with a class" or "nothing".
+No anchors, no duplicate removal.
 
 DETR reformulates detection as a **set prediction problem** using a transformer encoder-decoder. No anchors, no NMS:
 
@@ -130,6 +195,14 @@ DETR reformulates detection as a **set prediction problem** using a transformer 
 2. $N$ learned **object queries** attend to encoder output.
 3. Each query predicts a class and box (or "no object").
 4. Loss: Hungarian algorithm matches predictions to GT (bipartite matching), ensuring one-to-one assignment.
+
+(A **transformer** uses **self-attention**, where every token looks at every other token —
+ch. 11 builds one. The **Hungarian algorithm** finds the cheapest one-to-one pairing between
+two lists.)
+
+> **Picture it:** 100 detectives each write one answer on a card: "a dog at here" or "nothing".
+> At training time, a referee pairs each real object with exactly one card and penalises the
+> rest for not saying "nothing". Duplicates are punished, so the model learns not to make them.
 
 ```python
 # torchvision includes a DETR-like interface
@@ -159,9 +232,16 @@ Class logits: torch.Size([1, 100, 92])
 Box coords:   torch.Size([1, 100, 4])
 ```
 
+100 queries of 256 numbers each become 100 sets of 92 class scores (91 COCO classes + 1 "no
+object") and 100 boxes of 4 numbers. The final sigmoid squeezes box coordinates into $[0, 1]$,
+as fractions of the image width and height.
+
 DETR trades anchor engineering for longer training and weaker small-object detection, but its clean formulation spawned Deformable-DETR, DAB-DETR, and many successors.
 
 ## Speed vs accuracy tradeoff
+
+Detectors live on a curve: you can buy accuracy with time. Which point you pick depends on
+whether you need an answer in 5 milliseconds or can wait a second.
 
 | Model | Params | FPS (V100) | COCO mAP |
 |---|---|---|---|
@@ -171,9 +251,25 @@ DETR trades anchor engineering for longer training and weaker small-object detec
 | Faster R-CNN R101 FPN | 60M | 16 | 40 |
 | DETR R50 | 41M | 28 | 42 |
 
+Read across one row at a time. **FPS** is frames per second on a V100 GPU, and COCO mAP is the
+ch. 8 score averaged over IoU 0.5 to 0.95. A YOLO-nano with 3 million parameters matches the
+original Faster R-CNN R50's 37 mAP at roughly 50 times the speed. Treat the numbers as rough:
+they vary with image size, batch size, and software version.
+
 For real-time applications, YOLO wins. For maximum accuracy on non-real-time tasks, two-stage or query-based detectors are preferred.
 
+## Recap in plain words
+
+- Two-stage detectors propose regions and then classify them; one-stage detectors do both in one pass.
+- R-CNN ran a CNN 2,000 times per image; Fast R-CNN ran it once and cut regions out of the feature map with RoI pooling.
+- Faster R-CNN made the proposals learnable with a small Region Proposal Network on shared features.
+- YOLO predicts a fixed set of boxes per grid cell and relies on NMS to remove duplicates.
+- DETR predicts a fixed set of answers with object queries and uses one-to-one matching, so it needs no anchors and no NMS.
+
 ## Try it Yourself
+
+SSD (single-shot detector) is a one-stage model that predicts boxes from several feature-map
+resolutions. This runs a COCO-trained SSD300 on a $300 \times 300$ noise image.
 
 ```python
 import torch
@@ -184,6 +280,7 @@ import torchvision.models.detection as models_det
 model = det.ssd300_vgg16(weights=det.SSD300_VGG16_Weights.DEFAULT)
 model.eval()
 
+torch.manual_seed(0)
 x = [torch.rand(3, 300, 300)]
 with torch.no_grad():
     out = model(x)
@@ -193,15 +290,24 @@ print("SSD scores:", out[0]['scores'][:5].numpy().round(3))
 ```
 
 ```output
-SSD boxes: torch.Size([41, 4])
-SSD scores: [0.916 0.873 0.811 0.745 0.693]
+SSD boxes: torch.Size([103, 4])
+SSD scores: [0.065 0.061 0.058 0.052 0.045]
 ```
+
+SSD returns 103 boxes, but its top 5 scores are only 0.045 to 0.065 — again, noise contains no
+real objects, so every detection is a weak guess just above SSD's low default threshold.
+Try replacing the noise with a simple scene, for example a white image with a dark rectangle
+(`x = [torch.ones(3, 300, 300)]; x[0][:, 100:200, 50:250] = 0`), and see whether any score rises.
 
 Try varying the image resolution (300→600) and observe how many raw proposals each model produces before NMS. Which handles multi-scale better?
 
 ## Exercise
 
 Implement the Hungarian matching logic used in DETR's loss: given $N=5$ predicted boxes and $M=3$ ground-truth boxes, compute the $N \times M$ cost matrix (using IoU-based cost), find the optimal assignment using `scipy.optimize.linear_sum_assignment`, and report which predicted index maps to which GT index.
+
+> **Hint:** a good match should be cheap, so use cost $= 1 - \text{IoU}$. `linear_sum_assignment`
+> accepts a non-square $5 \times 3$ matrix and returns 3 pairs; the 2 leftover predictions are
+> the "no object" ones.
 
 <details>
 <summary>Solution</summary>
@@ -230,4 +336,9 @@ for r, c in zip(row_idx, col_idx):
 ```
 
 The bipartite assignment ensures each GT is matched to exactly one prediction — exactly what DETR's set-prediction formulation requires. The 1-IoU cost drives the optimizer to match high-overlap pairs.
+
+Running it matches pred 0 to gt 0 (IoU 0.846), pred 1 to gt 1 (0.758), and pred 4 to gt 2 (0.766).
+Pred 3 also overlaps gt 0 well, but gt 0 is already taken by the better pred 0, so pred 3 is
+left over as "no object" — exactly the duplicate that NMS would have removed in other detectors.
+Pred 2 overlaps nothing. Real DETR adds class-probability and L1 box costs to this matrix.
 </details>

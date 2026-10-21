@@ -7,11 +7,25 @@ order: 4
 
 ## The Adversarial Setup
 
+A GAN learns to generate by competition: one network makes fakes, another tries to catch
+them, and each gets better because the other does.
+
 A GAN has two networks playing a game. The **generator** $G_\theta$ maps a noise vector $z \sim p(z)$ (usually $\mathcal{N}(0,I)$) to fake data $\hat{x} = G(z)$. The **discriminator** $D_\phi$ maps any input to a probability in $(0,1)$: is this real or fake?
+
+**GAN** stands for **generative adversarial network**. The generator never sees a real image
+directly. Everything it learns comes through the discriminator's verdicts on its fakes.
+
+> **Picture it:** a forger and an art inspector. The forger paints; the inspector compares
+> paintings with genuine ones and says "fake" or "real". Every time the inspector catches a
+> fake, the forger learns which brushstrokes gave it away. Where it breaks: a real forger can
+> look at genuine paintings; the generator only ever hears the inspector's score.
 
 They train against each other. $D$ tries to tell real from fake; $G$ tries to fool $D$.
 
 ## The Minimax Loss
+
+Both players share one score. The discriminator tries to push it up; the generator tries to
+push it down. That tug of war is called a **minimax** game.
 
 The original GAN objective is:
 
@@ -19,14 +33,33 @@ $$
 \min_G \max_D \; \mathbb{E}_{x\sim p_\text{data}}[\log D(x)] + \mathbb{E}_{z\sim p(z)}[\log(1 - D(G(z)))]
 $$
 
+> **In plain words:** the first term is large when $D$ gives real data a high "real"
+> probability. The second term is large when $D$ gives fakes a low probability (so
+> $1 - D(G(z))$ is near 1). $\max_D$ means the discriminator chooses its weights to make the
+> sum as big as possible; $\min_G$ means the generator chooses its weights to make it as small
+> as possible. $\mathbb{E}$ is an average over samples.
+
 $D$ maximizes: high $D(x)$ for real data, low $D(G(z))$ for fakes.  
-$G$ minimizes: make $D(G(z))$ close to 1 so $\log(1-D(G(z)))$ is very negative... but maximizing it from $G$'s view means maximizing $D(G(z))$.
+$G$ minimizes: the generator can only affect the second term. It wants $D(G(z))$ close to 1, which makes $\log(1-D(G(z)))$ very negative. So minimizing the objective from $G$'s view means maximizing $D(G(z))$.
+
+> **Watch out:** this original form has a flaw early in training. When fakes are bad, $D$
+> rejects them confidently ($D(G(z))$ near 0), the curve $\log(1 - D)$ is almost flat there, and
+> the generator gets almost no gradient — exactly when it needs one most (ch. 5 measures this).
 
 In practice the **non-saturating generator loss** avoids vanishing gradients when $D$ is too good:
 
 $$
 \mathcal{L}_G = -\mathbb{E}[\log D(G(z))]
 $$
+
+> **In plain words:** instead of "make the inspector less sure it's fake", the generator's goal
+> becomes "make the inspector say *real*". Both have the same best outcome ($D(G(z)) = 1$), but
+> $-\log D$ is steep near $D = 0$, so a badly losing generator still gets a strong push.
+
+A loss **saturates** when it flattens out so its slope (gradient) is near zero. Both losses
+below take **logits** — raw scores before the sigmoid that turns them into probabilities —
+because `binary_cross_entropy_with_logits` is more numerically stable than taking logs of
+probabilities yourself.
 
 ```python
 import torch
@@ -51,13 +84,29 @@ print(f"G loss: {generator_loss(fake_logits):.4f}")
 ```
 
 ```output
-D loss: 0.4892
-G loss: 1.0847
+D loss: 0.7663
+G loss: 1.0807
 ```
+
+The real logits are all positive (the discriminator leans "real" on them) and three of the four
+fake logits are negative (it leans "fake"), so the discriminator is doing well and its loss is
+modest at 0.7663. The generator loss is higher at 1.0807 because its fakes are mostly being
+caught. A generator loss of $\log 2 \approx 0.693$ would mean fakes get a 50/50 verdict.
 
 ## DCGAN Architecture
 
+For images, both networks are built from convolutions: the generator grows a tiny tensor into
+an image, the discriminator shrinks an image down to one score.
+
 Deep Convolutional GAN uses transposed convolutions in G and strided convolutions in D. Batch normalization in both (except D's input layer and G's output layer).
+
+- A **transposed convolution** is a learned upsampling layer: with stride 2 it roughly
+  doubles the height and width.
+- A **strided convolution** with stride 2 roughly halves them.
+- **Batch normalization** rescales each layer's activations to a steady mean and spread,
+  which keeps the two-player training from blowing up.
+- The generator ends in **Tanh**, which outputs values in $[-1, 1]$, so real images must be
+  scaled to $[-1, 1]$ too.
 
 ```python
 import torch
@@ -113,13 +162,27 @@ print(f"D params: {sum(p.numel() for p in D.parameters()):,}")
 Noise:    torch.Size([8, 100, 1, 1])
 Fake:     torch.Size([8, 1, 28, 28])
 Logits:   torch.Size([8])
-G params: 866,433
-D params: 212,737
+G params: 837,504
+D params: 431,872
 ```
+
+Follow the shapes: 8 noise vectors of size 100 (shaped as $100 \times 1 \times 1$) become 8
+images of $1 \times 28 \times 28$, and the discriminator turns them into 8 logits, one per image.
+The generator is about twice the size of the discriminator (837,504 vs 431,872 weights), mostly
+because its first layer maps 100 noise channels to 256 feature maps with $4 \times 4$ kernels.
 
 ## The Training Loop
 
+Training alternates: one step that improves the inspector, then one step that improves the
+forger, over and over.
+
 D and G alternate. A common ratio is 1 D step per 1 G step, though you can do multiple D steps per G step to keep D stronger.
+
+Two details matter. When training $D$, the fakes are `.detach()`-ed, so that step does not
+change $G$. When training $G$, fresh fakes are made *with* gradients, so the generator's loss can
+flow back through $D$ into $G$ (only $G$'s optimizer steps, so $D$ stays fixed).
+`betas=(0.5, 0.999)` is the DCGAN recipe: a lower first Adam beta reacts faster to the moving
+target.
 
 ```python
 import torch
@@ -161,23 +224,58 @@ for epoch in range(1, 4):
 ```
 
 ```output
-Epoch 1  D_loss=0.9834  G_loss=1.4127
-Epoch 2  D_loss=0.8921  G_loss=1.5438
-Epoch 3  D_loss=0.8206  G_loss=1.6852
+Epoch 1  D_loss=1.3982  G_loss=2.1026
+Epoch 2  D_loss=0.6358  G_loss=4.2668
+Epoch 3  D_loss=0.4110  G_loss=5.5002
 ```
+
+Epoch 1 starts near balance: a D loss of 1.398 is close to the 1.386 a coin-flipping
+discriminator gets. Then the discriminator pulls ahead — D loss falls to 0.411 while G loss climbs
+from 2.10 to 5.50. A G loss of 5.5 means a typical fake gets $D(G(z)) \approx e^{-5.5} \approx 0.004$: the
+discriminator is catching nearly every fake. On this stand-in data (uniform noise per pixel), the
+smooth, correlated images a small conv generator makes are easy to tell apart from pixel noise.
 
 ## Reading the Loss Curves
 
+GAN losses don't fall toward zero like normal losses. A healthy GAN hovers near a stalemate,
+and the useful signal is *which way* the balance tips.
+
 A GAN in equilibrium should hover around:
-- $D_\text{loss} \approx \log 2 \approx 0.693$ — D is 50/50 on real vs fake.
+- $D_\text{loss} \approx 2\log 2 \approx 1.386$ — D is 50/50 on real vs fake (the loss above sums a real and a fake BCE term, each $\log 2$).
 - $G_\text{loss} \approx \log 2$ — G fools D half the time.
+
+**Equilibrium** here means neither player can improve by changing only its own weights — the
+discriminator outputs 0.5 for everything because real and fake look the same.
 
 If $D_\text{loss} \rightarrow 0$: D dominates, G gets no useful gradient (vanishing gradient for G).  
 If $G_\text{loss} \rightarrow 0$: G is fooling D perfectly, but this often signals mode collapse.
 
+**Mode collapse** is when the generator finds a few outputs that fool $D$ and produces only
+those (ch. 5). The training run above is drifting toward the first failure: D loss heading down,
+G loss heading up.
+
+> **Watch out:** a lower generator loss does not mean better images. Because the opponent keeps
+> changing, GAN losses are not comparable across runs or even across epochs. Judge a GAN by its
+> samples and by metrics like FID (ch. 11), not by its loss curve.
+
 GAN training is unstable by nature — the next chapter covers fixes.
 
+## Recap in plain words
+
+- A GAN pits a generator (makes fakes from noise) against a discriminator (scores real vs fake).
+- The original minimax objective has the discriminator maximize and the generator minimize the
+  same score.
+- The non-saturating loss $-\log D(G(z))$ gives the generator a strong gradient even when it is
+  losing badly.
+- DCGAN builds both players from convolutions, with batch norm and a Tanh output in $[-1, 1]$.
+- At balance, D loss sits near $2\log 2$ and G loss near $\log 2$; a falling D loss with a
+  climbing G loss means the discriminator is winning.
+
 ## Try it Yourself
+
+This is the smallest useful GAN: both players are 16-unit networks, and the target is a 1-D bell
+curve centred at 3 with spread 0.5. After 500 alternating steps, the generator is asked for 1000
+samples.
 
 ```python
 import torch
@@ -221,13 +319,23 @@ with torch.no_grad():
 ```
 
 ```output
-Generated: mean=2.97, std=0.48
+Generated: mean=3.08, std=1.02
 Target:    mean=3.00, std=0.50
 ```
 
+The mean landed on target (3.08 vs 3.00), but the spread is twice too wide (1.02 vs 0.50). Matching
+the centre is easy — the discriminator punishes it immediately — but matching the exact width
+takes much longer to learn, and a 1-D discriminator gives a weak signal about it. Try 2000 steps,
+or a lower learning rate such as `1e-3`, and see whether the std moves toward 0.50. Also try
+changing the target to a two-peaked mixture and watch whether the generator finds both peaks.
+
 ## Exercise
 
-The minimax and non-saturating generator losses behave very differently when D is strong (fake logits ≈ -3). Compute both generator losses at `fake_logits = [-3.0, -2.5, -2.0, -0.5, 0.5, 2.0]` and show that the non-saturating loss has much larger gradients when D is winning.
+The minimax and non-saturating generator losses behave very differently when D is strong (fake logits $\approx -3$). Compute both generator losses at `fake_logits = [-3.0, -2.5, -2.0, -0.5, 0.5, 2.0]` and show that the non-saturating loss has much larger gradients when D is winning.
+
+> **Hint:** make `fake_logits` a tensor with `requires_grad=True`, build each loss, call
+> `.backward()`, and read `fake_logits.grad`. Re-create the tensor before the second loss so the
+> gradients don't add up.
 
 <details>
 <summary>Solution</summary>
@@ -256,4 +364,11 @@ for fl, ng, mg in zip([-3.0, -2.5, -2.0, -0.5, 0.5, 2.0], ns_grads, mm_grads):
 ```
 
 At logit=-3 (D is confident fake), the non-saturating gradient is large (~0.16) while the minimax gradient is tiny (~0.008). This is why the non-saturating loss is universally preferred.
+
+The printed gradients are per-element gradients of a *mean* over 6 logits, so each is divided
+by 6. Undoing that, the slope with respect to a logit $l$ is $-(1 - \sigma(l))$ for the
+non-saturating loss and $-\sigma(l)$ for the minimax loss: at $l = -3$, $\sigma(l) \approx 0.047$,
+giving 0.953 vs 0.047 — a 20-fold difference. The two columns mirror each other: at $l = 2$
+(generator winning) the minimax gradient is the larger one, but by then the generator no longer
+needs the help.
 </details>

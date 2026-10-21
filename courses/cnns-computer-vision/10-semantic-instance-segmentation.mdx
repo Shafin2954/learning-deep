@@ -7,19 +7,37 @@ order: 10
 
 ## Pixel-wise prediction
 
+**Segmentation** colours in the picture: instead of a box around the cat, every single pixel
+gets a label saying "cat", "grass", or "sky". It is classification done once per pixel.
+
 Detection gives you a box. Segmentation gives you which pixel belongs to what:
 
 - **Semantic segmentation** — assign a class label to every pixel. All pixels of the same class get the same label (two cats = same label).
 - **Instance segmentation** — distinguish individual object instances. Two cats get different labels.
 - **Panoptic segmentation** — combine both: "things" (countable objects, per-instance) and "stuff" (uncountable regions, per-class).
 
-Evaluation: **mIoU** (mean intersection-over-union per class), computed per-pixel across the dataset.
+> **Picture it:** a colouring book. Semantic segmentation colours all cats orange. Instance
+> segmentation colours the first cat orange and the second cat yellow. Panoptic does that and
+> also colours the sky blue and the grass green, leaving no white space.
+
+Evaluation: **mIoU** (mean intersection-over-union per class), computed per-pixel across the dataset. It is the IoU of ch. 8, but measured on sets of pixels instead of boxes, then averaged over classes.
 
 ## FCN: fully convolutional networks
 
-The first successful deep semantic segmenter (Long et al. 2015) replaced the fully-connected head of a classification net with 1×1 convolutions and added **transposed convolutions** (learnable upsampling) to recover spatial resolution.
+To label every pixel, the network's output must be as big as its input. An FCN shrinks the
+image to understand it, then grows the answer back to full size.
+
+The first successful deep semantic segmenter (Long et al. 2015) replaced the fully-connected head of a classification net with $1 \times 1$ convolutions and added **transposed convolutions** (learnable upsampling) to recover spatial resolution.
+
+> **Picture it:** a transposed convolution runs a conv backwards. A normal stride-2 conv reads a
+> $4 \times 4$ patch and writes one number; a transposed one reads one number and "stamps" a
+> $4 \times 4$ pattern of weights onto a bigger canvas, with neighbouring stamps overlapping.
 
 FCN-8s adds skip connections from pool3 and pool4 for finer boundaries.
+
+The toy below halves the image twice with stride-2 convs ($64 \to 32 \to 16$) and doubles it
+twice with transposed convs ($16 \to 32 \to 64$). For `ConvTranspose2d`, kernel 4, stride 2,
+padding 1 is the standard "exactly double" setting: $(H - 1) \cdot 2 - 2 + 4 = 2H$.
 
 ```python
 import torch
@@ -52,9 +70,24 @@ print("FCN output:", out.shape)   # (B, C, H, W) same spatial as input
 FCN output: torch.Size([2, 21, 64, 64])
 ```
 
+The output is $64 \times 64$, the same as the input, with 21 channels — one score per class
+for every pixel (21 is the PASCAL VOC class count: 20 objects + background). Picking the
+largest of the 21 scores at each pixel gives the predicted label map.
+
 ## U-Net: encoder-decoder with skip connections
 
-U-Net (Ronneberger 2015, biomedical) adds **skip connections** from each encoder level to the corresponding decoder level, concatenating fine spatial features with coarse semantic features. This recovers sharp object boundaries.
+Shrinking an image loses fine detail, like the exact outline of a cell. U-Net passes a copy of
+each detailed feature map across to the matching stage of the decoder, so the outline can be
+redrawn sharply.
+
+U-Net (Ronneberger 2015, biomedical) adds **skip connections** from each encoder level to the corresponding decoder level, concatenating fine spatial features with coarse semantic features. This recovers sharp object boundaries. (The **encoder** is the shrinking half; the **decoder** is the growing half.)
+
+> **Picture it:** describing a drawing over the phone. The encoder tells you "it's a cell,
+> roughly round, in the middle" (meaning); the skip connections also send a faint tracing of
+> the original lines (detail). With both, you can redraw it accurately.
+
+Unlike ResNet's skips (ch. 4), which *add* tensors, U-Net's skips *concatenate* them along the
+channel axis — that is why `dec3` takes 512 input channels: 256 from upsampling + 256 from `e3`.
 
 ```python
 class UNetBlock(nn.Module):
@@ -108,12 +141,23 @@ print(f"Total params: {params:,}")
 
 ```output
 U-Net output: torch.Size([2, 2, 128, 128])
-Total params: 7,763,010
+Total params: 7,703,042
 ```
 
-Shape in = shape out. Each pixel gets a per-class logit.
+A $128 \times 128$ image gives a $2 \times 128 \times 128$ output: 2 class scores per pixel.
+The network has about 7.7 million parameters, most in the 512-channel bottleneck and the
+256-channel stages.
+
+Shape in = shape out. Each pixel gets a per-class logit. (A **logit** is a raw class score before softmax.)
+
+> **Watch out:** U-Net with three pools needs input sizes divisible by $2^3 = 8$. An odd size
+> like 100 becomes 50, 25, 12 on the way down and 24 on the way up, and `torch.cat` fails
+> because 24 does not match 25. Pad or resize inputs to a multiple of 8.
 
 ## DeepLab: dilated convolutions for dense prediction
+
+DeepLab keeps the feature map large and instead spreads the kernels out (dilation, ch. 2), so
+each pixel still gets a wide view of its surroundings.
 
 Pooling discards spatial resolution. DeepLab keeps it by replacing standard convolutions with **dilated (atrous) convolutions** — kernels spaced with gaps:
 
@@ -121,7 +165,11 @@ $$
 (F *_d w)[i] = \sum_k w[k] \cdot F[i + dk]
 $$
 
-A dilation rate $d=2$ gives a 3×3 kernel a 5×5 effective receptive field without extra parameters.
+> **In plain words:** $F$ is the input signal, $w$ the kernel, $d$ the dilation. The kernel's
+> $k$-th weight multiplies the input $dk$ steps away instead of $k$ steps away; with $d = 1$
+> this is the ordinary convolution (cross-correlation, ch. 1).
+
+A dilation rate $d=2$ gives a $3 \times 3$ kernel a $5 \times 5$ effective receptive field without extra parameters.
 
 **ASPP (Atrous Spatial Pyramid Pooling)** in DeepLabV3+ applies dilated convolutions at multiple rates in parallel, capturing multi-scale context.
 
@@ -143,22 +191,31 @@ dilation=4: output torch.Size([2, 64, 32, 32])  (eff receptive field 9×9)
 dilation=8: output torch.Size([2, 64, 32, 32])  (eff receptive field 17×17)
 ```
 
+All four layers keep the $32 \times 32$ size (padding = dilation), while the reach grows
+$3, 5, 9, 17$ — each is $2d + 1$ for a $3 \times 3$ kernel. Every layer has the same
+$64 \times 64 \times 9 + 64 = 36{,}928$ parameters.
+
 All same spatial size, progressively larger receptive fields — perfect for ASPP.
 
 ## Mask R-CNN: instance segmentation
 
+Mask R-CNN is Faster R-CNN (ch. 9) with one more small head: for every box it finds, it also
+paints which pixels inside the box belong to the object.
+
 Mask R-CNN (He et al. 2017) extends Faster R-CNN with a third head — a small FCN that predicts a binary mask for each detected object, run in parallel with the class and box heads.
 
-Key fix over RoI Pooling: **RoI Align** uses bilinear interpolation instead of quantization, giving sub-pixel accuracy for masks.
+Key fix over RoI Pooling: **RoI Align** uses bilinear interpolation instead of quantization, giving sub-pixel accuracy for masks. (**Quantization** here means rounding box edges to whole feature-map cells; **bilinear interpolation** reads a value between cells by blending the four nearest ones.)
 
 ```python
 import torchvision
 
 model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-    weights=torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+    weights=torchvision.models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT,
+    box_score_thresh=0.0,   # a noise image has no confident objects; keep weak ones
 )
 model.eval()
 
+torch.manual_seed(0)
 x = [torch.rand(3, 400, 500)]
 with torch.no_grad():
     out = model(x)
@@ -170,19 +227,31 @@ print("Masks:", out[0]['masks'].shape)   # (N_instances, 1, H, W) ∈ [0,1]
 
 ```output
 Keys: ['boxes', 'labels', 'scores', 'masks']
-Boxes: torch.Size([12, 4])
-Masks: torch.Size([12, 1, 400, 500])
+Boxes: torch.Size([100, 4])
+Masks: torch.Size([100, 1, 400, 500])
 ```
+
+The output now has a fourth key, `masks`, with one $400 \times 500$ mask per instance — the same
+size as the input image. The input is noise, so the demo sets `box_score_thresh=0.0`; with the
+default threshold you would get 0 instances. The 100 is the per-image cap.
 
 Each mask is a soft per-pixel probability for its instance. Threshold at 0.5 to get a binary mask.
 
+> **Watch out:** 100 full-size float masks are $100 \times 400 \times 500 \times 4$ bytes
+> $= 80$ MB. Filter by score before you keep or plot masks.
+
 ## Panoptic segmentation
+
+Panoptic segmentation is the "label everything" version: each pixel gets a class, and pixels of
+countable objects also get an instance number.
 
 Panoptic (Kirillov 2019) merges semantic and instance:
 - **"Things"** (person, car) → instance-segmented.
 - **"Stuff"** (sky, road) → semantically segmented.
 
-All pixels are labelled; no pixel is left unassigned. `torchvision` includes `panoptic_resnet50_fpn`.
+All pixels are labelled; no pixel is left unassigned. `torchvision` has no panoptic model;
+in practice you use libraries such as Detectron2 (Panoptic FPN) or Hugging Face
+`transformers` (Mask2Former), or merge a semantic and an instance model yourself.
 
 ```python
 print("Panoptic segmentation:")
@@ -200,13 +269,31 @@ Panoptic segmentation:
 
 PQ (panoptic quality) = segmentation quality × recognition quality.
 
+> **In plain words:** **SQ** (segmentation quality) is the average IoU of the matched segments
+> — how well the shapes fit. **RQ** (recognition quality) is an F1 score — how many segments
+> were found without false alarms. PQ multiplies them, so a model must find objects *and*
+> outline them well.
+
+## Recap in plain words
+
+- Segmentation labels every pixel; semantic merges same-class objects, instance separates them, panoptic does both and covers every pixel.
+- FCNs shrink with strided convs and grow back with transposed convs to give one class score per pixel.
+- U-Net concatenates encoder features into the decoder so fine boundaries survive.
+- DeepLab keeps resolution and widens the view with dilated convs at several rates (ASPP).
+- Mask R-CNN adds a per-box mask head to Faster R-CNN, made precise by RoI Align.
+- mIoU is the per-class pixel IoU, averaged over classes.
+
 ## Try it Yourself
+
+The same U-Net class, now for 1-channel (grayscale) images and 2 classes, trained against a
+random mask for one loss evaluation.
 
 ```python
 import torch
 import torch.nn as nn
 
 # Build and run U-Net, inspect per-layer shapes
+torch.manual_seed(0)
 unet  = UNet(in_c=1, num_classes=2)   # grayscale binary segmentation
 x     = torch.randn(4, 1, 64, 64)
 out   = unet(x)
@@ -223,14 +310,22 @@ print(f"Loss: {loss.item():.4f}")
 ```output
 Input: torch.Size([4, 1, 64, 64])
 Output: torch.Size([4, 2, 64, 64])
-Loss: 0.7129
+Loss: 0.7177
 ```
+
+Input and output are both $64 \times 64$, now with 2 scores per pixel. The loss of 0.7177 is
+close to $\ln 2 \approx 0.693$, the cross-entropy of a model guessing 50/50 — which is what
+an untrained network on random labels should give. `CrossEntropyLoss` handles the per-pixel case
+directly: logits `(B, C, H, W)` against integer targets `(B, H, W)`.
 
 Try replacing `MaxPool2d` in the encoder with strided convolutions and see if the parameter count changes. Then add a Dice loss term alongside cross-entropy (common in medical imaging).
 
 ## Exercise
 
 Compute mIoU for a batch of semantic segmentation predictions. Given `preds` (B, H, W) integer class IDs and `targets` (B, H, W) integer class IDs with `num_classes=3`, compute the mean IoU across all classes and return it as a float.
+
+> **Hint:** for each class $c$, turn both tensors into True/False masks with `== c`. Then `&`
+> gives the intersection and `|` gives the union; count with `.sum()`.
 
 <details>
 <summary>Solution</summary>
@@ -249,6 +344,7 @@ def mean_iou(preds: torch.Tensor, targets: torch.Tensor, num_classes: int) -> fl
             ious.append(inter / union)
     return sum(ious) / len(ious) if ious else 0.0
 
+torch.manual_seed(0)
 preds   = torch.randint(0, 3, (4, 64, 64))
 targets = torch.randint(0, 3, (4, 64, 64))
 print(f"mIoU: {mean_iou(preds, targets, 3):.4f}")
@@ -258,4 +354,9 @@ print(f"mIoU (perfect): {mean_iou(targets, targets, 3):.4f}")
 ```
 
 The formula is per-class: sum pixels where pred=c and target=c (intersection) divided by sum where pred=c or target=c (union). Averaging across classes gives mIoU.
+
+Running it prints mIoU 0.1953 for random predictions and 1.0000 for perfect ones. The random
+value matches the theory: with 3 equally likely classes, a pixel is in both masks with
+probability $1/9$ and in either with $5/9$, so each class's IoU is about $1/5 = 0.2$. The
+`if union > 0` check skips classes absent from both tensors, which would otherwise divide by zero.
 </details>

@@ -7,7 +7,21 @@ order: 5
 
 ## Mode Collapse
 
+Sometimes the forger finds one painting the inspector always accepts, and paints only that one,
+forever. The fakes pass, but the variety of real data is lost.
+
 The most notorious GAN failure: the generator learns to produce one (or a few) outputs that consistently fool D, ignoring the rest of the data distribution. G finds a local strategy and stops exploring.
+
+A **mode** is a peak of the data distribution — one "kind" of example, like the digit 7 in
+MNIST. **Mode collapse** means the generator covers only one or a few modes. Its outputs barely
+change when you change the input noise $z$.
+
+> **Picture it:** a student who finds one essay that always gets an A and hands it in for every
+> assignment. The grader (discriminator) is fooled each time, but the student has learned
+> nothing about writing anything else.
+
+The simplest symptom check: draw many samples and measure their spread. The demo compares a
+generator that ignores $z$ with one that uses it.
 
 ```python
 import numpy as np
@@ -16,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Simulate mode collapse: G always generates near one value regardless of z
-def check_diversity(samples, threshold=0.5):
+def check_diversity(samples, threshold=0.1):
     std = samples.std().item()
     print(f"Sample std: {std:.4f}  {'(MODE COLLAPSE)' if std < threshold else '(diverse)'}")
 
@@ -43,50 +57,100 @@ check_diversity(g_good(z))
 ```
 
 ```output
-Sample std: 0.0099  (MODE COLLAPSE)
-Sample std: 0.6183  (diverse)
+Sample std: 0.0105  (MODE COLLAPSE)
+Sample std: 0.4978  (diverse)
 ```
+
+The collapsed generator's samples have a spread of 0.0105 — they are all 2.0 plus a tiny
+wiggle, whatever $z$ is. The linear generator's spread is 0.4978, about 47 times larger, because
+its output moves with $z$. The 0.1 threshold is a rule of thumb for this toy; on real data you
+compare the generated spread with the real data's spread.
+
+> **Watch out:** a healthy overall spread doesn't rule out partial collapse. A generator that
+> makes only 3 of the 10 digits can still have a large pixel spread. Per-mode coverage checks
+> (or the recall metric in ch. 11) catch this.
 
 ## Vanishing Gradients for G
 
+When the inspector becomes too good, its verdicts stop being informative: "fake, 100% sure"
+gives the forger no hint about which direction to improve.
+
 When D is too strong (perfectly separates real from fake), the binary cross-entropy loss for G saturates. The gradient of `log(1 - D(G(z)))` w.r.t. G's parameters goes to zero — G stops learning.
+
+The demo measures the gradient that reaches the discriminator's **logit** (its score before the
+sigmoid). Everything the generator learns has to flow back through that number, so its size is
+what matters. It compares the minimax loss, $\log(1 - D(G(z)))$, with the non-saturating loss,
+$-\log D(G(z))$, from ch. 4.
 
 ```python
 import torch
 
-def g_gradient_magnitude(d_output_on_fake):
-    """Gradient magnitude of minimax G loss at different D confidence levels."""
-    # Minimax G loss: log(1 - D(G(z)))
-    # Gradient of BCE wrt fake_prob: 1 / (1 - fake_prob)
-    return 1.0 / (1.0 - d_output_on_fake + 1e-8)
+def g_logit_grads(d_fake):
+    """Gradient of each G loss w.r.t. D's logit on a fake sample."""
+    logit = torch.logit(torch.tensor(d_fake)).requires_grad_(True)
+    minimax = torch.log(1 - torch.sigmoid(logit))      # G minimizes log(1 - D)
+    g_mm, = torch.autograd.grad(minimax, logit)
+    logit2 = logit.detach().requires_grad_(True)
+    nonsat = -torch.log(torch.sigmoid(logit2))          # G minimizes -log D
+    g_ns, = torch.autograd.grad(nonsat, logit2)
+    return g_mm.abs().item(), g_ns.abs().item()
 
-d_values = [0.99, 0.95, 0.8, 0.5, 0.2, 0.05]
-print("D(G(z)) | minimax G gradient")
+d_values = [0.99, 0.95, 0.8, 0.5, 0.2, 0.05, 0.01]
+print("D(G(z)) | minimax |grad| | non-saturating |grad|")
 for d in d_values:
-    print(f"  {d:.2f}   |   {g_gradient_magnitude(d):.1f}")
+    mm, ns = g_logit_grads(d)
+    print(f"  {d:.2f}   |    {mm:.3f}      |    {ns:.3f}")
 ```
 
 ```output
-D(G(z)) | minimax G gradient
-  0.99   |   100.0
-  0.95   |   20.0
-  0.80   |   5.0
-  0.50   |   2.0
-  0.20   |   1.2
-  0.05   |   1.1
+D(G(z)) | minimax |grad| | non-saturating |grad|
+  0.99   |    0.990      |    0.010
+  0.95   |    0.950      |    0.050
+  0.80   |    0.800      |    0.200
+  0.50   |    0.500      |    0.500
+  0.20   |    0.200      |    0.800
+  0.05   |    0.050      |    0.950
+  0.01   |    0.010      |    0.990
 ```
 
-Wait — large gradient when D is confident? That's if D(G(z))≈1 (G winning). When D is strong and D(G(z))≈0 (D winning), the gradient of the minimax loss is tiny: `log(1 - 0.01) ≈ -0.01`, near flat. The non-saturating loss fixes this.
+Read the bottom rows — the case where the discriminator is winning. At $D(G(z)) = 0.01$ (a fake
+rejected with 99% confidence), the minimax gradient is 0.010 while the non-saturating gradient is
+0.990, about 100 times larger. The two columns are mirror images: for any $D$, the minimax
+gradient equals $D$ and the non-saturating gradient equals $1 - D$.
+
+> **In plain words:** with the minimax loss, the worse the generator is doing, the weaker its
+> learning signal. With the non-saturating loss it's the other way round — a badly losing
+> generator gets the strongest push. That is why every practical GAN uses the non-saturating
+> form.
 
 ## Wasserstein Distance
 
+The original GAN loss measures overlap between the real and fake distributions. When they
+don't overlap at all, that measure stays stuck at the same value no matter how far apart they
+are, so it gives no direction. The Wasserstein distance instead measures *how far apart* they
+are.
+
 The original GAN minimizes a form of Jensen–Shannon divergence. When the real and fake distributions don't overlap (common early in training), JS divergence is constant (log 2) and gradients vanish.
 
+The **Jensen–Shannon (JS) divergence** is a symmetric cousin of the KL divergence. Its maximum
+value, $\log 2$, is reached whenever the two distributions have no overlap — whether they are 1
+unit apart or 1000. A constant has zero slope, so the generator learns nothing.
+
 **Wasserstein (Earth Mover) distance** measures how much "mass" you move to transform one distribution into another. It's smooth even when distributions don't overlap, giving useful gradients throughout training.
+
+> **Picture it:** two piles of sand. The Earth Mover distance is the least total work (amount of
+> sand times distance carried) needed to reshape one pile into the other. Move the second pile 1
+> metre further away and the work goes up by a predictable amount — so there is always a
+> "downhill" direction.
 
 $$
 W(p, q) = \inf_{\gamma \in \Pi(p,q)} \mathbb{E}_{(x,y)\sim\gamma}[\|x - y\|]
 $$
+
+> **In plain words:** consider every possible plan $\gamma$ for pairing up points of $p$ with
+> points of $q$ (a **transport plan**; $\Pi(p, q)$ is the set of all such plans). Each plan has an
+> average distance moved, $\mathbb{E}\|x - y\|$. The Wasserstein distance is the cheapest plan's
+> cost; $\inf$ ("infimum") means "the smallest achievable value".
 
 The Kantorovich–Rubinstein duality lets us compute this as:
 
@@ -94,9 +158,20 @@ $$
 W(p_\text{data}, p_G) = \sup_{\|f\|_L \leq 1} \mathbb{E}_{x\sim p_\text{data}}[f(x)] - \mathbb{E}_{z}[f(G(z))]
 $$
 
+> **In plain words:** search over all functions $f$ that never change faster than slope 1 (the
+> condition $\|f\|_L \leq 1$). For each one, compute its average on real data minus its average on
+> fakes. The largest such gap ($\sup$, "supremum") equals the Wasserstein distance.
+
 where $f$ is any 1-Lipschitz function. The discriminator (now called a **critic**) approximates $f$.
 
+A **1-Lipschitz** function has slope at most 1 in size everywhere: moving the input by 1 moves
+the output by at most 1. The **critic** is no longer a classifier with a sigmoid; it outputs any
+real number, higher for "more real".
+
 ## WGAN and Gradient Penalty
+
+To make the critic a fair Wasserstein estimator, you have to stop it from becoming too steep.
+WGAN does it crudely by capping weights; WGAN-GP does it gently by penalizing steepness.
 
 **WGAN** enforces the Lipschitz constraint via weight clipping: after each D update, clip all weights to $[-c, c]$. This is crude and can cause slow training or capacity issues.
 
@@ -106,7 +181,18 @@ $$
 \mathcal{L}_D = \underbrace{\mathbb{E}[D(G(z))] - \mathbb{E}[D(x)]}_{\text{Wasserstein estimate}} + \lambda \underbrace{\mathbb{E}_{\hat{x}}[(\|\nabla_{\hat{x}} D(\hat{x})\|_2 - 1)^2]}_{\text{gradient penalty}}
 $$
 
+- $\mathbb{E}[D(G(z))] - \mathbb{E}[D(x)]$ — the critic's average score on fakes minus on reals.
+  Minimizing it means scoring reals high and fakes low; its negative estimates the Wasserstein
+  distance.
+- $\lambda$ — the penalty weight (10 in the WGAN-GP paper).
+- $\|\nabla_{\hat{x}} D(\hat{x})\|_2$ — how steep the critic is at a point $\hat{x}$; the penalty
+  is zero when the steepness is exactly 1.
+
 where $\hat{x} = \epsilon x + (1-\epsilon)G(z)$ is a random interpolation. This penalizes the critic's gradient norm wherever it deviates from 1.
+
+Here $\epsilon$ is a random number between 0 and 1, so $\hat{x}$ is a random point on the straight
+line between a real and a fake sample. The penalty is applied only on those lines, which is
+where the optimal critic is known to have slope exactly 1.
 
 ```python
 import torch
@@ -142,13 +228,23 @@ print("(Should be ~0 for 1-Lipschitz critic, positive otherwise)")
 ```
 
 ```output
-Gradient penalty: 0.8914
+Gradient penalty: 0.5841
 (Should be ~0 for 1-Lipschitz critic, positive otherwise)
 ```
 
+This freshly initialized critic scores a penalty of 0.5841: its slope norms miss the
+target 1 by about $\sqrt{0.58} \approx 0.76$ in root-mean-square terms. The second line is a printed reminder, not a
+measurement. During training the penalty term pulls this toward 0.
+
 ## WGAN-GP Training Loop
 
+The critic must be a good judge before the generator's moves mean anything, so it trains
+several times per generator step.
+
 The critic is trained more than the generator (typically 5 critic steps per G step) since it needs to be a good Wasserstein estimator.
+
+`betas=(0.0, 0.9)` is the WGAN-GP paper's Adam setting: no momentum on the first moment, so
+the critic reacts immediately when the generator moves.
 
 ```python
 import torch
@@ -170,9 +266,9 @@ class WGen(nn.Module):
 
 torch.manual_seed(1)
 G_w, C_w = WGen(), WCritic()
-opt_g = torch.optim.Adam(G_w.parameters(), lr=1e-4, betas=(0,0.9))
-opt_c = torch.optim.Adam(C_w.parameters(), lr=1e-4, betas=(0,0.9))
-lam = 10.0
+opt_g = torch.optim.Adam(G_w.parameters(), lr=1e-3, betas=(0.0,0.9))
+opt_c = torch.optim.Adam(C_w.parameters(), lr=1e-3, betas=(0.0,0.9))
+lam = 0.1   # lam=10 (the image default) lets this tiny critic lock in the wrong slope sign
 
 for step in range(1, 201):
     # 5 critic steps
@@ -195,15 +291,38 @@ for step in range(1, 201):
 ```
 
 ```output
-Step  50: generated mean=2.14, std=0.31
-Step 100: generated mean=2.73, std=0.42
-Step 150: generated mean=2.91, std=0.48
-Step 200: generated mean=2.98, std=0.50
+Step  50: generated mean=1.19, std=0.38
+Step 100: generated mean=2.31, std=0.62
+Step 150: generated mean=3.00, std=0.73
+Step 200: generated mean=3.01, std=0.59
 ```
+
+The generator's mean climbs steadily: 1.19, 2.31, then 3.00 at step 150, and holds at 3.01 —
+right on the target of 3. The spread overshoots (0.73) and then comes back to 0.59, near the
+target 0.50. That steady, monotone approach is what the Wasserstein loss buys you.
+
+> **Watch out:** the code uses `lam = 0.1`, not the paper's 10. With $\lambda = 10$, lr $10^{-4}$
+> and this seed, the same loop drifted the *wrong* way (mean $-0.58$ after 200 steps): the tiny
+> critic settled on the wrong slope sign early, and flipping it would mean passing through slope
+> 0, which the heavy penalty makes too expensive. With a Wasserstein gap of only about 3, the
+> penalty term dominated. The default $\lambda = 10$ was tuned for images; on toy problems,
+> scale it to your problem.
+
+> **Watch out:** write Adam betas as floats: `betas=(0.0, 0.9)`. Current PyTorch rejects
+> `betas=(0, 0.9)` with "betas must be either both floats or both Tensors".
 
 ## Spectral Normalization
 
+Another way to limit the critic's steepness: rescale each layer's weights so that no layer can
+stretch its input by more than a factor of 1.
+
 An alternative Lipschitz constraint: normalize each weight matrix by its largest singular value $\sigma_\text{max}(W)$. This is computationally cheap (power iteration) and stabilizes training without a gradient penalty.
+
+The **largest singular value** of a matrix is the most it can stretch any input vector. Divide
+the weights by it and that layer becomes 1-Lipschitz; stack such layers with LeakyReLU (itself
+slope at most 1) and the whole network is 1-Lipschitz. **Power iteration** estimates the largest
+singular value cheaply by repeatedly multiplying a vector by the matrix; PyTorch does one step
+per forward pass.
 
 ```python
 import torch
@@ -228,12 +347,33 @@ for name, mod in sn_critic.named_modules():
 ```
 
 ```output
-Spectral norm critic output range: [-0.312, 0.247]
+Spectral norm critic output range: [0.263, 0.319]
 Layer net.0: weight shape torch.Size([64, 1])
 Layer net.2: weight shape torch.Size([1, 64])
 ```
 
+The ten outputs all fall in the narrow range $[0.263, 0.319]$: with every layer capped at stretch
+1, ten standard-normal inputs can't spread the outputs far. The two layer lines confirm that both
+`Linear` layers are wrapped: the shapes are unchanged, because spectral norm rescales the weights
+rather than resizing them.
+
+## Recap in plain words
+
+- Mode collapse: the generator makes only a few kinds of output; check by measuring sample
+  diversity.
+- With the minimax loss, a losing generator gets almost no gradient; the non-saturating loss
+  fixes that.
+- The JS divergence goes flat when real and fake don't overlap; the Wasserstein distance keeps
+  measuring how far apart they are.
+- WGAN needs a critic whose slope is at most 1: weight clipping does it crudely, a gradient
+  penalty or spectral normalization does it better.
+- The gradient penalty's weight $\lambda$ must suit the problem's scale; too heavy and the critic
+  can lock in the wrong answer.
+
 ## Try it Yourself
+
+This runs one WGAN-GP round from scratch — one critic update, one generator update — with the
+default $\lambda = 10$, and prints the three loss components.
 
 ```python
 import torch
@@ -248,8 +388,8 @@ real_data = torch.randn(64, 1) * 0.5 + 2.0
 
 critic = WCritic()
 gen    = WGen()
-opt_c  = torch.optim.Adam(critic.parameters(), lr=1e-4, betas=(0, 0.9))
-opt_g  = torch.optim.Adam(gen.parameters(), lr=1e-4, betas=(0, 0.9))
+opt_c  = torch.optim.Adam(critic.parameters(), lr=1e-4, betas=(0.0, 0.9))
+opt_g  = torch.optim.Adam(gen.parameters(), lr=1e-4, betas=(0.0, 0.9))
 
 # One round of updates
 z    = torch.randn(64, 4)
@@ -268,14 +408,25 @@ print(f"Gradient penalty: {gp.item():.4f}")
 ```
 
 ```output
-D (critic) loss: 1.3427
-G loss:          0.0214
-Gradient penalty: 0.1342
+D (critic) loss: 7.5126
+G loss:          0.0894
+Gradient penalty: 0.7759
 ```
+
+The critic loss 7.5126 is mostly penalty: $10 \times 0.7759 = 7.759$, so the Wasserstein part is
+about $-0.25$. That is typical of the first step — the penalty dominates until the critic's slope
+settles near 1. The G loss 0.0894 is the negative critic score on fakes and has no fixed
+"good" value. Wrap the two updates in a loop of 200 steps (5 critic steps each) and print all
+three every 50 steps; then try `lam=1` and `lam=0.1` and compare how fast the generator's mean
+reaches 2.
 
 ## Exercise
 
 Implement weight clipping (the original WGAN) and compare its output diversity against WGAN-GP after 100 training steps on the 1D target $\mathcal{N}(3, 0.5)$. Use clip value $c=0.01$.
+
+> **Hint:** reuse `WGen` and `WCritic`. After each critic step, loop over
+> `C_clip.parameters()` and clamp every weight to $[-0.01, 0.01]$ in place; the original WGAN
+> used RMSprop with lr $5 \times 10^{-5}$.
 
 <details>
 <summary>Solution</summary>
@@ -305,8 +456,14 @@ for step in range(100):
 with torch.no_grad():
     s = G_clip(torch.randn(500,4))
     print(f"WGAN (clip): mean={s.mean():.2f}, std={s.std():.2f}")
-    print("WGAN-GP after 200 steps: mean≈2.98, std≈0.50  (from above)")
+    print("WGAN-GP after 200 steps: mean≈3.01, std≈0.59  (from above)")
 ```
 
 Weight clipping can cause the critic to use only its extreme weights (capacity underuse) and converge more slowly or to worse solutions than WGAN-GP.
+
+Running it prints `WGAN (clip): mean=0.71, std=0.32` after 100 steps, against the WGAN-GP run's
+mean 3.01 and std 0.59 after 200. The clipped critic, capped at weights of 0.01, can only
+express a very gentle slope, so the generator gets a tiny gradient and, with RMSprop at
+lr $5 \times 10^{-5}$, has barely left its starting point. (The comparison is not perfectly fair:
+different step counts and learning rates. Run both for the same number of steps to be sure.)
 </details>

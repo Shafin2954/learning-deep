@@ -7,6 +7,9 @@ order: 6
 
 ## Your single biggest enemy: overfitting
 
+A model that memorizes its practice questions can ace the practice test and still fail the real
+exam. **Overfitting** is exactly that: great scores on the training data, poor scores on new data.
+
 Your single biggest enemy in this competition is **overfitting**. Bengali is a
 modest-resource language; your labeled data will be small, your model (a pretrained
 LLM) will be huge and expressive. A big model on small data memorizes the training
@@ -14,12 +17,31 @@ set — including its noise — and then fails on the test set. Regularization i
 collection of techniques that fight this. For you, this chapter is not optional
 theory; it's survival.
 
+**Noise** is the random, unrepeatable part of the labels: typos, annotator disagreements, flukes.
+**Regularization** means any technique that discourages the model from fitting that noise.
+
+> **Picture it:** a student preparing for an exam with only 12 practice questions. A sensible
+> student learns the method. A student with a perfect memory learns the 12 answers by heart,
+> including the two that have typos in the answer key, and is lost when the real questions are
+> slightly different. A huge LLM on a small dataset is the student with the perfect memory.
+
 ## Seeing overfitting: the U-shaped validation curve
+
+Give a model more and more flexibility and its training error keeps falling. Its error on fresh
+data falls at first, then rises again once the extra flexibility is spent on noise.
 
 Fit polynomials of rising degree to 12 noisy points: as degree grows, training error
 keeps dropping while validation error bottoms out and then *climbs*. The model stopped
 learning the signal and started memorizing noise. Every technique below pushes its
 bottom lower and later.
+
+The **validation set** is data held back from training and used only to measure performance on
+unseen examples. **MSE** (mean squared error) is the average squared gap between prediction and
+truth. A polynomial of **degree** $d$ has $d + 1$ adjustable coefficients, so degree 11 can pass
+exactly through all 12 points.
+
+The first half of the block also previews dropout (explained below); the second half is the
+U-curve.
 
 ```python
 import numpy as np
@@ -61,13 +83,30 @@ degree 11: train=0.0000  val=0.0300  <- overfit
 Degree 5 is best (val MSE 0.0009); degree 11 hits train MSE 0.0000 but val 0.0300.
 The U-shaped validation curve is overfitting.
 
+Follow the val column: 0.1876, 0.0046, 0.0009, 0.0050, 0.0300. It falls, bottoms out at degree 5,
+then climbs back up, the U shape. Meanwhile the train column only ever falls, to exactly 0.0000
+at degree 11, where the curve threads through every noisy point. The val error at degree 11 is
+33 times worse than at degree 5. In the first two lines, dropout's training-mode mean is 0.999
+and its eval-mode mean is 1.0: on average, dropout leaves the signal's size unchanged.
+
+> **Watch out:** never pick the model with the lowest *training* error. On this data it would
+> choose degree 11, the worst-but-one model on fresh data. Always choose on validation.
+
 ## Weight decay (L2 regularization)
+
+Big weights let a model make sharp, wiggly turns to hit individual noisy points. Weight decay
+charges a fee for big weights, so the model only uses them when the data really pays for it.
 
 Add a penalty proportional to the squared size of the weights:
 
 $$
 \tilde{L} = L + \frac{\lambda}{2}\sum_w w^2
 $$
+
+> **In plain words:** the new loss $\tilde{L}$ is the old loss $L$ plus $\lambda/2$ times the sum
+> of every weight squared. $\lambda$ ("lambda") sets how expensive big weights are: $\lambda = 0$
+> switches the penalty off, a large $\lambda$ pushes all weights toward zero. Its gradient is
+> $\lambda w$, so every step shrinks each weight a little, which is why it is called "decay".
 
 The optimizer then prefers smaller weights unless the data really justifies large
 ones. Smaller weights = a smoother, less wiggly function = less memorization.
@@ -76,6 +115,9 @@ values for fine-tuning: 0.01–0.1.
 
 ## Dropout
 
+Dropout switches off a random selection of units at every training step. The network cannot
+count on any one unit being present, so it learns several independent ways to reach the answer.
+
 During training, randomly zero a fraction $p$ of activations each step, then scale
 the survivors by $\frac{1}{1-p}$ so the expected value is unchanged:
 
@@ -83,13 +125,31 @@ $$
 \tilde{h}_i = \begin{cases} \dfrac{h_i}{1-p} & \text{with probability } 1-p \\ 0 & \text{with probability } p \end{cases}
 $$
 
+> **In plain words:** each activation $h_i$ survives with probability $1 - p$ and is boosted by
+> $1/(1 - p)$, or is set to 0 with probability $p$. With $p = 0.5$, survivors are doubled, so
+> the average stays $0.5 \times 2h_i + 0.5 \times 0 = h_i$. This version is called **inverted
+> dropout** because the rescaling happens during training rather than at inference.
+
 This stops the network from relying on any single feature — it must spread its bets,
 which generalizes better. At inference, dropout is off (you use the full network).
 Transformers have dropout baked into attention and feed-forward layers; for
 fine-tuning, the default `0.1` is usually fine, and raising it slightly can help on
 tiny datasets.
 
+**Inference** means using the trained model to make predictions, as opposed to training it.
+
+> **Picture it:** a football team where, at every practice, a coach sends a random half of the
+> players to the bench. Nobody can rely on the star striker always being on the pitch, so every
+> player learns to cover several roles. On match day (inference) the whole team plays.
+
+> **Watch out:** in PyTorch, dropout is on or off according to `model.train()` and
+> `model.eval()`. Forgetting `model.eval()` before validation keeps dropout active and makes
+> scores noisy and too low.
+
 ## Early stopping — your most reliable lever
+
+Since validation error falls and then rises during training, the simplest fix is to stop at the
+bottom and keep that version of the model.
 
 Watch validation metric every epoch; when it stops improving for a few checks
 ("patience"), stop and keep the *best* checkpoint, not the last. This directly
@@ -98,7 +158,14 @@ of epochs is often all you can afford before overfitting, early stopping is the
 technique that saves you. It costs nothing and needs only a trustworthy validation
 split (F15).
 
+A **checkpoint** is a saved copy of the model's weights at one moment in training. **Patience**
+is how many checks without improvement you tolerate before stopping, because validation scores
+wobble and one bad epoch is not proof of overfitting.
+
 ## Label smoothing
+
+Training on targets of exactly 1 and exactly 0 pushes the model to be infinitely sure. Label
+smoothing asks for "very likely" instead of "certain".
 
 Instead of training toward a hard one-hot target (1 for the true class, 0 elsewhere),
 use a soft target:
@@ -107,10 +174,20 @@ $$
 \tilde{y}_i = \begin{cases} 1 - \varepsilon & i = \text{true class} \\ \dfrac{\varepsilon}{K - 1} & \text{otherwise} \end{cases}
 $$
 
+> **In plain words:** the true class gets $1 - \varepsilon$ and the leftover $\varepsilon$ is
+> shared equally among the other $K - 1$ classes. With $\varepsilon = 0.1$ and $K = 5$, the
+> target becomes 0.9 for the true class and 0.025 for each of the other four.
+
 This stops the model from becoming overconfident, improves calibration (F14), and
 often helps classification metrics slightly. Common smoothing: $\varepsilon = 0.1$.
 
+**Calibration** means the model's stated confidence matches reality: among predictions made at
+80% confidence, about 80% should be right.
+
 ## Data augmentation and the smallest-model principle
+
+The other two levers are more data and a smaller model. Augmentation manufactures more training
+examples; the smallest-model principle gives the model less room to memorize.
 
 **Data augmentation** grows the data rather than constraining the model. For Bengali
 text this is high-value because you're data-starved. Techniques (Bengali ch. 10 goes
@@ -118,6 +195,10 @@ deep): back-translation (Bn→En→Bn to paraphrase), synonym/entity replacement
 controlled paraphrasing with an LLM, token/word dropout, and round-trip translation.
 Caveat: bad augmentation injects noise or label errors — always validate that it
 helps on your CV, never assume.
+
+**Back-translation** translates a sentence into another language and back, producing a
+paraphrase that keeps the meaning. **CV** (cross-validation, F14) is the procedure of scoring on
+several held-out splits to get a trustworthy estimate.
 
 **The smallest-model principle:** prefer the smallest model and the fewest trainable
 parameters that do the job. This is exactly why **LoRA/QLoRA** (Bengali ch. 9) —
@@ -130,7 +211,24 @@ training time; label smoothing limits confidence; augmentation adds data; small
 models limit parameters. Stack the cheap ones (early stopping + weight decay + the
 model's built-in dropout) by default, then ablate the rest on your CV.
 
+To **ablate** a technique is to remove it and measure whether the score drops; if it does not,
+the technique was not earning its keep.
+
+## Recap in plain words
+
+- Overfitting is when a model fits the noise in its training data and does worse on new data.
+- Validation error traces a U shape as model flexibility grows; the bottom of the U is the
+  sweet spot.
+- Weight decay charges a fee for large weights, which keeps the learned function smooth.
+- Dropout randomly switches off units during training so no single unit becomes essential.
+- Early stopping halts training at the validation optimum and restores that best checkpoint.
+- Label smoothing replaces "certain" targets with "very likely" ones, reducing overconfidence.
+- More data (augmentation) and fewer trainable parameters (LoRA) are the other two levers.
+
 ## Try it Yourself
+
+This simulates early stopping on a list of validation losses that dips and then rises, with a
+patience of 2 epochs.
 
 ```python
 import numpy as np
@@ -158,6 +256,14 @@ print(f"stop and restore epoch {epoch} (val={best}). "
 stop and restore epoch 4 (val=0.47). Training past it only overfits.
 ```
 
+Trace it. The loss improves through epoch 4 (0.47). Epoch 5 (0.475) is worse, so `bad` becomes
+1; epoch 6 (0.49) is worse again, so `bad` reaches 2, equal to the patience, and the loop stops.
+It restores epoch 4, not epoch 6, which is the whole point.
+
+Try a variation: set `patience=1`, then `patience=5`. With 1 it stops one epoch earlier but
+still restores epoch 4; with 5 it never triggers on this short list and returns the best epoch
+after reading every value.
+
 ## Exercise
 
 Add early stopping to the from-scratch MLP training loop from F2: hold out 20% as
@@ -165,11 +271,65 @@ validation, track validation accuracy each epoch, and stop (restoring the best
 weights) when it hasn't improved for `patience` epochs. This is the exact mechanism
 you'll rely on when fine-tuning a Bengali model that overfits in 2–3 epochs.
 
+> **Hint:** shuffle the row indices and split them 80/20 before training. After every epoch,
+> score the validation rows; whenever the score improves, save copies of all the weights.
+
 <details>
-<summary>Hint</summary>
+<summary>Solution</summary>
 
 Keep a copy of the best weights: `best_state = [W.copy() for W in params]` whenever
 validation improves; on stop, copy them back. The "restore best, not last" detail is
 what makes early stopping actually work — the last epoch is usually past the U-curve's
 bottom.
+
+The version below adds 20% label noise and a wide hidden layer so that the network has noise to
+overfit to:
+
+```python
+import numpy as np
+def relu(z): return np.maximum(0, z)
+def softmax(z):
+    z = z - z.max(1, keepdims=True); e = np.exp(z); return e / e.sum(1, keepdims=True)
+
+np.random.seed(1)
+X = np.random.randn(200, 2)
+y = ((X[:, 0] * X[:, 1]) > 0).astype(int)
+flip = np.random.rand(200) < 0.20; y[flip] = 1 - y[flip]     # 20% label noise to overfit on
+Y = np.eye(2)[y]
+idx = np.random.permutation(200); tr, va = idx[:160], idx[160:]   # 80/20 split
+
+W1 = np.random.randn(2, 128); b1 = np.zeros(128)
+W2 = np.random.randn(128, 2) * 0.5; b2 = np.zeros(2)
+params = [W1, b1, W2, b2]
+
+def acc(rows):
+    P = softmax(relu(X[rows] @ W1 + b1) @ W2 + b2); return (P.argmax(1) == y[rows]).mean()
+
+best_acc, best_ep, bad, patience = -1, -1, 0, 300
+best_state = [W.copy() for W in params]
+for ep in range(20000):
+    Xt, Yt = X[tr], Y[tr]
+    z1 = Xt @ W1 + b1; h = relu(z1); P = softmax(h @ W2 + b2)
+    dz2 = (P - Yt) / len(tr); dh = dz2 @ W2.T; dz1 = dh * (z1 > 0)
+    grads = [Xt.T @ dz1, dz1.sum(0), h.T @ dz2, dz2.sum(0)]
+    for W, g in zip(params, grads): W -= 0.5 * g          # in place: params stay linked
+    v = acc(va)
+    if v > best_acc:
+        best_acc, best_ep, bad = v, ep, 0
+        best_state = [W.copy() for W in params]
+    else:
+        bad += 1
+        if bad >= patience:
+            break
+last_train, last_val = acc(tr), acc(va)
+for W, B in zip(params, best_state): W[...] = B            # restore BEST, not last
+print(f"stopped at epoch {ep}; last weights: train {last_train:.3f}, val {last_val:.3f}")
+print(f"restored epoch {best_ep}: train {acc(tr):.3f}, val {acc(va):.3f}")
+```
+
+It prints that training stopped at epoch 362, when the last weights scored 0.650 on validation,
+and that the restored epoch-62 weights score 0.850. Keeping the last weights would have cost 20
+points of validation accuracy. Two details matter: the updates are in place (`W -= ...`,
+`W[...] = B`) so `params` keeps pointing at the live arrays, and the saved state is a *copy*,
+or it would silently change along with training.
 </details>

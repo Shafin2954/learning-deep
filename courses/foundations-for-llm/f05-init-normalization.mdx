@@ -7,6 +7,10 @@ order: 5
 
 ## Why initialization and normalization matter
 
+Signals passing through a deep network get multiplied again and again. Unless you control their
+size, they either balloon or fade away. Initialization sets a safe size at the start, and
+normalization keeps resetting it during training.
+
 Two quiet pieces of plumbing decide whether a deep network trains at all:
 **initialization** (the starting weights) and **normalization** (keeping activations
 well-scaled as they flow through layers). They never appear in the headline
@@ -14,12 +18,24 @@ architecture diagram, yet every Transformer block has a LayerNorm in it, and a b
 init can stop training cold. For fine-tuning you mostly inherit these — but knowing
 why they're there tells you what's wrong when a run explodes or flatlines.
 
+> **Picture it:** a long line of people passing a message by shouting. If everyone shouts a
+> little louder than they heard, the last person is deafened. If everyone speaks a little
+> softer, the message dies out. Good initialization tells each person to repeat at the volume
+> they heard; normalization is a volume knob at each person that resets the level to "normal".
+
 ## The exploding/vanishing signal problem
+
+Multiply a number by 1.1 thirty-two times and you get about 21; multiply by 0.9 thirty-two times
+and you get about 0.03. Layers act like those multipliers, so small scale errors compound.
 
 Each layer multiplies its input by a weight matrix. Stack many layers and the
 activation magnitudes compound. If weights are a bit too large, activations (and
 gradients) grow exponentially with depth — overflow, NaNs. A bit too small — they
 vanish — no gradient — no learning. A 32-layer LLM is unforgiving here.
+
+**Activations** are the values flowing out of each layer. **Variance** measures how spread out
+a set of numbers is around its mean; its square root is the **standard deviation** (std), the
+typical distance from the mean.
 
 For a linear layer $h = xW$ with $W \in \mathbb{R}^{d_{\text{in}} \times d_{\text{out}}}$, if each
 entry of $W$ is drawn from $\mathcal{N}(0, \sigma^2)$, the output variance is:
@@ -28,25 +44,59 @@ $$
 \mathrm{Var}(h_j) = d_{\text{in}} \cdot \sigma^2 \cdot \mathrm{Var}(x_i)
 $$
 
+> **In plain words:** each output $h_j$ adds up $d_{\text{in}}$ products of a weight and an
+> input. Independent random terms add their variances, so the output's variance is (number of
+> terms) times (weight variance) times (input variance). $\mathcal{N}(0, \sigma^2)$ means "a
+> bell curve centered at 0 with variance $\sigma^2$". (Strictly, the last factor is the input's
+> mean square $\mathbb{E}[x_i^2]$; it equals the variance when the inputs have mean 0.)
+
 To keep $\mathrm{Var}(h_j) \approx \mathrm{Var}(x_i)$, set $\sigma^2 = 1/d_{\text{in}}$.
+
+With $d_{\text{in}} = 512$ and $\sigma = 1$, each layer multiplies the variance by 512, so the std
+grows by $\sqrt{512} \approx 22.6$ per layer.
 
 ## Initialization: keep variance ~1 through each layer
 
+The fix is to scale the random starting weights down by the number of inputs, so each layer's
+output has about the same spread as its input.
+
 ### Xavier/Glorot and He/Kaiming initialization
+
+Two standard recipes, named after the researchers who proposed them, differ only by which
+nonlinearity follows the layer.
 
 - **Xavier/Glorot** (for tanh/linear): $\sigma^2 = \dfrac{1}{d_{\text{in}}}$ (or $\dfrac{2}{d_{\text{in}} + d_{\text{out}}}$).
 - **He/Kaiming** (for ReLU/GELU): $\sigma^2 = \dfrac{2}{d_{\text{in}}}$ — the factor of 2 compensates for ReLU
   zeroing roughly half of all inputs on average.
 
+The $\dfrac{2}{d_{\text{in}} + d_{\text{out}}}$ version averages the forward and backward fan:
+it balances keeping activations steady going forward and gradients steady going backward.
+**GELU** is a smooth cousin of ReLU used in most transformers.
+
 ### Why the factor of 2 for ReLU
 
+ReLU throws away half of its input on average, so you start the weights with twice the variance
+to make up for the loss.
+
 ReLU zeroes out all negative inputs. If $z \sim \mathcal{N}(0, \sigma^2)$, then
-$\mathrm{Var}(\mathrm{ReLU}(z)) = \tfrac{1}{2}\sigma^2$, because half the mass is killed. To keep
+$\mathbb{E}[\mathrm{ReLU}(z)^2] = \tfrac{1}{2}\sigma^2$, because half the mass is killed. To keep
 output variance equal to input variance through a ReLU layer:
 
 $$
 \sigma^2_W = \frac{2}{d_{\text{in}}}
 $$
+
+> **In plain words:** the bell curve is symmetric, so the positive half carries exactly half of
+> the mean square. The next layer's variance depends on that mean square, so doubling the weight
+> variance from $1/d_{\text{in}}$ to $2/d_{\text{in}}$ restores it.
+
+> **Watch out:** the quantity He init preserves is the *mean square* (the RMS, root mean
+> square), not the variance of the ReLU output. ReLU outputs are all $\ge 0$ and have a positive
+> mean, so their plain std is smaller: about $0.83\sigma$ instead of $\sigma$. You will see that
+> 0.83 in the next output.
+
+The block pushes 1,000 random inputs of width 512 through one ReLU layer twice, once with weights
+of std 1 and once with He init, then checks what LayerNorm does to badly scaled values.
 
 ```python
 import numpy as np
@@ -84,12 +134,27 @@ after LayerNorm -> mean: -0.0  std: 1.0
 With naive init the activation std blows up to ~13; with He init it stays ~0.83.
 Across 32 layers, that difference is the gap between "trains" and "NaN at step 3."
 
+Both numbers match the theory. Naive init gives a pre-activation std of
+$\sqrt{512} \approx 22.6$, and ReLU's plain std is about 0.58 of that, which is the 13.18 you see.
+He init gives a pre-activation std of $\sqrt{2} \approx 1.41$, and $0.58 \times 1.41 \approx 0.83$,
+exactly the second line; its RMS is 1.00, as designed. The LayerNorm line shows mean $-0.0$ (a
+tiny negative number rounded to 0) and std 1.0, starting from values with mean 3 and std 5.
+
 ## Normalization: standardize activations on the fly
+
+Good starting weights are not enough, because training keeps changing the weights. A
+normalization layer measures the current spread of the values and rescales them back to a
+standard size, at every step.
 
 Even with good init, distributions drift during training. Normalization layers fix
 this by re-standardizing activations mid-network.
 
+To **standardize** a set of numbers means to subtract their mean and divide by their std, so
+the result has mean 0 and std 1.
+
 ### BatchNorm vs LayerNorm vs RMSNorm
+
+The three differ in *which* numbers they average over.
 
 - **BatchNorm** normalizes each feature across the *batch*. Great for CNNs, awkward
   for sequences/variable lengths and small batches — so LLMs don't use it.
@@ -100,25 +165,52 @@ this by re-standardizing activations mid-network.
   Modern LLMs (Llama, Mistral) use RMSNorm — fewer operations, same stabilizing
   effect.
 
+> **Picture it:** a spreadsheet with one row per token and one column per feature. BatchNorm
+> standardizes each *column* using all the rows in the batch. LayerNorm standardizes each *row*
+> on its own. A row's result therefore never depends on which other tokens happen to share its
+> batch.
+
 ### LayerNorm formula
+
+LayerNorm standardizes one token's features, then lets the model rescale and shift them with two
+learned vectors.
 
 $$
 \mathrm{LN}(x) = \gamma \cdot \frac{x - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta
 \qquad \text{where } \mu, \sigma^2 \text{ are computed over the feature dimension}
 $$
 
+> **In plain words:**
+> - $\mu$ and $\sigma^2$ are the mean and variance of this token's features.
+> - $(x - \mu) / \sqrt{\sigma^2 + \varepsilon}$ standardizes the features to mean 0, std 1;
+>   $\varepsilon$ (about $10^{-5}$) avoids dividing by zero.
+> - $\gamma$ (scale) and $\beta$ (shift) are learned per feature, so the model can undo the
+>   standardization where that helps.
+
 ### RMSNorm formula
+
+RMSNorm keeps only the "divide by the typical size" half of LayerNorm.
 
 $$
 \mathrm{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \varepsilon}}
 $$
 
+> **In plain words:** divide each feature by the root of the average squared feature, $d$ being
+> the number of features. No mean is subtracted, so a vector of all 5s stays all 1s instead of
+> becoming all 0s. Implementations usually also multiply by a learned scale $\gamma$.
+
 ### Pre-norm vs post-norm
+
+Where you put the normalization inside the block matters for deep stacks.
 
 Early Transformers put LayerNorm *after* the residual addition ("post-norm"); modern
 ones put it *before* the sub-layer ("pre-norm"), which makes deep stacks far more
 stable to train. If you ever build a Transformer from scratch (F12) and it won't
 train, switching to pre-norm is the first thing to try.
+
+A **residual addition** is the shortcut $x + \text{sublayer}(x)$ that lets the input skip past
+a layer (F12). With pre-norm, that shortcut path carries the raw signal straight from the bottom
+of the stack to the top, untouched by any normalization, so gradients flow back cleanly.
 
 **For the competition:** you rarely set init or norm by hand when fine-tuning — the
 pretrained model already has them. But when a fine-tune produces NaNs, the usual
@@ -126,7 +218,23 @@ suspects are right here (too-high learning rate interacting with norm/residual s
 or in F4 (no warmup). And if you ever build a model from scratch, He init + pre-norm
 LayerNorm/RMSNorm is the safe default.
 
+> **Watch out:** in half precision (F7), the variance inside LayerNorm can overflow for large
+> activations. Frameworks compute normalization in 32-bit floats for this reason; do not
+> "optimize" that away.
+
+## Recap in plain words
+
+- Each layer multiplies the signal's spread, so small scale errors grow exponentially with depth.
+- Drawing weights with variance $1/d_{\text{in}}$ keeps the spread steady through a linear layer.
+- He init uses $2/d_{\text{in}}$ because ReLU removes half of the mean square.
+- Normalization layers re-standardize activations during training, not only at the start.
+- LayerNorm standardizes each token's features; RMSNorm only divides by their root mean square.
+- Pre-norm (normalize before each sub-layer) is the stable choice for deep transformers.
+
 ## Try it Yourself
+
+This stacks 20 ReLU layers with naive and He init, then compares RMSNorm and LayerNorm on the
+same row of data.
 
 ```python
 import numpy as np
@@ -163,6 +271,16 @@ RMSNorm row0 : [ 0.89 -0.15 -0.85  1.47 -0.69 -1.79 -0.25  0.73]
 LayerNorm row0: [ 0.97 -0.07 -0.77  1.56 -0.61 -1.72 -0.17  0.81]
 ```
 
+The first line is about $9.5 \times 10^{20}$: with std-1 weights, each layer multiplied the
+signal by roughly 11, and 20 layers compounded that into overflow territory. The He line ends at
+1.04 after the same 20 layers. In the last two lines, the RMSNorm and LayerNorm rows are close
+but not equal (for example 0.89 vs 0.97 in the first slot), because this data has mean around 1
+and only LayerNorm subtracts it.
+
+Try a variation: use `lambda d: np.sqrt(1/d)` (Xavier) with the ReLU stack. The std should
+shrink layer after layer, since ReLU keeps removing half the mean square that Xavier does not
+compensate for.
+
 ## Exercise
 
 Implement the **backward pass** of LayerNorm (gradient of the normalized output
@@ -170,8 +288,45 @@ w.r.t. its input), or — easier and just as instructive — gradient-check a fo
 LayerNorm numerically the way you did for the MLP in F2. Then answer: why does
 LayerNorm make training more robust to the learning rate?
 
+> **Hint:** define a scalar loss `(layernorm(x) * g).sum()` for a fixed random `g`. Its gradient
+> with respect to the LayerNorm output is exactly `g`, so you can test any backward formula
+> against central differences on `x`.
+
 <details>
-<summary>Answer to the conceptual part</summary>
+<summary>Solution</summary>
+
+A backward pass checked against numerical gradients:
+
+```python
+import numpy as np
+np.random.seed(0)
+eps = 1e-5
+def layernorm(x):
+    mu = x.mean(-1, keepdims=True); var = x.var(-1, keepdims=True)
+    return (x - mu) / np.sqrt(var + eps)
+
+def layernorm_backward(x, g):                  # g = dL/d(output)
+    mu = x.mean(-1, keepdims=True); var = x.var(-1, keepdims=True)
+    s = np.sqrt(var + eps); xhat = (x - mu) / s
+    return (g - g.mean(-1, keepdims=True)
+              - xhat * (g * xhat).mean(-1, keepdims=True)) / s
+
+x = np.random.randn(3, 8) * 4 + 1
+g = np.random.randn(3, 8)                       # pretend upstream gradient
+L = lambda x: (layernorm(x) * g).sum()          # a loss whose gradient wrt LN output is g
+num = np.zeros_like(x); h = 1e-6
+for idx in np.ndindex(x.shape):
+    xp = x.copy(); xp[idx] += h; xm = x.copy(); xm[idx] -= h
+    num[idx] = (L(xp) - L(xm)) / (2 * h)
+print("max |analytic - numerical|:", f"{np.abs(layernorm_backward(x, g) - num).max():.1e}")
+```
+
+It prints a gap of about $7.8 \times 10^{-10}$, so the formula is right. Read the formula as
+"divide by the std, after removing two things from the incoming gradient": its average (moving
+every feature together only shifts the mean, which LayerNorm erases) and its component along
+$\hat{x}$ (scaling the row only changes the std, which LayerNorm also erases).
+
+The conceptual part:
 
 By re-standardizing each token's activations to mean 0 / variance 1, LayerNorm keeps
 the input scale to every sub-layer roughly constant regardless of what the previous

@@ -7,15 +7,36 @@ order: 1
 
 ## Why Standard Attention Doesn't Scale
 
+Attention lets every word look at every other word. That is powerful, but "everyone looks at
+everyone" means the work grows with the *square* of the text length: double the text, and the
+work goes up four times.
+
 Self-attention computes a score between every pair of tokens in the sequence. For a sequence of length $n$, that's $n^2$ pairs — and you need to store the full $n \times n$ attention matrix. Both time and memory scale as $O(n^2)$.
 
-For $n = 1{,}000$: 1M entries. For $n = 128{,}000$ (a 128K context window): 16.4 billion entries per layer. At float16 (2 bytes each), that's 33 GB just for the attention matrix in one layer. GPT-4-class models have ~96 layers.
+A **token** is one chunk of text the model reads (roughly a word or word-piece). The
+**attention matrix** is the table of scores that says how much token $i$ cares about token
+$j$. **$O(n^2)$** ("big-O of n squared") is shorthand for "grows like the square of $n$".
+
+For $n = 1{,}000$: 1M entries. For $n = 128{,}000$ (a 128K context window): 16.4 billion entries per head, per layer. At float16 (2 bytes each), that's about 33 GB just for one head's attention matrix in one layer. GPT-4-class models are reported to have around 96 layers, each with many heads.
+
+> **Picture it:** a party where every guest must shake hands with every other guest. With 10
+> guests that's 45 handshakes; with 1,000 guests it's about half a million. Adding guests
+> is cheap; the handshakes are what kill you.
 
 $$
 \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right)V
 $$
 
+> **In plain words:** $Q$ (queries), $K$ (keys) and $V$ (values) are three tables with one
+> row per token. Multiply every query by every key to get raw scores, divide by
+> $\sqrt{d_k}$ (the square root of the row width) to keep them from getting huge, turn each
+> row into weights that sum to 1 with softmax, then use those weights to average the values.
+
 The bottleneck is $QK^T$ — an $(n \times d_k) \cdot (d_k \times n)$ matmul that produces an $(n \times n)$ matrix.
+
+The code below counts the bytes needed to hold those $n \times n$ score tables for a
+GPT-2-small-sized model: 12 **heads** (independent attention computations running side by
+side) times 12 **layers** (stacked attention blocks).
 
 ```python
 import numpy as np
@@ -34,28 +55,54 @@ for seq_len in [512, 2048, 8192, 32768]:
 ```
 
 ```output
-n=   512: 0.01 GB
-n=  2048: 0.15 GB
-n=  8192: 2.42 GB
-n= 32768: 38.65 GB
+n=   512: 0.08 GB
+n=  2048: 1.21 GB
+n=  8192: 19.33 GB
+n= 32768: 309.24 GB
 ```
 
-The jump from 2K to 32K context is 256×. This is why long-context models need architectural changes, not just more GPU memory.
+Read the last column. Going from 512 to 2,048 tokens (4 times longer) takes memory from 0.08 GB
+to 1.21 GB, about 16 times more. From 2K to 32K is 16 times longer and 256 times more memory:
+309 GB, far more than any single GPU holds. This is why long-context models need
+architectural changes, not more GPU memory.
+
+> **Watch out:** these numbers assume you actually store every score table. Real kernels
+> such as FlashAttention avoid storing them, which fixes *memory* but not the $n^2$ *compute*.
+> The square law is still there.
 
 ## The KV Cache Problem
 
+When a model writes text, it produces one token at a time. To avoid redoing all the old work
+each step, it keeps notes about every past token. Those notes are the **KV cache**, and they
+grow with every token you generate.
+
 At inference time, attention has a different bottleneck: the **KV cache**. When generating token by token, you don't recompute the full attention from scratch each step — you cache the keys and values for all past tokens.
+
+**Inference** means using a trained model to produce output (as opposed to training it).
 
 For each new token, the model:
 1. Computes Q, K, V for the new token
 2. Appends K and V to the cache
 3. Attends new Q against all cached K and V
 
+> **Picture it:** a meeting secretary who writes a two-line summary (a key and a value) of
+> everything each speaker said. When a new person talks, the secretary compares the new
+> remark against all the summaries rather than replaying the whole meeting. Fast, but the
+> notebook keeps getting thicker.
+
 The KV cache size at step $t$ (sequence length $t$):
 
 $$
 \text{KV cache} = 2 \times t \times n_{\text{layers}} \times n_{\text{heads}} \times d_{\text{head}} \times \text{dtype bytes}
 $$
+
+> **In plain words:**
+> - the leading $2$ is because you store both keys *and* values;
+> - $t$ is how many tokens you have seen so far;
+> - $n_{\text{layers}}$, $n_{\text{heads}}$, $d_{\text{head}}$ are the number of layers, the number of key/value heads, and the width of each head;
+> - dtype bytes is the size of one number (2 for float16/bfloat16).
+>
+> Every factor multiplies, and only $t$ grows while you generate.
 
 ```python
 def kv_cache_gb(seq_len, num_layers, num_heads, d_head, batch=1, dtype_bytes=2):
@@ -77,19 +124,41 @@ for ctx in [4096, 32768]:
 ```
 
 ```output
-ctx=   4096: 0.27 GB KV cache
-ctx=  32768: 2.15 GB KV cache
-ctx= 128000: 8.39 GB KV cache
+ctx=   4096: 0.54 GB KV cache
+ctx=  32768: 4.29 GB KV cache
+ctx= 128000: 16.78 GB KV cache
 
-ctx=   4096, batch=32: 8.59 GB
-ctx=  32768, batch=32: 68.72 GB
+ctx=   4096, batch=32: 17.18 GB
+ctx=  32768, batch=32: 137.44 GB
 ```
 
-Even with GQA (Grouped Query Attention) reducing KV heads from 32 to 8, a single 128K-context request uses 8.4 GB. Serving 32 concurrent users at 32K context uses 69 GB — more than the model weights themselves.
+Look at the first block: one request at 128,000 tokens already needs 16.78 GB of cache.
+The second block multiplies by the batch size: 32 users at 32K context need 137.44 GB.
+
+Even with **GQA** (Grouped Query Attention — several query heads share one key/value head)
+reducing KV heads from 32 to 8, a single 128K-context request uses about 16.8 GB. Serving 32
+concurrent users at 32K context uses about 137 GB — many times more than the 8B model's own
+weights, which take about 16 GB in bfloat16.
+
+> **Watch out:** people budget GPU memory for the model weights and forget the cache. At long
+> context and large batch, the cache, not the weights, is what runs you out of memory.
 
 ## Compute vs Memory Bandwidth
 
+A GPU can do arithmetic much faster than it can fetch numbers from its memory. If a job does
+only a little math per number fetched, the GPU sits idle waiting for data.
+
 Modern GPUs have far more raw FLOPs than they can feed from memory. An A100 has 312 TFLOPS (BF16) but only 2 TB/s memory bandwidth. The ratio is ~156 FLOPs per byte transferred.
+
+A **FLOP** is one floating-point arithmetic operation (an add or a multiply). **Memory
+bandwidth** is how many bytes per second can move between the GPU's main memory and its
+compute units. **Arithmetic intensity** is FLOPs done per byte moved. If an operation's
+intensity is below the GPU's ratio (156 here), it is **memory-bound**: memory speed, not math
+speed, sets the pace.
+
+> **Picture it:** a chef who can chop 156 onions a minute, but a delivery person who brings
+> only one onion a minute. A faster chef changes nothing; you need more onions per trip.
+> That "per-trip" view is the **roofline model**.
 
 For attention at long contexts, you spend most time **reading and writing the KV cache** — a memory-bandwidth-bound operation. Adding more FLOPs doesn't help.
 
@@ -113,15 +182,29 @@ print(f"Memory-bound: {intensity < arithmetic_intensity_break_even}")
 
 ```output
 Break-even arithmetic intensity: 156 FLOPs/byte
-Attention intensity at n=8192: 63.5 FLOPs/byte
+Attention intensity at n=8192: 128.0 FLOPs/byte
 Memory-bound: True
 ```
 
-Attention at long sequences is memory-bandwidth limited. This is why FlashAttention (ch. 12's Under the Trench) matters — it doesn't reduce FLOPs, it reduces memory reads/writes via tiling.
+The first line is the A100's break-even point: 156 FLOPs per byte. The second line says one
+attention layer at 8,192 tokens does only 128 FLOPs per byte moved, because it has to read and
+write the huge $n \times n$ score table. 128 is below 156, so the last line confirms it is
+memory-bound. During token-by-token generation it is worse still: each step reads the whole
+cache to do a tiny amount of math for one new token.
+
+Attention at long sequences is memory-bandwidth limited. This is why FlashAttention matters
+(ch. 2 compares it with the approximate methods; ch. 12's Under the Trench names the general
+hardware-aware design idea) — it doesn't reduce FLOPs, it reduces memory reads/writes via
+**tiling**, which means working on small blocks that fit in fast on-chip memory so the full
+table is never written out.
 
 ## The Alternatives
 
-Three families of architectures attack this problem:
+Several families of architectures attack these costs, each by changing a different part of
+the model. The rest of the course takes them apart one by one.
+
+Three of the families below change attention itself; the fourth (MoE) leaves attention alone
+and attacks the cost of the feed-forward layers instead:
 
 | Approach | How | Training | Inference | Quality |
 |----------|-----|----------|-----------|---------|
@@ -130,9 +213,29 @@ Three families of architectures attack this problem:
 | **Sparse attention** | Attend only to local/selected tokens | Parallel | Partial KV cache | Good |
 | **MoE** | Sparse FFN, not sparse attention | Parallel | Parallel | Matches dense |
 
-The next chapters cover each in depth.
+Reading the columns: **parallel** training means all positions are processed at once (fast on
+GPUs). **Recurrent $O(1)$/step** inference means each new token costs the same small amount
+of work and memory no matter how long the text is, because the model keeps a fixed-size
+summary instead of a growing cache. **FFN** is the feed-forward network inside each block;
+**MoE** (mixture of experts) runs only a few of many FFNs per token.
+
+The next chapters cover each in depth: linear attention (ch. 2), state space models and
+Mamba (ch. 3–4), other recurrent designs (ch. 5), MoE (ch. 6–7), and hybrids that mix them
+(ch. 8).
+
+## Recap in plain words
+
+- Attention compares every token with every other one, so its cost grows with the square of the length.
+- Storing all the score tables for GPT-2 small hits 309 GB at 32K tokens.
+- During generation the KV cache grows by one entry per token; for Llama-3 8B at 128K it is 16.78 GB per request.
+- Batching multiplies the cache: 32 users at 32K need 137 GB, far more than the weights.
+- Long-context attention is memory-bound (128 FLOPs/byte vs the A100's 156), so faster math alone does not help.
+- The alternatives (linear attention, SSMs, sparse attention, MoE) each replace a growing cost with a fixed or smaller one.
 
 ## Try it Yourself
+
+The experiment compares one layer's attention score tables with a state space model's
+fixed-size state, $D = 16$ numbers per position, across five sequence lengths.
 
 ```python
 import numpy as np
@@ -154,18 +257,30 @@ compare_costs([512, 2048, 8192, 32768, 131072])
 ```
 
 ```output
-       n | Attn QK^T (GB) | SSM state (MB) | Ratio
+       n |   Attn QK^T (GB) |   SSM state (MB) |    Ratio
 ------------------------------------------------------------
-     512 |           0.003 |           0.09 |    3072x
-    2048 |           0.050 |           0.36 |   12288x
-    8192 |           0.805 |           1.44 |   49152x
-   32768 |          12.884 |           5.76 |  196608x
-  131072 |         206.158 |          23.07 |  786432x
+     512 |            0.025 |             0.10 |      256x
+    2048 |            0.403 |             0.39 |     1024x
+    8192 |            6.442 |             1.57 |     4096x
+   32768 |          103.079 |             6.29 |    16384x
+  131072 |         1649.267 |            25.17 |    65536x
 ```
+
+The attention column grows by 16 times every time $n$ grows 4 times (0.403 GB to 6.442 GB),
+while the SSM column grows only 4 times (0.39 MB to 1.57 MB). At 131,072 tokens attention needs
+1,649 GB and the SSM 25 MB. The ratio column is $n \cdot n_{\text{heads}} / D$, so it grows
+linearly with $n$: 256 times at 512 tokens, 65,536 times at 131K.
+
+Try changing `D = 16` to `D = 64` (a fatter state, as in Mamba-2) and see how much the ratio
+falls. Then double `num_heads` and see which column moves.
 
 ## Exercise
 
 The KV cache for a model with 40 layers, 40 KV heads (GQA-off), and $d_{\text{head}} = 128$ serving a batch of 16 requests at 16K context each: how many GB? At what context length does a single request exceed 8 GB?
+
+> **Hint:** reuse the KV-cache formula. Every factor except $t$ and the batch is fixed, so
+> compute one request at one length, then scale. For the second part, step the context up
+> in chunks of 4,096 until you cross 8 GB.
 
 <details>
 <summary>Solution</summary>
@@ -185,10 +300,13 @@ for ctx in range(4096, 200000, 4096):
 ```
 
 ```output
-Batch 16, ctx 16K: 163.8 GB
-Single request > 8 GB at ctx=65,536
+Batch 16, ctx 16K: 214.7 GB
+Single request > 8 GB at ctx=12,288
 ```
 
-With 40 heads (no GQA), a 16K batch costs 164 GB — more than two A100s' worth of HBM. This is exactly why Llama-3 uses GQA (8 KV heads instead of 32).
+With 40 KV heads (no GQA), a 16-request batch at 16K costs 214.7 GB — about 2.7 times the
+80 GB of HBM on an A100 80GB. A single request crosses 8 GB at only 12,288 tokens, because
+each 4,096-token chunk costs about 2.7 GB. This is exactly why Llama-3 uses GQA (8 KV heads
+instead of 32): cutting KV heads 4 times cuts the cache 4 times, with little quality loss.
 
 </details>

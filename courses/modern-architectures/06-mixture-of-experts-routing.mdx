@@ -7,13 +7,24 @@ order: 6
 
 ## The FFN bottleneck
 
+Most of a transformer's arithmetic is not in attention at ordinary lengths; it is in the
+feed-forward block that every token passes through. Making that block bigger makes the model
+smarter, but also makes every token more expensive.
+
 Every transformer layer spends the majority of its FLOPs in the feedforward sublayer.
-A standard FFN with hidden size $d$ and expansion factor 4 costs $8d^2$ FLOPs per token.
+A standard FFN with hidden size $d$ and expansion factor 4 costs $8d^2$ multiply-adds (about $16d^2$ FLOPs) per token, because its two weight matrices hold $d \times 4d$ and $4d \times d$ numbers.
 Scaling to a larger FFN means paying that cost for every token, every layer.
 Mixture-of-Experts (MoE) breaks this coupling: you can grow the parameter count dramatically
 while keeping the per-token compute budget fixed.
 
+The **FFN** (feed-forward network) is the two-layer MLP in each transformer block. The
+**expansion factor** is how much wider its middle layer is than the model ($4d$ here).
+**Parameters** are the stored weights; **compute** is the arithmetic each token costs.
+
 ## The core idea
+
+Instead of one huge FFN, keep many smaller FFNs, the **experts**, and send each token to only
+a couple of them. You store all the experts, but each token pays for only the ones it visits.
 
 Replace a single FFN with $N$ expert FFNs:
 
@@ -21,14 +32,25 @@ $$
 \text{MoE}(x) = \sum_{i=1}^{N} G(x)_i \cdot E_i(x)
 $$
 
+> **In plain words:** the layer's output is a weighted sum of the experts' outputs. $E_i(x)$
+> is what expert $i$ says about token $x$, and $G(x)_i$ is how much the layer trusts expert
+> $i$ for this token. If a weight is exactly 0, that expert does not need to run at all.
+
 where $G(x) \in \mathbb{R}^N$ is a gating vector and $E_i$ is the $i$-th expert network.
 In the dense limit every $G(x)_i > 0$ and you pay the full cost. In the sparse limit you
 zero out all but the top-$k$ gate values, so only $k$ experts actually run.
+
+> **Picture it:** a hospital. Every patient (token) goes to reception (the router), which
+> sends them to two of eight specialists. The hospital employs eight doctors' worth of
+> knowledge, but each patient only takes up two doctors' time.
 
 For top-2 routing with $N=8$ experts, each token runs through exactly 2 of 8 FFNs —
 regardless of how large each expert is.
 
 ## The router network
+
+The **router** (also called the gate) is a tiny layer that scores how suitable each expert is
+for the current token, then keeps only the best few.
 
 The gating function is a linear projection followed by softmax:
 
@@ -36,8 +58,15 @@ $$
 G_{\text{raw}}(x) = x W_g, \quad G(x) = \text{softmax}(\text{top-}k(G_{\text{raw}}(x)))
 $$
 
+> **In plain words:** multiply the token by a matrix $W_g$ to get one score per expert,
+> keep the $k$ highest scores, and turn those $k$ scores into weights that sum to 1.
+
 `top-k` zeroes out all logits except the $k$ largest before softmax, so the weights sum to 1
 over only the selected experts. The router is learned jointly with the rest of the model.
+
+A **logit** is a raw, unnormalized score. In the code, "zeroing out" is done by setting the
+unchosen logits to $-\infty$, because $e^{-\infty} = 0$: after the softmax, those experts get
+weight exactly 0.
 
 ```python
 import torch
@@ -73,24 +102,47 @@ print(f"gate weights (first token): {weights[0, 0, indices[0, 0]].tolist()}")
 ```output
 weights shape:  torch.Size([2, 16, 8])
 indices shape:  torch.Size([2, 16, 2])
-selected experts per token (first token): [3, 6]
-gate weights (first token): [0.5821, 0.4179]
+selected experts per token (first token): [6, 4]
+gate weights (first token): [0.7317435145378113, 0.2682565152645111]
 ```
+
+The weights tensor has one entry per expert (8) for each of the $2 \times 16$ tokens; the
+indices tensor holds the 2 chosen experts per token. The first token went to experts 6 and 4,
+with weights 0.732 and 0.268. Those two add up to 1, and the other six experts got 0.
+
+> **Watch out:** `torch.topk` returns experts sorted by score, not by expert number. Code
+> that assumes the first index is the smaller expert id will mix up weights and experts.
 
 ## Capacity factor and token dropping
 
+GPUs work best when every expert gets a batch of the same, fixed size. So each expert gets a
+fixed number of seats per batch; tokens that arrive after the seats are full are turned away.
+
 Each expert has a fixed buffer — its *capacity*. If more tokens are routed to an expert than
 it can hold, the overflow tokens are dropped (their representation is passed through unchanged).
+
+"Passed through unchanged" works because of the **residual connection**: the block adds its
+output to its input, so a dropped token keeps its input and skips this layer's expert.
 
 $$
 \text{capacity} = \left\lfloor \frac{\text{tokens per batch}}{\text{num\_experts}} \times \text{capacity\_factor} \right\rfloor
 $$
 
+> **In plain words:** capacity = (fair share of tokens per expert) times a safety margin,
+> rounded down. The fair share is what each expert would get if routing were perfectly even.
+
 A capacity factor of 1.0 gives each expert exactly its fair share. Setting it to 1.25
 gives 25% slack. Setting it below 1 guarantees some dropping even in the balanced case.
 Token dropping introduces a training/inference asymmetry and can hurt quality on long inputs.
 
+> **Watch out:** with top-$k$ routing each token makes $k$ requests, so many implementations
+> multiply the fair share by $k$ as well. Check which convention a codebase uses before
+> comparing capacity factors between papers.
+
 ## Top-1 vs top-2 routing
+
+The more experts each token visits, the better the answer and the higher the cost. The
+choice of $k$ is that dial.
 
 | Setting | Experts per token | FLOPs per token | Quality |
 |---------|-------------------|-----------------|---------|
@@ -99,15 +151,23 @@ Token dropping introduces a training/inference asymmetry and can hurt quality on
 | Dense   | N                 | N× FFN          | Highest |
 
 Switch Transformer (Google, 2021) uses top-1 for maximum efficiency. Mixtral uses top-2 for
-quality. Top-2 is the current default for most production MoE LLMs.
+quality. Top-2 was the common default for the first wave of production MoE LLMs (GShard,
+Mixtral). Newer models such as DeepSeek-V3 split the FFN into many small **fine-grained
+experts** and route each token to 8 of them, plus an always-on **shared expert**.
 
 ## Expert specialization
+
+Nobody tells the experts what to specialize in. The router and the experts learn together,
+and patterns appear on their own.
 
 After training, individual experts tend to specialize. Analyzing which tokens route to which
 expert reveals patterns: punctuation tokens may cluster in one expert, code tokens in another,
 named entities in a third. This specialization is emergent — not designed in. You can inspect
 it by forward-passing a corpus through the trained router and computing expert assignment
 histograms per token-type category.
+
+**Emergent** means it arises from training rather than from a rule someone wrote. An
+**assignment histogram** counts how many tokens each expert received.
 
 ```python
 # Visualize expert assignment frequency on a mini corpus
@@ -128,29 +188,56 @@ for expert_id in sorted(counts):
 ```
 
 ```output
-Expert 0:  22 tokens  ███████████
+Expert 0:  25 tokens  ████████████
 Expert 1:  28 tokens  ██████████████
-Expert 2:  18 tokens  █████████
-Expert 3:  25 tokens  ████████████
-Expert 4:  31 tokens  ███████████████
-Expert 5:  20 tokens  ██████████
-Expert 6:  24 tokens  ████████████
-Expert 7:  32 tokens  ████████████████
+Expert 2:  19 tokens  █████████
+Expert 3:  18 tokens  █████████
+Expert 4:  27 tokens  █████████████
+Expert 5:  23 tokens  ███████████
+Expert 6:  34 tokens  █████████████████
+Expert 7:  26 tokens  █████████████
 ```
 
-Real trained routers are much less balanced than this random demo — which is exactly the load
-imbalance problem addressed in the next chapter.
+The counts add up to 200, because 100 tokens each pick 2 experts. With a random router the
+loads range from 18 (expert 3) to 34 (expert 6), against a fair share of 25. Even pure chance
+gives one expert almost twice the load of another.
+
+Real trained routers can end up much less balanced than this random demo — which is exactly the load
+imbalance problem addressed in the next chapter. Without a fix, a few experts that start
+slightly better attract more tokens, train more, get better still, and the rest starve.
 
 ## Why MoE scales parameters cheaply
+
+MoE separates two numbers that are equal in a normal model: how many weights the model
+*stores* and how many weights each token *uses*.
 
 A 7B dense model has 7B active parameters per token. An 8×7B MoE model with top-2 routing
 has 46.7B total parameters but only ~13B active per token — roughly the same compute as a
 13B dense model, with quality approaching a much larger dense model.
 
+Why not $8 \times 7 = 56$B total and $2 \times 7 = 14$B active? Because only the FFNs are
+copied 8 times. Attention, embeddings and norms are shared by all experts, so they are counted
+once.
+
 The parameter count scales with $N$; the FLOPs scale with $k$. This is the key asymmetry.
 The catch: you need $N \times$ more memory to load all expert weights at inference time.
 
+> **Watch out:** "13B active" does not mean "fits on a 13B GPU budget". All 46.7B weights
+> must sit in memory, because the next token may pick any expert.
+
+## Recap in plain words
+
+- The FFN dominates per-token compute, and MoE replaces it with many expert FFNs.
+- A router scores the experts for each token, keeps the top $k$, and normalizes their weights.
+- Only the chosen $k$ experts run, so compute grows with $k$ while stored parameters grow with $N$.
+- Each expert has a fixed capacity; overflow tokens are dropped and pass through on the residual.
+- Even a random router gives uneven loads (18 to 34 here), and training can make it worse.
+- Mixtral 8x7B stores 46.7B parameters but uses about 13B per token.
+
 ## Try it Yourself
+
+A complete, small MoE layer: 4 experts, each a two-layer MLP, with top-2 routing. The loop
+sends each token's rows only to the experts it picked, and weights their outputs.
 
 ```python
 import torch
@@ -199,15 +286,26 @@ print(f"Active params per token: {params_dense:,} (top-2 of 4 = same compute as 
 
 ```output
 Input:  torch.Size([2, 8, 128])  Output: torch.Size([2, 8, 128])
-Dense FFN params: 131,072  |  MoE params: 262,656  (4 experts)
-Active params per token: 131,072 (top-2 of 4 = same compute as dense)
+Dense FFN params: 262,144  |  MoE params: 524,800  (4 experts)
+Active params per token: 262,144 (top-2 of 4 = same compute as dense)
 ```
+
+The output has the same shape as the input, so it drops in where an FFN would go. The second
+line compares sizes, ignoring bias terms: two experts' worth of weights (262,144) against the
+whole layer (524,800 = 4 experts plus a 512-weight router). Each token touches only 262,144
+weights, because top-2 of 4 runs two experts.
+
+Change `num_experts=4` to `16` (and the `params_moe` line to match). The stored parameters
+grow 4 times, but each token's compute stays the same.
 
 ## Exercise
 
 You have an MoE layer with 8 experts and top-2 routing. A batch has 32 tokens.
 If the capacity factor is 1.25, what is the capacity per expert?
 Then: in a batch where all tokens route to expert 0 first, how many tokens get dropped?
+
+> **Hint:** start from the fair share, 32 tokens over 8 experts. Apply the factor and round
+> down. Then compare the capacity with the 32 tokens that all want expert 0.
 
 <details>
 <summary>Solution</summary>
@@ -239,4 +337,8 @@ Expert utilization: expert 0 = 5/32, all others = 0
 
 With capacity 5 and 32 tokens all routing to expert 0, 27 tokens get dropped — demonstrating
 why load imbalance is catastrophic and why the auxiliary loss (next chapter) is essential.
+
+Only 5 of 32 tokens, 16%, get their first-choice expert, while the other seven experts sit
+idle for that first choice. Raising the capacity factor would not save you: it would need to be
+8.0 to fit all 32 tokens, which wastes memory on seven empty buffers.
 </details>

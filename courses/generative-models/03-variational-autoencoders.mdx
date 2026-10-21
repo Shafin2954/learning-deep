@@ -7,15 +7,39 @@ order: 3
 
 ## The Probabilistic View
 
+A plain autoencoder maps each input to one exact point. A variational autoencoder maps each
+input to a small fuzzy cloud of points instead, and that fuzziness is what fills in the gaps
+from ch. 2.
+
 A VAE frames the autoencoder problem probabilistically. The encoder is no longer a deterministic function; it outputs the parameters of a distribution over $z$:
 
 $$
 q_\phi(z|x) = \mathcal{N}(\mu_\phi(x),\, \text{diag}(\sigma^2_\phi(x)))
 $$
 
+> **In plain words:** for an input $x$, the encoder outputs two vectors: a centre $\mu$ and a
+> spread $\sigma$ for every code dimension. The code is then "somewhere in a bell curve around
+> $\mu$, about $\sigma$ wide". $\text{diag}$ means each dimension gets its own independent spread,
+> with no correlations between dimensions.
+
+A **deterministic** function always gives the same output for the same input. The VAE
+encoder $q_\phi(z|x)$ is not: it describes a *range* of plausible codes.
+
+> **Picture it:** instead of sticking a pin in the map for each training image, you drop a
+> blob of paint. Blobs from neighbouring images overlap and cover the farmland between
+> neighbourhoods, so the decoder learns what lives there too.
+
 The decoder defines a conditional likelihood $p_\theta(x|z)$. The true posterior $p(z|x)$ is intractable (requires integrating out all possible $z$), so you approximate it with $q_\phi(z|x)$ — variational inference.
 
+The **posterior** $p(z|x)$ is the exact answer to "which codes could have produced this $x$?"
+under the model. Computing it needs the intractable marginal from ch. 1. **Variational
+inference** replaces it with a simple stand-in distribution $q_\phi$ and tunes $\phi$ until the
+stand-in is as close as possible.
+
 ## The ELBO
+
+You can't compute the true score $\log p_\theta(x)$, but you can compute a number that is always
+below it. Pushing that floor up pushes the real score up with it.
 
 Maximizing $\log p_\theta(x)$ directly is intractable. Instead, maximize the **Evidence Lower BOund (ELBO)**:
 
@@ -26,11 +50,33 @@ $$
 - **Reconstruction term**: how well the decoder recovers $x$ from a sampled $z$.
 - **KL term**: forces the approximate posterior $q_\phi(z|x)$ toward the standard Gaussian prior $p(z)=\mathcal{N}(0,I)$.
 
+> **In plain words:** ELBO = (how well can you rebuild $x$ from a code drawn from its cloud?)
+> minus (how far is that cloud from a plain standard bell curve?). The first part wants
+> sharp, informative codes. The second part wants every cloud to look like the same
+> featureless bell. Training balances the two.
+
+"Evidence" is another name for $\log p_\theta(x)$. The **prior** $p(z)$ is what you assume codes
+look like before seeing any data — here a standard normal $\mathcal{N}(0, I)$. Because every
+cloud is pulled toward that one bell, at generation time you can draw $z$ from $\mathcal{N}(0, I)$
+and land somewhere the decoder knows.
+
+> **Picture it:** a sculptor with a strict budget. The reconstruction term pays for detail;
+> the KL term is the tax on deviating from a plain block. A high tax gives smooth, generic
+> sculptures; a low tax gives detailed ones that might not fit together.
+
 With a Gaussian $q_\phi$ and standard Gaussian prior, the KL has a closed form:
 
 $$
 \text{KL}(q_\phi(z|x) \| p(z)) = -\frac{1}{2}\sum_{j=1}^{d_z}(1 + \log\sigma_j^2 - \mu_j^2 - \sigma_j^2)
 $$
+
+> **In plain words:** for each code dimension $j$ (there are $d_z$ of them), the cost is zero
+> exactly when $\mu_j = 0$ and $\sigma_j = 1$. Moving the centre away from 0 adds $\mu_j^2$;
+> making the spread too narrow or too wide makes $\sigma_j^2 - \log\sigma_j^2 - 1$ positive.
+
+A **closed form** is a formula you can evaluate directly, with no sampling or integration. The
+code below works with $\log\sigma^2$ (called `log_var`) rather than $\sigma$, because a network
+output can be any real number, while $\sigma$ must be positive.
 
 ```python
 import torch
@@ -53,11 +99,20 @@ print(f"KL at (0,0): {kl_divergence_gaussian(torch.zeros(1,3), torch.zeros(1,3))
 ```output
 mu:      [[ 0.5 -0.3  1.2]]
 log_var: [[-0.4  0.1 -0.8]]
-KL:      1.0781
-KL at (0,0): 0.0000
+KL:      1.0524
+KL at (0,0): -0.0000
 ```
 
+The total KL is 1.0524. Splitting it by hand, the three dimensions contribute about 0.160,
+0.048, and 0.845 — the third dimension, with $\mu = 1.2$ far from 0, pays most of the bill. The
+last line checks the formula's anchor: at $\mu = 0, \log\sigma^2 = 0$ the KL is 0 (the
+"$-0.0000$" is a floating-point zero with a sign bit, not a negative number).
+
 ## The Reparameterization Trick
+
+Gradients can't flow through a dice roll. The trick: roll the dice *first*, with no learnable
+parts, then move and stretch the result with learnable numbers. Moving and stretching can be
+differentiated.
 
 To backpropagate through a sample $z \sim q_\phi(z|x)$, you can't differentiate through the sampling operation. The reparameterization trick rewrites sampling as a deterministic function:
 
@@ -65,7 +120,17 @@ $$
 z = \mu_\phi(x) + \sigma_\phi(x) \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)
 $$
 
+> **In plain words:** draw plain noise $\epsilon$ from a standard bell curve, multiply it by the
+> spread $\sigma$, and add the centre $\mu$. The symbol $\odot$ means element-by-element
+> multiplication.
+
 The randomness is in $\epsilon$ (not a function of $\phi$), so gradients flow through $\mu$ and $\sigma$ normally.
+
+> **Picture it:** a dart thrower with a fixed shaky hand ($\epsilon$). You can't train the shake,
+> but you can move where they stand ($\mu$) and how far back they stand ($\sigma$). Both of those
+> are smooth knobs you can tune by gradient.
+
+The encoder below computes `(0.5 * log_var).exp()`, which is $\sqrt{\sigma^2} = \sigma$.
 
 ```python
 import torch
@@ -97,12 +162,30 @@ print(f"z has grad_fn: {z.grad_fn is not None}")   # gradients flow
 
 ```output
 z shape:       torch.Size([4, 16])
-mu range:      [-0.314, 0.298]
-sigma range:   [0.681, 1.382]
+mu range:      [-0.320, 0.203]
+sigma range:   [0.915, 1.198]
 z has grad_fn: True
 ```
 
+The untrained encoder outputs centres between $-0.320$ and $0.203$ and spreads between 0.915 and
+1.198 — close to the prior already, since random weights give small outputs and
+$e^{0} = 1$. The key line is the last: `z has grad_fn: True` means PyTorch recorded how $z$ was
+computed from $\mu$ and $\sigma$, so a loss on $z$ can send gradients back into the encoder.
+
+> **Watch out:** if you write `z = torch.normal(mu, sigma)` instead, the result still carries a
+> `grad_fn`, but the gradients it sends back to `mu` and `sigma` are all zeros, so the encoder
+> silently never learns. Always sample $\epsilon$ separately and combine (or use
+> `torch.distributions.Normal(mu, sigma).rsample()`, which does exactly that).
+
 ## Full VAE
+
+Put the probabilistic encoder, the reparameterized sample, and a decoder together, and the
+loss is the negative ELBO.
+
+The reconstruction term uses **binary cross-entropy (BCE)** — the right log-likelihood when
+each pixel is treated as a probability between 0 and 1. `reduction='sum'` adds the error over
+all 784 pixels, so it lives on the same scale as the KL (which is also summed), and the total
+is divided by the batch size.
 
 ```python
 import torch
@@ -147,11 +230,20 @@ print(f"Recon shape: {recon.shape}, mu shape: {mu.shape}")
 ```
 
 ```output
-ELBO loss: 552.34
+ELBO loss: 549.80
 Recon shape: torch.Size([32, 784]), mu shape: torch.Size([32, 16])
 ```
 
+The printed "ELBO loss" of 549.80 is the *negative* ELBO per example: smaller is better. It is
+large because it sums over 784 pixels. The shapes confirm the plumbing: 32 reconstructions of 784
+pixels and 32 code centres of 16 numbers.
+
+> **Watch out:** the ELBO is something you *maximize*; the loss you *minimize* is its negative.
+> Papers and code often call both "the ELBO". Check the sign before comparing numbers.
+
 ## Training a VAE
+
+Training is the usual loop on the negative ELBO. Here it runs on 4000 random-noise vectors.
 
 ```python
 import torch
@@ -176,18 +268,37 @@ for epoch in range(1, 6):
 ```
 
 ```output
-Epoch 1  ELBO=561.4
-Epoch 2  ELBO=496.3
-Epoch 3  ELBO=471.8
-Epoch 4  ELBO=458.2
-Epoch 5  ELBO=449.7
+Epoch 1  ELBO=545.9
+Epoch 2  ELBO=544.6
+Epoch 3  ELBO=544.3
+Epoch 4  ELBO=544.2
+Epoch 5  ELBO=544.1
 ```
+
+The loss barely moves: 545.9 to 544.1. As in ch. 2, random noise has no structure to learn. You
+can compute the floor exactly: a decoder that outputs 0.5 for every pixel pays a BCE of
+$\log 2 \approx 0.693$ per pixel, and $784 \times 0.693 \approx 543.4$. The VAE sits about 0.7
+above that floor, which is the small KL it still pays. On real images the loss would fall far
+below the "predict 0.5" floor.
 
 ## Posterior Collapse and β-VAE
 
+Sometimes the VAE's tax on informative codes wins, and the encoder gives up on some code
+dimensions entirely — they carry no information about the input.
+
 **Posterior collapse**: some latent dimensions learn $q_\phi(z_j|x) \approx p(z_j) = \mathcal{N}(0,1)$ — the encoder ignores them. The decoder then ignores those dimensions too. You end up with fewer effective latent dimensions than you asked for.
 
+> **Picture it:** a group project where one teammate's slides are blank. The presenter learns
+> to skip them. Nobody is graded on those slides, so they stay blank.
+
 **β-VAE**: multiply the KL term by $\beta > 1$ to push for more disentangled representations. Higher $\beta$ trades reconstruction quality for disentanglement — each $z_j$ controls one factor of variation.
+
+A representation is **disentangled** when each code dimension controls one understandable
+factor — one for rotation, one for size, one for colour — instead of all being mixed. The
+`beta` argument of `vae_loss` above is exactly this multiplier.
+
+The check below applies the collapse rule (centre near 0 and spread near 1) to four example
+dimensions:
 
 ```python
 import torch
@@ -210,7 +321,30 @@ Dim 2: mu=-0.01, sigma=0.99  (COLLAPSED)
 Dim 3: mu=0.63, sigma=0.55  (active)
 ```
 
+Dimensions 0 and 2 have $\mu$ within 0.02 of zero and $\sigma$ within 0.01 of one, so they are
+flagged as collapsed: they look identical to the prior and carry no information. Dimensions 1
+and 3 have shifted centres (0.85, 0.63) and narrow spreads (0.30, 0.55), meaning the encoder is
+pinning down a specific value per input.
+
+> **Watch out:** in real use, measure collapse over a whole dataset — per-dimension *average*
+> KL, or the variance of $\mu_j$ across inputs. One input's $\mu$ near zero is not enough; a
+> dimension is collapsed only if it is near the prior for *every* input.
+
+## Recap in plain words
+
+- A VAE encoder outputs a bell curve (centre and spread) for each input, not a single point.
+- The ELBO = reconstruction quality minus the KL cost of differing from a standard bell curve;
+  it is a guaranteed lower bound on $\log p_\theta(x)$.
+- The KL between two Gaussians has a closed form, zero at $\mu = 0, \sigma = 1$.
+- The reparameterization trick ($z = \mu + \sigma \odot \epsilon$) lets gradients pass through
+  sampling.
+- Posterior collapse is when code dimensions copy the prior and carry nothing; $\beta$ scales the
+  KL to trade detail for disentanglement.
+
 ## Try it Yourself
+
+This is a tiny VAE (8 inputs, 2-number code) trained for 200 full-batch steps, then used as a
+generator: draw $z$ from the prior and decode.
 
 ```python
 import torch
@@ -252,16 +386,28 @@ with torch.no_grad():
 
 ```output
 Samples from prior (5 × 8):
-[[0.51 0.48 0.47 0.52 0.49 0.53 0.47 0.51]
- [0.54 0.46 0.52 0.45 0.50 0.48 0.53 0.49]
- [0.49 0.50 0.51 0.48 0.52 0.47 0.50 0.53]
- [0.52 0.51 0.48 0.50 0.49 0.54 0.46 0.52]
- [0.50 0.47 0.53 0.51 0.48 0.52 0.49 0.47]]
+[[0.49 0.57 0.44 0.56 0.51 0.49 0.49 0.51]
+ [0.48 0.55 0.49 0.53 0.5  0.49 0.46 0.51]
+ [0.5  0.57 0.42 0.55 0.52 0.49 0.5  0.51]
+ [0.49 0.56 0.47 0.51 0.52 0.49 0.48 0.51]
+ [0.49 0.56 0.49 0.49 0.52 0.49 0.46 0.51]]
 ```
+
+Every generated value sits between 0.42 and 0.57 — the samples are all close to 0.5, the average
+of uniform data. That is the honest outcome on structureless data: there is nothing to encode,
+so the KL term wins and the decoder outputs the mean. Note the code uses `F.mse_loss` (a mean
+over 8 values) against a KL summed over 2 dimensions, so the KL is weighted much more heavily
+than in the BCE version. Try multiplying the MSE by 8 (sum instead of mean), or replace `X` with
+structured data such as `torch.rand(500, 1).repeat(1, 8)`, and watch the sample rows become
+different from each other.
 
 ## Exercise
 
 Implement the KL annealing trick: start training with $\beta=0$ (pure reconstruction) and linearly increase $\beta$ to 1 over the first 10 epochs. Train a VAE on the synthetic data below and compare the fraction of collapsed latent dimensions at epoch 1 vs epoch 20 with and without annealing.
+
+> **Hint:** compute `beta = min(1.0, epoch / 10)` at the start of each epoch and multiply the
+> KL by it. Run the loop twice — once with that schedule, once with `beta = 1.0` throughout —
+> and count dimensions whose average $|\mu|$ stays below 0.1.
 
 <details>
 <summary>Solution</summary>
@@ -294,4 +440,11 @@ for epoch in range(1, 21):
 ```
 
 KL annealing lets the reconstruction loss establish useful representations before the KL term collapses unused dimensions. Without annealing, many dimensions collapse immediately in early training.
+
+Run on this data, though, the annealed model reports `collapsed_dims=8/8` at epochs 1, 10 and 20.
+That is the right answer for uniform noise: there is no shared structure to encode, so
+whatever the schedule, the KL eventually wins on every dimension. (Note also that the schedule
+starts at $\beta = 0.1$, not 0, because epoch 1 gives $1/10$.) To see annealing help, use data
+with real structure — for example, 8-dimensional vectors generated from 2 hidden factors — and
+compare the two runs: the annealed one typically keeps more dimensions active.
 </details>

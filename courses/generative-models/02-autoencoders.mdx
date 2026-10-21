@@ -7,13 +7,35 @@ order: 2
 
 ## The Encoder-Decoder Structure
 
+An autoencoder squeezes an input down to a short summary, then tries to rebuild the original
+from that summary alone. If the rebuild is good, the summary must have kept what matters.
+
 An autoencoder compresses input $x$ into a low-dimensional code $z = f_\phi(x)$, then reconstructs $\hat{x} = g_\theta(z)$. It trains end-to-end by minimizing reconstruction error — for continuous inputs typically MSE, for binary inputs binary cross-entropy.
+
+- The **encoder** $f_\phi$ is the squeezing network; $\phi$ are its weights.
+- The **code** (or **latent**) $z$ is the short summary.
+- The **decoder** $g_\theta$ is the rebuilding network; $\theta$ are its weights.
+- **Reconstruction error** measures how far the rebuild $\hat{x}$ is from the original $x$.
+  **MSE** (mean squared error) averages the squared pixel differences.
+
+> **Picture it:** describing a friend's face over the phone in exactly 32 words, so a sketch
+> artist on the other end can draw it. The words are $z$. You can't waste words on noise; you
+> have to pick the features that matter.
 
 $$
 \mathcal{L}(\phi, \theta) = \frac{1}{N}\sum_{i=1}^N \|x^{(i)} - g_\theta(f_\phi(x^{(i)}))\|^2
 $$
 
+> **In plain words:** for every training example, encode it, decode it, and measure the
+> squared distance to the original. Average over all $N$ examples. Training adjusts both
+> networks' weights ($\phi$ and $\theta$) together to make that average small.
+
 The bottleneck — a latent dimension smaller than the input — forces the network to compress. Nothing is explicitly told to the network about what to compress; it learns from the loss alone.
+
+The **bottleneck** is the narrowest layer — here the code. The model below takes a flattened
+28-by-28 image (784 numbers, the MNIST digit size) down through 256 and 64 units to a 32-number
+code, then mirrors that path back up. The final **Sigmoid** squashes outputs into $[0, 1]$, the
+range of pixel brightness.
 
 ```python
 import torch
@@ -50,11 +72,22 @@ print(f"Total params: {total_params:,}")
 ```output
 Input:       torch.Size([8, 784])
 Latent code: torch.Size([8, 32])
-Reconstruction: torch.Size([8, 32])
-Total params: 476,048
+Reconstruction: torch.Size([8, 784])
+Total params: 439,728
 ```
 
+The shapes trace the round trip: 8 images of 784 numbers become 8 codes of 32 numbers and come
+back as 8 images of 784. The code is $784/32 = 24.5$ times smaller than the input. The last line
+counts 439,728 weights; most of them sit in the two big $784 \times 256$ layers
+($2 \times 784 \times 256 \approx 401{,}000$).
+
 ## Training Loop
+
+Training is the same loop as any network: feed a batch in, compare the output to a target,
+nudge the weights. The only twist is that the target is the input itself — no labels needed.
+
+That makes an autoencoder **self-supervised**: the data supplies its own answer key. The demo
+uses 5000 random vectors as stand-in "images" so it runs anywhere.
 
 ```python
 import torch
@@ -84,14 +117,28 @@ for epoch in range(1, 6):
 ```
 
 ```output
-Epoch 1  loss=0.1523
-Epoch 2  loss=0.0891
-Epoch 3  loss=0.0742
-Epoch 4  loss=0.0671
-Epoch 5  loss=0.0631
+Epoch 1  loss=0.0834
+Epoch 2  loss=0.0833
+Epoch 3  loss=0.0831
+Epoch 4  loss=0.0829
+Epoch 5  loss=0.0826
 ```
 
+The loss falls only from 0.0834 to 0.0826 over 5 epochs — almost nothing. That is the honest
+result for this data: every pixel is independent uniform noise, so there is no structure to
+compress. The best a network can do without real structure is to output 0.5 everywhere, which
+scores the variance of a uniform $[0, 1]$ variable, $1/12 \approx 0.0833$. The loss sits right on
+that floor.
+
+> **Watch out:** a loss that will not drop below the variance of your data means the model is
+> predicting the average. On real MNIST (strong structure: strokes, blank borders) the same
+> network drops well below this floor within one epoch. Always compare your loss to the
+> "predict the mean" baseline.
+
 ## Types of Autoencoders
+
+The basic autoencoder has a few variants, each adding one extra rule to force the code to be
+useful.
 
 ### Undercomplete vs Overcomplete
 
@@ -99,9 +146,20 @@ An **undercomplete** AE has `latent_dim < input_dim`. The bottleneck forces comp
 
 An **overcomplete** AE has `latent_dim >= input_dim`. Without regularization, it can learn the identity function and capture no structure. You need regularization to make this useful.
 
+The **identity function** copies its input unchanged. **Regularization** is any extra
+penalty that stops the network from taking that lazy route — the next two variants are
+examples.
+
+> **Picture it:** if the phone description could be as long as the photo itself, you would
+> read out every pixel and learn nothing about faces.
+
 ### Sparse Autoencoder
 
 Add an L1 penalty on the activations: $\mathcal{L} = \text{MSE} + \lambda \|z\|_1$. This pushes most latent dimensions toward zero, so each input is represented by a few active features.
+
+The **L1 penalty** $\|z\|_1$ is the sum of absolute values of the code. Adding it, with a
+small weight $\lambda$, charges the network for every non-zero code entry. A **sparse** code is
+one where most entries are zero, so each input switches on only a handful of features.
 
 ```python
 import torch
@@ -111,7 +169,7 @@ def sparse_loss(recon, x, z, lam=1e-3):
     return nn.functional.mse_loss(recon, x) + lam * z.abs().mean()
 
 # Example with a batch
-model = Autoencoder(784, 128)   # overcomplete: 128 > 32
+model = Autoencoder(784, 128)   # wider code: 128 > 32 (still < 784, so not truly overcomplete)
 x = torch.rand(16, 784)
 recon, z = model(x)
 loss = sparse_loss(recon, x, z, lam=5e-4)
@@ -121,13 +179,25 @@ print(f"Fraction of near-zero activations: {sparsity:.3f}")
 ```
 
 ```output
-Sparse loss: 0.1648
-Fraction of near-zero activations: 0.214
+Sparse loss: 0.0826
+Fraction of near-zero activations: 0.076
 ```
+
+This model is untrained, so the numbers are a starting point. The loss 0.0826 is almost all MSE:
+the penalty adds only $5 \times 10^{-4}$ times the mean absolute code. Only 0.076 (7.6%) of code
+entries are near zero right now. Training with the penalty would push that fraction up.
+
+> **Watch out:** the 128-dimensional code here is wider than 32 but still far smaller than 784,
+> so this model is not truly overcomplete. Sparsity matters most when the code is as wide as
+> or wider than the input.
 
 ### Denoising Autoencoder
 
 Corrupt the input with noise, train to reconstruct the clean version. This forces the encoder to learn robust, smooth representations.
+
+A **denoising autoencoder** sees a dirty copy and is graded against the clean original. It can't
+copy its input, because the input is wrong; it has to learn what clean data looks like. This
+same idea — predict clean from noisy — returns as the core of diffusion models (ch. 7–8).
 
 ```python
 import torch
@@ -149,15 +219,29 @@ print(f"Reconstruction MSE:       {loss.item():.4f}")
 ```
 
 ```output
-Noisy input MSE vs clean: 0.0900
-Reconstruction MSE:       0.0682
+Noisy input MSE vs clean: 0.0629
+Reconstruction MSE:       0.0830
 ```
+
+The first line is the size of the corruption: 0.0629. The second line, 0.0830, is the untrained
+network's error. It is *worse* than doing nothing (returning the noisy input). Training has to
+bring the reconstruction MSE below 0.0629 before the denoiser is helping at all.
 
 ## What the Latent Space Looks Like
 
+The **latent space** is the space of all possible codes. A plain autoencoder only learns to use
+the codes it was trained on, and leaves holes between them.
+
 If you train an AE on MNIST with `latent_dim=2` for visualization, the latent codes cluster loosely by digit class — the network discovers class structure implicitly. But the space has **gaps**: regions between clusters that don't correspond to any training data. Sampling from a gap produces garbage reconstructions.
 
+> **Picture it:** a city map with ten neighbourhoods and empty farmland between them. The
+> decoder only learned the streets of the neighbourhoods. Drop it in a field and it has no
+> idea what should be there.
+
 This is the key problem a VAE (ch. 3) solves.
+
+The demo fakes the 2-D codes of a trained digit model: ten clusters of 50 points each, one per
+digit, then probes a point between clusters.
 
 ```python
 import torch
@@ -174,7 +258,7 @@ for i, (cx, cy) in enumerate(cluster_centers):
 codes = np.vstack(codes)
 
 # A point in the "gap" between clusters:
-gap_point = np.array([[1.5, 1.5]])  # between clusters 5, 6, 9
+gap_point = np.array([[1.5, 1.5]])  # between clusters 5, 8 and 3
 closest = np.argmin(np.linalg.norm(codes - gap_point, axis=1))
 print(f"Gap point: {gap_point[0]}")
 print(f"Nearest training code at distance: {np.linalg.norm(codes[closest]-gap_point[0]):.2f}")
@@ -184,12 +268,33 @@ print("Sampling gap points → decoder produces garbage (no training signal ther
 
 ```output
 Gap point: [1.5 1.5]
-Nearest training code at distance: 1.23
-Latent space coverage: [-4.3 -4.4] to [4.3 4.3]
+Nearest training code at distance: 0.65
+Latent space coverage: [-4.4 -4.1] to [4.3 4.1]
 Sampling gap points → decoder produces garbage (no training signal there)
 ```
 
+The probe at $(1.5, 1.5)$ is 0.65 from the nearest single code, while the nearest cluster
+*centres* (clusters 5, 8 and 3) are about 1.6 to 2.1 away. So it sits in a thinly covered patch
+on the edge of the clusters, not inside any of them. The codes span roughly $-4.4$ to $4.3$, but
+nothing in training tells the decoder what such in-between points should look like. The last
+line is a printed statement, not a measurement: with a real trained decoder, such points often
+decode to blurry blends or nonsense.
+
+## Recap in plain words
+
+- An autoencoder encodes an input to a short code and decodes it back, trained to make the
+  rebuild match the input.
+- The bottleneck is what makes it learn: a code too wide can copy the input and learn nothing.
+- Random noise can't be compressed — the loss stalls at the "predict the mean" floor ($1/12$ for
+  uniform pixels).
+- Sparse AEs penalize active code entries; denoising AEs learn to undo corruption.
+- A plain AE's latent space has gaps, so you can't sample new data from it reliably — the VAE
+  fixes this.
+
 ## Try it Yourself
+
+This is a smaller denoising autoencoder (code size 16) checked before any training. Its job
+after training would be to beat the noisy input's error.
 
 ```python
 import torch
@@ -218,13 +323,22 @@ print(f"Recon  MSE (untrained): {nn.functional.mse_loss(recon, x_clean):.4f}")
 
 ```output
 Reconstruction shape: torch.Size([32, 784])
-Noisy  MSE: 0.0898
-Recon  MSE (untrained): 0.2503
+Noisy  MSE: 0.0614
+Recon  MSE (untrained): 0.0828
 ```
+
+The noisy input's error is 0.0614 and the untrained reconstruction's is 0.0828, so right now the
+network makes things worse. Add a training loop like the one in the Training Loop section
+(say 20 epochs on 2000 random vectors) and check whether recon MSE falls below 0.0614. Then
+swap the random data for structured data, such as `torch.rand(2000, 1).repeat(1, 784)`, where
+every pixel in an image is the same value — the 16-number code should be more than enough.
 
 ## Exercise
 
 Implement an autoencoder with `latent_dim=2` on the synthetic dataset below. After training for 20 epochs, encode all training points and print the range of both latent dimensions. Then sample a point from the center of the latent space (z=[0,0]) and decode it — comment on whether the reconstruction looks like a valid input.
+
+> **Hint:** reuse the encoder/decoder pattern from the first example with 64 inputs and a 2-unit
+> bottleneck. After training, call `model.dec(torch.zeros(1, 2))` directly to decode the centre.
 
 <details>
 <summary>Solution</summary>
@@ -265,4 +379,9 @@ with torch.no_grad():
 ```
 
 The center decode (z=[0,0]) produces a blurry average of training data. This is the AE's gap problem: the center of the learned space may not be populated by any training point, giving a blurred reconstruction. VAEs fix this by enforcing a Gaussian prior on z.
+
+Running it, the codes span roughly $[-2.17, 1.15]$ and $[-1.59, 2.15]$, and the centre decode has
+values between 0.398 and 0.580 with mean 0.496. A real input from `torch.rand` would spread over
+the whole $[0, 1]$ range; this output hugs 0.5, the dataset average. It is a valid-looking
+vector in shape only — a "mean image", not a sample.
 </details>

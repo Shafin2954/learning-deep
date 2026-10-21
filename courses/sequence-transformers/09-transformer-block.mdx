@@ -7,10 +7,19 @@ order: 9
 
 ## The encoder block
 
+A Transformer is a stack of identical blocks. Each block does two things to every token:
+first it lets tokens exchange information (attention), then it lets each token think on its
+own (a small feed-forward network). Two safety features keep a deep stack trainable.
+
 Each encoder layer has two sub-layers with **residual connections** and **layer normalization**:
 
 1. Multi-head self-attention
 2. Position-wise feed-forward network (FFN)
+
+A **residual connection** adds a sub-layer's input back to its output ($x + f(x)$), so the
+sub-layer only has to learn a correction, and gradients have a direct path backward.
+**Layer normalization** rescales each token's vector to mean 0 and variance 1 (then applies a
+learned scale and shift), keeping the numbers in a healthy range layer after layer.
 
 **Pre-norm** (modern default): normalize before the sub-layer.
 
@@ -21,9 +30,26 @@ $$
 x'' = x' + \text{FFN}(\text{LayerNorm}(x'))
 $$
 
+> **In plain words:** first, normalize, run attention, and add the result to the original
+> $x$. Then normalize that, run the FFN, and add again. The un-normalized $x$ flows straight
+> through both additions — the "residual stream".
+
+> **Picture it:** a shared document passed down a line of editors. Each editor reads a clean
+> copy (layer norm), writes suggested edits, and the edits are added to the document rather
+> than replacing it. If an editor has nothing useful to add, the document passes through
+> unchanged.
+
 **Post-norm** (original paper): normalize after the residual. Pre-norm is more stable and trains without learning-rate warmup more readily.
 
+Post-norm is $x' = \text{LayerNorm}(x + \text{MHA}(x))$: the normalization sits on the main
+path, so every gradient must pass through all $N$ of them. In pre-norm the residual path has
+no normalization at all, which is why it behaves better in deep stacks.
+
 ## The feed-forward network
+
+After attention mixes information between tokens, the FFN processes each token on its own:
+widen the vector, apply a nonlinearity, shrink it back. It is the same small network for
+every position.
 
 The FFN applies two linear transformations with a nonlinearity between:
 
@@ -31,9 +57,21 @@ $$
 \text{FFN}(x) = \text{GELU}(x W_1 + b_1) W_2 + b_2
 $$
 
+> **In plain words:** multiply by $W_1$ to go from $d$ to $4d$ numbers, add a bias, pass
+> through GELU (a smooth gate that lets positive values through and squashes negative ones
+> toward 0), then multiply by $W_2$ to come back to $d$ numbers. "Position-wise" means each
+> token goes through it separately.
+
 The inner dimension is $4 d_{\text{model}}$ by convention (from the original paper). GELU is preferred over ReLU in modern Transformers — it's smoother and avoids the "dead unit" problem of ReLU.
 
+A **dead unit** is a ReLU neuron whose input is negative for every example: its output and
+gradient are always 0, so it never recovers. GELU has a small nonzero slope for negative
+inputs.
+
 ## Implementing the encoder block
+
+The block wires the two equations together, reusing multi-head attention from ch. 7 and
+adding dropout on each sub-layer's output.
 
 ```python
 import torch
@@ -100,10 +138,22 @@ print("Params:", sum(p.numel() for p in block.parameters()))
 
 ```output
 EncoderBlock output shape: torch.Size([3, 10, 64])
-Params: 33,600
+Params: 49728
 ```
 
+Shape in equals shape out, `[3, 10, 64]` — that is what makes blocks stackable. The 49,728
+parameters split as 16,384 for attention ($4 \times 64^2$), 33,088 for the FFN
+($64 \times 256 + 256 + 256 \times 64 + 64$), and 256 for the two layer norms
+($2 \times (64 + 64)$).
+
+> **Watch out:** a block's output keeps the input's scale only because of the residual.
+> Remove the `x +` and stack 12 blocks, and the signal and gradients typically collapse or
+> blow up within a few layers.
+
 ## The decoder block
+
+The decoder block adds one sub-layer in the middle: after looking at earlier target tokens,
+it looks at the encoder's output — this is where the translation "reads" the source.
 
 The decoder block has three sub-layers:
 1. **Masked self-attention** — causal mask prevents attending to future tokens.
@@ -144,7 +194,18 @@ print("DecoderBlock output shape:", dec_out.shape)
 DecoderBlock output shape: torch.Size([3, 8, 64])
 ```
 
+The decoder keeps its own length, 8, even though it attends to 15 encoder tokens:
+cross-attention returns one vector per query, and queries come from the decoder. The causal
+mask has shape `(1, 1, 8, 8)` so it broadcasts over batch and heads.
+
+> **Watch out:** `enc_out` is not passed through `ln2` here — only the decoder's queries are
+> normalized. That is fine because the encoder stack already ends with its own final
+> LayerNorm (see the next block).
+
 ## Stacking blocks: full encoder
+
+A full encoder is embeddings plus positions (ch. 8), then $N$ blocks, then one final layer
+norm.
 
 ```python
 class TransformerEncoder(nn.Module):
@@ -174,10 +235,18 @@ print(f"Total encoder params: {total:,}")
 
 ```output
 Encoder output shape: torch.Size([2, 20, 64])
-Total encoder params: 268,864
+Total encoder params: 295,808
 ```
 
+Check the 295,808 by hand: 4 blocks of 49,728 is 198,912; the token embedding is
+$1000 \times 64 = 64{,}000$; the learned positions add $512 \times 64 = 32{,}768$; and the
+final LayerNorm adds 128. The final norm is needed with pre-norm, because the last block's
+residual stream has never been normalized.
+
 ## Parameter count formula
+
+Most of a Transformer's weights live in a handful of square-ish matrices, so you can estimate
+the size of any model from three numbers: width, depth, and vocabulary.
 
 For a transformer with $d$ model dimension, $h$ heads, $N$ layers:
 
@@ -185,6 +254,10 @@ For a transformer with $d$ model dimension, $h$ heads, $N$ layers:
 - Per FFN: $2 \cdot d \cdot 4d = 8d^2$
 - Per block total: $12 d^2$
 - Embeddings: $V \cdot d + T_{\max} \cdot d$
+
+Note that $h$ does not appear: splitting into more heads reshapes the same matrices (ch. 7).
+The formula ignores biases and layer norms, which are only $O(d)$ per block — 576 of the
+49,728 above. $V$ is the vocabulary size and $T_{\max}$ the longest position.
 
 GPT-2 small: $d=768$, $N=12$, $V=50257$. Block params: $12 \times 768^2 \approx 7.1$M per layer, $12 \times 7.1 \approx 85$M for blocks, plus embedding ≈ $125$M total.
 
@@ -197,8 +270,22 @@ print(f"GPT-2 small estimate: {total/1e6:.1f}M params")
 ```
 
 ```output
-GPT-2 small estimate: 123.7M params
+GPT-2 small estimate: 124.3M params
 ```
+
+The estimate is 124.3M; GPT-2 small's published count is about 124M. Almost a third of it is
+the token embedding: $50{,}257 \times 768 \approx 38.6$M. The output layer adds nothing,
+because GPT-2 reuses the embedding matrix as its output projection (**weight tying**).
+
+## Recap in plain words
+
+- A block is attention (tokens share information) then an FFN (each token processed alone).
+- Residual connections add each sub-layer's output to its input, giving gradients a direct
+  path.
+- Pre-norm normalizes before each sub-layer and is the stable modern default.
+- The decoder block adds cross-attention, with queries from the decoder and keys/values from
+  the encoder.
+- Per block, parameters are about $12d^2$: $4d^2$ for attention plus $8d^2$ for the FFN.
 
 ## Try it Yourself
 
@@ -243,12 +330,20 @@ print("Params:", sum(p.numel() for p in block.parameters()))
 
 ```output
 Output shape: torch.Size([2, 10, 32])
-Params: 9,280
+Params: 12576
 ```
+
+With $d = 32$, the formula predicts $12 \times 32^2 = 12{,}288$; the real 12,576 adds 160
+FFN biases and 128 layer-norm numbers. Try `SimpleTransformerBlock(64, 4)` and check that the
+count is about four times bigger (doubling $d$ quadruples $d^2$). Then change $h$ to 8: the
+count does not move.
 
 ## Exercise
 
 Stack 2 `EncoderBlock` layers and 2 `DecoderBlock` layers into a minimal seq2seq Transformer. Verify shapes: encoder input `(2, 12, 64)` → encoder output `(2, 12, 64)` → decoder input `(2, 8, 64)` → decoder output `(2, 8, 64)`.
+
+> **Hint:** run the source through every encoder block first. Only then run the target
+> through the decoder blocks, giving every decoder block the same final encoder output.
 
 <details>
 <summary>Solution</summary>
@@ -282,4 +377,8 @@ print("Decoder output:", dec_out.shape)  # (2, 8, 64)
 ```
 
 The decoder processes 8 target tokens while attending to all 12 source tokens in cross-attention. Each decoder block does three operations in sequence.
+
+Every decoder layer attends to the top encoder layer's output, not to the encoder layer at the
+same depth. For a real model you would also pass a causal `tgt_mask` and add embeddings,
+positions, final LayerNorms, and an output projection to the vocabulary.
 </details>

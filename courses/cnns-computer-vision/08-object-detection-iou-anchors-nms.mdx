@@ -7,13 +7,26 @@ order: 8
 
 ## The detection problem
 
+Classification answers "what is in this picture?". **Object detection** answers "what is
+where?": it draws a rectangle around every object it finds and names each one.
+
 Classification assigns one label to one image. Detection must find **multiple objects of possibly different classes at unknown locations**. Each prediction is a 5-tuple: $(x_1, y_1, x_2, y_2, \text{class})$ plus a confidence score.
+
+The four numbers are a **bounding box** — the top-left corner $(x_1, y_1)$ and bottom-right
+corner $(x_2, y_2)$ in pixels. The **confidence score** is how sure the detector is, from 0 to 1.
 
 Two sub-problems:
 1. **Where** — predict bounding box coordinates (regression).
 2. **What** — classify each detected region (classification).
 
+> **Picture it:** a "Where's Wally?" page. A classifier says "Wally is on this page". A
+> detector circles every Wally, every dog, and every umbrella, and writes how sure it is next
+> to each circle.
+
 ## Intersection over Union (IoU)
+
+To grade a predicted box you need one number for "how well does it line up with the true box?".
+IoU is that number: the shared area divided by the total area covered.
 
 IoU measures how much two boxes overlap:
 
@@ -21,7 +34,14 @@ $$
 \text{IoU}(A, B) = \frac{|A \cap B|}{|A \cup B|}
 $$
 
+> **In plain words:** $|A \cap B|$ is the area where the two boxes overlap (the
+> intersection); $|A \cup B|$ is the area covered by either box (the union), counted once.
+> Their ratio is 1 when the boxes are identical and 0 when they do not touch.
+
 Range: 0 (no overlap) to 1 (perfect match). IoU $\geq$ 0.5 is typically called a "match"; IoU $\geq$ 0.75 is strict.
+
+The intersection is itself a rectangle: its left edge is the larger of the two left edges, its
+right edge the smaller of the two right edges, and the same for top and bottom.
 
 ```python
 import numpy as np
@@ -57,11 +77,30 @@ IoU(box1, box1) = 1.000
 IoU(box1, box3) = 0.000
 ```
 
+Look at the first line. Boxes 1 and 2 are each $10 \times 10$ and overlap in a $5 \times 5$ square,
+so IoU $= 25 / (100 + 100 - 25) = 25/175 = 0.143$. Even though a quarter of each box overlaps,
+the IoU is low — well under the 0.5 "match" bar.
+
+> **Watch out:** IoU punishes small shifts hard on small boxes. Moving a $10 \times 10$ box by
+> 5 pixels in both directions drops IoU from 1.0 to 0.143; the same shift on a
+> $100 \times 100$ box keeps it at 0.82.
+
 ## Anchor boxes
+
+Predicting a box from nothing is hard: the coordinates could be anything. **Anchors** give the
+detector a set of starting guesses — rectangles of fixed shapes laid out all over the image —
+so it only has to predict small corrections.
 
 Instead of predicting absolute box coordinates (unbounded, hard to regress), detectors place a grid of **anchor boxes** — predefined rectangles at multiple scales and aspect ratios — and predict **offsets** relative to each anchor.
 
-Common anchor setup: at each grid cell, 3 scales × 3 aspect ratios = 9 anchors.
+Common anchor setup: at each grid cell, 3 scales $\times$ 3 aspect ratios = 9 anchors.
+
+> **Picture it:** a tray of cookie cutters — small, medium, large, each in tall, square, and
+> wide — placed at every grid point of the image. The detector's job is to say which cutter
+> fits an object best and how to nudge it.
+
+Each anchor keeps its area near $s^2$: the code sets width $s\sqrt{r}$ and height $s/\sqrt{r}$,
+so their product is always $s^2$ while the ratio $r$ = width / height changes.
 
 ```python
 def generate_anchors(
@@ -90,10 +129,18 @@ print("First anchor (cx=16, cy=16):", anchors[0].round(1))
 
 ```output
 Feature map 7×7 → 441 anchors
-First anchor (cx=16, cy=16): [  -6.7  -27.3   38.7   59.3]
+First anchor (cx=16, cy=16): [ 4.7 -6.6 27.3 38.6]
 ```
 
+A $7 \times 7$ grid with 9 anchors per cell gives $49 \times 9 = 441$ anchors. The first one is the
+smallest scale (32) with ratio 0.5 — tall and thin, about $22.6 \times 45.3$ — centred at
+$(16, 16)$. Its top edge is at $-6.6$, outside the image; anchors at the border often hang over
+the edge, and detectors clip or ignore them.
+
 ## Box parameterization
+
+The detector does not output corners directly. It outputs four small numbers that say how far
+to shift the anchor's centre and how much to stretch its width and height.
 
 Rather than predicting $(x_1, y_1, x_2, y_2)$ directly, detectors predict offsets relative to an anchor $(a_x, a_y, a_w, a_h)$:
 
@@ -105,6 +152,13 @@ t_w = \log(g_w / a_w), \quad t_h = \log(g_h / a_h)
 $$
 
 where $(g_x, g_y, g_w, g_h)$ is the ground-truth box centre and size. The log prevents negative width/height predictions.
+
+> **In plain words:**
+> - $t_x$, $t_y$: how far the true centre is from the anchor's centre, measured in anchor
+>   widths and heights (so the numbers are similar for big and small objects).
+> - $t_w$, $t_h$: how much wider or taller the true box is, on a log scale. To decode, you
+>   compute $a_w e^{t_w}$, which is positive for any $t_w$.
+> - $t_w = 0$ means "same width as the anchor".
 
 ```python
 def encode_box(gt: np.ndarray, anchor: np.ndarray) -> np.ndarray:
@@ -127,18 +181,28 @@ print("Encoded:", enc.round(3))
 ```
 
 ```output
-Encoded: [0.    0.    0.    0.048]
+Encoded: [0.1   0.067 0.    0.   ]
 ```
+
+The true box and the anchor have the same size ($100 \times 150$), so $t_w = t_h = 0$. The
+centre is 10 pixels to the right and 10 down: $10/100 = 0.1$ and $10/150 \approx 0.067$.
 
 Near-zero offsets mean the anchor already closely matches the ground-truth.
 
 ## Non-Maximum Suppression (NMS)
 
+Detectors usually fire several boxes on the same object, all slightly shifted. **Non-maximum
+suppression** keeps the most confident one and deletes the copies that overlap it too much.
+
 A detector may fire many overlapping boxes for the same object. NMS keeps only the best:
 
 1. Sort boxes by score (descending).
-2. Take the highest-score box. Remove all others with IoU ≥ threshold against it.
+2. Take the highest-score box. Remove all others with IoU $\geq$ threshold against it.
 3. Repeat on remaining boxes.
+
+> **Picture it:** five friends point at the same bird and shout. NMS listens to the loudest
+> friend, tells everyone pointing at the same spot to be quiet, then moves to the loudest
+> friend pointing somewhere else.
 
 ```python
 def nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.5) -> list:
@@ -169,15 +233,25 @@ print("Kept boxes:\n", boxes[kept])
 ```
 
 ```output
-Kept box indices: [0, 3]
+Kept box indices: [np.int64(0), np.int64(3)]
 Kept boxes:
  [[ 10  10  80  80]
-  [200 200 280 280]]
+ [200 200 280 280]]
 ```
+
+Box 0 has the top score (0.95) and is kept. Boxes 1 and 2 overlap it with IoU above 0.5 and are
+removed. Box 3 (score 0.91) does not touch box 0 at all, so it survives as a second detection.
+(`np.int64(0)` is just how NumPy 2 prints an integer index.)
 
 Boxes 1 and 2 were suppressed because they heavily overlapped box 0 (the highest-score box).
 
+> **Watch out:** run NMS separately for each class. Otherwise a confident "person" box can
+> delete the "bicycle" box underneath it, because the two overlap heavily.
+
 ## Soft-NMS
+
+Hard NMS has a weakness: two people standing close together produce overlapping boxes, and
+one of them gets deleted. Soft-NMS turns those scores down instead of deleting them.
 
 Hard NMS discards boxes above the IoU threshold. Soft-NMS decays scores instead:
 
@@ -187,15 +261,34 @@ $$
 
 then remove only boxes with score below a minimum. This helps when two objects genuinely overlap.
 
+> **In plain words:** $M$ is the box just kept; $b_i$ is another box with score $s_i$. The
+> more $b_i$ overlaps $M$, the closer $e^{-\text{IoU}^2/\sigma}$ gets to a small number, and
+> the more its score shrinks. A box with IoU 0 keeps its score exactly. $\sigma$ sets how
+> harsh the decay is.
+
 ## Mean Average Precision (mAP)
+
+To score a detector over a whole dataset you need to reward finding every object (**recall**:
+the share of true objects found) and punish false alarms (**precision**: the share of predicted
+boxes that are right). Average precision sums up that trade-off in one number.
 
 For each class:
 1. Rank predictions by confidence.
-2. Mark each prediction as TP (IoU ≥ 0.5 with a GT box) or FP.
+2. Mark each prediction as TP (IoU $\geq$ 0.5 with a GT box) or FP.
 3. Compute a precision–recall curve.
 4. Interpolate: $\text{AP} = \sum_{r} \text{precision}(r) \cdot \Delta r$ over 11 or 101 points.
 
+(TP = **true positive**, a correct detection; FP = **false positive**, a false alarm; GT =
+ground truth, the labelled boxes.)
+
+> **In plain words:** AP is the area under the precision–recall curve. Walk recall from 0 to 1
+> in small steps $\Delta r$; at each step take the best precision you can get at that recall
+> or higher; add them up.
+
 mAP@0.5 = average AP across all classes at IoU threshold 0.5. COCO mAP averages over IoU 0.5:0.05:0.95.
+
+That last notation means 10 thresholds, 0.50, 0.55, …, 0.95, so COCO mAP rewards boxes that are
+tight, not just roughly right.
 
 ```python
 def compute_ap(precisions: np.ndarray, recalls: np.ndarray) -> float:
@@ -213,10 +306,25 @@ print(f"AP = {compute_ap(precisions, recalls):.3f}")
 ```
 
 ```output
-AP = 0.627
+AP = 0.582
 ```
 
+At each of the 11 recall levels $0, 0.1, \dots, 1.0$ the code takes the best precision at that
+recall or higher: 1.0, 0.9, 0.8, 0.8, 0.7, 0.7, 0.5, 0.5, 0.3, 0.3, 0.2. Their sum is 6.4, and
+$6.4 / 11 \approx 0.582$.
+
+## Recap in plain words
+
+- A detector outputs boxes, class labels, and confidence scores, many per image.
+- IoU = overlap area / combined area; 0.5 is the usual "this counts as a hit" bar.
+- Anchors are fixed starting boxes at every grid cell; the network predicts small offsets from them.
+- Offsets are centre shifts in anchor units and log size ratios, so decoded sizes stay positive.
+- NMS keeps the highest-scoring box and removes overlapping duplicates; Soft-NMS only lowers their scores.
+- AP summarises the precision–recall curve per class; mAP averages AP over classes (and, for COCO, over IoU thresholds).
+
 ## Try it Yourself
+
+This throws 20 random boxes with random scores at the NMS function from above.
 
 ```python
 import numpy as np
@@ -236,14 +344,21 @@ print(f"After  NMS: {len(kept)} boxes kept")
 
 ```output
 Before NMS: 20 boxes
-After  NMS: 8 boxes kept
+After  NMS: 19 boxes kept
 ```
+
+Only one box out of 20 is removed. Random boxes of 20 to 80 pixels scattered over a
+$200 \times 200$ area rarely overlap by IoU 0.5 or more, so NMS has little to do. Real detector
+outputs are the opposite: dozens of near-identical boxes per object.
 
 Try varying `iou_threshold` from 0.3 to 0.8 and plot the number of boxes kept. Then implement Soft-NMS and compare the kept count on the same inputs.
 
 ## Exercise
 
 Implement `batch_iou(boxes_a, boxes_b)` that computes the IoU of every pair in an $(N, 4)$ array with every box in an $(M, 4)$ array, returning an $(N, M)$ matrix — all in NumPy without explicit loops. This is the vectorized IoU needed inside fast NMS and anchor assignment.
+
+> **Hint:** add a new axis to each array, `boxes_a[:, None, :]` and `boxes_b[None, :, :]`,
+> so that `np.maximum` and `np.minimum` broadcast to $(N, M)$ automatically.
 
 <details>
 <summary>Solution</summary>
@@ -276,4 +391,8 @@ print(batch_iou(A, B))
 ```
 
 The key is broadcasting `(N,1,4)` against `(1,M,4)` — all pairwise operations vectorize without loops, giving $O(NM)$ time with minimal Python overhead.
+
+The printed matrix is `[[1, 0], [0.143, 0]]`: box A0 matches B0 exactly, A1 overlaps B0 the
+same way as in the first example on this page, and B1 touches neither. With 441 anchors and
+a few ground-truth boxes, this one call replaces thousands of Python-level `iou` calls.
 </details>

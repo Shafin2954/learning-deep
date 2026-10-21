@@ -7,21 +7,49 @@ order: 2
 
 ## The Core Insight
 
+Attention's cost comes from one step: comparing every query with every key. If you could
+rewrite that comparison so the keys get summarized *first*, each query would only need to
+read the summary, and the square law (ch. 1) would disappear.
+
 Standard attention rewrites as:
 
 $$
 \text{Attention}(Q, K, V)_i = \frac{\sum_j \exp(q_i \cdot k_j / \sqrt{d}) \, v_j}{\sum_j \exp(q_i \cdot k_j / \sqrt{d})}
 $$
 
+> **In plain words:** the answer for token $i$ is a weighted average of all the value
+> vectors $v_j$. Each weight is $\exp$ of how well query $q_i$ matches key $k_j$, and the
+> bottom line divides by the total weight so the weights sum to 1. That is the softmax from
+> ch. 1, written out one row at a time.
+
 The problem is the $\exp(q_i \cdot k_j)$ term — it couples every pair $(i, j)$, making the computation inherently $O(n^2)$.
 
 The linear attention trick: replace $\exp(q \cdot k)$ with a **kernel function** $\kappa(q, k) = \phi(q)^T \phi(k)$, where $\phi: \mathbb{R}^d \to \mathbb{R}^r$ is a feature map. Then:
+
+A **kernel function** is any similarity score between two vectors. A **feature map** $\phi$
+turns a vector into a new list of $r$ numbers, chosen so that a plain dot product of the
+new lists gives that similarity score.
 
 $$
 \text{Attention}(Q, K, V)_i = \frac{\sum_j \phi(q_i)^T \phi(k_j) \, v_j}{\sum_j \phi(q_i)^T \phi(k_j)} = \frac{\phi(q_i)^T \sum_j \phi(k_j) v_j^T}{\phi(q_i)^T \sum_j \phi(k_j)}
 $$
 
+> **In plain words:** once the similarity splits into "something about $q_i$" times
+> "something about $k_j$", the $q_i$ part can be pulled outside the sum. What is left
+> inside the sums depends only on keys and values, so you can compute it once and reuse it
+> for every query.
+
 The key step: compute $S = \sum_j \phi(k_j) v_j^T$ and $z = \sum_j \phi(k_j)$ first (once, in $O(n)$), then each query answer is just $\phi(q_i)^T S / \phi(q_i)^T z$, also $O(n)$ total. No $n \times n$ matrix needed.
+
+> **Picture it:** instead of every student (query) phoning every classmate (key) to ask
+> what they know, all classmates write onto one shared whiteboard ($S$), and keep a tally of
+> how much they wrote ($z$). Each student then reads the whiteboard once. The whiteboard has
+> a fixed size, which is also its weakness: it cannot hold every detail.
+
+The code implements exactly that, with the feature map $\phi(x) = \max(x, 0) + 1$, which
+keeps every feature positive so the weights cannot go negative. The docstring calls it
+"ELU+1", the map used in the original linear-transformer paper; the code uses a cheaper
+ReLU+1 stand-in with the same job.
 
 ```python
 import numpy as np
@@ -60,26 +88,53 @@ print(f"Output mean: {out.mean():.4f}, std: {out.std():.4f}")
 
 ```output
 Output shape: (512, 64)
-Output mean: -0.0012, std: 0.3847
+Output mean: -0.0087, std: 0.0421
 ```
+
+The shape line confirms you get one 64-number answer for each of the 512 tokens, and no
+$512 \times 512$ table was ever built. Look at the std: 0.0421, tiny compared with the
+values' own std of 1. With such a flat feature map, every query gives nearly the same weight
+to every key, so each output is close to the plain average of all 512 value vectors. That
+blurriness is the first hint of why linear attention is weaker.
 
 ## Softmax Approximation: Performer (FAVOR+)
 
+A cruder feature map gives a different kind of attention. A cleverer one can *imitate*
+softmax attention on average, using randomness.
+
 The ELU+1 feature map above is fast but doesn't approximate softmax. The **Performer** (Choromanski et al., 2020) approximates $\exp(q \cdot k / \sqrt{d})$ using random Fourier features:
+
+**Random features** are features built from random directions $\omega_i$: project the input
+onto each random direction and exponentiate. Averaged over many random directions, the dot
+product of two such feature lists comes out equal to the softmax similarity.
 
 $$
 \phi(x) = \frac{1}{\sqrt{r}} \left[\exp(\omega_1^T x), \ldots, \exp(\omega_r^T x)\right], \quad \omega_i \sim \mathcal{N}(0, I)
 $$
 
+> **In plain words:** pick $r$ random directions $\omega_1, \dots, \omega_r$ (each drawn
+> from a standard normal distribution), score $x$ against each one, exponentiate, and
+> scale by $1/\sqrt{r}$. More random directions ($r$ larger) means a better average and a
+> smaller error.
+
 The FAVOR+ variant uses orthogonal random features for lower variance.
+
+**Orthogonal** random features are random directions forced to be at right angles to each
+other, so they cover the space more evenly and the estimate wobbles less.
+
+> **Watch out:** the formula above leaves out two details the code needs. To estimate
+> $\exp(q \cdot k / \sqrt{d})$ rather than $\exp(q \cdot k)$, the input is first divided by
+> $d^{1/4}$; and each feature is multiplied by $\exp(-\|x\|^2/2)$ so the average comes out
+> right. Skip either and the "approximation" approximates the wrong thing.
 
 ```python
 def performer_feature_map(X, num_features=64, seed=0):
     """Random feature approximation of exp(q·k/sqrt(d))."""
     rng = np.random.default_rng(seed)
     d = X.shape[1]
-    # Sample random projection matrix
-    W = rng.standard_normal((num_features, d)) / np.sqrt(d)
+    X = X / d ** 0.25  # so phi(q)·phi(k) estimates exp(q·k/sqrt(d))
+    # Sample random projection matrix, rows w ~ N(0, I)
+    W = rng.standard_normal((num_features, d))
     # phi(x) = exp(Wx - ||x||^2/2) / sqrt(r)
     proj = X @ W.T  # (n, r)
     x_sq = np.sum(X ** 2, axis=1, keepdims=True) / 2
@@ -111,23 +166,41 @@ print(f"Approx output norm: {np.linalg.norm(approx):.3f}")
 ```
 
 ```output
-Mean absolute error (Performer vs exact): 0.0523
-Mean absolute error (Performer vs exact): 0.0523
-Exact output norm: 7.842
-Approx output norm: 7.619
+Mean absolute error (Performer vs exact): 0.0323
+Exact output norm: 6.535
+Approx output norm: 6.953
 ```
+
+The mean absolute error is 0.0323, and the output's overall size is close: norm 6.953 for the
+approximation against 6.535 for exact attention, about 6% too large. Each output entry is
+typically around 0.14 in size here, so an error of 0.03 is real, not rounding noise.
 
 The approximation is close but not exact — and errors accumulate across layers.
 
 ## Linformer: Low-Rank Key/Value Projection
 
+Another shortcut: instead of letting each query look at all $n$ tokens, squash the keys and
+values down to a short list of $k$ summary rows, and attend to those.
+
 Instead of approximating the kernel, **Linformer** (Wang et al., 2020) approximates the attention matrix as low-rank: project $K$ and $V$ from $n$ tokens down to $k \ll n$ tokens before forming attention.
+
+**Low-rank** means the big matrix can be rebuilt from far fewer independent rows than it
+has; much of it is repetition. A **projection** here is a fixed matrix that mixes the $n$
+token rows into $k$ new rows.
 
 $$
 \tilde{K} = E K \in \mathbb{R}^{k \times d}, \quad \tilde{V} = F V \in \mathbb{R}^{k \times d}
 $$
 
+> **In plain words:** $E$ and $F$ are $k \times n$ mixing matrices. $\tilde{K}$ and
+> $\tilde{V}$ are the squashed keys and values: $k$ rows instead of $n$, each still $d$
+> numbers wide.
+
 Then attention is $(n \times d) \cdot (d \times k) \cdot (k \times d)$ — $O(nk)$ instead of $O(n^2)$.
+
+> **Picture it:** instead of reading 256 individual reviews, you read 32 digests, each a
+> blend of reviews. If the digests were written well (learned), you lose little. If they
+> were blended at random, they tell you almost nothing.
 
 ```python
 def linformer_attention(Q, K, V, k=32):
@@ -156,13 +229,27 @@ V = rng.standard_normal((n, d))
 out_exact   = standard_attention(Q, K, V)
 out_linform = linformer_attention(Q, K, V, k=k)
 print(f"Linformer k={k}/{n}, error: {np.abs(out_exact - out_linform).mean():.4f}")
+print(f"Typical |exact output|: {np.abs(out_exact).mean():.4f}")
 ```
 
 ```output
-Linformer k=32/256, error: 0.1821
+Linformer k=32/256, error: 1.3914
+Typical |exact output|: 0.0788
 ```
 
+The error is 1.3914, while a typical exact output is only 0.0788 in size, so the error is
+about 18 times the signal. This is not a bug in the method. In the code, $E$ and $F$ are
+*random* and never trained, so the 32 "digests" are random blends. Real Linformer **learns**
+$E$ and $F$ during training, and relies on trained attention matrices being close to
+low-rank, which random $Q$ and $K$ are not.
+
+> **Watch out:** a fixed $k$ means a fixed-size summary. Longer inputs get squashed harder,
+> which is why Linformer quality degrades as length grows past its training length.
+
 ## Why These Never Fully Won
+
+Linear attention is cheaper, but "cheaper" lost to "exact and fast enough". Each of the four
+reasons below is a property of the fixed-size summary or of the hardware.
 
 Despite the elegance, linear attention variants have real weaknesses:
 
@@ -170,6 +257,10 @@ Despite the elegance, linear attention variants have real weaknesses:
 2. **Approximation errors compound** — each layer introduces error; deep networks degrade more.
 3. **The softmax isn't just a kernel trick** — the normalization creates competition between tokens, which is a useful inductive bias.
 4. **FlashAttention solved the memory problem without losing quality** — for most practical lengths, IO-aware exact attention is now faster than approximate methods.
+
+An **inductive bias** is a built-in preference that steers what a model learns easily. Softmax
+makes tokens compete for weight, so the model can put almost all its attention on one token.
+**IO-aware** means designed around memory traffic (input/output), not FLOPs, as in ch. 1.
 
 ```python
 # Comparison table
@@ -196,9 +287,25 @@ Linformer            O(nk)      O(k)       Fixed k, degrades >4K
 FlashAttention       O(n²)      O(n)       Exact, 2-4x faster via IO
 ```
 
+Read the Time and Memory columns together. Every approximate method gets below $O(n^2)$
+time, but pays in the Notes column. FlashAttention keeps $O(n^2)$ time yet cuts memory to
+$O(n)$ and is still exact: it never writes the full score table out to slow memory.
+
 The lesson: approximate attention is appealing in theory but SSMs (ch. 3–4) and hardware-aware exact attention won in practice.
 
+## Recap in plain words
+
+- Softmax attention costs $O(n^2)$ because the similarity ties every query to every key.
+- If the similarity splits into $\phi(q)^T \phi(k)$, keys and values can be summed once into a fixed-size summary that every query reads.
+- A crude feature map (ReLU+1) gives very flat, blurry attention; the outputs here had std 0.0421.
+- Performer's random features imitate softmax on average; the error here was 0.0323 with 128 features.
+- Linformer squashes $n$ tokens into $k$ rows; with random, untrained projections the error was 18 times the signal.
+- Fixed-size summaries lose on exact recall, which is why exact attention plus FlashAttention, and SSMs, took over.
+
 ## Try it Yourself
+
+The experiment counts multiply-adds for exact attention ($n \cdot n \cdot d$) and linear
+attention ($n \cdot d \cdot d$, with $r = d$ features) at four lengths.
 
 ```python
 import numpy as np
@@ -219,15 +326,26 @@ benchmark_complexity([512, 2048, 8192, 32768])
 ```output
        n |    Exact ops |   Linear ops |    Speedup
 --------------------------------------------------
-     512 |   16,777,216 |   16,777,216 |        1.0x
-    2048 |  268,435,456 |   16,777,216 |       16.0x
-    8192 | 4,294,967,296 |   16,777,216 |      256.0x
-   32768 | 68,719,476,736 |   16,777,216 |     4096.0x
+     512 |   16,777,216 |    2,097,152 |        8.0x
+    2048 |  268,435,456 |    8,388,608 |       32.0x
+    8192 | 4,294,967,296 |   33,554,432 |      128.0x
+   32768 | 68,719,476,736 |  134,217,728 |      512.0x
 ```
+
+The speedup column is $n / d$: 8 times at 512 tokens, 512 times at 32,768. Exact cost grows 16
+times each time $n$ grows 4 times; linear cost grows only 4 times. Notice that the linear
+column is never free: at $n = 512$ it still does 2.1 million operations.
+
+Try `d=128` or `d=256`. The speedup halves each time, because the linear method's cost grows
+with $d^2$ while exact attention's grows only with $d$.
 
 ## Exercise
 
 For linear attention with feature dimension $r = 64$ and a standard 12-head, 12-layer transformer (d_k = 64), at what sequence length do exact and linear attention have equal FLOPs? Why does that number change when you reduce $r$?
+
+> **Hint:** write both costs per head. Exact attention's main cost is $n^2 d_k$. Linear
+> attention's is $n \cdot r \cdot d_k$. Set them equal and cancel what you can. The number of
+> heads and layers multiplies both sides equally.
 
 <details>
 <summary>Solution</summary>
@@ -258,5 +376,10 @@ Smaller r → breaks even sooner, but approximation is worse
 ```
 
 This is the core tradeoff — a smaller feature map saves more compute but approximates the full kernel less accurately.
+
+The heads and layers cancel, so the answer is $n = r$ whatever the model size. Real
+contexts are thousands of tokens long, far above 64, so linear attention always "wins" on
+FLOPs. The catch is quality: the Performer demo above shows that fewer random features mean a
+noisier imitation of softmax.
 
 </details>

@@ -7,7 +7,22 @@ order: 6
 
 ## The Core Idea
 
+A flow takes a plain bell curve and bends, stretches, and squeezes it, step by step, into the
+shape of your data. Because every step can be undone exactly, you can always trace a data point
+back to the bell curve and read off its exact probability.
+
 A normalizing flow transforms a simple distribution (standard Gaussian) into a complex one via a sequence of invertible, differentiable functions. The key requirement: you can compute the Jacobian determinant efficiently.
+
+- **Invertible** means every output comes from exactly one input, so the step can be run
+  backwards.
+- **Differentiable** means smooth enough to take slopes, so you can train it by gradient.
+- The **Jacobian** is the matrix of all slopes of the outputs with respect to the inputs. Its
+  **determinant** says how much the function stretches or squeezes a tiny region of space: a
+  determinant of 2 doubles a small area, 0.5 halves it.
+
+> **Picture it:** a lump of clay with a fixed amount of material (total probability = 1). Where
+> you stretch the clay thin, the density drops; where you squash it, the density rises. The
+> Jacobian determinant is the local "stretch factor" that keeps the books balanced.
 
 If $z \sim p_z(z)$ and $x = f(z)$ with $f$ invertible, the change-of-variables formula gives:
 
@@ -15,13 +30,24 @@ $$
 \log p_x(x) = \log p_z(f^{-1}(x)) + \log \left|\det \frac{\partial f^{-1}}{\partial x}\right|
 $$
 
+> **In plain words:** to score a data point $x$, map it back to its code $f^{-1}(x)$, score the
+> code under the simple bell curve, then correct for how much the mapping stretched space at
+> that point. Stretched regions get lower density; compressed regions get higher density.
+
 Or equivalently, writing $z = f^{-1}(x) = g(x)$:
 
 $$
 \log p_x(x) = \log p_z(g(x)) + \log |\det J_g(x)|
 $$
 
+> **In plain words:** same formula, with $g$ naming the "data to code" direction and $J_g$ its
+> Jacobian. Training a flow means maximizing this number on real data.
+
 This is **exact** — no variational bound, no discriminator. You can compute the exact log-likelihood of any data point.
+
+The smallest flow is one line: $x = e^z$. Going back, $g(x) = \log x$, whose slope is
+$1/x$, so the correction term is $\log(1/x) = -\log x$. This builds the **log-normal**
+distribution.
 
 ```python
 import torch
@@ -44,15 +70,28 @@ for xi, lpi in zip(x, lp):
 
 ```output
 x     | log p(x)
-0.5   | -1.1121
+0.5   | -0.4660
 1.0   | -0.9189
-2.0   | -1.6121
-3.0   | -2.6479
+2.0   | -1.8523
+3.0   | -2.6210
 ```
+
+At $x = 1$, the code is $z = 0$ and the stretch correction is 0, so you get the bell curve's peak,
+$-\frac{1}{2}\log(2\pi) \approx -0.9189$. At $x = 0.5$ the log-density is *higher* ($-0.4660$):
+mapping $z$ through $e^z$ squeezes all negative codes into $(0, 1)$, piling probability up there.
+At $x = 3$ it falls to $-2.6210$. These match the textbook log-normal density exactly.
 
 ## Affine Coupling Layers (RealNVP)
 
+A general neural network's Jacobian determinant is expensive to compute. Coupling layers are
+designed so that the determinant is the product of a few numbers you already have.
+
 Computing $\det J$ for an arbitrary NN is $O(d^3)$. RealNVP uses coupling layers with triangular Jacobians — $O(d)$.
+
+$O(d^3)$ means the cost grows with the cube of the dimension $d$: for a $64 \times 64$ colour
+image ($d = 12{,}288$), that is about $1.9 \times 10^{12}$ operations per determinant. A
+**triangular** matrix (zeros on one side of the diagonal) has a determinant equal to the product
+of its diagonal, which is $O(d)$.
 
 Split $x$ into two halves: $x_1$ and $x_2$.
 - $x_1$ passes through unchanged.
@@ -62,11 +101,26 @@ $$
 y_1 = x_1 \qquad y_2 = x_2 \odot e^{s(x_1)} + t(x_1)
 $$
 
+> **In plain words:** keep the first half as it is. Multiply each entry of the second half by a
+> scale factor $e^{s}$ and add a shift $t$, where both $s$ and $t$ are computed by small
+> networks that look only at the first half. $e^{s}$ is always positive, so the scale can never be
+> zero and the step can always be undone.
+
+> **Picture it:** two people walking side by side. One walks normally; the other changes stride
+> and position based on what the first one is doing. If you know where the first person is, you
+> can always work out where the second person started.
+
 The Jacobian is lower-triangular with diagonal $e^{s(x_1)}$, so:
 
 $$
 \log |\det J| = \sum_i s_i(x_1)
 $$
+
+> **In plain words:** the log of the stretch factor is the sum of the scale outputs $s_i$. No
+> matrix work at all. The networks $s$ and $t$ can be as complicated as you like, because you
+> never need to invert them — inversion only needs to subtract $t$ and divide by $e^{s}$.
+
+An **affine** map is one that scales and shifts. The layer below implements both directions.
 
 ```python
 import torch
@@ -107,16 +161,31 @@ print(f"Log-det per sample: {log_det[:3].detach().numpy().round(3)}")
 ```
 
 ```output
-Input  x: [-0.126  0.433 -0.748  1.594]
-Output y: [-0.126  0.433 -1.012  2.143]
-Reconstructed x: [-0.126  0.433 -0.748  1.594]
-Max recon error: 3.58e-07
-Log-det per sample: [0.452 0.381 0.517]
+Input  x: [-0.31  -0.929  2.745 -0.225]
+Output y: [-0.31  -0.929  4.074 -0.299]
+Reconstructed x: [-0.31  -0.929  2.745 -0.225]
+Max recon error: 1.19e-07
+Log-det per sample: [0.068 0.318 0.205]
 ```
+
+The first two entries of the output ($-0.31$, $-0.929$) are identical to the input — that is
+the half that passes through. The third entry changed from 2.745 to 4.074 and the fourth from
+$-0.225$ to $-0.299$. The reconstruction matches the input to $1.19 \times 10^{-7}$, which is
+float32 rounding noise: the inverse is exact by construction, not learned. The log-dets (0.068,
+0.318, 0.205) differ per sample because $s$ depends on each sample's first half.
 
 ## Building a Full Flow
 
+One coupling layer never changes its first half. Stack several, swapping which half is frozen
+each time, and every dimension gets transformed.
+
 Stack multiple coupling layers, alternating which dimensions are masked so all dimensions eventually interact.
+
+Here "masked" means held fixed. The code swaps halves with `torch.flip` before odd-numbered
+layers and swaps back after. The total log-det is the sum of each layer's log-det, because
+stretch factors multiply and logs add. `log_prob` sends $x$ to $z$, scores $z$ under the
+standard normal, and adds the total log-det. Sampling runs the other way: draw $z$ and call
+`inverse`.
 
 ```python
 import torch
@@ -166,14 +235,27 @@ print(f"Sample range: [{x_samples.min():.2f}, {x_samples.max():.2f}]")
 ```
 
 ```output
-Log probabilities: min=-4.87, mean=-1.94, max=0.13
+Log probabilities: min=-22.81, mean=-4.61, max=-2.35
 Samples shape: torch.Size([100, 2])
-Sample range: [-3.94, 4.12]
+Sample range: [-7.09, 13.42]
 ```
+
+This flow is untrained, so the numbers only show the machinery works. Mean log-probability on
+standard-normal inputs is $-4.61$; a perfect model of $\mathcal{N}(0, I)$ in 2-D would score about
+$-2.84$ ($= -\log(2\pi) - 1$). The random layers stretch space unevenly — one point scores
+$-22.81$ — and the samples spread from $-7.09$ to 13.42, much wider than the bell curve they
+came from.
 
 ## Training a Flow
 
+Training a flow is the most direct recipe in this course: make the real data as probable as
+possible. There is nothing else to balance.
+
 Maximize average log-likelihood — no reconstruction term, no discriminator.
+
+The loss is the **negative log-likelihood (NLL)**, the average of $-\log p(x)$ over a batch;
+lower is better. The data is **two moons**: two interlocking half-circles, a standard 2-D test
+that a single bell curve can't fit.
 
 ```python
 import torch
@@ -205,14 +287,32 @@ for epoch in range(1, 6):
 ```
 
 ```output
-Epoch 1  NLL=3.847
-Epoch 2  NLL=2.913
-Epoch 3  NLL=2.541
-Epoch 4  NLL=2.318
-Epoch 5  NLL=2.187
+Epoch 1  NLL=3.166
+Epoch 2  NLL=2.156
+Epoch 3  NLL=1.999
+Epoch 4  NLL=1.942
+Epoch 5  NLL=1.904
 ```
 
+The NLL drops from 3.166 to 1.904 nats per point in 5 epochs (a **nat** is the unit of log
+probability when using natural logs). The big drop happens in the first two epochs, after which
+gains shrink. Keep this in perspective: the best single 2-D Gaussian fitted to this data scores
+about 1.91. After 5 epochs the flow is only level with "one blob"; it needs many more epochs
+(at 100 epochs the same loop reaches an NLL of about 1.08) before the two moon shapes appear in
+samples.
+
+> **Watch out:** always compare a generative model's NLL with a simple baseline such as one
+> Gaussian. A falling loss proves the model is learning, not that it has learned anything a
+> five-number model (two means, three covariance entries) couldn't.
+
+> **Watch out:** `make_moons` uses `np.random.randn` with no seed, so the noise — and therefore
+> these NLL values — change from run to run in the third decimal. Seed NumPy too if you need
+> exact reproducibility.
+
 ## Flows vs VAEs
+
+Flows and VAEs both decode a bell-curve code into data, but flows insist on being exactly
+reversible, and pay for it with a code as large as the data.
 
 | Property | Normalizing Flow | VAE |
 |----------|-----------------|-----|
@@ -222,7 +322,24 @@ Epoch 5  NLL=2.187
 | Training | NLL | ELBO |
 | Sampling | Fast (invert flow) | Fast (decode from $z$) |
 
+The "same dim" row is forced: an invertible map can't lose information, so it can't squeeze
+784 numbers into 32. That makes flows memory-hungry on images and is one reason diffusion and
+latent models took over.
+
+## Recap in plain words
+
+- A flow is a chain of reversible, smooth steps from a bell curve to the data.
+- The change-of-variables formula gives the exact log-likelihood: score the code, then correct
+  for stretching with the log Jacobian determinant.
+- Affine coupling layers keep half the input fixed and scale-and-shift the other half, so their
+  log-det is a cheap sum of scales.
+- Stacking coupling layers with alternating halves lets every dimension change.
+- Flows train by plain maximum likelihood, and their codes are as large as the data.
+
 ## Try it Yourself
+
+This checks the two promises of a coupling flow on 6-dimensional inputs: the inverse is exact,
+and log-dets add across layers.
 
 ```python
 import torch
@@ -248,17 +365,28 @@ print(f"\nTotal log-det (4 layers): mean={total_ld.mean():.3f}")
 
 ```output
 Invertibility check:
-  Sample 0: max error = 2.98e-07
-  Sample 1: max error = 1.19e-07
-  Sample 2: max error = 2.38e-07
-  Sample 3: max error = 2.98e-07
+  Sample 0: max error = 0.00e+00
+  Sample 1: max error = 5.96e-08
+  Sample 2: max error = 1.19e-07
+  Sample 3: max error = 2.38e-07
 
-Total log-det (4 layers): mean=0.247
+Total log-det (4 layers): mean=-0.392
 ```
+
+All four reconstruction errors are at or below $2.38 \times 10^{-7}$ — sample 0 is exactly 0 —
+which is float32 rounding, not approximation. The 4-layer flow's mean total log-det is $-0.392$:
+on average it slightly compresses space. Swap `Tanh` for `ReLU` in `CouplingLayer` and check that
+invertibility still holds (it does: invertibility comes from the coupling structure, not from
+$s$ and $t$). Then multiply the output of `scale_net` by 10 and watch the errors grow, since
+$e^{s}$ becomes huge and float32 runs out of precision.
 
 ## Exercise
 
 Show that a flow trained on a Gaussian mixture can assign reasonable log-likelihoods to in-distribution vs out-of-distribution points. Train the `RealNVP` on samples from $\mathcal{N}(-2,0.5)$ and evaluate log-prob on both in-distribution points (near -2) and OOD points (near +5).
+
+> **Hint:** **OOD** means out-of-distribution — points unlike the training data. Train with the
+> NLL loss from the Training a Flow section for a few hundred mini-batch steps, then compare
+> `flow.log_prob(...).mean()` on the two test sets under `torch.no_grad()`.
 
 <details>
 <summary>Solution</summary>
@@ -287,4 +415,9 @@ with torch.no_grad():
 ```
 
 The flow correctly assigns much lower log-probability to OOD points. This is the anomaly detection use case — likelihood-based models give you a natural score.
+
+Running it gives about $-0.84$ for points near $(-2, 0)$ and $-84.42$ for points near $(5, 0)$, a
+gap of 83.59 nats — the OOD points are about $e^{83}$ times less likely. Be careful generalizing:
+here the OOD points are far from the data in raw space, which is the easy case. On images, flows
+famously give high likelihood to some OOD datasets, so check before trusting the score.
 </details>

@@ -7,14 +7,25 @@ order: 6
 
 ## Why pretrained weights transfer
 
+**Transfer learning** means starting from a network someone already trained on a huge dataset
+and reusing what it learned for your own, smaller task. Edges, textures, and shapes look the
+same in cat photos and in factory photos, so that knowledge carries over.
+
 CNNs trained on ImageNet learn a hierarchy of visual features: early layers detect edges and textures, middle layers compose them into parts, late layers encode object-specific patterns. These universal visual primitives transfer to almost any vision task.
+
+> **Picture it:** hiring an experienced photographer to sort your product photos. They
+> already know light, edges, and shapes; you only teach them your 5 product names. Training
+> from scratch is hiring someone who has never seen a photo.
 
 You have two strategies:
 
-- **Feature extraction** — freeze all backbone weights, attach a new head, train only the head. Fast; works when your data is small or your task is similar to ImageNet.
+- **Feature extraction** — freeze all backbone weights, attach a new head, train only the head. Fast; works when your data is small or your task is similar to ImageNet. (The **backbone** is the pretrained body of the network; the **head** is the small final layer that outputs your classes; to **freeze** a weight is to stop training it.)
 - **Fine-tuning** — unfreeze some or all backbone layers after head training. Allows the backbone to specialize for your distribution. Better accuracy, requires more data and care to avoid forgetting.
 
 ## Loading a pretrained backbone
+
+torchvision ships many trained models; you pick one and name the weights you want. The first
+call downloads the weight file (about 100 MB for ResNet-50) and caches it.
 
 ```python
 import torch
@@ -32,7 +43,18 @@ ResNet-50 output layer: Linear(in_features=2048, out_features=1000, bias=True)
 Total params: 25,557,032
 ```
 
+The last layer `fc` maps 2,048 features to 1,000 scores — one per ImageNet class. The whole
+network has about 25.6 million parameters, and you are about to throw away only the
+$2048 \times 1000 + 1000 = 2{,}049{,}000$ of them that live in that head.
+
+> **Watch out:** pretrained models expect inputs prepared the way their training data was:
+> RGB, resized, and normalised with the ImageNet mean and standard deviation. Use
+> `ResNet50_Weights.IMAGENET1K_V2.transforms()` to get the exact recipe.
+
 ## Feature extraction: freeze the backbone
+
+Freezing is a single switch per weight: `requires_grad = False` tells PyTorch not to compute a
+gradient for it, so the optimizer never changes it.
 
 ```python
 import torch.nn as nn
@@ -52,12 +74,18 @@ print(f"Trainable: {trainable:,}  /  Total: {total:,}")
 ```
 
 ```output
-Trainable: 10,245  /  Total: 25,548,285
+Trainable: 10,245  /  Total: 23,518,277
 ```
 
-Only the final linear head (2048×5 + bias) trains. The backbone stays fixed.
+Only 10,245 of 23.5 million parameters will train — about 0.04%. That is why feature
+extraction is fast and hard to overfit.
+
+Only the final linear head ($2048 \times 5$ + bias) trains. The backbone stays fixed.
 
 ## Fine-tuning: unfreeze layer4 and head
+
+Once the new head is sensible, you let the last block of the backbone adjust too, gently.
+Last layers hold the most task-specific features, so they gain the most from adapting.
 
 A common recipe: train the head for a few epochs (frozen backbone), then unfreeze the last few layers and continue with a lower learning rate.
 
@@ -71,12 +99,25 @@ print(f"Trainable after unfreezing layer4: {trainable:,}")
 ```
 
 ```output
-Trainable after unfreezing layer4: 6,313,989
+Trainable after unfreezing layer4: 14,974,981
 ```
+
+Unfreezing `layer4` raises the trainable count from 10,245 to about 15.0 million: in ResNet-50,
+the last stage alone holds well over half the parameters.
+
+> **Watch out:** unfreezing *before* training the new head is a classic mistake. The random
+> head sends large, meaningless gradients into the backbone and can wreck the pretrained
+> features in the first few steps.
 
 ## Discriminative learning rates
 
+**Discriminative learning rates** give each part of the network its own step size: tiny steps
+for the early, generic layers and bigger ones for the late, task-specific layers.
+
 Early layers learn generic features; late layers learn task-specific ones. Assigning lower LR to early layers avoids destroying low-level features while letting late layers adapt.
+
+> **Picture it:** renovating a house. You barely touch the foundations (early layers), you
+> repaint the rooms (middle layers), and you fully redo the kitchen (the head).
 
 ```python
 optimizer = torch.optim.AdamW([
@@ -101,7 +142,16 @@ Parameter groups: 5
   group 4: lr=0.001
 ```
 
+The optimizer holds 5 parameter groups. The head's learning rate (0.001) is 100 times the
+earliest layers' (0.00001), with `layer3` and `layer4` in between.
+
 ## Simulated fine-tuning on synthetic data
+
+Here is the full training loop for feature extraction, on made-up data so it runs anywhere.
+Each class gets its own brightness offset, so there is a real pattern for the head to learn.
+
+The backbone stays in `eval()` mode throughout. That keeps its BatchNorm layers using their
+pretrained running statistics (ch. 5) instead of re-estimating them from your small batches.
 
 ```python
 import torch
@@ -119,17 +169,17 @@ model.fc = nn.Linear(2048, NUM_CLASSES)
 for p in model.parameters(): p.requires_grad = False
 for p in model.fc.parameters(): p.requires_grad = True
 
-X_train = torch.randn(64, 3, 224, 224)
+# Synthetic but learnable: each class gets its own brightness offset
 y_train = torch.randint(0, NUM_CLASSES, (64,))
-X_val   = torch.randn(16, 3, 224, 224)
+X_train = torch.randn(64, 3, 112, 112) + 0.5 * y_train.view(-1, 1, 1, 1)
 y_val   = torch.randint(0, NUM_CLASSES, (16,))
+X_val   = torch.randn(16, 3, 112, 112) + 0.5 * y_val.view(-1, 1, 1, 1)
 
-optimizer = torch.optim.Adam(model.fc.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.fc.parameters(), lr=1e-2)
 loss_fn   = nn.CrossEntropyLoss()
 model.eval()  # freeze BN stats
 
 for epoch in range(EPOCHS):
-    model.train()
     for i in range(0, 64, BATCH):
         xb, yb = X_train[i:i+BATCH], y_train[i:i+BATCH]
         optimizer.zero_grad()
@@ -144,14 +194,24 @@ for epoch in range(EPOCHS):
 ```
 
 ```output
-Epoch 1  val_acc=0.25
-Epoch 2  val_acc=0.31
-Epoch 3  val_acc=0.38
+Epoch 1  val_acc=0.56
+Epoch 2  val_acc=0.62
+Epoch 3  val_acc=0.75
 ```
 
-On random data, 0.2 is chance for 5 classes; the model improves above chance even in 3 epochs because backbone features are already discriminative.
+Validation accuracy climbs from 0.56 to 0.75 over 3 epochs, using only 12 small optimizer
+steps on the head. Chance level for 5 balanced classes is 0.2, so the frozen features clearly
+carry the brightness signal. With only 16 validation images, each image is worth
+$1/16 \approx 0.06$ of accuracy, so read these numbers as rough.
+
+> **Watch out:** a common bug is calling `model.train()` at the top of each epoch "to be safe".
+> With a frozen backbone this silently switches its BatchNorm layers back to batch
+> statistics and overwrites the pretrained running averages with numbers from your batches.
 
 ## When to freeze vs fine-tune
+
+How much to unfreeze depends on two questions: how much data you have, and how different your
+images look from ImageNet photos.
 
 | Scenario | Strategy |
 |---|---|
@@ -160,17 +220,27 @@ On random data, 0.2 is chance for 5 classes; the model improves above chance eve
 | Large dataset (> 10k), similar domain | Fine-tune all layers, small LR |
 | Large dataset, different domain | Full fine-tune, moderate LR |
 
+Read the table as a dial: more data lets you unfreeze more, and a more unusual domain makes
+unfreezing more worthwhile.
+
 A rule of thumb: if your images look like ImageNet, frozen features are already excellent. If your images differ significantly (medical scans, satellite imagery), fine-tune deeper.
 
 ## Linear probing
 
+A **linear probe** measures how good frozen features are: you turn every image into a feature
+vector once, then fit the simplest possible classifier on top. If a straight-line classifier
+does well, the features already separate the classes.
+
 The simplest evaluation of pretrained features: extract feature vectors for every image (one forward pass, no gradients), then fit a logistic regression on top.
+
+The code uses a **forward hook** — a function PyTorch calls every time a layer runs — to catch
+the output of `avgpool`, just before the head.
 
 ```python
 from sklearn.linear_model import LogisticRegression
 import numpy as np
 
-# Extract 512-d features from avgpool
+# Extract 2048-d features from avgpool
 def extract_features(model, X):
     model.eval()
     features = []
@@ -184,6 +254,7 @@ def extract_features(model, X):
     h.remove()
     return np.vstack([f.reshape(len(f), -1) for f in features])
 
+torch.manual_seed(0); np.random.seed(0)
 X = torch.randn(100, 3, 224, 224)
 y = np.random.randint(0, 5, 100)
 feats = extract_features(backbone, X)
@@ -195,10 +266,29 @@ print(f"Linear probe train acc: {clf.score(feats, y):.2f}")
 
 ```output
 Feature shape: (100, 2048)
-Linear probe train acc: 0.52
+Linear probe train acc: 0.69
 ```
 
+The features are 2,048 numbers per image. The 0.69 *training* accuracy looks good, but the
+labels here are random: there is nothing real to learn. The classifier is memorising 100 points
+in 2,048 dimensions, which is easy. (The warning that `LogisticRegression` did not converge is
+printed to stderr and does not change the point.)
+
+> **Watch out:** always report a probe's accuracy on held-out images. With more feature
+> dimensions than images, training accuracy can be high even when the labels are noise.
+
+## Recap in plain words
+
+- Pretrained CNNs already know edges, textures, and parts, and that knowledge transfers to new image tasks.
+- Feature extraction freezes the backbone and trains only a new head: fast and safe for small data.
+- Fine-tuning then unfreezes the last stages, with lower learning rates for earlier layers.
+- Keep a frozen backbone in `eval()` mode so its BatchNorm statistics stay pretrained.
+- A linear probe tests feature quality, but only held-out accuracy counts.
+
 ## Try it Yourself
+
+The same recipe on a phone-sized model. MobileNetV3-Small has about 10 times fewer
+parameters than ResNet-50.
 
 ```python
 import torch
@@ -226,16 +316,23 @@ print("Output:", model(x).shape)
 
 ```output
 MobileNetV3-Small total params: 2,542,856
-Trainable params: 10,250
-Linear probe train acc: 0.52
+Trainable params: 601,098
 Output: torch.Size([4, 10])
 ```
+
+The model has 2.54 million parameters, of which 601,098 are trainable — the whole
+`classifier`, which has a hidden layer ($576 \times 1024 + 1024 = 590{,}848$) plus the new
+10-class output layer ($1024 \times 10 + 10 = 10{,}250$). The output is 4 rows of 10 scores.
 
 Try unfreezing `model.features[-1]` (the last MobileNet block) and compare trainable parameter count. Then set different learning rates for frozen and unfrozen parts using AdamW parameter groups.
 
 ## Exercise
 
 Write a `fine_tune_setup(model_name, num_classes, unfreeze_last_n)` function that loads a pretrained torchvision model by name (`"resnet18"`, `"resnet50"`, `"efficientnet_b0"`), replaces its classification head, freezes all but the last `unfreeze_last_n` children, and returns the model + an AdamW optimizer with LR 1e-4 for unfrozen layers and 1e-5 for frozen layers.
+
+> **Hint:** a dictionary from name to (constructor, weights) handles the three models.
+> `model.children()` lists the top-level blocks in order, so slicing that list splits frozen
+> from free.
 
 <details>
 <summary>Solution</summary>
@@ -274,6 +371,7 @@ def fine_tune_setup(model_name: str, num_classes: int, unfreeze_last_n: int):
     free_params   = [p for m in free_children for p in m.parameters()]
     opt = torch.optim.AdamW([
         {"params": free_params,   "lr": 1e-4},
+        {"params": frozen_params, "lr": 1e-5},
     ], weight_decay=1e-4)
     return model, opt
 
@@ -284,4 +382,10 @@ print("Output:", model(x).shape)
 ```
 
 The function handles both `fc`-headed (ResNet) and `classifier`-headed (EfficientNet) torchvision models, freezes everything but the last `n` children, and returns an optimizer with proper learning rates.
+
+It prints `Groups: 2` and an output of shape `[2, 5]`. Two details are worth knowing. First, for
+ResNet-18 the last 2 children are `avgpool` (no weights) and `fc`, so `unfreeze_last_n=2` really
+trains only the head; use 3 to include `layer4`. Second, the frozen group's 1e-5 rate only
+matters once you later set `requires_grad = True` on those weights — AdamW skips any parameter
+without a gradient.
 </details>

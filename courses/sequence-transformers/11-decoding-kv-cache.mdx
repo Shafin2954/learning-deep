@@ -7,13 +7,30 @@ order: 11
 
 ## Decoding is generation
 
+A trained language model does not write text by itself. It only answers one question: "given
+these tokens, how likely is each possible next token?" A **decoding strategy** is the rule
+you use to turn those probabilities into actual text, one token at a time.
+
 Training a language model minimizes cross-entropy over every token in a sequence. At inference
 you only have the input prefix and you need to generate what comes next — one token at a time.
 The decoding strategy you choose shapes the output more than you might expect.
 
+The **prefix** (or prompt) is the text you start from. **Inference** means using the trained
+model, as opposed to training it.
+
+> **Picture it:** the model is a weather forecaster that only ever says "70% sun, 20% cloud,
+> 10% rain". Decoding is your rule for what to pack: always the most likely (greedy), plan for
+> several futures (beam search), or roll a weighted die (sampling).
+
 ## Greedy decoding
 
+Greedy decoding always takes the single most likely next token, then repeats.
+
 The simplest rule: at each step take the token with the highest logit.
+
+A **logit** is the raw score the model gives each token before softmax turns scores into
+probabilities. The highest logit is always the highest probability, so `argmax` over logits
+is enough.
 
 ```python
 import torch
@@ -54,13 +71,30 @@ print(" ".join(vocab[i.item()] for i in out[0]))
 <bos> the cat sat on mat <eos>
 ```
 
+The toy "model" is a fixed table where each token strongly prefers one successor (logit 5
+against 0 for the rest). Greedy follows the chain from `<bos>` to `<eos>` and stops there,
+after 6 new tokens.
+
 Greedy decoding is deterministic and fast but tends to repeat itself on longer generations
 because the highest-probability continuation at each step can form loops.
 
+**Deterministic** means the same input always gives the same output.
+
+> **Watch out:** the best token at each step does not always give the best sentence. A first
+> word with probability 0.5 followed by words at 0.1 loses to a first word at 0.4 followed by
+> words at 0.9. Greedy can never go back and change its mind.
+
 ## Beam search
+
+Beam search hedges: it keeps the few best partial sentences alive at every step instead of
+committing to one.
 
 Beam search keeps the top-$k$ hypotheses at each step rather than committing to the single
 best token.
+
+A **hypothesis** is one candidate partial output. The **beam width** $k$ is how many
+hypotheses survive each step. Each is scored by the sum of its tokens' log-probabilities,
+which is the log of the whole sequence's probability.
 
 ```python
 def beam_search(logit_fn, input_ids, beam_width=3, max_new_tokens=10, eos_id=None):
@@ -100,11 +134,25 @@ print(" ".join(vocab[i] for i in result))
 <bos> the cat sat on mat <eos>
 ```
 
+With a table this clear-cut, beam search finds the same sentence as greedy. On a real model the
+two often differ, because beam search can keep a slightly worse first token that leads to a much
+better continuation.
+
 Length penalty (dividing score by sequence length) prevents beam search from always preferring
 short sequences. The beam width controls the quality-compute tradeoff: wider beams search more
 of the space but cost `beam_width` forward passes per step.
 
+Why short sequences win otherwise: every log-probability is negative, so every extra token
+lowers the sum. Dividing by length compares average quality per token instead.
+
+> **Picture it:** exploring a cave with three torches. At every fork you light the three most
+> promising tunnels and let the others go dark. Wider beams mean more torches — better odds of
+> finding the exit, more fuel burned.
+
 ## Temperature scaling and sampling
+
+Sampling rolls a weighted die instead of always taking the favourite, which makes text more
+varied. Temperature controls how loaded the die is.
 
 Instead of taking the argmax, you can sample from the distribution. Temperature $T$ sharpens
 or flattens the logits before softmax:
@@ -113,8 +161,15 @@ $$
 p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}
 $$
 
+> **In plain words:** divide every logit $z_i$ by $T$, then softmax. Dividing by a small $T$
+> stretches the gaps between scores, so the favourite takes nearly all the probability.
+> Dividing by a large $T$ shrinks the gaps, so the probabilities move toward equal.
+
 $T < 1$ makes the distribution peakier (more deterministic). $T > 1$ makes it flatter (more
 random). $T = 1$ is the raw model distribution.
+
+As $T \to 0$, sampling becomes greedy decoding; as $T \to \infty$, it becomes a uniform random
+pick over the whole vocabulary.
 
 ```python
 def sample_decode(logit_fn, input_ids, max_new_tokens, temperature=1.0,
@@ -155,16 +210,31 @@ print(" ".join(vocab[i.item()] for i in out[0]))
 <bos> the cat sat on mat <eos>
 ```
 
+Even with sampling at $T = 0.8$, each step's favourite has a logit 5 higher than the other six,
+which gives it probability about 0.99 per step (the gap becomes $5 / 0.8 = 6.25$ after
+temperature). So the seeded sample follows the same path as greedy.
+
+> **Watch out:** `torch.multinomial` is random. Without `torch.manual_seed`, every run gives a
+> different sample — good for a chatbot, bad for a test or a reproducible experiment.
+
 ### Top-k sampling
 
 Keep only the $k$ most probable tokens and redistribute probability mass over them. Common
 values: $k = 50$ for creative text, $k = 10$ for more focused output.
+
+The idea: the long tail of very unlikely tokens is where nonsense lives. Cutting it off keeps
+variety among plausible tokens without ever picking a token at probability 0.0001.
 
 ### Nucleus (top-p) sampling
 
 Keep the smallest set of tokens whose cumulative probability exceeds $p$. This adapts the
 cutoff to the model's confidence: when the model is sure, the nucleus is small; when it is
 uncertain, more tokens are included. $p = 0.9$ or $p = 0.95$ are typical defaults.
+
+For example, with probabilities 0.6, 0.25, 0.1, 0.05 and $p = 0.9$, the nucleus is the first
+three tokens (0.6 + 0.25 + 0.1 = 0.95). If the model were 0.95 sure of one token, the nucleus
+would be that token alone. In the code, `cumprobs - probs > top_p` removes a token only if the
+tokens before it already passed $p$, so the token that crosses the line is kept.
 
 ### Repetition penalty
 
@@ -173,13 +243,27 @@ penalty factor $> 1$. This breaks loops without changing the distribution for ne
 
 ## The KV cache
 
+Generating a long text one token at a time means running the model again and again on a
+prefix that grows by one token. Most of that work repeats what was done on the previous step.
+The KV cache saves the repeated part.
+
 Without caching, generating the $t$-th token requires recomputing all key and value tensors
 for positions $1 \ldots t-1$ — even though you computed them on every previous step. This is
 $O(T^2)$ total work.
 
+Why $O(T^2)$: step $t$ recomputes $t$ positions, and $1 + 2 + \cdots + T = T(T+1)/2$.
+
 The KV cache stores the key and value projections for every layer and every previously seen
 position. On step $t$ you only compute keys and values for position $t$, append them to the
 cache, and run attention over the full cached sequence.
+
+Keys and values of old positions never change in a causal model: position 3 cannot see
+position 7, so position 3's key is the same no matter how long the text grows. That is what
+makes caching them safe.
+
+> **Picture it:** a meeting where each new person must hear everyone's introduction. Without a
+> cache, all earlier people re-introduce themselves every time someone joins. With a cache, the
+> introductions are written on a whiteboard once; the newcomer reads the board and adds a line.
 
 ```python
 import torch
@@ -240,10 +324,20 @@ Output matches: True
 Cached K shape: torch.Size([1, 4, 6, 16])
 ```
 
+The first line is the proof: the last position's output from the full 6-token pass matches the
+cached one-token pass (within $10^{-5}$). The cache now holds keys for all 6 positions — shape
+`[1, 4, 6, 16]`: 1 sequence, 4 heads, 6 positions, 16 numbers per head.
+
+This attention layer has no causal mask. That is fine for this check because the newest token
+is the last position, and the last position may see everything anyway (ch. 7).
+
 The key insight: the output for the new token is identical whether you recompute the full
 sequence or use the cache. You get the same result while only doing one attention query.
 
 ### Cache memory cost
+
+The cache trades compute for memory: every layer stores a key and a value vector for every
+head, for every token so far.
 
 For a model with $L$ layers, $H$ heads, head dimension $d$, and sequence length $T$:
 
@@ -251,18 +345,35 @@ $$
 \text{KV cache size} = 2 \times L \times H \times T \times d \times \text{bytes per element}
 $$
 
+> **In plain words:** 2 (one key and one value) times layers times heads times tokens times
+> numbers per head, times the bytes each number takes (2 for FP16). Memory grows linearly with
+> the length $T$ and with the batch size.
+
 A 70B-parameter model with 80 layers, 8 KV heads, and head dim 128 at FP16:
 $2 \times 80 \times 8 \times T \times 128 \times 2 = 327{,}680 \times T$ bytes.
-At $T = 8{,}192$ tokens that is 2.56 GB per sequence — for a single batch element.
+At $T = 8{,}192$ tokens that is about 2.68 GB (2.5 GiB) per sequence — for a single batch element.
 
-This is why inference memory is dominated by the KV cache, not the model weights, at long
-context lengths. GQA/MQA reduce this by sharing K and V heads.
+The weights of that model take about 140 GB in FP16, so one sequence's cache is small next to
+them. But serve 64 sequences of 8,192 tokens at once and the caches need about 170 GB — more
+than the weights.
+
+At long context lengths and large batch sizes, inference memory is dominated by the KV cache, not the model weights. GQA/MQA reduce this by sharing K and V heads.
+
+**MQA** (multi-query attention) gives all query heads one shared key/value head; **GQA**
+(grouped-query attention) shares one key/value head per group of query heads. The "8 KV
+heads" above is GQA: the model has 64 query heads, but caches only 8.
 
 ### Batched generation and left-padding
 
+When you generate for several prompts at once, new tokens are appended at the right end of
+each row. If the prompts have different lengths, they must all end at the same column, so you
+pad on the left.
+
 When you generate for a batch of prompts with different lengths, you left-pad shorter prompts
-so all sequences start at position 0 in the attention mask. Right-padding would corrupt
-positional encodings for all but the longest sequence.
+so all sequences end at the same position and new tokens append directly after real text. With right-padding, the new token for a short prompt would land after a run of pad tokens.
+
+Left-padding needs care too: the attention mask must hide the pad slots, and position IDs
+should start counting at each prompt's first real token, so `[0, 4, 5]` gives token 4 position 0.
 
 ```python
 # Left-padding example
@@ -276,6 +387,26 @@ print(padded)
 ```output
 [[1, 2, 3], [0, 4, 5], [0, 0, 6]]
 ```
+
+Each row is now 3 tokens long and ends with its real last token (3, 5, 6), so the next generated
+token for every prompt goes into column 3.
+
+> **Watch out:** many Hugging Face tokenizers pad on the right by default
+> (`tokenizer.padding_side = "right"`), which is right for training and classification but wrong
+> for batched generation with decoder-only models. Set it to `"left"` before calling `generate`.
+
+## Recap in plain words
+
+- Decoding turns next-token probabilities into text, one token at a time.
+- Greedy takes the top token each step: fast and deterministic, but prone to loops.
+- Beam search keeps the $k$ best partial outputs and uses a length penalty to avoid favouring
+  short ones.
+- Temperature reshapes the distribution; top-k and top-p cut off the unlikely tail before
+  sampling.
+- The KV cache stores past keys and values, so each new token costs one position's work
+  instead of the whole prefix.
+- The cache grows with layers, heads, length, and batch, and can outgrow the weights.
+- Batched generation left-pads prompts so new tokens append in the same column.
 
 ## Try it Yourself
 
@@ -325,13 +456,23 @@ Greedy: <bos> a b c <eos>
 Temp=2: <bos> a b c <eos>
 ```
 
+Both lines follow the same path. At $T = 2$ the first step's favourite `a` still has
+probability about 0.70 (the gap of 4 between `a` and `b` halves to 2 after temperature), and
+with `torch.manual_seed(0)` the sampled path happens to match greedy every step.
+
 Try changing `temperature` to 5.0 to see random deviations from the greedy path.
+
+At $T = 5$ the first step's favourite drops to about 0.38, and three seeded runs gave
+`<bos> a b a b`, `<bos> b <eos>` and `<bos> c <eos>` — wrong letters and early stops. Change the
+`2.0` in `logit_fn(ids2)[0, -1] / 2.0` to try it.
 
 ## Exercise
 
 Implement a repetition penalty: before softmax, divide the logit of any token that already
-appears in `ids` by a penalty factor $\alpha > 1$. Show that with $\alpha = 10$ and the
-logit table above, the model avoids repeating 'a' even if forced to start with it twice.
+appears in `ids` by a penalty factor $\alpha > 1$. Show that with $\alpha = 10$ and a copy of the logit table above changed so that 'b' is followed by 'a' (logit 5) ahead of 'c' (logit 4), the model breaks out of the `a b a b` loop that greedy decoding falls into once 'a' has been forced at the start.
+
+> **Hint:** copy the logits before editing them (`.clone()`), so you never change the model's
+> table. Loop over the set of tokens already in `ids` and shrink only positive logits.
 
 <details>
 <summary>Solution</summary>
@@ -351,14 +492,27 @@ def decode_with_rep_penalty(logit_fn, input_ids, max_new_tokens, alpha=2.0, eos_
             break
     return ids
 
-# Force 'a' at start then let penalty steer
+# Make the table loop: after 'b', prefer 'a' (logit 5) over 'c' (logit 4)
+loop_table = logit_table.clone()
+loop_table[2] = torch.tensor([0., 5., 0., 4., 0.])
+def loop_fn(ids):
+    return loop_table[ids[0, -1].item()].unsqueeze(0).unsqueeze(0)
+
+# Force 'a' at start, then compare no penalty (alpha=1) with alpha=10
 forced = torch.tensor([[0, 1]])  # <bos>, a
-result = decode_with_rep_penalty(logit_fn, forced, max_new_tokens=5, alpha=10.0, eos_id=4)
-print(" ".join(vocab[i.item()] for i in result[0]))
+for alpha in [1.0, 10.0]:
+    result = decode_with_rep_penalty(loop_fn, forced, max_new_tokens=5, alpha=alpha, eos_id=4)
+    print(f"alpha={alpha:>4}:", " ".join(vocab[i.item()] for i in result[0]))
 ```
 
 The penalty divides positive logits for seen tokens, pushing the model toward tokens it has
 not yet generated. The key insight is that you only penalize positive logits — negative logits
 would become less negative (increase probability) if divided by $\alpha$.
+
+Running it prints `alpha= 1.0: <bos> a b a b a b` (no penalty: stuck in the loop) and
+`alpha=10.0: <bos> a b c <eos>`. After 'b', the seen token 'a' drops from 5 to 0.5, below
+'c' at 4, so the model moves on. The usual fix for negative logits (as in the CTRL paper and
+Hugging Face) is to *multiply* them by $\alpha$ instead, so seen tokens always lose
+probability.
 
 </details>

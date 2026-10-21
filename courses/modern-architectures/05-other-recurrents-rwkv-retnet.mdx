@@ -7,13 +7,28 @@ order: 5
 
 ## The Zoo of Efficient Sequence Models
 
+Mamba is not the only design that keeps a fixed-size memory. Several others reach the same
+goal by different routes, and seeing them side by side shows which ideas are shared and which
+are particular.
+
 After Mamba, a cluster of other architectures attack the efficiency problem from different angles. They share the same goal: **train in parallel like a transformer, infer as a recurrence**. Each makes different design choices about what to preserve from attention and what to replace.
 
+> **Picture it:** three restaurants that all promise "fast service". One pre-cooks a running
+> stew (RWKV), one keeps a whiteboard of orders that fades over time (RetNet), one cooks
+> everything in one big batch with a clever recipe (Hyena). Same promise, different kitchens.
+
 ## RWKV: RNN Meets Transformer
+
+RWKV replaces "look at every past token" with "keep a running weighted average of past values,
+where older tokens count less". The average can be updated one token at a time, so generation
+costs the same at token 10 and at token 100,000.
 
 RWKV (Peng et al., 2023, pronounced "RWK-V") reframes the attention computation as a weighted moving average with learned decay. It operates as:
 - **A transformer during training** (parallel WKV computation)
 - **An RNN during inference** (constant-time per token)
+
+A **weighted moving average** is an average that slides along the sequence, giving each item
+a weight. **Decay** means the weight shrinks the further back the token is.
 
 The core is the **WKV operator** (Weighted Key-Value):
 
@@ -21,7 +36,20 @@ $$
 \text{wkv}_t = \frac{\sum_{i=1}^{t} e^{-(t-1-i)w + k_i} v_i}{\sum_{i=1}^{t} e^{-(t-1-i)w + k_i}}
 $$
 
+> **In plain words:** the output at step $t$ is a weighted average of all past values $v_i$.
+> Each weight has two parts: $e^{k_i}$ (how important token $i$ said it was, through its
+> key) and a decay factor $e^{-(\text{age}) \cdot w}$ (how long ago it was). The bottom line
+> is the total weight, so the weights sum to 1.
+
 where $w$ is a channel-wise decay vector (learned, positive), $k_i$ and $v_i$ are key/value vectors. The exponential decay $e^{-(t-i)w}$ makes older tokens contribute less — like a learned forgetting rate.
+
+> **Watch out:** the exact offset in the exponent differs between RWKV versions. The paper's
+> form sums past tokens with age $t - 1 - i$ and gives the current token a separate learned
+> "bonus" $u$. The code below uses the simpler $e^{-(t-i)w}$ with no bonus, which is enough to
+> show the mechanism.
+
+The recurrent trick is to keep the top sum (`num`) and bottom sum (`den`) as running totals.
+Each step, multiply both by $e^{-w}$ (age everything by one step) and add the new token.
 
 ```python
 import numpy as np
@@ -59,14 +87,26 @@ print(f"Decay w: {w.round(3)}")
 
 ```output
 RWKV WKV output shape: (8, 4)
-Output (first token): [ 0.8247 -0.6012  0.3451 -0.1823]
-Output (last token):  [ 0.2134 -0.0891  0.1052  0.3217]
-Decay w: [0.287 0.614 0.198 0.521]
+Output (first token): [-0.1139 -0.8402 -0.8245  0.6506]
+Output (last token):  [-0.3629  0.3564 -0.1623 -0.0623]
+Decay w: [0.252 0.62  0.475 0.57 ]
 ```
+
+At the first token, the output is that token's own value, since nothing older exists. By the
+last token, each channel's output is a blend of all 8 values. The decay line shows the four
+channels' forgetting rates: channel 0 has $w = 0.252$ and keeps $e^{-0.252} \approx 0.78$ of
+its history per step, while channel 1, at $w = 0.62$, keeps only about 0.54.
 
 RWKV also uses **token shift** (time-mixing and channel-mixing layers): mix the current token with the previous token's features before computing R, K, V. This gives the model a form of local context without an explicit convolution.
 
+Here **R** is the "receptance", a gate that decides how much of the WKV output to let
+through, playing a role similar to Mamba's gate $z$ (ch. 4).
+
 ## RetNet: Retention Mechanism
+
+RetNet keeps attention's $QK^T$ form but multiplies it by a mask that fades with distance, and
+drops the softmax. Without the softmax, the same computation can be rearranged into a
+fixed-size running state.
 
 RetNet (Sun et al., 2023) builds the parallel/recurrent duality directly into the architecture via **retention**:
 
@@ -74,12 +114,24 @@ $$
 \text{Retention}(Q, K, V) = (Q K^T \odot D) V
 $$
 
+> **In plain words:** compute the usual query-key scores, multiply each score element-wise
+> ($\odot$) by a decay weight $D$, then use the result to mix values. There is no softmax, so
+> scores are not normalized and not exponentiated.
+
 where $D_{mn} = \gamma^{m-n}$ for $m \geq n$ else $0$ — a causal decay mask with learnable per-head $\gamma \in (0, 1)$.
+
+**Causal** means token $m$ can only see tokens at or before $m$ (the zeros above the diagonal
+block the future). With $\gamma = 0.9$, a token one step back gets weight 0.9, ten steps back
+gets $0.9^{10} \approx 0.35$.
 
 This has three equivalent computation modes:
 1. **Parallel** (training): compute like attention with the $D$ mask, $O(n^2)$ but parallelizable
 2. **Recurrent** (single-step inference): $O(1)$ per token via state $s_t = \gamma s_{t-1} + k_t v_t^T$
 3. **Chunkwise** (efficient for long sequences): process chunks in parallel, propagate state between chunks
+
+> **Picture it:** a whiteboard where each token writes its key-value note, and every minute
+> the old writing fades by 10% ($\gamma = 0.9$). A query reads the whole board at once. The
+> board is a fixed $d \times d$ grid, no matter how many notes were written.
 
 ```python
 def retnet_parallel(Q, K, V, gamma=0.9):
@@ -116,11 +168,22 @@ print(f"Output shape: {out_par.shape}")
 ```
 
 ```output
-Parallel vs recurrent max diff: 2.78e-15
+Parallel vs recurrent max diff: 3.89e-16
 Output shape: (16, 8)
 ```
 
+The parallel and recurrent modes agree to $3.89 \times 10^{-16}$, rounding error. The first
+mode builds a $16 \times 16$ masked table; the second never does, it keeps one $8 \times 8$
+state matrix. That equivalence holds only because there is no softmax.
+
+> **Watch out:** retention is linear attention (ch. 2) with a fixed decay. It inherits the
+> same weakness on exact recall: everything older is squashed into the same $d \times d$ board.
+
 ## Hyena: Long Convolutions Without Attention
+
+Hyena gives up on query-key matching entirely. It mixes tokens with very long filters, as in
+the convolution view of SSMs (ch. 3), and adds input-dependent gates so the mixing still
+reacts to content.
 
 Hyena (Poli et al., 2023) goes further — replacing attention entirely with **implicit long convolutions**. Instead of dot-product attention, it uses a data-controlled convolution:
 
@@ -128,9 +191,16 @@ $$
 y = h(x) * x
 $$
 
-where the convolution filter $h(x)$ is itself parameterized as an MLP evaluated at position indices — so it can vary with the input. The key insight: you can compute this efficiently via FFT in $O(n \log n)$, and the filter can capture very long-range dependencies.
+> **In plain words:** slide a filter $h$ along the input $x$ and take a running weighted sum
+> at every position, where the filter can be as long as the whole sequence.
+
+The convolution filter $h(x)$ is **implicit**: rather than storing one weight per lag, a small MLP (multi-layer perceptron) computes the filter value from the position index. That lets the filter be as long as the sequence with only a few parameters. The input dependence comes from element-wise **gates**, projections of the input that multiply the signal before and after each convolution. The key insight: you can compute this efficiently via FFT in $O(n \log n)$, and the filter can capture very long-range dependencies.
 
 Hyena is especially effective for **DNA sequence modeling** and audio, where sequences are very long (100K+ tokens) and local convolutions with long range work well.
+
+The code below shows only the convolution part. A fixed decaying sinusoid stands in for the
+MLP-generated filter, with a different frequency per channel. The FFT is padded to length
+$2T$ so the circular FFT convolution behaves like a normal, non-wrapping one.
 
 ```python
 def hyena_convolution(x, filter_fn, pad=False):
@@ -166,10 +236,21 @@ print(f"Output norm: {np.linalg.norm(y):.3f}")
 
 ```output
 Hyena output shape: (64, 4)
-Output norm: 38.421
+Output norm: 55.745
 ```
 
+The shape confirms one output per token and channel, 64 by 4, with no $64 \times 64$ table.
+The norm, 55.745, is large because the filter barely decays ($e^{-0.01 t}$ still keeps 53% at
+$t = 63$), so each output adds up dozens of past inputs.
+
+> **Watch out:** Hyena's inference is not a cheap fixed-state recurrence. Its filter covers
+> the whole past, so generating each new token still touches all old ones, unless the filter
+> is distilled into a small SSM afterwards.
+
 ## Comparison: All Efficient Architectures
+
+The table puts the six families side by side: their training cost, their per-token inference
+cost, and rough star ratings for quality and hardware friendliness.
 
 ```python
 architectures = {
@@ -187,17 +268,34 @@ for name, d in architectures.items():
 ```
 
 ```output
-Model          Train (time) Infer (time/step)    Quality      HW
+Model                 Train           Infer    Quality       HW
 -----------------------------------------------------------------
-Transformer      O(n²)      O(n) KV cache       ★★★★★     ★★★
-Linear Attn      O(n)       O(1)/step             ★★★    ★★★★
-RWKV             O(n)       O(1)/step            ★★★★   ★★★★
-RetNet           O(n²)      O(1)/step            ★★★★   ★★★★
-Mamba            O(n)       O(1)/step           ★★★★★  ★★★★★
-Hyena        O(n log n)     O(n log n)           ★★★★     ★★★
+Transformer           O(n²)   O(n) KV cache      ★★★★★      ★★★
+Linear Attn            O(n)       O(1)/step        ★★★     ★★★★
+RWKV                   O(n)       O(1)/step       ★★★★     ★★★★
+RetNet                O(n²)       O(1)/step       ★★★★     ★★★★
+Mamba                  O(n)       O(1)/step      ★★★★★    ★★★★★
+Hyena            O(n log n)      O(n log n)       ★★★★      ★★★
 ```
 
+The two columns to compare are Train and Infer. Only the transformer has a growing KV cache at
+inference. RetNet trains in $O(n^2)$ in its parallel form but infers at $O(1)$ per step;
+Hyena is $O(n \log n)$ on both. The star ratings are the course's rough summary of published
+results, not measurements from this code.
+
+## Recap in plain words
+
+- RWKV, RetNet and Hyena all aim to train in parallel and infer cheaply, like Mamba.
+- RWKV is a decaying weighted average of values, updated with two running sums; each channel learns its own decay.
+- RetNet is attention without softmax times a distance-decay mask, so it has parallel, recurrent and chunkwise forms that give identical outputs.
+- Hyena replaces attention with very long, implicitly parameterized convolutions plus input-dependent gates, computed by FFT.
+- All of them compress the past, so exact long-range recall stays harder than with full attention.
+
 ## Try it Yourself
+
+The **chunkwise** mode splits the sequence into chunks of 4. Inside each chunk it uses the
+parallel form; across chunks it carries the $d \times d$ state, exactly as the recurrent form
+does. That is how RetNet trains on long sequences in linear time.
 
 ```python
 import numpy as np
@@ -225,14 +323,15 @@ def retnet_chunkwise(Q, K, V, gamma=0.9, chunk_size=4):
         inner = (Q_c @ K_c.T * D_c) @ V_c  # (L, d)
 
         # Cross-chunk: each Q attends to previous state
-        # Decay the state by gamma^chunk_pos for each position in chunk
-        decay_vec = gamma ** (L - np.arange(L))  # (L,)
+        # Position i in the chunk sees the old state decayed by gamma^(i+1)
+        decay_vec = gamma ** (np.arange(L) + 1)  # (L,)
         cross = (Q_c @ s) * decay_vec[:, None]   # (L, d)
 
         outputs.append(inner + cross)
 
         # Update state: s = gamma^L * s + K_c^T V_c accumulated with decay
-        s = (gamma ** L) * s + K_c.T @ V_c
+        k_decay = gamma ** (L - 1 - np.arange(L))  # newer keys decay less
+        s = (gamma ** L) * s + (K_c * k_decay[:, None]).T @ V_c
 
     return np.vstack(outputs)
 
@@ -248,12 +347,25 @@ print(f"Recurrent vs chunkwise max diff: {np.abs(out_rec - out_chunk).max():.4f}
 ```
 
 ```output
-Recurrent vs chunkwise max diff: 0.0031
+Recurrent vs chunkwise max diff: 0.0000
 ```
+
+The maximum difference is 0.0000: chunkwise, recurrent and parallel all compute the same
+retention. Two details make it exact. Position $i$ inside a chunk sees the carried state
+decayed by $\gamma^{i+1}$, and when a chunk is folded into the state, its older keys are decayed
+more than its newer ones.
+
+Try `chunk_size=1` (pure recurrence) and `chunk_size=16` (pure parallel). Both should still
+print 0.0000. Then change `decay_vec` back to `gamma ** (L - np.arange(L))` to see how big an
+error a one-line decay bug causes.
 
 ## Exercise
 
 For RWKV, the decay $w$ is a learned, positive, per-channel vector. What happens to the model's behavior when $w$ is very large vs very small? Design an experiment to show this.
+
+> **Hint:** keep everything else fixed and vary only $w$. Then think about what to feed in:
+> if every key and value is the same, any average of them is the same too, so decay cannot
+> show up. Use random inputs.
 
 <details>
 <summary>Solution</summary>
@@ -291,6 +403,9 @@ w=10.00: output[0]=1.0000, output[19]=1.0000, converges_fast=yes
 
 With constant k and v, all decays converge — vary them to see the difference:
 
+Every row prints 1.0000. That is the expected failure of the first experiment: when every value
+is 1, any weighted average of them is 1, whatever the weights.
+
 ```python
 def wkv_varying(w, T=20, seed=0):
     rng = np.random.default_rng(seed)
@@ -309,15 +424,19 @@ for w_val in [0.01, 2.0, 10.0]:
     # Correlation: does early input affect late output?
     corr = np.corrcoef(out[:5].mean(), out[-5:].mean())[0, 1] if False else "n/a"
     print(f"w={w_val:5.2f}: range=[{out.min():.3f}, {out.max():.3f}], "
-          f"std={out.std():.3f} (large=sensitive to history)")
+          f"std={out.std():.3f} (large=tracks the newest token)")
 ```
 
 ```output
-w= 0.01: range=[-0.841, 0.912], std=0.531 (large=sensitive to history)
-w= 2.00: range=[-0.738, 0.846], std=0.421 (large=sensitive to history)
-w=10.00: range=[-0.654, 0.801], std=0.372 (large=sensitive to history)
+w= 0.01: range=[-0.350, 0.527], std=0.222 (large=tracks the newest token)
+w= 2.00: range=[-0.920, 1.438], std=0.641 (large=tracks the newest token)
+w=10.00: range=[-1.010, 1.493], std=0.696 (large=tracks the newest token)
 ```
 
 Large $w$ → strong decay → model is more "local" (recent tokens dominate). Small $w$ → weak decay → model retains older history. RWKV learns different $w$ per channel, so each channel can specialize in different time scales.
+
+The standard deviations prove it. With $w = 0.01$ the output is a long average of many tokens,
+so it barely moves (std 0.222). With $w = 10$ the output is almost exactly the newest value,
+so it jumps around as much as the inputs do (std 0.696, range $-1.010$ to $1.493$).
 
 </details>
