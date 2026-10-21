@@ -7,10 +7,16 @@ order: 14
 
 ## Match the metric to the task
 
+The number you train on and the number you are judged on are usually different. Winning means
+knowing exactly how the judge scores you, and having your own way to measure that score before
+you submit.
+
 You optimize cross-entropy (F3), but you're **scored** on a competition metric — and
 those are different things. The team that understands the metric and builds a
 trustworthy way to estimate it usually wins, independent of model cleverness. This
 chapter is the measurement discipline.
+
+A **metric** is the formula that turns predictions and true answers into a score.
 
 Know exactly how your metric is computed:
 - **Classification / sentiment / NLI:** accuracy if classes are balanced; otherwise
@@ -25,6 +31,21 @@ $$
 F_1 = \frac{2 \cdot P \cdot R}{P + R}
 $$
 
+> **In plain words:**
+> - $TP$ (true positives): flagged and really positive. $FP$ (false positives): flagged but
+>   not positive. $FN$ (false negatives): positive but missed.
+> - Precision is the share of your flags that were right; recall is the share of real
+>   positives you caught.
+> - $F_1$ combines them with the **harmonic mean**, which is dragged toward the smaller of the
+>   two: precision 1.0 with recall 0.1 gives $F_1 \approx 0.18$, not 0.55.
+
+**NLI** (natural language inference) is deciding whether one sentence follows from, contradicts,
+or is unrelated to another.
+
+> **Picture it:** a fishing net. Precision asks "of everything in my net, how much is fish and
+> how much is old boots?". Recall asks "of all the fish in the lake, how many did I catch?". A
+> tiny net has high precision and low recall; a net the size of the lake has the opposite.
+
 - **Extractive QA:** **Exact Match (EM)** and **token-level $F_1$** between predicted
   and gold answer spans.
 - **Generation / summarization / translation:** **BLEU**/**chrF** (n-gram overlap;
@@ -35,7 +56,19 @@ $$
   and optimize *that*.
 - **Ranking / retrieval (RAG):** recall@k, MRR, NDCG.
 
+A **gold** answer is the reference answer written by the annotators. **Morphologically rich**
+means words change form a lot (many suffixes and inflections), so two correct answers often share
+characters but not whole words. **recall@k** is the share of queries whose right document is in
+the top $k$; **MRR** and **NDCG** also reward putting it near the top.
+
+> **Watch out:** "F1" in a competition can mean binary F1 (one positive class), macro-F1
+> (classes averaged equally) or micro/weighted F1 (big classes count more). On imbalanced data
+> these can differ by 10 points or more. Check which one the rules use.
+
 ## Precision, recall, F1 — from scratch
+
+Counting the three kinds of hits and misses by hand is the surest way to understand these
+metrics. The block scores 7 predictions.
 
 ```python
 import numpy as np
@@ -64,7 +97,15 @@ precision, recall, F1: (0.75, 0.75, 0.75)
 macro-F1: 0.708
 ```
 
+For class 1, the predictions contain 3 true positives (positions 0, 3 and 6), 1 false positive
+(position 4) and 1 false negative (position 1), so precision and recall are both $3/4 = 0.75$,
+and so is F1. Macro-F1 also scores class 0, which gets F1 0.667 (2 right, 1 false alarm, 1
+miss), and averages the two: $(0.75 + 0.667)/2 = 0.708$.
+
 ## Build a validation scheme that mirrors the test set
+
+A practice test is only useful if it resembles the real exam. Your validation split must be built
+so that its score rises and falls with the hidden test score.
 
 Your local score must move together with the leaderboard, or you're flying blind.
 **$k$-fold cross-validation** splits the data into $k$ parts, trains on $k-1$ and
@@ -76,17 +117,36 @@ be honest:
 - **Group** by any unit that must not be split — if the same author, document, or source
   appears in both train and validation, you leak (F15). Use grouped folds then.
 
+The **leaderboard** (LB) is the competition's public ranking, computed on part of the hidden
+test set. A **fold** is one of the $k$ parts. **Leaking** means information from the validation
+rows reaches training, which makes the validation score too optimistic.
+
+> **Picture it:** $k$-fold is a class of 5 students taking turns as the examiner. Each turn,
+> four study together and the fifth sets the test. Everyone is examined once, and the average
+> mark is far more reliable than a single test.
+
 For expensive LLM fine-tuning you often can't afford 5 folds; a single, carefully
 built, stratified (and grouped) **hold-out** validation set is acceptable — but guard
 it religiously and never tune on the public leaderboard (F15).
 
 ## Calibration — are your probabilities honest?
 
+A model that says "90% sure" should be right about 90% of the time. Calibration checks whether the
+stated confidence matches the real hit rate.
+
 A model is *calibrated* if, among predictions it makes with confidence $c$, about a
 fraction $c$ are correct. Deep models are often **overconfident** — they say 0.99 and
 are right 0.90 of the time. This matters when (a) the metric uses probabilities
 (log-loss, AUC), (b) you set decision thresholds, or (c) you ensemble — miscalibrated
 members blend badly.
+
+**Log-loss** is cross-entropy used as a metric. **AUC** measures how well the scores rank
+positives above negatives. A **decision threshold** is the cut-off, such as 0.5, above which you
+predict "positive". To **ensemble** is to average several models' predictions.
+
+> **Picture it:** a weather forecaster. If, on all the days she said "70% chance of rain", it
+> rained on about 7 out of 10, she is calibrated. If it rained on only 5 out of 10, she is
+> overconfident, even if her forecasts rank the days correctly.
 
 Measure it with **Expected Calibration Error (ECE)**: bin predictions by confidence,
 compare average confidence to average accuracy per bin, and take the weighted gap:
@@ -95,8 +155,22 @@ $$
 \mathrm{ECE} = \sum_{b=1}^{B} \frac{|B_b|}{n} \left|\overline{\mathrm{conf}}(B_b) - \overline{\mathrm{acc}}(B_b)\right|
 $$
 
+> **In plain words:**
+> - Split the $n$ predictions into $B$ bins by confidence, for example 0–0.2, 0.2–0.4, and so on.
+> - In each bin $B_b$, compare the average stated confidence with the actual hit rate.
+> - Weight each bin's gap by its share of predictions, $|B_b|/n$, and add them up.
+> - 0 means perfectly honest; bigger means less honest.
+
 Fix it with **temperature scaling** — divide logits by a learned $T > 1$ to soften — or
 isotonic/Platt scaling, fit on validation.
+
+**Temperature scaling** is the same temperature knob as in F1 and F13, but with $T$ chosen to
+make validation probabilities honest. **Platt scaling** fits a small logistic regression on top
+of the scores; **isotonic** scaling fits a staircase-shaped mapping. Neither changes which class
+is predicted, only how confident the prediction is.
+
+The block below computes ECE for 7 binary predictions, where `probs` is the predicted probability
+of class 1 and `labels` is the truth.
 
 ```python
 import numpy as np
@@ -119,13 +193,37 @@ print("ECE:", round(ece(probs, labels), 3), "(0 = perfectly calibrated)")
 ECE: 0.207 (0 = perfectly calibrated)
 ```
 
-An ECE of 0.207 on this toy overconfident set — confirmed.
+An ECE of 0.207 on this toy set — confirmed.
+
+Look at what produced 0.207. Every prediction above 0.5 really was class 1, and every
+prediction below it really was class 0: the model is always *right*, but its confidence is too
+*low*. For example, the bin holding 0.7 and 0.8 averages 0.75 confidence while both cases were
+class 1, a gap of 0.25. So this toy set is **underconfident**, the opposite of the usual deep-net
+failure. A temperature $T < 1$ would sharpen it.
+
+> **Watch out:** ECE with 7 predictions and 5 bins is far too noisy to trust; one changed label
+> moves it a lot. Use at least several hundred validation predictions, and look at the
+> per-bin gaps (a **reliability diagram**), not only the single number.
 
 **Put it together for the competition:** (1) read the exact metric, (2) build a
 stratified+grouped CV/hold-out that tracks the LB, (3) optimize the *metric* (tune
 thresholds/decoding to it, not just loss), (4) check calibration before you ensemble.
 
+## Recap in plain words
+
+- You train on cross-entropy but are scored on a task metric, so learn exactly how that
+  metric is computed.
+- Precision is "how many of my flags were right"; recall is "how many real positives I caught";
+  F1 combines them.
+- Macro-F1 averages F1 over classes, so rare classes count as much as common ones.
+- Cross-validation scores the model on several held-out parts and averages them.
+- Stratify folds by label, and group them by anything (author, document) that must not be split.
+- A calibrated model's confidence matches its hit rate; ECE measures the mismatch.
+
 ## Try it Yourself
+
+This splits 12 labels, 8 of class 0 and 4 of class 1, into 4 stratified folds and prints each
+fold's members and class counts.
 
 ```python
 import numpy as np
@@ -144,10 +242,25 @@ def stratified_folds(y, k=3, seed=0):
 y = np.array([0]*8 + [1]*4)                 # imbalanced 2:1
 folds = stratified_folds(y, k=4)
 for i, f in enumerate(folds):
-    print(f"fold {i}: indices {list(f)}  class counts {dict(Counter(y[f]))}")
+    print(f"fold {i}: indices {f.tolist()}  class counts {dict(Counter(y[f].tolist()))}")
 # Every fold keeps ~2:1 -> validation scores are comparable and trustworthy.
 # A plain random split could hand one fold all the minority class -> useless estimate.
 ```
+
+```output
+fold 0: indices [2, 5, 9]  class counts {0: 2, 1: 1}
+fold 1: indices [0, 4, 10]  class counts {0: 2, 1: 1}
+fold 2: indices [1, 3, 8]  class counts {0: 2, 1: 1}
+fold 3: indices [6, 7, 11]  class counts {0: 2, 1: 1}
+```
+
+Every fold has exactly `{0: 2, 1: 1}`: two of class 0 and one of class 1, the same 2:1 ratio as
+the whole dataset. Each index from 0 to 11 appears in exactly one fold, so every example is
+validated exactly once.
+
+Try a variation: replace the folds with a plain shuffle, `np.array_split(np.random.permutation(12), 4)`,
+and print the class counts. With only 4 minority examples, some folds will often end up with
+zero or two of them.
 
 ## Exercise
 
@@ -158,11 +271,46 @@ leaderboard position will be noisy, so you should trust improvements only when t
 exceed the fold-to-fold noise. This function is how you'll decide whether any change
 *actually* helped (F15).
 
+> **Hint:** reuse `stratified_folds` and `macro_f1` from this chapter. For each fold, the
+> training rows are all the rows *not* in that fold; `np.setdiff1d` gives you them.
+
 <details>
-<summary>Hint</summary>
+<summary>Solution</summary>
 
 For each fold $f$: train on the union of the other folds, predict on fold $f$, score
 with `macro_f1`. Return `np.mean(scores), np.std(scores)`. Decision rule: accept a
 change only if $\text{new\_mean} - \text{old\_mean} > \text{old\_std}$ — otherwise it's
 within noise.
+
+Run the `prf`/`macro_f1` block and the Try-it block first, then:
+
+```python
+def cross_validate(make_model, X, y, k=5, seed=0):
+    folds = stratified_folds(y, k=k, seed=seed)
+    scores = []
+    for f in folds:
+        train = np.setdiff1d(np.arange(len(y)), f)       # every row not in this fold
+        model = make_model().fit(X[train], y[train])
+        scores.append(macro_f1(y[f], model.predict(X[f])))
+    return np.mean(scores), np.std(scores)
+
+class NearestCentroid:                                   # a tiny stand-in model
+    def fit(self, X, y):
+        self.classes = np.unique(y)
+        self.centers = np.array([X[y == c].mean(0) for c in self.classes]); return self
+    def predict(self, X):
+        d = ((X[:, None, :] - self.centers[None]) ** 2).sum(-1)
+        return self.classes[d.argmin(1)]
+
+rng = np.random.default_rng(0)
+y = np.array([0] * 120 + [1] * 60)                       # imbalanced 2:1
+X = rng.normal(size=(180, 2)) + y[:, None] * 1.5         # class 1 shifted by 1.5
+mean, std = cross_validate(NearestCentroid, X, y, k=5)
+print(f"macro-F1 = {mean:.3f} +/- {std:.3f} over 5 folds")
+```
+
+It prints `macro-F1 = 0.844 +/- 0.067 over 5 folds`. The fold-to-fold spread of 0.067 is the
+noise floor: a new idea that lifts the mean from 0.844 to 0.860 has not beaten it, so you
+should not believe the gain. `make_model` is a function that returns a *fresh*, untrained model,
+so no fold reuses weights trained on another fold.
 </details>

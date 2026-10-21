@@ -7,6 +7,11 @@ order: 11
 
 ## Why distill across architectures?
 
+Training a big model from scratch is very expensive. **Distillation** is the shortcut: let a
+trained model (the **teacher**) show a new model (the **student**) what it would answer, and
+train the student to copy it. Cross-architecture distillation does this when teacher and
+student are built completely differently.
+
 Knowledge distillation usually transfers within the same architecture family — a large
 BERT into a smaller BERT (DistilBERT), or a large GPT into a smaller GPT. Cross-architecture
 distillation transfers knowledge across fundamentally different designs: a Transformer
@@ -18,7 +23,14 @@ serves the same request at $O(n)$ cost with constant-size recurrent state. If a 
 student can recover most of the Transformer teacher's quality, you get better
 throughput per GPU-dollar.
 
+> **Picture it:** a master chef (Transformer) who cooks brilliantly but needs a huge kitchen,
+> training an apprentice who works from a food truck (Mamba). The apprentice cannot copy the
+> chef's kitchen layout, but can taste every dish and learn to make it taste the same.
+
 ## Standard distillation recap
+
+The student learns from two signals at once: the true answers, and the teacher's full
+opinion of how likely every answer was.
 
 In standard knowledge distillation (Hinton et al., 2015), the student minimizes:
 
@@ -26,10 +38,20 @@ $$
 \mathcal{L} = \alpha \cdot \mathcal{L}_{CE}(y, \hat{y}) + (1-\alpha) \cdot \mathcal{L}_{KL}(p_T, p_S)
 $$
 
+> **In plain words:**
+> - $\mathcal{L}_{CE}(y, \hat{y})$ is the usual cross-entropy against the true label $y$;
+> - $\mathcal{L}_{KL}(p_T, p_S)$ is the **KL divergence**, a measure of how far the student's probabilities $p_S$ are from the teacher's $p_T$ (0 means identical);
+> - $\alpha$ sets the mix between "match the label" and "match the teacher".
+
 where $p_T = \text{softmax}(z_T / \tau)$ and $p_S = \text{softmax}(z_S / \tau)$ are the
 teacher and student logits softened by temperature $\tau$. A higher $\tau$ spreads
 probability more evenly across classes, revealing the teacher's "dark knowledge" —
 which wrong answers it considered plausible.
+
+**Dark knowledge** is the information hidden in the small probabilities: a teacher that gives
+"cat" 0.9, "lynx" 0.08 and "truck" 0.0001 is telling you cats look like lynxes, not trucks.
+Dividing logits by $\tau > 1$ before the softmax makes those small numbers big enough to learn
+from.
 
 ```python
 import torch
@@ -46,6 +68,7 @@ def distillation_loss(student_logits, teacher_logits, labels, alpha=0.5, tau=4.0
     return alpha * ce_loss + (1 - alpha) * kl_loss
 
 # Example: 4-class logits for a batch of 8
+torch.manual_seed(0)
 B, C = 8, 4
 student_logits  = torch.randn(B, C)
 teacher_logits  = torch.randn(B, C)
@@ -56,16 +79,25 @@ print(f"Distillation loss: {loss.item():.4f}")
 ```
 
 ```output
-Distillation loss: 1.5823
+Distillation loss: 1.2149
 ```
+
+The loss for this batch of 8 random 4-class predictions is 1.2149, half cross-entropy and half
+softened KL. The KL part is multiplied by $\tau^2 = 16$; that standard correction keeps its
+gradients the same size as the cross-entropy's, as the Try it section shows.
 
 ## The cross-architecture mismatch
 
-When the teacher is a Transformer and the student is an SSM, you can't match hidden
-states layer-by-layer — the attention layer produces a $(B, T, T)$ attention matrix that
-has no counterpart in Mamba's hidden state. This limits distillation to **output-level**
-(logit matching) rather than the richer **feature-level** distillation used within
-the same architecture.
+Inside, a Transformer and a Mamba model hold different kinds of intermediate results, so the
+easiest thing to match is the final answer, token by token.
+
+When the teacher is a Transformer and the student is an SSM, you can't directly match its
+attention layer by layer — the attention layer produces a $(B, T, T)$ attention matrix that
+has no counterpart in Mamba-1's hidden state. The simplest recipes therefore stick to
+**output-level** distillation (logit matching) rather than the richer **feature-level**
+distillation (matching intermediate activations) used within the same architecture. Mamba-2's
+duality (ch. 4) does give an SSM its own $T \times T$ mixing matrix, which is what lets newer
+recipes match attention patterns too.
 
 Two practical approaches:
 
@@ -77,22 +109,47 @@ Two practical approaches:
    attention layer at a time with an SSM block, fine-tune to recover quality, then
    replace the next layer. This trains a sequence of increasingly Mamba-like models.
 
+**Fine-tuning** is a short extra round of training that adapts an existing model.
+
 ## SAMBA and Zamba distillation recipes
 
-**SAMBA** (Microsoft, 2024): starts with a pretrained Transformer, trains a hybrid
-Mamba+SWA student from scratch using the Transformer's output logits as soft targets
-at every token. Recovers 95%+ of the teacher's quality at 2× inference throughput.
+Samba and Zamba are often mentioned in this context, but the published distillation recipes
+come from other papers. Getting that right matters if you go looking for the details.
 
-**Zamba** (Zyphra, 2024): uses a single shared-attention layer that appears at multiple
-depths via weight tying. The distillation recipe includes both token-level KL loss and
-a "layer mimicry" loss that aligns the MLP outputs (which are architecture-agnostic)
-between teacher and student.
+**Samba** (Microsoft, 2024) and **Zamba** (Zyphra, 2024) were both pretrained from scratch,
+not distilled from a Transformer. Their relevance here is architectural: Samba's Mamba plus
+sliding-window design and Zamba's single shared-attention layer, reused at multiple depths
+via weight tying (ch. 8), are typical *targets* for a distilled hybrid.
+
+The documented Transformer-to-SSM recipes are these:
+
+- **MOHAWK** (Bick et al., 2024) distills in three stages: first align each layer's mixing
+  matrix with the teacher's attention matrix, then align each block's hidden-state outputs,
+  then distill end-to-end on the logits. It turned Phi-1.5 into a Mamba-2-style student using
+  a small fraction of the usual training tokens.
+- **Mamba in the Llama** (Wang et al., 2024) initializes Mamba layers from the teacher's
+  attention projections (queries, keys and values map onto the SSM's $C$, $B$ and input),
+  keeps a fraction of the attention layers, then trains with token-level KL and fine-tuning.
+
+> **Watch out:** many blog posts describe Samba or Zamba as "distilled". Check the paper's
+> training section before copying a recipe, because "trained from scratch" and "distilled"
+> need very different budgets and data.
 
 ## Throughput × quality Pareto frontier
+
+Every model is a trade between how good it is and how fast it is. The best trades form a
+curve, and distillation tries to push models onto it.
 
 The goal of cross-architecture distillation is to move along the Pareto frontier: for a
 fixed quality level, achieve better throughput; or for a fixed throughput budget, achieve
 better quality.
+
+The **Pareto frontier** is the set of models that no other model beats on *both* quality and
+speed at once. **PPL** (perplexity) measures how surprised a language model is by real text;
+lower is better.
+
+The table below is illustrative: it shows the typical shape of the trade, not measurements
+from a specific paper.
 
 | Model | Quality (PPL↓) | Throughput (tok/s) | Context |
 |-------|---------------|-------------------|---------|
@@ -103,6 +160,9 @@ better quality.
 The distilled hybrid hits near-teacher quality at near-SSM throughput — the sweet spot.
 
 ## When to use each model family in production
+
+There is no single best model. The right choice depends on how long your inputs are, how fast
+answers must arrive, and how much memory you have.
 
 The production choice is rarely "best model wins." It is "best model given my
 latency/memory/throughput constraint":
@@ -116,7 +176,24 @@ latency/memory/throughput constraint":
 - **Multi-tenant serving (many users, varied lengths)** → Hybrid. PagedAttention handles
   short requests; SSM layers handle the long tail cheaply.
 
+**Latency** is the wait for one answer; **throughput** is answers per second across all
+users. **Multi-tenant** means one server shares many users. **PagedAttention** (from vLLM)
+stores the KV cache in fixed-size pages, like an operating system's memory pages, so many
+requests of different lengths can share GPU memory without waste.
+
+## Recap in plain words
+
+- Distillation trains a student to copy a teacher's full probability outputs, not only the right answers.
+- Temperature $\tau$ softens both distributions so small "wrong-answer" probabilities carry signal; the KL term is scaled by $\tau^2$.
+- Transformer and Mamba internals differ, so the simplest recipes match outputs token by token.
+- Progressive substitution swaps attention layers for SSM layers one at a time, fine-tuning in between.
+- MOHAWK and Mamba-in-the-Llama are the documented Transformer-to-SSM recipes; Samba and Zamba were trained from scratch.
+- Pick the family by context length, latency and memory, not by a single leaderboard.
+
 ## Try it Yourself
+
+Token-level distillation for a language model: random student and teacher logits over a
+1,000-word vocabulary at 32 positions, compared at four temperatures.
 
 ```python
 import torch, torch.nn.functional as F
@@ -132,6 +209,7 @@ def token_level_distill_loss(student_lm_logits, teacher_lm_logits, tau=3.0):
     kl = F.kl_div(log_p_s, p_t, reduction='batchmean') * (tau ** 2)
     return kl
 
+torch.manual_seed(0)
 B, T, V = 4, 32, 1000
 student  = torch.randn(B, T, V)
 teacher  = torch.randn(B, T, V)
@@ -142,14 +220,25 @@ for tau in [1.0, 2.0, 4.0, 8.0]:
 ```
 
 ```output
-tau=1.0  KL loss=6.9078
-tau=2.0  KL loss=1.8412
-tau=4.0  KL loss=0.4823
-tau=8.0  KL loss=0.1241
+tau=1.0  KL loss=31.9800
+tau=2.0  KL loss=31.9807
+tau=4.0  KL loss=31.9813
+tau=8.0  KL loss=31.9843
 ```
+
+The scaled loss barely moves: 31.9800 at $\tau = 1$ and 31.9843 at $\tau = 8$. The raw KL
+shrinks roughly like $1/\tau^2$, and the $\tau^2$ factor cancels that, which is exactly why
+the factor is there.
 
 Higher temperature → softer distributions → smaller raw KL, but scaled by $\tau^2$ in
 the full loss to keep gradient magnitudes comparable across temperatures.
+
+> **Watch out:** why is the loss about 32 rather than about 1? With `reduction='batchmean'`
+> on a $(B, T, V)$ tensor, PyTorch divides the sum by $B = 4$ only, not by $B \times T = 128$.
+> The loss is summed over the 32 positions. Flatten to $(B \cdot T, V)$ first if you want a
+> per-token average.
+
+Remove the `* (tau ** 2)` and rerun to see the raw KL fall as $\tau$ grows.
 
 ## Exercise
 
@@ -157,6 +246,10 @@ Implement progressive substitution: given a 4-layer toy Transformer, replace its
 one at a time with SSM proxies and measure the KL divergence between the original model's
 output and the increasingly substituted model's output. Plot KL vs number of substituted
 layers.
+
+> **Hint:** keep the teacher's layers in a list, and for $n$ substitutions build a new list
+> whose first $n$ entries are fresh SSM proxies and whose rest are the teacher's layers.
+> Run both stacks on the same input under `torch.no_grad()` and compare softmaxed outputs.
 
 <details>
 <summary>Solution</summary>
@@ -181,6 +274,7 @@ class SSMProxy(nn.Module):
     def forward(self, x):
         return torch.sigmoid(self.gate(x)) * self.val(x) + x
 
+torch.manual_seed(0)
 D, N_LAYERS = 32, 4
 teacher_layers = nn.ModuleList([ToyTransformerLayer(D) for _ in range(N_LAYERS)])
 
@@ -211,13 +305,16 @@ for n_sub in range(N_LAYERS + 1):
 
 ```output
 Substituted layers: 0/4  KL=0.0000
-Substituted layers: 1/4  KL=0.1832
-Substituted layers: 2/4  KL=0.3541
-Substituted layers: 3/4  KL=0.5203
-Substituted layers: 4/4  KL=0.6987
+Substituted layers: 1/4  KL=0.0012
+Substituted layers: 2/4  KL=0.0259
+Substituted layers: 3/4  KL=0.5875
+Substituted layers: 4/4  KL=11.6462
 ```
 
-KL grows roughly linearly with substituted layers, suggesting each layer contributes
-independently. In practice, fine-tuning after each substitution step keeps the KL low —
+KL is far from linear in the number of substituted layers: it grows by more than an order of
+magnitude with each extra layer (0.0012, 0.0259, 0.5875, then 11.6462). Replacing the first
+layer barely matters, because three of the original teacher layers still follow it and reshape its output; replacing the last
+ones leaves nothing to absorb the change. The proxies are untrained, so this is the worst case. In practice, fine-tuning after each substitution step keeps the KL low —
 progressive substitution with fine-tuning recovers quality that cold substitution loses.
+
 </details>

@@ -7,13 +7,29 @@ order: 13
 
 ## The project
 
+In plain words: you build one of the "cheaper than attention" ideas from this course with your
+own hands, plus a memory-saving version of attention, then race them against ordinary
+attention on speed and on quality, and write up honestly who won and why.
+
 You will implement either a minimal SSM/Mamba block (selective scan) or an MoE FFN layer
 with routing and load-balancing, pair it with a grouped-query attention (GQA) module you
 write from scratch, and benchmark both throughput and quality against vanilla multi-head
 attention on a real sequence task. The deliverable is a working implementation backed by
 a written tradeoff analysis.
 
+**Vanilla multi-head attention** (MHA) is the standard attention of ch. 1, with every query
+head having its own key and value head. **GQA** lets several query heads share one key/value
+head to shrink the KV cache. The project proves the course because every claim you make about
+speed, memory or recall must come from your own measurements, not from a paper's table.
+
+> **Picture it:** a test kitchen. You cook the new recipe and the classic recipe side by side,
+> with the same ingredients, the same oven and a stopwatch, and you taste both. Then you write
+> the review.
+
 ## Hard constraints (no vibe coding)
+
+These rules make sure the core ideas are built by you rather than imported, so the result
+shows your understanding, not a library's.
 
 - You MAY NOT use the `mamba-ssm`, `megalodon`, `state-spaces`, or any other SSM library
   for the core SSM block. Implement the selective scan yourself in PyTorch.
@@ -25,7 +41,17 @@ a written tradeoff analysis.
 - You MAY use PyTorch's autograd; you do NOT need to write CUDA kernels.
 - You MAY use standard training utilities (DataLoader, LR scheduler, AMP).
 
+**Autograd** is PyTorch's automatic gradient computation. **AMP** (automatic mixed precision)
+runs parts of training in 16-bit floats for speed.
+
+> **Watch out:** GPU calls return before the work is finished. Call
+> `torch.cuda.synchronize()` before reading `time.perf_counter()`, and run a few warm-up
+> iterations first, or your timings measure nothing but launch overhead.
+
 ## What it must contain (and the chapter each tests)
+
+Six pieces: one efficient block, GQA, a speed test, a quality test, a recall test, and a
+written analysis. Each one exercises specific chapters.
 
 - **SSM block or MoE FFN** (ch. 3–7): implement one of:
   - A selective-scan SSM block: input-dependent $\Delta, B, C$ projected from input,
@@ -33,40 +59,68 @@ a written tradeoff analysis.
   - A top-2 MoE FFN: linear router → softmax → top-2 selection → dispatch tokens to
     expert FFNs → weighted sum → auxiliary load-balancing loss $\alpha \sum f_i P_i$
     (ch. 6–7).
-- **Grouped-query attention (GQA)** (ch. 2, ch. 1): implement attention with $n_q$ query
+
+  In plain words: either a memory that each token can choose to write into or wipe, or a set
+  of specialist FFNs with a receptionist that spreads the work evenly.
+- **Grouped-query attention (GQA)** (ch. 1): implement attention with $n_q$ query
   heads and $n_{kv}$ key-value heads where $n_q > n_{kv}$; each K/V head is shared
   across $n_q / n_{kv}$ query heads. Verify output matches $n_q = n_{kv}$ (standard MHA)
   to floating-point tolerance. (ch. 1)
+
+  In plain words: compute fewer K/V heads and repeat each one for its group of query heads.
+  When the group size is 1 it must reduce exactly to ordinary MHA.
 - **Throughput benchmark** (ch. 1): measure tokens/second at sequence lengths 256, 1024,
   and 4096 for (a) your alternative block and (b) vanilla MHA, on the same hardware.
   Report the ratio. (ch. 1, 2)
+
+  Expect the ratio to change with length: at 256 tokens attention is cheap, at 4096 its
+  $n^2$ cost shows.
 - **Quality benchmark** (ch. 3–12): train your model and a Transformer baseline on a
   small language modeling task (e.g., char-level Shakespeare or wikitext-2 subset) with
   equal parameter budgets. Report final validation perplexity. (ch. 9–12)
+
+  **Perplexity** is $e$ raised to the average per-token loss in nats; lower is better.
+  "Equal parameter budgets" is the fair-baseline rule from ch. 12.
 - **Needle-in-haystack or copy task** (ch. 3, 4): show whether your alternative can
   retrieve a specific token planted early in a long sequence (copy task at delay
   $T = 64, 128, 256$). Compare to a Transformer with the same depth. (ch. 3–4)
+
+  This is the recall weakness of fixed-size states (ch. 4, ch. 8) put to an actual test.
 - **Tradeoff analysis** (ch. 12): apply the 6-step paper-reading framework from ch. 12
   to your own experiment — key equation, ablation (what if you remove the load-balancing
   loss? what if you use MHA instead of GQA?), and the architecture decision checklist.
 
+> **Watch out:** a pure Python loop over time steps will make an SSM look slow at every
+> length. Either vectorize the scan (ch. 4) or state clearly in the analysis that your
+> timing measures the loop, not the algorithm.
+
 ## Acceptance criteria
+
+These are the pass/fail lines. Each one is a number you can measure and report.
 
 - **SSM path**: selective scan passes the copy task at delay $T = 64$ (output token at
   position 64 matches input token at position 0 with accuracy > 95% after training).
-- **MoE path**: with 8 experts and top-2 routing, the maximum expert utilization fraction
-  is below $2/N = 0.25$ on the validation set (load balance achieved).
+- **MoE path**: with 8 experts and top-2 routing, the busiest expert receives a fraction of
+  all routing assignments (each token makes 2) below $2/N = 0.25$ on the validation set,
+  that is, at most twice the fair share of $1/N$ (load balance achieved).
 - **GQA**: output of your GQA with $n_{kv} = n_q$ (fully expanded) matches
   `torch.nn.functional.scaled_dot_product_attention` on the same inputs to `atol=1e-5`.
 - **Throughput**: your implementation shows measurable advantage over vanilla MHA at
   sequence length $\geq 1024$ (at least 1.3× faster tokens/sec, or measurably smaller
   peak memory).
-- **Perplexity**: your model reaches validation perplexity within 1.5 nats of a
-  Transformer baseline trained with equal parameter budget and equal steps.
+- **Perplexity**: your model's validation loss is within 1.5 nats of a Transformer
+  baseline trained with equal parameter budget and equal steps (perplexity within a
+  factor of about 4.5).
 - **Analysis**: the tradeoff writeup explicitly addresses all four axes — active FLOPs
   per token, KV cache memory formula, training parallelizability, and recall quality.
 
+> **Watch out:** use `torch.cuda.max_memory_allocated()` (after `reset_peak_memory_stats()`)
+> for the peak-memory claim, and compare at the same batch size and sequence length.
+
 ## Skills checklist (tick before you claim done)
+
+If you can honestly tick every box, you can build, measure and choose between the
+architectures of this course.
 
 - [ ] I can implement a selective scan (or MoE router + dispatch) in pure PyTorch without
   external libraries, and explain what each component does.

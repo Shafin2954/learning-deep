@@ -7,6 +7,9 @@ order: 13
 
 ## The training objective
 
+A language model learns from one exercise repeated across all its text: hide the next word and
+guess it. Writing happens the same way in reverse: guess a word, append it, and guess again.
+
 You've built the architecture (F12). This chapter is how it *learns* to be a language
 model and how it *generates* text — the two ends of every LLM. Both reduce to things
 you already know (F1, F3, F10), arranged for sequences.
@@ -20,6 +23,13 @@ $$
 \text{targets} = [2, 9, 1, 7] \quad\text{(each input's "next token")}
 $$
 
+> **In plain words:** drop the last token to get the inputs and drop the first token to get the
+> targets. Each input then lines up with the token that followed it: 5 is followed by 2, 2 by 9,
+> 9 by 1, and 1 by 7.
+
+A **causal language model** is a decoder (F12) trained this way: each position may only use the
+tokens before it.
+
 The model produces a logit distribution at every position (F12 → $(T, \text{vocab})$),
 and you apply cross-entropy (F3) at each position against the shifted target, averaged:
 
@@ -27,14 +37,26 @@ $$
 L = -\frac{1}{T} \sum_{t=1}^{T} \log p_\theta(x_t \mid x_{<t})
 $$
 
+> **In plain words:** at each position $t$, take $-\log$ of the probability the model gave the
+> real token $x_t$, using only the earlier tokens $x_{<t}$ ("all $x$ before position $t$"),
+> then average over the $T$ positions. This is the loss of F3, with "the class" replaced by "the
+> next token".
+
 Because of the causal mask (F10/F12), position $t$'s prediction only used tokens $\le t$
 — no cheating. This is called **teacher forcing**: during training you always feed the
 *true* previous tokens (not the model's own guesses), so all positions train in parallel
 in one forward pass. One sequence → $T$ next-token predictions → one loss.
 
+> **Picture it:** a teacher reading a sentence aloud to a student, pausing after every word to
+> ask "what comes next?". Whatever the student answers, the teacher continues with the *real*
+> next word, so one wrong guess never derails the rest of the lesson.
+
 Pretraining does this over trillions of tokens; **fine-tuning does the exact same thing
 on your task data** — sometimes masking the loss so it only counts the *answer* tokens,
 not the prompt.
+
+**Masking the loss** means multiplying the per-position losses by 0 for the prompt tokens and 1
+for the answer tokens, so the model is graded only on what it should write.
 
 **Why this single objective is so powerful.** To predict the next token well across all
 of human text, the model is forced to learn grammar, facts, reasoning patterns,
@@ -43,12 +65,23 @@ training separate skills; they emerge from one objective. This is also why *data
 quality is everything*: the model faithfully learns to imitate whatever it's trained on
 (F3's MLE view), errors included.
 
+> **Watch out:** teacher forcing creates a gap between training and use. In training the model
+> always sees perfect previous tokens; in generation it sees its own, possibly wrong, ones. Small
+> early mistakes can therefore snowball into nonsense on long outputs, which is one reason
+> decoding settings matter.
+
 ## Decoding strategies
+
+Once trained, the model gives a probability for every possible next token. A **decoding
+strategy** is the rule for choosing one: always take the favourite, or roll weighted dice, and
+over how many candidates.
 
 At inference there's no "next token" to feed, so the model generates **autoregressively**:
 run the model, get the logits for the last position, pick a token, append it, run again
 (with KV-cache, F12, so it's cheap). How you "pick" is the decoding strategy, and it
 matters a lot for output quality:
+
+**Autoregressive** means each output is fed back in as input for the next step.
 
 - **Greedy** — always take the argmax. Deterministic, but repetitive and often dull.
 - **Temperature** — divide logits by $T$ before softmax (you saw this in F1). $T < 1$
@@ -62,6 +95,16 @@ matters a lot for output quality:
   *constrained* generation (translation, where there's a "right" answer) than for
   open-ended text.
 
+The **argmax** is the position of the largest value, the single most likely token. **Cumulative
+probability** is the running total of probabilities when tokens are sorted from most to least
+likely. Note that the letter $T$ is used twice in this chapter, for sequence length and for
+temperature; the context tells you which.
+
+> **Picture it:** choosing a restaurant. Greedy always goes to the top-rated one. Top-$k$ picks
+> at random among the 3 best. Top-$p$ picks among however many it takes to cover 90% of the
+> votes: two places on a night when opinion is clear, ten when it is divided. Temperature decides
+> how much the ratings sway the choice at all.
+
 For the competition: **match decoding to the task.** Classification/extractive answers
 → greedy or low temperature (you want the most likely answer). Translation/summarization
 → beam search or low-temperature sampling. Open generation → top-$p$ with moderate
@@ -72,7 +115,13 @@ tune since it needs no retraining.
 `repetition_penalty`, `no_repeat_ngram_size`, or top-$p$ sampling. Tune gently: Bengali
 legitimately repeats some words, and aggressive n-gram blocking can hurt.
 
+An **n-gram** is a run of $n$ consecutive tokens; `no_repeat_ngram_size=3` forbids any 3-token
+run from appearing twice.
+
 ## Shift and decode in code
+
+The block builds the shifted inputs and targets, then implements greedy, temperature, top-$k$
+and top-$p$ decoding on one row of 5 logits.
 
 ```python
 import numpy as np
@@ -117,10 +166,37 @@ temp=0.7 top-k2: 3
 top-p=0.9      : 3
 ```
 
-Token 3 has the highest logit (3.0) so greedy picks it; with `d=64` dimensions you'd
-see more variance across strategies.
+Token 3 has the highest logit (3.0), so greedy picks it. With only 5 tokens and one clear
+favourite, the two sampled strategies also drew token 3 here, but they could have drawn
+something else.
+
+The first two lines show the shift: inputs `[5 2 9 1]` and targets `[2 9 1 7]`. For the
+sampling lines, the numbers explain the agreement. After softmax, token 3 has probability
+0.61; at temperature 0.7 that rises to 0.75, and top-$k$ = 2 leaves only tokens 3 and 0 in the
+running. Top-$p$ = 0.9 also keeps only tokens 3 and 0 here (cumulative 0.834). A different seed
+would sometimes pick token 0.
+
+> **Watch out:** this `decode` keeps only tokens whose running total stays at or below $p$, so
+> it drops the token that pushes the total *past* $p$. The usual definition ("smallest set whose
+> total exceeds $p$") includes that token, which here would add token 1 (total 0.916). Library
+> implementations include it.
+
+## Recap in plain words
+
+- A language model is trained to predict every next token, with targets equal to the inputs
+  shifted by one.
+- The loss is cross-entropy averaged over all positions, computed in one parallel pass.
+- Teacher forcing feeds the true previous tokens during training, never the model's own
+  guesses.
+- Generation is a loop: predict, choose one token, append it, repeat.
+- Greedy takes the favourite; temperature, top-$k$ and top-$p$ control how adventurous sampling
+  is.
+- Choose decoding by task: near-greedy for answers with one right output, top-$p$ for open text.
 
 ## Try it Yourself
+
+This applies five temperatures to the same 5 logits and prints the resulting distribution and
+its favourite.
 
 ```python
 import numpy as np
@@ -137,6 +213,24 @@ for T in [0.3, 0.7, 1.0, 1.5, 3.0]:
 # This single knob is often the cheapest quality lever at inference time.
 ```
 
+```output
+temp   distribution (rounded)            argmax
+ 0.3  [0.84  0.159 0.001 0.    0.   ]   -> 0
+ 0.7  [0.628 0.307 0.036 0.018 0.011]   -> 0
+ 1.0  [0.531 0.322 0.072 0.044 0.032]   -> 0
+ 1.5  [0.43  0.308 0.113 0.081 0.067]   -> 0
+ 3.0  [0.314 0.266 0.161 0.136 0.123]   -> 0
+```
+
+The favourite is token 0 at every temperature, because dividing all logits by the same
+positive number never changes their order. What changes is the margin: at $T = 0.3$ token 0
+gets 0.84 and tokens 2 to 4 get almost nothing, while at $T = 3.0$ token 0 has only 0.314 and
+the weakest token still has 0.123. Greedy decoding gives the same answer at every temperature;
+sampling does not.
+
+Try a variation: make the two top logits equal, `[3.0, 3.0, 1.0, 0.5, 0.2]`. Tokens 0 and 1 then
+share the top probability at every temperature, and only the rest of the distribution changes.
+
 ## Exercise
 
 Implement `generate(model_logits_fn, prompt_ids, max_new, strategy)` that
@@ -146,8 +240,11 @@ current sequence, decode one token with your chosen strategy, append it, repeat.
 from-scratch version of `model.generate()` — the function you'll call on your LLM at
 submission time.
 
+> **Hint:** keep the sequence as a Python list, call your logits function on the whole list each
+> step, reuse `decode` from above, and stop early when the end-of-sequence token appears.
+
 <details>
-<summary>Hint</summary>
+<summary>Solution</summary>
 
 ```python
 def generate(logits_fn, ids, max_new=20, T=1.0, rep_penalty=1.2):
@@ -164,4 +261,28 @@ def generate(logits_fn, ids, max_new=20, T=1.0, rep_penalty=1.2):
 
 The repetition penalty divides the logit of any token already produced, making loops
 less likely — tune it gently (aggressive values suppress legitimate repetition).
+
+`EOS` is the **end-of-sequence** token id, the token a model emits to say "I am done". To try it,
+run the `decode` block above first, then this mock model that is strongly tempted to repeat
+itself:
+
+```python
+# A mock "model": prefers the token after the last one (mod 6); token 5 is EOS.
+EOS = 5
+def mock_logits(ids):
+    logits = np.full(6, 1.0)                       # all logits positive here
+    logits[(ids[-1] + 1) % 6] = 4.0
+    logits[ids[-1]] = 4.5                          # a strong pull to repeat itself
+    return logits
+np.random.seed(0)
+print("no penalty  :", generate(mock_logits, [0], max_new=10, T=0.7, rep_penalty=1.0))
+np.random.seed(0)
+print("penalty 1.5 :", generate(mock_logits, [0], max_new=10, T=0.7, rep_penalty=1.5))
+```
+
+Without a penalty it prints `[0, 0, 1, 1, 1, 1, 1, 1, 2, 3, 3]`, stuck on token 1 for five
+steps. With a penalty of 1.5 it prints `[0, 1, 2, 3, 4, 5]`, walking straight to EOS. Dividing
+works only for positive logits: dividing a *negative* logit by 1.5 moves it toward 0 and makes
+the token *more* likely. That is why Hugging Face's `repetition_penalty` divides positive logits
+and multiplies negative ones.
 </details>

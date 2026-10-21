@@ -2,6 +2,8 @@
 
 Course 11 of 20. Current (2026). The move beyond vanilla attention — SSMs, Mamba, MoE, LNNs, KANs, and hybrid architectures.
 
+**In plain words:** standard attention compares every token with every other one, so its cost and memory grow with the square of the text length, and this course is about the designs that avoid that bill. Chapter 1 measures the problem (score tables, the KV cache, memory bandwidth), and chapters 2–5 show the recurrent alternatives that keep a fixed-size memory instead: linear attention, state space models (S4), Mamba's selective scan, and RWKV, RetNet and Hyena. Chapters 6–7 switch to a different cost, the feed-forward layer, and show how Mixture-of-Experts stores many experts but runs only a few per token, and how to keep them evenly loaded. Chapter 8 combines the ideas into hybrids such as Jamba and Samba, and chapters 9–10 cover two outsiders, liquid networks and Kolmogorov-Arnold networks. Chapters 11–12 teach you to move knowledge from a Transformer into a cheaper model and to read architecture papers critically, and the capstone (ch. 13) has you build one alternative yourself and benchmark it honestly against attention.
+
 ## Chapters
 1. The efficiency problem: O(n²) and KV-cache cost
 2. Linear and kernelized attention

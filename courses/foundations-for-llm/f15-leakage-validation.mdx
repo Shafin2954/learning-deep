@@ -7,17 +7,33 @@ order: 15
 
 ## Why this chapter decides your leaderboard position
 
+A practice score is only worth something if it predicts the real score. Most competition
+disasters come from a practice setup that quietly let the answers in, or that looked nothing
+like the real test.
+
 This is the chapter that decides whether you place well or collapse on the private
 leaderboard. Models are commodities; a **trustworthy validation setup** is the edge.
 Almost every catastrophic competition finish — great public score, terrible private
 score — traces to one of two things: **data leakage** or a **validation set that didn't
 mirror the test set**. Master this and you'll beat flashier solutions.
 
+Competitions usually split their hidden test set in two. The **public leaderboard** scores your
+submissions on one part during the competition; the **private leaderboard** scores the other part
+at the end and decides the final ranking. A model tuned to the public part can drop many places
+when the private part is revealed, which is called a **shake-up**.
+
 ## Leakage — the forms it takes
+
+Leakage means the model gets a peek at something it will not have when it is used for real.
+It learns to rely on that peek, so it looks brilliant in practice and fails in the real test.
 
 Leakage is when information that won't exist at test time sneaks into training. The
 model learns to exploit it, your validation score soars, and then the real test — which
 doesn't have that information — exposes the lie. Common forms:
+
+> **Picture it:** a student who finds the answer key stapled to the back of every practice test.
+> Their practice scores are perfect, they learn nothing about the subject, and the real exam,
+> which comes without a stapled key, reveals it.
 
 - **Target leakage:** a feature that encodes the answer (e.g., a column derived from
   the label, or "was\_resolved" when predicting "will\_resolve"). Rule of thumb: if a
@@ -36,11 +52,25 @@ doesn't have that information — exposes the lie. Common forms:
   encodings, TF-IDF, embeddings from the full corpus) on train+test together, then
   validating. Fit preprocessing **inside** the CV fold, on training data only.
 
+The **target** is the label you are predicting. To **deduplicate** is to remove repeated
+copies so each example appears once. **Fitting** a preprocessing step means computing its
+numbers (means, vocabularies, word weights) from data; doing that on validation rows lets their
+statistics flow into training.
+
 For an LLM competition specifically: watch for **pretraining contamination** (the base
 model may have *seen the test text* on the web — public benchmarks are notorious), and
 for **prompt leakage** in few-shot examples that overlap the test set.
 
+**Few-shot examples** are worked examples pasted into the prompt to show the model the task.
+
+> **Watch out:** the strongest leakage alarm is a score that looks too good. If a quick baseline
+> reaches 0.99 on a task where published systems get 0.80, assume leakage and go hunting before
+> you celebrate.
+
 ## Train/test contamination — detected and fixed
+
+Duplicates are the easiest leak to create and the easiest to fix: remove copies first, then
+split. The block shows what happens in each order.
 
 ```python
 import numpy as np
@@ -61,7 +91,7 @@ print("leaked sentences (in both train & val):", leaked)   # non-empty -> leakag
 # RIGHT: deduplicate FIRST, then split unique items.
 unique = sorted(set(data))
 uidx = rng.permutation(len(unique))
-u_train, u_val = {unique[i] for i in uidx[:8]}, {unique[i] for i in uidx[8:]}
+u_train, u_val = {unique[i] for i in uidx[:6]}, {unique[i] for i in uidx[6:]}
 print("overlap after dedup-then-split:", u_train & u_val)   # empty -> clean
 ```
 
@@ -70,7 +100,20 @@ leaked sentences (in both train & val): ['বাক্য_0']
 overlap after dedup-then-split: set()
 ```
 
+The wrong order leaked "বাক্য_0": one copy landed in training and the other in validation, so
+the model would be graded on a sentence it had already memorized. In the right order, the
+overlap is `set()`, the empty set: after deduplicating, the 8 unique sentences are split 6 to
+2, and no sentence can be on both sides because each now exists only once.
+
+> **Watch out:** exact deduplication misses near-duplicates, such as the same sentence with
+> different punctuation, spacing, or Unicode normalization (Bengali ch. 2). Normalize the text
+> before comparing, and consider fuzzy matching for paraphrases.
+
 ## Adversarial validation — detect train/test drift
+
+Ask a simple question: can a model tell training rows from test rows? If it cannot, they look
+alike and ordinary validation is safe. If it can, they differ, and your validation must account
+for that.
 
 A sharp diagnostic. Label all training rows 0 and all test rows 1, mix them, and train
 a classifier to tell them apart. If it **can't** (AUC $\approx 0.5$), train and test
@@ -78,6 +121,19 @@ come from the same distribution — random CV is safe. If it **can** (AUC $\gg 0
 differ, and your CV will lie unless you account for the drift (e.g., validate on the
 train rows that most "look like" test, or reweight). This single check has saved
 countless competitors from a CV that didn't match the test set.
+
+**Drift** (distribution shift) means the test data differs systematically from the training data,
+for example different websites, topics or years. **AUC** is the chance that a randomly chosen test
+row gets a higher score than a randomly chosen training row: 0.5 is a coin flip, 1.0 is perfect
+separation.
+
+> **Picture it:** a sommelier who claims two cellars hold the same wine. You pour glasses from
+> both, unlabelled. If a taster cannot tell which cellar each glass came from, the claim holds.
+> If they sort them right three times out of four, the wines differ.
+
+The toy version below skips the classifier and uses the raw value as the score, which is enough
+for one feature: training values come from a bell curve centered at 0, test values from one
+centered at 0.8.
 
 ```python
 import numpy as np
@@ -102,11 +158,20 @@ print("adversarial AUC:", round(auc(X, is_test), 3),
 adversarial AUC: 0.726 (~0.5 = same dist; >>0.5 = train/test drift -> fix your CV)
 ```
 
-AUC of 0.726 — the classifier easily tells train from test, confirming the distributions
+AUC of 0.726 — the classifier clearly tells train from test, confirming the distributions
 differ. In a real competition, this tells you to adjust your CV strategy before training
 anything.
 
+The number matches theory: for two unit-width bell curves 0.8 apart, the expected AUC is about
+0.71, and 0.726 is within sampling noise of that. In practice you would train a real classifier
+(such as gradient-boosted trees or logistic regression on text features) with cross-validation,
+and then look at its most important features: they name exactly what differs between train and
+test.
+
 ## The cardinal rule — your CV must move with the leaderboard
+
+Your local score is your compass. Check that it points the same way as the leaderboard, and when
+the two disagree, believe the compass.
 
 Build the validation scheme to imitate how the test set was created. Then track the
 relationship: when your CV improves, does the public LB improve too? If they diverge,
@@ -114,7 +179,13 @@ relationship: when your CV improves, does the public LB improve too? If they div
 A correlated, trustworthy CV lets you make dozens of decisions offline without burning
 submissions.
 
+**Probing** the leaderboard means submitting many variants and keeping whichever scores best
+there. Each pick is a small fit to the public sample's noise, and those fits add up.
+
 ## Submission discipline
+
+The last days decide the result. Habits that protect you: stop changing things early, never
+steer by the public score, and be able to rebuild your best run.
 
 - **Freeze early.** Lock your approach with several days left; leave time for the
   submission environment's surprises (no internet, time/memory limits).
@@ -128,7 +199,22 @@ submissions.
 truth; adversarial validation tells you which you have. Build the truth, then optimize
 against it relentlessly.
 
+## Recap in plain words
+
+- Leakage is any information at training time that will not exist at prediction time.
+- Duplicates, shared authors or sources, future data and preprocessing fitted on everything are
+  the common leaks.
+- Deduplicate first, then split, and keep every row of a group on the same side.
+- Adversarial validation checks whether train and test differ by training a model to tell them
+  apart.
+- Build validation to imitate how the test set was made, and trust it over the public
+  leaderboard.
+- Accept a change only when its gain is bigger than the fold-to-fold noise.
+
 ## Try it Yourself
+
+This splits 10 rows from 5 authors so that each author's rows land entirely in training or
+entirely in validation.
 
 ```python
 import numpy as np
@@ -149,11 +235,25 @@ def grouped_split(groups, val_frac=0.3, seed=0):
     return train, val
 
 tr, va = grouped_split(groups)
-print("train groups:", sorted(set(groups[tr])))
-print("val   groups:", sorted(set(groups[va])))
-print("any group in both? ", set(groups[tr]) & set(groups[va]))   # must be empty
+print("train groups:", sorted(set(groups[tr].tolist())))
+print("val   groups:", sorted(set(groups[va].tolist())))
+print("any group in both? ", set(groups[tr].tolist()) & set(groups[va].tolist()))   # must be empty
 # No author appears on both sides -> the model can't 'recognize the author' to cheat.
 ```
+
+```output
+train groups: [0, 1, 3, 4]
+val   groups: [2]
+any group in both?  set()
+```
+
+Author 2 went to validation and authors 0, 1, 3 and 4 to training; the overlap is `set()`, so no
+author is on both sides. With 5 authors and `val_frac=0.3`, `int(5 * 0.3)` gives 1 validation
+group, which here is 2 of the 10 rows. Grouped splits rarely hit the requested fraction exactly,
+because groups come in different sizes.
+
+Try a variation: change `seed=0` to other values and watch which author is held out, then set
+`val_frac=0.5` to hold out 2 authors.
 
 ## Exercise
 
@@ -162,6 +262,9 @@ website each row came from). Design the validation scheme: (1) what would you
 deduplicate, (2) what would you group by, (3) would you stratify, and (4) how would you
 use adversarial validation to check it? Write it as a short checklist you'd actually
 run before training anything.
+
+> **Hint:** go through the leakage forms in this chapter one by one and ask which column could
+> carry each kind of leak.
 
 <details>
 <summary>Model answer</summary>
@@ -175,4 +278,9 @@ is preserved (F14). (4) Run **adversarial validation** between your train and th
 competition test: if AUC $\gg 0.5$, the test is drifted (different sources?), so
 validate on the train rows most similar to test. Only after this passes do you train —
 and you accept changes only when CV gain beats CV noise (F14).
+
+One caveat on (2): group by `source` only if the test set comes from *new* websites. If the
+test rows come from the same websites as training, grouping makes validation harsher than the
+test; adversarial validation (4) is how you find out which case you are in. scikit-learn's
+`StratifiedGroupKFold` does (2) and (3) together.
 </details>
