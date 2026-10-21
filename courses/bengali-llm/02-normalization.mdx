@@ -7,18 +7,30 @@ order: 2
 
 ## The disease and the cure
 
+If the same word can be stored in two different ways, pick one way and rewrite every copy
+into it before the model ever sees the text. That rewriting is the whole idea of this
+chapter.
+
 In Chapter 1 you saw the disease: visually identical Bengali text can be different bytes.
-Normalization is the cure — collapsing every encoding of "the same thing" into one
+**Normalization** is the cure — collapsing every encoding of "the same thing" into one
 canonical form so your model sees signal, not encoding noise. For a modest-resource
 language like Bengali, where you have far less data than English, you cannot afford to
 split your already-thin signal across encoding variants.
+
+> **Picture it:** a teacher collecting homework where half the class writes dates as
+> 05/07 and half as 7 May. Before grading, she rewrites every date in one format. Nothing
+> about the answers changes; they just become comparable.
 
 Normalization happens in two layers. Use both.
 
 ## Layer 1: Unicode NFC (free, do it always)
 
-Unicode defines canonical equivalence. NFC ("Normalized Form Composed") rewrites text
-into a single canonical sequence. It handles the cases from Chapter 1:
+The Unicode standard itself already knows that some code-point sequences are "the same
+letter", and it ships a built-in rule for rewriting them into one standard spelling.
+
+Unicode defines **canonical equivalence** — the official list of sequences that must be
+treated as the same text. **NFC** ("Normalized Form Composed") rewrites text into a single
+canonical sequence. It handles the cases from Chapter 1:
 
 - e-kar + aa-kar (U+09C7 U+09BE) $\to$ o-kar (U+09CB).
 - য + nukta and the precomposed য় both collapse to the same sequence.
@@ -51,27 +63,56 @@ NFC equal?  True
 nukta NFC equal? True
 ```
 
+The first line is the problem: the two spellings of নো are `False` when compared raw. The
+second line is the cure: after NFC they are `True`. The third line shows the same rescue
+for the two spellings of য়.
+
+> **Watch out:** "same sequence" does not always mean "one code point". For য়, NFC goes the
+> *other* way: the single code point U+09DF is on Unicode's composition-exclusion list, so
+> NFC rewrites it to the two-code-point form য + ় (U+09AF U+09BC). Both inputs still end up
+> identical, which is all you need, but do not write code that assumes NFC output is always
+> the shorter form.
+
 ### Why NFC works: canonical decomposition then recomposition
+
+NFC runs in two steps: break everything into its smallest official pieces, then glue the
+pieces back together in the one standard way.
 
 $$
 \text{NFC}(s) = \mathrm{Compose}(\mathrm{CanonicalDecompose}(s))
 $$
 
+> **In plain words:**
+> - $s$ is your input string.
+> - $\mathrm{CanonicalDecompose}$ splits every precomposed letter into its base plus marks
+>   and puts the marks in a fixed order.
+> - $\mathrm{Compose}$ re-joins those pieces into precomposed letters wherever Unicode allows.
+>
+> Because every spelling breaks down to the same pieces, every spelling comes back out the same.
+
 Any sequence of code points that represent the same abstract character collapse to the
 same composed form. The two encodings of ো both decompose to the same sequence and
 recompose to U+09CB.
 
+> **Picture it:** two LEGO models that look the same but were built in different orders.
+> Take both fully apart, sort the bricks, then rebuild with the official instructions. Now
+> they are the same model, brick for brick.
+
 ## Layer 2: Bengali-aware normalization
+
+The plain idea: some Bengali messes are not "officially the same" in Unicode's eyes, so NFC
+leaves them alone. You need a second tool that knows Bengali habits.
 
 NFC only fixes *canonical* equivalence. Bengali has many *non-canonical* problems NFC
 won't touch: legacy/typing variants, stray ZWNJ/ZWJ that change conjunct rendering
 without changing meaning, inconsistent use of the *khanda ta* ৎ vs ত্, assamese/bengali
 letter confusions, and punctuation and whitespace chaos.
 
-The `normalizer` library from csebuetnlp (the team behind BanglaBERT/BanglaT5) encodes
-the community-standard rules. It's the same preprocessing those models were trained
-with — so using it aligns your inputs with the model's expectations, which matters for
-tokenizer fertility and accuracy.
+The `normalizer` library from **csebuetnlp** — the research group at BUET behind
+BanglaBERT/BanglaT5 — encodes the community-standard rules. It's the same preprocessing
+those models were trained with — so using it aligns your inputs with the model's
+expectations, which matters for tokenizer **fertility** (how many tokens a word is split
+into, ch. 3) and accuracy.
 
 ```python
 # Layer 2 (run locally — installs from csebuetnlp):
@@ -80,10 +121,30 @@ from normalizer import normalize
 
 raw = "ডাউনলোড  করেন।।   ৫টি  ফাইল‌"   # double daṛi, extra spaces, a stray ZWNJ
 clean = normalize(raw)
-print(repr(clean))   # standardized punctuation/spaces, ZWNJ handled
+print(repr(clean))   # spaces collapsed; the double daṛi and the trailing ZWNJ survive
+print(repr(normalize("“হ্যালো”")))   # curly quotes -> plain ASCII quotes
 ```
 
+```output
+'ডাউনলোড করেন।। ৫টি ফাইল\u200c'
+'"হ্যালো"'
+```
+
+The first output line shows what the library changed and what it did not. The runs of
+spaces collapsed to single spaces, but the double daṛi `।।` is still there and so is the
+trailing `‌` (ZWNJ). The second line shows a real rewrite: the curly quotes `“ ”` became
+plain `"` characters. So the library is not a "fix everything" button; it fixes the things
+its rules cover, and you still own the rest of the pipeline below.
+
+> **Watch out:** `normalize` applies NFKC by default (its signature has
+> `unicode_norm='NFKC'`), a stronger rewrite than NFC that also folds "compatibility"
+> characters. That is what the csebuetnlp models expect; for other models, check that NFKC
+> does not change anything your task cares about.
+
 ## The cleaning pipeline
+
+After the two normalization layers, you do ordinary tidying, and the order matters because
+each step assumes the one before it already ran.
 
 Then the ordinary cleaning, in a deliberate order:
 
@@ -92,10 +153,11 @@ Then the ordinary cleaning, in a deliberate order:
 3. Standardize digits — decide whether ০–৯ stay Bengali or map to 0–9. Be consistent
    across train/test.
 4. Standardize punctuation — daṛi "।" vs ".", quotes, dashes.
-5. Handle **code-mixing**: real Bengali text is full of English words ("download করেন"),
-   Banglish (Bengali written in Latin letters), URLs, emojis, and hashtags. Decide per
-   task: keep English (usually yes — it carries meaning), strip URLs/emojis if noise, and
-   *never* blindly lowercase or strip non-Bengali if the task needs it.
+5. Handle **code-mixing** — text that mixes two languages in one sentence: real Bengali
+   text is full of English words ("download করেন"), **Banglish** (Bengali written in Latin
+   letters), URLs, emojis, and hashtags. Decide per task: keep English (usually yes — it
+   carries meaning), strip URLs/emojis if noise, and *never* blindly lowercase or strip
+   non-Bengali if the task needs it.
 6. Collapse whitespace; strip control characters; drop or keep newlines deliberately.
 
 Two rules that save competitions:
@@ -103,10 +165,31 @@ Two rules that save competitions:
 - **Normalize train and test with the exact same function.** Wrap it once, import it
   everywhere. Divergence here is silent and fatal.
 - **Don't over-clean.** Aggressive cleaning (removing all English, all punctuation, all
-  digits) throws away signal. Clean to *consistency*, not to *minimalism*. Let ablations
-  on your CV (Chapter 15) decide each step, not intuition.
+  digits) throws away signal. Clean to *consistency*, not to *minimalism*. Let **ablations**
+  — experiments that switch off one step at a time and measure the score — on your CV
+  (Chapter 15) decide each step, not intuition.
+
+> **Picture it:** cleaning is like washing vegetables. You want the dirt off, so every
+> carrot looks like every other carrot. Peel too hard and you throw away the vegetable.
+
+> **Watch out:** a sentiment label can hinge on an emoji (🙂 vs 😡) and a QA answer can be
+> an English name inside Bengali text. Removing emojis or English "because it is noise" can
+> delete the very signal the task is scored on.
+
+## Recap in plain words
+
+- Normalization rewrites every spelling of the same text into one spelling, so the model sees one input instead of several.
+- NFC is the free, built-in first layer: it fixes the two spellings of ো and of য়.
+- The csebuetnlp `normalizer` is the Bengali-aware second layer and matches what BanglaBERT/BanglaT5 saw in training.
+- That library collapses spaces and standardizes quotes, but in our test it left `।।` and a trailing ZWNJ untouched.
+- Clean in a fixed order, with one shared function for train and test.
+- Clean to consistency, not to minimalism; let CV ablations decide each step.
 
 ## Try it Yourself
+
+`basic_clean` below runs four steps in order: NFC, optional digit mapping, daṛi-to-period
+plus whitespace collapse, and ZWNJ/ZWJ removal. It prints each raw sample next to its
+cleaned form.
 
 ```python
 import unicodedata, regex
@@ -135,13 +218,21 @@ for s in samples:
 ```
 
 ```output
-'আমি   বাংলায়‌ গান গাই।' -> 'আমি বাংলায় গান গাই.'
+'আমি   বাংলায়\u200c গান গাই।' -> 'আমি বাংলায় গান গাই.'
 '৫টি আপেল ও 3টি কলা।' -> '5টি আপেল ও 3টি কলা.'
 'ডাউনলোড করেন https://x.io 🙂' -> 'ডাউনলোড করেন https://x.io 🙂'
 ```
 
+Line 1: the extra spaces collapsed, the stray `‌` after বাংলায় disappeared, and `।`
+became `.`. Line 2: with `bengali_digits=False`, `৫` became `5`, so both numbers now use
+the same digits. Line 3 is unchanged, because this starter function has no URL or emoji
+step.
+
 This is a *starter*. In the real pipeline, slot the csebuetnlp `normalize` in as step
 1.5 (after NFC). Then ablate each step on your CV.
+
+Variation to try: call `basic_clean(s)` with the default `bengali_digits=True` and compare
+line 2; then add a `regex.sub(r"https?://\S+", " ", text)` step and watch line 3 change.
 
 ## Exercise
 
@@ -150,8 +241,12 @@ everywhere, with toggles for: digit mapping, punctuation standardization, URL re
 emoji removal, and ZWNJ/ZWJ stripping. The point is one canonical entry point used
 identically on train and test.
 
+> **Hint:** a **factory** is a function that builds and returns another function. Read the
+> toggles once in the outer function, then return an inner `f(text)` that applies only the
+> steps that are switched on, always starting with NFC.
+
 <details>
-<summary>Solution sketch</summary>
+<summary>Solution</summary>
 
 ```python
 import unicodedata, regex
@@ -180,4 +275,10 @@ def make_normalizer(map_digits=False, std_punct=True, drop_url=True,
 clean = make_normalizer(map_digits=True)
 TRAIN = TEST = clean       # <- the same function on both. always.
 ```
+
+The key insight is the last line: `TRAIN = TEST = clean` makes it impossible for train and
+test to drift apart, because there is only one function. Run on the kernel,
+`clean("৫টি ফাইল‌ https://x.io  ডাউনলোড।")` returns `5টি ফাইল ডাউনলোড.`: digit mapped,
+ZWNJ gone, URL gone, daṛi standardized. Note the order: URLs are removed before digits and
+punctuation are rewritten, so a `.` inside a URL can never be confused with a sentence end.
 </details>

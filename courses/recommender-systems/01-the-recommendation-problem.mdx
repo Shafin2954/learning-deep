@@ -7,10 +7,29 @@ order: 1
 
 ## What you are actually predicting
 
+A recommender's job is to pick a handful of things to show one person, in order, from a pile
+far too big to show. The product question is "which ten things go on this screen, top to
+bottom?", not "what score would this person give this item?".
+
 A recommender does not predict ratings. It produces an **ordered short list** of items for a user,
 under a budget — ten slots on a home page, three in a carousel, one in a notification. Everything
 that follows in this course is a way of filling those slots, and most of the mistakes come from
 optimising something else and hoping it transfers.
+
+> **Picture it:** a shop window with ten hooks. The shop owns a thousand products. Nobody cares how
+> well the owner could guess a customer's opinion of product 731; what matters is which ten go on
+> the hooks, and which one goes at eye level.
+
+Two words you will see on every page. A **user** is the person you recommend to; an **item** is
+anything you could show them (a film, a song, a product). An **interaction** is one logged event
+between them: a click, a play, a purchase. The **interaction matrix** is a giant table with one
+row per user and one column per item, where a cell is filled if that user touched that item.
+
+The block below builds a synthetic year of logs that behaves like real data. Each user has a
+hidden **taste vector** (four numbers describing what they like), each item has a **style vector**,
+and the chance of an interaction grows when the two point the same way. Some users are far more
+active than others, popularity is **heavy-tailed** (a few items are enormously popular, most are
+not), a quarter of items launch partway through the year, and tastes drift month to month.
 
 ```python
 import numpy as np
@@ -52,12 +71,27 @@ observed interactions: 84,392 (75,955 distinct user-item pairs)
 density: 2.3442%
 ```
 
+Read the three lines. There are 3,600,000 possible user-item cells, but only 84,392 logged
+events, and only 75,955 distinct user-item pairs (some users came back to the same item). The
+density on the last line is the share of cells with an event: 2.34%.
+
 That density is the defining fact of the field. **Over 97% of the matrix is missing** — and real
 catalogues are two orders of magnitude sparser still. The missing entries are not missing at
 random — a user has not seen most items, and the ones they have
 seen were shown to them by a previous recommender.
 
+> **Watch out:** an empty cell does not mean "this user dislikes this item". It usually means
+> "this user never saw this item". Treating the 97% of empty cells as zeros-that-mean-no is the
+> first big mistake in recommender work, and the rest of this course keeps coming back to it.
+
 ## Explicit and implicit feedback are different problems
+
+There are two kinds of signal you can learn from. Either the user tells you how much they liked
+something, or you watch what they do and guess.
+
+**Explicit feedback** is a direct statement of preference, like a 1-to-5 star rating. **Implicit
+feedback** is behaviour you infer preference from: clicks, plays, purchases, time spent. The table
+compares them.
 
 | | Explicit (ratings) | Implicit (clicks, plays, purchases) |
 |---|---|---|
@@ -66,6 +100,13 @@ seen were shown to them by a previous recommender.
 | Volume | rare; users rate a fraction of what they consume | abundant; every interaction is logged |
 | Bias | who chooses to rate, and when | what was shown, and how it was ranked |
 | Objective | reconstruct the observed entries | rank all items, including unobserved ones |
+
+> **Picture it:** explicit feedback is a restaurant review card the customer chose to fill in.
+> Implicit feedback is the till receipt. You get a receipt from everyone, but it never tells you
+> what they hated; you get a card from a few people, and those people are not typical customers.
+
+The next block turns the first 20,000 events into star ratings. The rating is the user-item taste
+match plus noise, centred around 3.4 and clipped to the 1–5 range.
 
 ```python
 ratings = pd.DataFrame({
@@ -92,11 +133,31 @@ mean rating 3.933
 share of the matrix with a rating: 0.5556%
 ```
 
+Look at the counts: 8,271 fives against 651 ones, a mean of 3.933. The ratings pile up at the top.
+And the last line shows how rare ratings are: even if every one of the first 20,000 events had
+been rated, only 0.56% of the matrix would carry a star.
+
 Ratings skew high because people mostly rate things they chose to consume. A model that predicts
 ratings well is answering "how much would this user like this item *if they watched it*" — which
 is not the question the product asks.
 
+> **Watch out:** a model with a low rating error can still make a bad recommendation list. Rating
+> error only measures the cells users chose to fill, and those cells are mostly items they already
+> expected to like.
+
 ## The interaction matrix, stored properly
+
+Almost every cell is empty, so you should only store the filled ones. Writing down the full table
+wastes memory on millions of zeros.
+
+A **sparse matrix** stores only the non-zero cells. The **CSR** format ("compressed sparse row")
+keeps three arrays: `data` (the values), `indices` (the column of each value) and `indptr` (where
+each row starts and ends inside the other two). The number of stored values is called **nnz**
+("number of non-zeros").
+
+> **Picture it:** instead of a 3,000-page notebook with a 1,200-box grid on every page, you keep one
+> short shopping list per user: "items 4, 81, 902". `indptr` is the table of contents telling you on
+> which line each user's list starts.
 
 ```python
 def to_csr(df, n_users, n_items, value=1.0):
@@ -124,10 +185,31 @@ interactions per user: median 19 | p10 5 | p99 110
 interactions per item: median 24 | max 975 | items with < 5: 226
 ```
 
+The first line says 75,955 stored values: duplicates of the same (user, item) pair were summed into
+one cell, and the block then set every value to 1.0, so the matrix records "touched or not". The
+second line is the memory payoff: 28.8 MB dense against 0.9 MB sparse, a 32-fold saving at only 2%
+density. The last two lines show the skew: the median user has 19 interactions but the top 1% have
+110 or more; the busiest item has 975 interactions while 226 items have fewer than 5.
+
 Never materialise the dense matrix. At a realistic scale — ten million users, a million items —
 the dense form is 80 terabytes and the sparse form is a few gigabytes.
 
+> **Watch out:** many innocent-looking operations silently densify a sparse matrix, for example
+> `M.toarray()`, `M + 1`, or subtracting a mean from every cell. On a toy dataset this works; on
+> production data it crashes the machine.
+
 ## The long tail decides your architecture
+
+A few items get most of the attention and most items get almost none. That shape, called the
+**long tail**, decides what a model can and cannot learn.
+
+The **head** is the small set of very popular items; the **tail** is the long list of rarely
+touched ones. The block sorts items from most to least popular and asks what share of all
+interactions the top slice carries.
+
+> **Picture it:** a bookshop where the ten bestsellers on the front table sell as much as the
+> entire back room. The back room is the tail: it is most of the shop, and the till barely hears
+> from it.
 
 ```python
 order = np.argsort(-per_item)
@@ -151,11 +233,26 @@ items never interacted with: 72
 users with fewer than 5 interactions: 257 (8.6%)
 ```
 
+Read down the first block. The top 1% of items (12 of them) carry 12.4% of interactions; the top
+10% carry 51.0%, over half; the top half carries 93.3%. So the bottom 600 items share under 7% of
+the signal. Then 72 items were never touched at all, and 257 users (8.6%) have fewer than 5
+interactions.
+
 Two consequences you will meet in every later chapter. **Head items dominate the training signal**,
 so a model that only learns popularity scores surprisingly well; and **tail items and new users
 have almost no data**, which is the cold-start problem (ch. 9) rather than a modelling failure.
 
 ## The baseline that beats most first attempts
+
+Before building anything clever, recommend the most popular items the user has not touched yet.
+That baseline is embarrassingly hard to beat, so you always measure against it.
+
+Three ideas appear in this block. A **temporal split** trains on everything before a cut-off day
+and tests on what happens after, the way the model will be used in real life: you learn from the
+past and predict the future. **Recall@k** asks "of the held-out items this user actually touched,
+how many made it into my top $k$?"; the block divides by the smaller of $k$ and the number of
+held-out items, so a perfect list always scores 1. The **popularity baseline** ranks items by their
+training-period interaction count and skips anything the user has already seen.
 
 ```python
 def temporal_split(events, holdout_days=60):
@@ -206,12 +303,36 @@ recall@10, random     : 0.0100
 recall@10, popularity : 0.1055
 ```
 
+The first line shows the split: 67,285 training interactions up to day 299 and 17,107 test
+interactions in the last 60 days. Then the comparison. Random lists reach recall@10 of 0.0100 —
+close to what chance predicts: 10 random items out of 1,200 catch about 0.8% of a user's held-out
+items, and capping the denominator at 10 nudges heavy users slightly above that. Popularity reaches 0.1055, more than ten times better, with zero
+personalisation.
+
 Popularity is not a strawman. In many production systems it is within a few points of the deployed
 model, and any personalised model that cannot beat it is not earning its serving cost. It is also
 the baseline that makes evaluation honest: a metric that cannot separate your model from
 popularity is not measuring personalisation.
 
+> **Watch out:** always filter out items the user already interacted with before scoring. If you
+> forget, any model that "recommends" the user's own history gets free hits on repeat purchases,
+> and the metric rewards a list the user would find useless.
+
+## Recap in plain words
+
+- A recommender fills a few ordered slots; it is a ranking problem, not a rating-prediction problem.
+- The user-item table is about 98% empty here, and empty means "never saw it", not "dislikes it".
+- Ratings (explicit) are rare and skew positive; clicks and plays (implicit) are plentiful but have no real negatives.
+- Store interactions as a sparse CSR matrix: 0.9 MB instead of 28.8 MB here, and the gap grows with scale.
+- The top 10% of items carry half the interactions, so popularity alone is a strong model.
+- Evaluate with a temporal split and always compare against the popularity baseline.
+
 ## Try it Yourself
+
+`dataset_report` summarises any event log in four lines. It adds the **Gini coefficient** of item
+popularity, a single number for how unequal the shares are: 0 means every item is equally popular,
+1 means one item takes everything. The second call keeps only the events on the 120 most popular
+items.
 
 ```python
 def dataset_report(events, n_users, n_items):
@@ -254,12 +375,22 @@ it cannot learn about the tail because it never shows the tail, and the logs the
 unpopular. Run this on your own logs and the gap between catalogue size and covered items tells you
 how much of that loop you are in.
 
+Notice also that the head-only log still has 38,745 interactions, over half of the full 75,955,
+from only 10% of the items. Try a variation: change the 120 to 600 (the top half) and check how
+close the Gini and the cold-item share come back to the full-log values.
+
 ## Exercise
 
 Build the data layer the rest of this course will use: a loader that produces a CSR interaction
 matrix from an event log, a temporal split that respects the fact that you will predict the
 future, and a popularity baseline evaluated with recall@k and coverage. Then show what a *random*
 split would have told you instead, and explain the difference.
+
+**Coverage** here means the share of the catalogue that appears in at least one user's list.
+
+> **Hint:** wrap the split, the CSR matrix, the per-user `seen` and `truth` sets, and the
+> popularity counts in one class. To fake a random split with the same class, shuffle the events
+> and give the first `len(test)` rows a late timestamp, so the "holdout period" is a random sample.
 
 <details>
 <summary>Solution</summary>
@@ -379,6 +510,9 @@ is free recall in an offline metric and a bug in a product. And `eval_recommende
 **coverage** alongside recall, because a recommender that shows the same ten items to everyone can
 score respectably on recall while being useless — that is the accuracy-diversity tension chapter 2
 puts numbers on.
+
+Look at the coverage numbers to see that tension already: random lists cover 100% of the catalogue
+and popularity covers 2.25%, about 27 items for 2,716 users.
 
 One caveat this data layer cannot fix: the held-out interactions are the items the *previous*
 system showed the user, so an offline metric rewards you for reproducing that system's choices.
