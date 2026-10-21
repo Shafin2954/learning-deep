@@ -7,6 +7,9 @@ order: 10
 
 ## The autoregressive factorization
 
+An autoregressive model writes an image the way you write a sentence: one piece at a time,
+each piece chosen while looking at everything written so far.
+
 Every generative model must define $p(x)$. Autoregressive models do it by the chain rule —
 no approximation needed:
 
@@ -14,25 +17,58 @@ $$
 p(x) = \prod_{i=1}^{D} p(x_i \mid x_1, x_2, \ldots, x_{i-1})
 $$
 
+> **In plain words:** the probability of a whole image is the probability of the first pixel,
+> times the probability of the second pixel given the first, times the third given the first
+> two, and so on for all $D$ pixels. $\prod$ means "multiply together". This is the **chain
+> rule of probability**, and it is exact for any distribution.
+
+**Autoregressive** means "predicting from your own earlier outputs". The price of exactness is
+that you must pick an order — for images, usually **raster order**: row by row, left to right,
+like reading.
+
+> **Picture it:** a game of "finish the drawing" where each player sees everything drawn so far
+> and adds one pixel. If every player plays like the original artist would, the final drawing
+> looks like the artist's work.
+
 Each pixel (or token) is predicted from all previous ones. Training is fast because all
 conditional distributions can be computed in parallel (you have the ground-truth $x_{<i}$
 at training time). Sampling is slow because you must generate one element at a time.
+
+$x_{<i}$ is shorthand for "all elements before $i$". At training time the whole real image is
+known, so one forward pass predicts every pixel at once — as long as the network can't peek at
+the pixel it is predicting. At sampling time the earlier pixels don't exist yet, so you need $D$
+passes. That training trick is called **teacher forcing**.
 
 This is the same factorization used by GPT — the "image" is just a sequence of pixels
 or discrete image tokens instead of text tokens.
 
 ## PixelCNN: masked convolutions for images
 
+A normal convolution looks at a pixel's neighbours on all sides — including pixels that, in
+reading order, haven't been drawn yet. PixelCNN blanks out those "future" positions in every
+filter.
+
 A naive CNN sees the whole image at once. PixelCNN (van den Oord et al., 2016) enforces
 the causal constraint by zeroing out the parts of the convolutional kernel that would
 see future pixels.
+
+The **causal constraint**: the prediction at a position may depend only on positions that come
+before it in the ordering. A **kernel** is the small grid of weights a convolution slides over
+the image. A **mask** is a same-shaped grid of 1s (keep) and 0s (blank out) multiplied into it.
 
 Two mask types:
 - **Mask A**: used in the first layer. Blocks the current pixel and all future pixels.
 - **Mask B**: used in subsequent layers. Allows the current pixel's own channel but still
   blocks future pixels.
 
+Why two kinds? The first layer reads the real image, so it must not see the pixel it is
+predicting. Later layers read *features* computed at each position, and the feature at the
+current position was already built only from the past — so it is safe to include.
+
 ### Implementing a masked convolution
+
+The code builds the mask once as a **buffer** (a tensor saved with the module but not trained)
+and multiplies it into the weights on every forward pass.
 
 ```python
 import torch
@@ -77,12 +113,24 @@ tensor([[1., 1., 1.],
         [0., 0., 0.]])
 ```
 
+Read the $3 \times 3$ grids as the filter's view, with the current pixel in the centre. Both masks
+keep the whole top row (the row above is already drawn) and zero the bottom row (the future).
+The middle row is the difference: Mask A keeps only the left neighbour (1, 0, 0), Mask B also
+keeps the centre (1, 1, 0).
+
 Mask A sees only the top-left context and excludes the current pixel. Mask B adds the
 current pixel back (the "B" stands for "including self"). Stacking several Mask B layers
 after the first Mask A layer grows the effective receptive field over past pixels without
 leaking future information.
 
+(The letters A and B are just the paper's names; "including self" is a handy way to remember
+which is which.) The **receptive field** is the patch of the input that can influence one
+output.
+
 ### Verifying no future leakage
+
+A rule like "no peeking" deserves a test. Change one pixel and check that only outputs *after*
+it in reading order respond.
 
 ```python
 import torch
@@ -112,31 +160,66 @@ print(f"Max change at pixel (7,7): {diff[0,0,7,7].item():.6f}")
 
 ```output
 Max change at pixel (2,2): 0.000000
-Max change at pixel (7,7): 0.183421
+Max change at pixel (7,7): 0.001752
 ```
+
+The change at pixel (2, 2) is exactly 0.000000: a pixel three rows above the perturbation can't
+see it. Pixel (7, 7), which comes after (5, 5) in reading order and lies within reach of the three
+$7 \times 7$ layers, changed by 0.001752. The size of that number depends on the random weights;
+what matters is zero versus non-zero.
 
 Pixel (2, 2) is unaffected by the perturbation at (5, 5). Pixel (7, 7) — which comes after
 (5, 5) in raster order — does change. The causal constraint holds.
 
+> **Watch out:** this vertical-and-horizontal masking leaves a **blind spot**: some pixels above
+> and to the right of the current one never reach it, no matter how many layers you stack. Gated
+> PixelCNN fixes this with separate vertical and horizontal stacks.
+
 ## PixelCNN++
+
+Treating pixel brightness as 256 unrelated categories ignores that 127 and 128 are almost the
+same. PixelCNN++ models brightness as a smooth curve instead.
 
 The original PixelCNN models each pixel as a 256-way softmax, which is wasteful for
 continuous intensities. PixelCNN++ replaces it with a mixture of discretized logistics:
+
+A **softmax** turns 256 scores into 256 probabilities that add to 1. A **logistic distribution**
+is a bell-like curve whose cumulative curve is the sigmoid $\sigma$. **Discretized** means each
+integer value $x_i$ gets the probability mass between $x_i - 0.5$ and $x_i + 0.5$.
 
 $$
 p(x_i \mid x_{<i}) = \sum_k \pi_k \, \sigma\!\left(\frac{x_i + 0.5 - \mu_k}{s_k}\right)
 - \sigma\!\left(\frac{x_i - 0.5 - \mu_k}{s_k}\right)
 $$
 
+- $\pi_k$ — the weight of mixture component $k$ (the weights add to 1).
+- $\mu_k$, $s_k$ — the centre and the width of component $k$.
+- $\sigma(\cdot)$ — the sigmoid, which gives the logistic curve's cumulative probability.
+
+> **In plain words:** for each component, the chance of exactly the value $x_i$ is the area under
+> its curve between $x_i - 0.5$ and $x_i + 0.5$ — the cumulative value at the top edge minus the
+> one at the bottom edge. The whole difference is multiplied by $\pi_k$, and the components are
+> added up.
+
 This requires only a small number of mixture components (typically 5–10) instead of 256
 softmax logits, and produces smoother probability distributions.
 
 ## VQ-VAE: discrete image tokens
 
+Predicting 196,608 numbers one by one is far too slow. VQ-VAE first turns an image into a short
+"word list" — a small grid of codebook indices — so the autoregressive model only has to write
+a few hundred words.
+
 Autoregressive sampling over raw pixels is slow because images are large ($28\times28 = 784$
 pixels for MNIST, $256\times256\times3 = 196\,608$ for a photo). VQ-VAE solves this by
 first compressing the image to a small grid of discrete tokens, then training an
 autoregressive model on those tokens.
+
+**VQ** stands for **vector quantization**: replacing each vector by the closest one from a fixed
+list. A **discrete token** is an integer ID, like a word's index in a dictionary.
+
+> **Picture it:** a mosaic. Instead of mixing any colour, the artist may only use tiles from a box
+> of 512 kinds. The image becomes a grid of tile numbers; the box is the **codebook**.
 
 ### The VQ-VAE components
 
@@ -145,19 +228,37 @@ autoregressive model on those tokens.
 **Codebook** $\{e_k\}_{k=1}^K$: a learned dictionary of $K$ $d$-dimensional vectors (typically $K = 512$).
 
 **Quantization**: each spatial position in $z_e$ is replaced by its nearest codebook entry:
+
 $$
 z_q(h, w) = e_k, \quad k = \arg\min_j \|z_e(h,w) - e_j\|_2
 $$
 
+> **In plain words:** at each grid position $(h, w)$, look through all codebook vectors, find the
+> one closest to the encoder's output there, and use it instead. $\arg\min_j$ means "the index $j$
+> that makes the distance smallest" — that index is the token.
+
 **Decoder** $D$: reconstructs $\hat{x}$ from $z_q$.
 
-**Loss**:
+The training loss has three parts, a **reconstruction** term, a **codebook** term and a
+**commitment** term:
+
 $$
 \mathcal{L} = \underbrace{\|x - \hat{x}\|^2}_{\text{recon}} + \underbrace{\|\text{sg}[z_e] - z_q\|^2}_{\text{codebook}} + \underbrace{\beta\|z_e - \text{sg}[z_q]\|^2}_{\text{commitment}}
 $$
 
+- Reconstruction — the decoded image should match the input.
+- Codebook — move each chosen codebook vector toward the encoder outputs that picked it.
+- Commitment — keep the encoder's outputs close to their chosen codes, weighted by $\beta$
+  (typically 0.25), so they don't drift away.
+
 where $\text{sg}[\cdot]$ is the stop-gradient operator. The straight-through estimator
 passes gradients through the quantization step during backprop.
+
+**Stop-gradient** treats its contents as a constant during backprop (in PyTorch,
+`.detach()`), so each term trains only the part it is meant to. Picking the nearest vector has no
+useful gradient, so the **straight-through estimator** pretends quantization was the identity in
+the backward pass: `z_e + (z_q - z_e).detach()` equals `z_q` going forward, but its gradient flows
+to `z_e` as if nothing happened.
 
 ```python
 import torch
@@ -183,8 +284,8 @@ class VectorQuantizer(nn.Module):
         z_q = self.embedding(indices).reshape(B, H, W, D).permute(0, 3, 1, 2)
 
         # Losses
-        codebook_loss = F.mse_loss(z_q.detach(), z_e)
-        commitment_loss = F.mse_loss(z_q, z_e.detach())
+        codebook_loss = F.mse_loss(z_q, z_e.detach())      # moves codebook toward encoder
+        commitment_loss = F.mse_loss(z_e, z_q.detach())    # keeps encoder near its code
         loss = codebook_loss + self.commitment_cost * commitment_loss
 
         # Straight-through: copy gradients from z_q to z_e
@@ -201,9 +302,19 @@ print(f"VQ loss:     {vq_loss.item():.4f}")
 
 ```output
 z_q shape:   torch.Size([2, 64, 8, 8])
-token_ids:   torch.Size([2, 8, 8])  (unique tokens: 97)
-VQ loss:     0.9823
+token_ids:   torch.Size([2, 8, 8])  (unique tokens: 110)
+VQ loss:     1.2327
 ```
+
+The quantized tensor keeps the encoder's shape, $[2, 64, 8, 8]$, and the token grid is
+$[2, 8, 8]$ — 128 integer IDs. Only 110 different codebook entries out of 512 were used, because
+this codebook is untrained and random inputs cluster near a few of its tiny initial vectors. The
+VQ loss 1.2327 is $1.25$ times the mean squared distance between encoder outputs and their codes
+(codebook term plus $0.25 \times$ commitment term, which have equal values going forward).
+
+> **Watch out:** in long training runs, many codebook entries can end up never chosen ("dead
+> codes"), wasting capacity. Common fixes are resetting unused entries to random encoder outputs
+> and updating the codebook with moving averages instead of gradients.
 
 After training the VQ-VAE, you have a $8 \times 8 = 64$-token sequence per image (instead
 of $256^2 = 65\,536$ pixels). You can then train a PixelCNN or GPT-style Transformer on
@@ -211,18 +322,34 @@ these integer token sequences — orders of magnitude faster than pixel-level au
 
 ## VQGAN: sharper images with adversarial loss
 
+MSE rewards "safe" blurry averages. VQGAN adds two judges that punish blur — one comparing deep
+image features, one GAN discriminator — so the decoder learns to draw crisp textures.
+
 VQ-VAE minimizes MSE reconstruction, which yields blurry images (MSE averages over modes).
 VQGAN adds a **patch discriminator** (from pix2pix) and a **perceptual loss** (VGG features)
 on top of the VQ-VAE objective:
+
+A **patch discriminator** judges small patches of the image as real or fake, which targets
+texture. A **perceptual loss** compares the two images through a pre-trained network (VGG), so
+images that look alike score as alike even if pixels differ slightly.
 
 $$
 \mathcal{L}_{\text{VQGAN}} = \mathcal{L}_{\text{VQ}} + \lambda_1 \mathcal{L}_{\text{perceptual}} + \lambda_2 \mathcal{L}_{\text{GAN}}
 $$
 
-The result is much sharper reconstructions. VQGAN's codebook is used as the image tokenizer
-for many modern image generation systems (Stable Diffusion's VAE, DALL-E).
+> **In plain words:** total loss = the VQ-VAE loss, plus $\lambda_1$ times the perceptual
+> distance, plus $\lambda_2$ times the GAN loss. The $\lambda$s set how much each judge counts.
+
+The result is much sharper reconstructions. VQGAN-style tokenizers are used by many image
+generation systems, such as Parti and MaskGIT. Two related designs are often confused with it:
+Stable Diffusion's autoencoder (ch. 9) comes from the same research line and is trained with
+the same perceptual and GAN losses, but keeps a *continuous* latent. DALL-E (2021) used a
+different discrete VAE.
 
 ## Connection to language models
+
+Once an image is a list of integers, an image generator and a text generator are the same kind
+of machine.
 
 Once images are tokenized to short integer sequences, image generation becomes
 indistinguishable from text generation. You can:
@@ -231,10 +358,32 @@ indistinguishable from text generation. You can:
 - Prepend class or text tokens → conditional generation.
 - Interleave text and image tokens → multimodal models (GPT-4V style).
 
+A **multimodal** model handles more than one kind of data — here, text and images in one
+sequence.
+
 This is why "vision language models" share so much architecture with pure text models —
 the pipeline is: pixels → VQGAN tokens → autoregressive Transformer.
 
+> **Watch out:** that pipeline is one design, not the only one. Many vision-language models that
+> *read* images feed continuous patch embeddings straight into the Transformer, with no discrete
+> tokens. Discrete tokens matter most when the model must *generate* images.
+
+## Recap in plain words
+
+- Autoregressive models score an image exactly by multiplying "next pixel given previous
+  pixels" probabilities.
+- PixelCNN enforces "no peeking" with masked convolutions: Mask A in the first layer, Mask B
+  after.
+- Training predicts all pixels in one pass; sampling needs one pass per pixel.
+- VQ-VAE compresses images to a small grid of codebook indices, trained with reconstruction,
+  codebook and commitment losses plus a straight-through gradient.
+- VQGAN adds perceptual and GAN losses for sharp images, and its tokens let a GPT-style model
+  generate images.
+
 ## Try it Yourself
+
+This is a complete (untrained) PixelCNN skeleton for $16 \times 16$ greyscale images: one Mask A
+layer, four Mask B layers, and a $1 \times 1$ convolution to 256 scores per pixel.
 
 ```python
 import torch
@@ -274,8 +423,15 @@ Input: torch.Size([1, 1, 16, 16])  →  Logits: torch.Size([1, 256, 16, 16])
 Each pixel predicts one of 256 intensity values.
 ```
 
+The output has shape $[1, 256, 16, 16]$: for every one of the 256 pixel positions there are 256
+scores, one per possible brightness. Softmax over the 256 channels gives the distribution
+$p(x_i | x_{<i})$ at each position.
+
 Try changing `kernel_size` to 3 and see how the receptive field shrinks. Try adding
 more Mask B layers and observe how quality improves (at the cost of more compute).
+
+To *see* the receptive field shrink without training, reuse the leakage test from earlier:
+perturb pixel (0, 0) and count how many outputs change with `kernel_size=7` versus 3.
 
 ## Exercise
 
@@ -283,6 +439,10 @@ You have a trained PixelCNN that outputs 256-class logits for each pixel.
 Write a `sample()` function that generates a $16 \times 16$ image by scanning
 pixels in raster order (row by row, left to right), sampling each pixel from
 the predicted distribution, and feeding it back for the next step.
+
+> **Hint:** start from a blank canvas, loop over rows then columns, run the model on the whole
+> canvas, take the softmax of the logits at the current position only, draw one value with
+> `torch.multinomial`, and write it into the canvas before moving on.
 
 <details>
 <summary>Solution</summary>
@@ -310,4 +470,7 @@ The key insight: you pass the entire canvas each time but only read the logit at
 position `(row, col)`. The mask ensures only past pixels influence this prediction.
 Raster-order scanning respects the causal ordering the model was trained on.
 
+A $16 \times 16$ image takes 256 full forward passes — the slow-sampling cost from the start of
+the chapter, made concrete. Dividing by 255 maps the sampled class to $[0, 1]$; make sure that
+matches how the training images were scaled, or the model sees inputs it never trained on.
 </details>

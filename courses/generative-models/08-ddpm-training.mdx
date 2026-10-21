@@ -7,13 +7,26 @@ order: 8
 
 ## The simplified training objective
 
+Training a diffusion model is a guessing game: you add known noise to a clean image, show the
+noisy result to the network, and ask "what noise did I add?". The network is graded on how
+close its guess is.
+
 DDPM's original derivation involves a variational lower bound, but the practical training loss
 collapses to something remarkably clean. You train a network $\epsilon_\theta$ to predict the
 noise $\epsilon$ that was added to $x_0$ to produce $x_t$:
 
+**DDPM** stands for **denoising diffusion probabilistic model** (Ho et al., 2020). The
+"variational lower bound" is the ELBO from ch. 3, written for a 1000-step chain; most of its
+terms simplify to weighted noise-prediction errors.
+
 $$
 \mathcal{L}_\text{simple} = \mathbb{E}_{t, x_0, \epsilon}\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]
 $$
+
+> **In plain words:** pick a random step $t$, a random clean image $x_0$, and random noise
+> $\epsilon$. Make the noisy image, ask the network for its noise guess
+> $\epsilon_\theta(x_t, t)$, and square the difference. Average over many such picks. The
+> $\mathbb{E}$ with three subscripts means "average over all three random choices".
 
 where $t \sim \text{Uniform}(1, T)$, $\epsilon \sim \mathcal{N}(0, I)$, and $x_t$ is sampled
 directly using the closed-form forward process from chapter 7:
@@ -22,6 +35,14 @@ $x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon$.
 This is a denoising objective: given a noisy image and the timestep, predict the noise. The
 network never needs to compute the full Markov chain — you sample a random $t$ and a random
 noise $\epsilon$, corrupt the image in one shot, and regress on the noise.
+
+A **Markov chain** is a sequence where each step depends only on the one before — here, the
+1000 noising steps. **Regress** means fit a prediction to a numeric target with a squared-error
+loss, as in linear regression.
+
+> **Picture it:** a teacher splashes a known pattern of paint on a photo and asks the student
+> to describe the splash. Sometimes it's a light splash, sometimes the photo is buried. Since the
+> teacher made the splash, there is always an exact answer key.
 
 ```python
 import torch
@@ -62,21 +83,41 @@ print(f"alpha_bar[0]={alpha_bar[0]:.4f}  alpha_bar[999]={alpha_bar[999]:.6f}")
 x0 shape: torch.Size([4, 1, 8, 8])
 xt shape: torch.Size([4, 1, 8, 8])
 eps shape: torch.Size([4, 1, 8, 8])
-alpha_bar[0]=0.9999  alpha_bar[999]=0.000043
+alpha_bar[0]=0.9999  alpha_bar[999]=0.000040
 ```
+
+All three tensors have the same shape, $4 \times 1 \times 8 \times 8$: the noise target has one value
+per pixel, like the image. The last line shows the range the network must cover — from
+$\bar\alpha = 0.9999$ (almost clean) to 0.000040 (almost pure noise).
 
 At $t=0$ the image is nearly unchanged; at $t=999$ it is almost pure noise.
 
+> **Watch out:** the math writes $t \sim \text{Uniform}(1, T)$, but the code uses 0-based
+> indices, `torch.randint(0, T, ...)`, so `alpha_bar[0]` is the paper's $\bar\alpha_1$. Mixing the two
+> conventions shifts the whole schedule by one step — a classic off-by-one bug in diffusion code.
+
 ## The U-Net noise predictor
+
+The noise guesser has to look at a whole image and output a same-sized image of noise guesses.
+The standard network for "image in, same-sized image out" is a U-Net.
 
 The network $\epsilon_\theta$ must accept a noisy image and a timestep. The dominant
 architecture is a U-Net with time conditioning.
+
+A **U-Net** shrinks the image step by step to capture big shapes, then grows it back to full
+size, with **skip connections** that pass fine detail straight across from each shrinking stage
+to the matching growing stage. Drawn as a diagram, it looks like a U. **Time conditioning**
+means the network is told $t$, so it knows how much noise to expect.
 
 ### Time embedding
 
 The timestep $t$ is encoded into a sinusoidal embedding (like positional encoding) and
 projected through two linear layers into a conditioning vector. Every residual block in the
 U-Net adds this vector to its hidden activations after a linear projection.
+
+A **sinusoidal embedding** turns one number $t$ into a vector of sines and cosines at many
+frequencies, so nearby timesteps get similar vectors and the network can tell them apart at
+every scale — the same trick transformers use for word positions.
 
 ```python
 import math
@@ -102,13 +143,23 @@ print(emb(t)[0, :8].detach().numpy().round(3))  # first 8 dims for t=0
 
 ```output
 torch.Size([5, 64])
-[ 0.     0.     0.     0.     0.     0.     0.     0.   ]
+[0. 0. 0. 0. 0. 0. 0. 0.]
 ```
+
+Five timesteps become five 64-number vectors. The second line, all zeros, is correct rather
+than a bug: the first 32 dimensions are sines, and $\sin(0 \cdot \text{freq}) = 0$ for every
+frequency at $t = 0$. The last 32 dimensions (cosines) are all 1 there, so the vector is not empty.
 
 ### Minimal U-Net block
 
 A real DDPM U-Net uses group norm, attention at low resolutions, and skip connections across
 resolutions. Here is a stripped-down block to show the pattern:
+
+- **Group norm** normalizes groups of channels within each image (unlike batch norm, it doesn't
+  depend on the batch).
+- **SiLU** is a smooth ReLU-like activation, $x \cdot \text{sigmoid}(x)$.
+- The time vector is projected to one number per channel and added to every pixel of that
+  channel — that is how $t$ reaches the convolution.
 
 ```python
 class ResBlock(nn.Module):
@@ -137,7 +188,14 @@ print(f"ResBlock output: {out.shape}")
 ResBlock output: torch.Size([2, 32, 16, 16])
 ```
 
+The output shape $[2, 32, 16, 16]$ equals the input's, which the residual `h + x` requires: the
+block learns a *correction* to its input. Stacks of these blocks at several resolutions, joined by
+down- and up-sampling, form the full U-Net.
+
 ## The sampling loop
+
+To generate, start from pure noise and apply the learned denoising step 1000 times, from
+$t = T$ down to 0.
 
 Given a trained model, you reverse the diffusion process step by step. The DDPM reverse step
 reconstructs $x_{t-1}$ from $x_t$:
@@ -145,6 +203,11 @@ reconstructs $x_{t-1}$ from $x_t$:
 $$
 x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{\beta_t}{\sqrt{1-\bar{\alpha}_t}}\,\epsilon_\theta(x_t, t)\right) + \sqrt{\beta_t}\,z
 $$
+
+> **In plain words:** remove the predicted noise (scaled by how much this step added), undo the
+> step's shrinking by dividing by $\sqrt{\alpha_t}$, then add back a small amount of fresh noise
+> $\sqrt{\beta_t}\,z$. The fresh noise keeps the process random, so different runs give different
+> samples.
 
 where $z \sim \mathcal{N}(0, I)$ for $t > 1$, and $z = 0$ at $t = 1$.
 
@@ -172,20 +235,43 @@ print("Sampling loop runs", T, "steps, output shape:", (4, 1, 32, 32))
 Sampling loop runs 1000 steps, output shape: (4, 1, 32, 32)
 ```
 
+This block only defines the loop and prints a description; nothing is sampled, because there is
+no trained model on this page. Note the `@torch.no_grad()` decorator: sampling needs no
+gradients, which saves memory. The real cost is `T` model calls per batch — 1000 U-Net passes.
+
 T=1000 reverse steps is slow — DDIM addresses this.
 
 ## DDIM: deterministic, fewer steps
 
+DDIM keeps the same trained network but takes big strides: it predicts the clean image, then
+jumps straight to a much less noisy level, skipping most of the 1000 steps.
+
 DDIM (Denoising Diffusion Implicit Models) reformulates the reverse process as a non-Markovian
 ODE whose solution can be approximated with far fewer steps. The DDIM update is:
+
+**Non-Markovian** means each step may use more than the immediately previous state. An **ODE**
+(ordinary differential equation) describes a smooth path; following a smooth path with a few
+big steps is much cheaper than a random walk with many small ones.
 
 $$
 x_{t-1} = \sqrt{\bar{\alpha}_{t-1}}\underbrace{\frac{x_t - \sqrt{1-\bar{\alpha}_t}\,\epsilon_\theta}{\sqrt{\bar{\alpha}_t}}}_{\hat{x}_0\text{ prediction}}
 + \sqrt{1-\bar{\alpha}_{t-1} - \sigma_t^2}\,\epsilon_\theta + \sigma_t z
 $$
 
+- The bracketed term ($\hat{x}_0$ prediction) is the network's current best guess of the clean
+  image, obtained by removing the predicted noise and undoing the scaling.
+- $\sqrt{\bar{\alpha}_{t-1}}\,\hat{x}_0$ places that guess at the next (less noisy) level.
+- $\sqrt{1-\bar{\alpha}_{t-1} - \sigma_t^2}\,\epsilon_\theta$ adds back the *predicted* noise at the right
+  strength, pointing toward $x_t$.
+- $\sigma_t z$ is optional fresh noise; $\sigma_t = 0$ removes all randomness.
+
 Setting $\sigma_t = 0$ makes sampling fully deterministic. You skip from $t=T$ to $t=0$ in
 50–200 steps instead of 1000, with almost no quality loss.
+
+> **Picture it:** DDPM walks down a staircase one step at a time, sometimes stumbling sideways.
+> DDIM looks at where the staircase ends, aims straight at it, and takes a few long strides.
+
+In the code, `eta` scales $\sigma_t$: `eta=0` is deterministic DDIM, `eta=1` behaves like DDPM.
 
 ```python
 def ddim_sample_step(model, x, t_now, t_prev, eta=0.0):
@@ -208,14 +294,25 @@ print(f"Step sequence (first 5): {step_seq[:5]}")
 
 ```output
 DDIM uses 50 steps vs DDPM's 1000
-Step sequence (first 5): [999, 979, 959, 939, 919]
+Step sequence (first 5): [980, 960, 940, 920, 900]
 ```
 
+The sampler would visit 50 timesteps — 980, 960, 940, and so on down to 0 — a 20-times speed-up
+over 1000 steps with the same trained network. Deterministic sampling also means the same
+starting noise always gives the same image, which is useful for editing and interpolation.
+
 ## Classifier-free guidance
+
+Guidance is a volume knob for "follow the prompt". The model predicts the noise twice — once
+with the prompt, once without — and exaggerates the difference.
 
 To condition generation on a label or text prompt, you train a single model that handles
 both conditional and unconditional generation. Half the time you pass the real condition $c$;
 half the time you pass a null condition $\emptyset$ (a zeroed-out or learned embedding).
+
+**Conditional** generation is generation guided by a given input (a class, a text prompt). In
+practice the condition is dropped less often than half the time — 10–20% is typical — but the
+idea is the same: one network learns both modes.
 
 At inference, you compute:
 
@@ -223,8 +320,17 @@ $$
 \hat{\epsilon} = \epsilon_\theta(x_t, \emptyset) + w\bigl(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \emptyset)\bigr)
 $$
 
+> **In plain words:** start from the prompt-free guess. Compute how the prompt changes the guess
+> ($\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \emptyset)$), and add that change $w$ times. At
+> $w = 0$ you get the unconditional model, at $w = 1$ the plain conditional model, and above 1 you
+> overshoot in the prompt's direction.
+
 The guidance scale $w > 1$ amplifies the direction toward condition $c$. Higher $w$ gives
 sharper, more faithful samples at the cost of diversity (fewer modes).
+
+> **Picture it:** a caricaturist. They see how a face differs from an "average face", then
+> exaggerate that difference. A little exaggeration makes the face more recognizable; too much
+> makes a monster.
 
 ```python
 def cfg_noise_pred(model, xt, t, condition, null_condition, w=7.5):
@@ -235,30 +341,52 @@ def cfg_noise_pred(model, xt, t, condition, null_condition, w=7.5):
     return eps_uncond + w * (eps_cond - eps_uncond)
 
 print("CFG equation: eps_hat = eps_uncond + w * (eps_cond - eps_uncond)")
-print("w=1.0 → no guidance (unconditional)")
+print("w=0.0 → unconditional model only")
+print("w=1.0 → plain conditional model (no extra guidance)")
 print("w=7.5 → strong guidance (Stable Diffusion default)")
 print("w=15+ → oversaturation, artifacts")
 ```
 
 ```output
 CFG equation: eps_hat = eps_uncond + w * (eps_cond - eps_uncond)
-w=1.0 → no guidance (unconditional)
+w=0.0 → unconditional model only
+w=1.0 → plain conditional model (no extra guidance)
 w=7.5 → strong guidance (Stable Diffusion default)
 w=15+ → oversaturation, artifacts
 ```
+
+The printed lines are the rules of thumb for $w$, not measurements. The key correction to a
+common misconception is the second pair: $w = 1$ is not "no conditioning" — it is the ordinary
+conditional prediction. Only $w = 0$ ignores the prompt.
+
+> **Watch out:** CFG doubles the cost of every sampling step, because the model runs twice (with
+> and without the condition). Implementations batch the two passes together to keep it fast.
 
 ### Guidance scale tradeoff
 
 | Scale $w$ | Quality | Diversity | Condition fidelity |
 |-----------|---------|-----------|-------------------|
-| 1.0 | Low | High | None |
+| 1.0 | Low | High | Plain conditional (weak) |
 | 3–5 | Medium | Medium | Moderate |
 | 7–10 | High | Low | Strong |
 | 15+ | Oversaturated | Very low | Rigid |
 
 The sweet spot for most tasks is $w \in [5, 10]$.
 
+## Recap in plain words
+
+- DDPM trains by adding known noise to clean data and teaching the network to predict that
+  noise, with a plain squared error.
+- The noise predictor is a U-Net that also receives the timestep as a sinusoidal embedding.
+- DDPM sampling removes predicted noise over 1000 steps, adding a little fresh noise each time.
+- DDIM reuses the same network to sample in about 50 deterministic steps.
+- Classifier-free guidance blends conditional and unconditional predictions; $w$ trades
+  diversity for prompt fidelity.
+
 ## Try it Yourself
+
+This measures the loss of the worst sensible model — one that always predicts zero noise — on
+a 200-step schedule. It is the baseline every real noise predictor must beat.
 
 ```python
 import torch
@@ -286,9 +414,16 @@ print("Expected ~1.0 (predicting zero for unit-variance noise)")
 ```
 
 ```output
-Loss with zero predictor: 0.9982
+Loss with zero predictor: 0.9184
 Expected ~1.0 (predicting zero for unit-variance noise)
 ```
+
+The loss is 0.9184, close to the expected 1.0: predicting zero gives an error equal to the mean of
+$\epsilon^2$, and $\epsilon$ has variance 1. It isn't exactly 1 because only $8 \times 16 = 128$
+noise values were drawn, and the test is unseeded, so each run prints a slightly different
+number (values between about 0.8 and 1.2 are normal). Change `x0` to `torch.randn(8000, 16)` and
+the loss settles at 1.00. Then try `eps_pred = xt`: it does better than zero at large $t$, where
+$x_t$ is mostly noise, and much worse at small $t$.
 
 ## Exercise
 
@@ -296,6 +431,10 @@ You have a trained DDPM. A colleague proposes using $w = 20$ for CFG to get very
 images. They observe that the images look over-saturated and unnatural. Explain (a) why high
 $w$ causes over-saturation geometrically, and (b) what change to the sampling procedure
 (without retraining) could recover diversity while keeping reasonable quality.
+
+> **Hint:** follow what large $w$ does to the predicted clean image $\hat{x}_0$ inside each step:
+> does it stay in the pixel range the model was trained on? Then think of a fix that acts on
+> $\hat{x}_0$ directly.
 
 <details>
 <summary>Solution</summary>
@@ -320,11 +459,15 @@ def dynamic_threshold(x0_pred, p=0.995):
     return x0_pred.clamp(-s[:, None], s[:, None]) / s[:, None]
 
 x0_example = torch.randn(4, 64) * 3      # simulate saturated pred
-print("Before dynamic threshold:", x0_example.abs().max().item():.3f)
-print("After dynamic threshold: ", dynamic_threshold(x0_example).abs().max().item():.3f)
+print(f"Before dynamic threshold: {x0_example.abs().max().item():.3f}")
+print(f"After dynamic threshold:  {dynamic_threshold(x0_example).abs().max().item():.3f}")
 ```
 
 Dynamic thresholding clips the predicted $x_0$ to within the training distribution
 at each step, preventing accumulation of extreme values across the reverse chain.
 
+Running the demo, values of the simulated over-saturated prediction reach 7.929; after dynamic
+thresholding the largest is 1.000. Each sample is clamped at its own 99.5th-percentile magnitude
+$s$ and divided by $s$, so the result always lands back in $[-1, 1]$ — the range training images
+had — while keeping the relative contrast within the image. Lowering $w$ remains the simplest fix.
 </details>

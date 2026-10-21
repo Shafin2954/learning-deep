@@ -7,17 +7,32 @@ order: 8
 
 ## Why pure SSMs aren't enough
 
+An SSM squeezes the whole past into a fixed-size memory (ch. 3–4). That is cheap, but a
+squeezed memory is blurry: ask it for the exact word from 5,000 tokens ago and it often cannot
+give it back. Attention can, because it keeps everything.
+
 Mamba handles long-range dependencies efficiently, but recall tasks expose its weakness.
 When a model needs to copy a specific token seen thousands of steps ago — "induction heads"
 in mechanistic-interpretability terms — pure SSMs underperform attention. Attention can
 directly look up a key-value pair anywhere in its context window; an SSM must compress
 everything into a fixed-size state vector.
 
+An **induction head** is an attention pattern that finds an earlier copy of the current token
+and predicts whatever followed it last time ("Harry … Potter; Harry → Potter").
+**Mechanistic interpretability** is the study of which circuits inside a network do what.
+
 The practical result: SSM-only models lag transformers on tasks like multi-step reasoning,
 long-context question answering, and associative recall. The fix is not to abandon SSMs
 but to mix them with a small number of attention layers placed strategically.
 
+> **Picture it:** a long road trip. The SSM layers are your memory of the journey: cheap,
+> always on, but fuzzy on details. The few attention layers are a photo album you can flip
+> back through when someone asks "what was the name of that café?". You do not need the album
+> at every mile, only now and then.
+
 ## The hybrid design space
+
+A **hybrid** is a stack that mixes layer types. Designing one comes down to three choices.
 
 Three questions define a hybrid:
 
@@ -25,41 +40,73 @@ Three questions define a hybrid:
 2. **What kind of attention?** Full attention, sliding-window, or grouped-query?
 3. **Is MoE in the mix?** Some hybrids also replace dense FFNs with sparse expert layers.
 
+**Sliding-window attention** (SWA) lets each token look only at the last $w$ tokens, so its
+cost and cache stay fixed. **Grouped-query attention** (GQA, ch. 1) shares key/value heads to
+shrink the KV cache. MoE is from ch. 6–7.
+
 The design tradeoff is always throughput vs quality at long context. Full attention
-layers are expensive at O(n²) but essential for recall; SSM layers are O(n) and handle
+layers are expensive at $O(n^2)$ but essential for recall; SSM layers are $O(n)$ and handle
 local pattern matching well.
 
 ## Jamba: Mamba + Attention + MoE
 
-Jamba (AI21 Labs, 2024) interleaves Mamba layers, full attention layers, and MoE FFN
-layers in a ratio of roughly 7 Mamba : 1 Attention : 8 MoE experts. With 52B total
-parameters but only 12B active at inference time (top-2 routing from 16 experts), Jamba
-fits on a single 80GB A100 at 256K context length — something no same-quality Transformer
-can do.
+Jamba mixes all three ideas of this course so far: mostly Mamba layers, a few attention
+layers, and MoE feed-forward blocks.
 
-Key observation from the Jamba ablations: replacing even one attention layer in the
-middle of a long SSM stack with full attention recovers most of the quality gap on
-recall benchmarks.
+Jamba (AI21 Labs, 2024) interleaves Mamba layers, full attention layers, and MoE FFN
+layers: one attention layer for every 7 Mamba layers, with an MoE FFN of 16 experts in every
+other layer. With 52B total
+parameters but only 12B active at inference time (top-2 routing from 16 experts), Jamba
+fits on a single 80GB GPU at up to about 140K tokens of context, and supports 256K in total.
+A same-size Transformer's KV cache alone would exceed that GPU at those lengths.
+
+Why does it fit? Only 1 layer in 8 keeps a KV cache, so the cache is about 8 times smaller
+than an all-attention model of the same depth.
+
+Key observation from the Jamba ablations: a pure Mamba model struggled with in-context
+learning (for example, sticking to the answer format shown in the prompt), and adding a small
+number of attention layers recovered most of the quality gap.
+
+An **ablation** is an experiment that removes or swaps one part to see how much it matters.
 
 ## Samba: Mamba + Sliding-Window Attention
 
-Samba (Microsoft, 2024) takes a more conservative approach: every other layer is a Mamba
-block and every other is a sliding-window attention layer (window size 2048). The
+Samba keeps the attention layers cheap by limiting how far back they look.
+
+Samba (Microsoft, 2024) takes a more conservative approach: Mamba blocks alternate with
+sliding-window attention layers (window size 2048), with an MLP after each. The
 sliding window is cheaper than full attention but still gives the model a precise local
 lookback. For tasks where the needle is always within 2K tokens of the haystack,
 Samba matches full-attention quality.
 
+"Needle in a haystack" is a test that hides one fact (the needle) in a long text (the
+haystack) and asks for it. Beyond the window, Samba must rely on its Mamba memory to carry the
+fact forward.
+
 ## Nemotron and Zamba
 
-Nemotron (NVIDIA) experiments with a 1:4 ratio — one full-attention layer every four
-Mamba layers. Zamba uses a single shared attention layer that appears at multiple
+NVIDIA and Zyphra pushed the ratio further, using even fewer attention layers, or one
+attention layer reused many times.
+
+NVIDIA's Mamba-2-Hybrid study and the Nemotron-H models keep only a small fraction of
+attention layers, around 7–8% of all layers (for example, 4 attention layers in a 56-layer
+8B model, the rest Mamba-2 and MLP layers). Zamba uses a single shared attention layer that appears at multiple
 depths via weight sharing, dramatically reducing the parameter cost of attention.
 
-The emerging consensus from ablations across all of these: **one attention layer per
-4 SSM layers** recovers the recall quality of a full transformer while preserving
-most of the SSM's throughput advantage at long context.
+**Weight sharing** means the same weights are reused in several places, so they are stored
+(and counted) once.
+
+The emerging consensus from ablations across all of these: **a small minority of attention
+layers**, roughly one per 4–7 SSM layers, recovers most of the recall quality of a full
+transformer while preserving most of the SSM's throughput advantage at long context.
+
+> **Watch out:** the "right" ratio depends on the task mix and the context length. Ratios
+> from one paper's benchmark do not transfer automatically to yours; ablate on your own data.
 
 ## Throughput comparison
+
+The table gives rough, order-of-magnitude figures for how the families compare. Treat them
+as a sketch of the trend, not as benchmark numbers.
 
 | Model type | Active params | Context (practical) | Relative throughput |
 |------------|--------------|---------------------|---------------------|
@@ -71,7 +118,15 @@ most of the SSM's throughput advantage at long context.
 Throughput advantage grows with sequence length; at 512 tokens hybrids offer little
 benefit, at 64K the SSM layers make the difference.
 
+At short lengths attention is cheap and the KV cache small, so everyone runs at roughly the
+same speed. At long lengths the transformer's cache reads dominate, and every attention layer
+you replace with an SSM layer removes a growing cost.
+
 ## Building a minimal hybrid block
+
+The code builds a toy hybrid: three gated "SSM-like" layers followed by one causal attention
+layer. The SSM stand-in is a gated linear layer with a residual connection, not a real scan,
+so it shows the *wiring*, not Mamba's behaviour.
 
 ```python
 import torch
@@ -126,14 +181,35 @@ print(f"Parameters: {total_params:,}")
 
 ```output
 torch.Size([2, 64, 128])
-Parameters: 263,424
+Parameters: 215,680
 ```
 
-The 3:1 SSM-to-attention ratio matches the practical consensus. You can stack multiple
+The output shape matches the input, so blocks stack. The parameter count is 215,680: each toy
+SSM layer has 49,792 parameters and the attention layer 66,304, about 31% of the block. Real
+Mamba layers are much larger than this gated stand-in, so in real hybrids the attention share
+of parameters is much smaller.
+
+> **Watch out:** the attention layer uses a **causal mask** (`torch.triu(..., diagonal=1)`)
+> so each token cannot see future tokens. Forget the mask and a language model trained this way
+> cheats by reading the answer.
+
+The 3:1 SSM-to-attention ratio is at the attention-heavy end of the range used in practice (Jamba uses 7:1). You can stack multiple
 `HybridBlock`s to build a full hybrid model. The attention layer adds disproportionate
-quality for a small fraction of total parameters.
+quality for its share of the compute.
+
+## Recap in plain words
+
+- Pure SSMs compress the past and so struggle with exact recall; attention keeps everything and recalls precisely.
+- Hybrids keep mostly SSM layers for speed and add a few attention layers for recall.
+- Jamba: 1 attention per 7 Mamba layers plus MoE, 52B total and 12B active, fitting long contexts on one 80GB GPU.
+- Samba uses sliding-window attention (2,048 tokens) so even its attention layers have a fixed cost.
+- Nemotron-H keeps about 8% attention layers; Zamba reuses one shared attention layer at several depths.
+- The speed advantage of hybrids appears at long contexts, not at 512 tokens.
 
 ## Try it Yourself
+
+A stack of 4 SSM-like layers, one attention layer, then the *same* 4 SSM layers again. Running
+the same `layers` object twice is weight sharing, the Zamba idea in miniature.
 
 ```python
 import torch
@@ -170,8 +246,16 @@ print("non-zero grad params:", sum(p.numel() for p in list(layers.parameters()) 
 
 ```output
 output shape: torch.Size([2, 32, 64])
-non-zero grad params: 33792
+non-zero grad params: 49920
 ```
+
+The shape is preserved: 2 sequences, 32 tokens, 64 channels. The count, 49,920, is the
+number of parameters (the label "non-zero grad" is loose; no gradients are computed here). It
+is 4 SSM layers of 8,320 plus attention of 16,640. Because the second pass reuses `layers`,
+running 9 layers costs only 5 layers' worth of parameters.
+
+Try replacing the second `layers(h)` with a fresh `nn.Sequential` of 4 new `MinimalSSM`s and
+count again. You should get 33,280 more parameters for the same depth.
 
 ## Exercise
 
@@ -179,6 +263,10 @@ Modify `HybridBlock` to accept an `attn_ratio` argument (default 4 meaning 1 att
 per 4 SSM layers) and a `use_attention` flag to toggle between pure SSM and hybrid mode.
 Count total parameters in each configuration for `d_model=256`, `n_layers=12`.
 How much do the attention layers contribute as a fraction of total parameters?
+
+> **Hint:** build the layer list in a loop and make every `attn_ratio`-th layer attention.
+> For the fraction, compare the hybrid's count with the pure-SSM count; the difference is
+> what swapping 3 SSM layers for 3 attention layers costs.
 
 <details>
 <summary>Solution</summary>
@@ -211,7 +299,14 @@ print(f"Pure SSM params:  {sum(p.numel() for p in pure.parameters()):,}")
 print(f"Hybrid params:    {sum(p.numel() for p in hybrid.parameters()):,}")
 ```
 
-Attention layers add roughly 15–20% more parameters but recover most of the quality
-gap on recall benchmarks. This asymmetry — small parameter cost, large quality gain —
-is why hybrids dominate pure SSMs in practice.
+```output
+Pure SSM params:  2,368,512
+Hybrid params:    2,565,888
+```
+
+The hybrid has 2,565,888 parameters against 2,368,512 for pure SSM, only about 8% more. The
+three attention layers hold 789,504 parameters, about 31% of the hybrid's total, because each
+toy attention layer (263,168) is somewhat bigger than the toy SSM layer it replaces (197,376).
+With real Mamba layers, which are much larger, the attention share drops further. Small parameter cost, large recall gain:
+this asymmetry is why hybrids dominate pure SSMs in practice.
 </details>

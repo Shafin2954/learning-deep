@@ -7,6 +7,9 @@ order: 11
 
 ## The order-blindness problem
 
+Attention looks at all the words at once, like a bag of word tiles poured on a table. It has no
+idea which tile came first. Positional encoding writes a position onto each tile.
+
 Attention (F10) has a hidden flaw: it's **order-blind**. Look at the formula —
 $\mathrm{softmax}(QK^\top/\sqrt{d}) \cdot V$ is a sum over tokens, and a sum doesn't
 care about order. Shuffle the input tokens and attention produces the same set of outputs,
@@ -16,7 +19,19 @@ positions. Positional encoding injects that missing information. Every LLM does 
 modern ones (Llama, Mistral, Qwen — the bases you'll fine-tune) use **RoPE**, so it's
 worth understanding.
 
+**Positional encoding** is any extra signal that tells the model where each token sits in the
+sequence. **RoPE** (rotary position embedding) is the version that encodes position as a
+rotation.
+
+> **Picture it:** a pile of numbered playing cards that someone has shuffled. The cards
+> themselves are the tokens; the position encoding is a small sticker in the corner of each
+> card saying "1st", "2nd", "3rd". Attention can read the stickers even though the cards arrive
+> in a pile.
+
 ## Sinusoidal encoding — the original Transformer
+
+The 2017 Transformer stamped each position with a pattern of waves of different speeds. Each
+position gets a unique combination of wave heights, like a barcode.
 
 Add to each token's embedding a fixed vector that depends on its position, built from
 sines and cosines of different frequencies:
@@ -26,11 +41,25 @@ $$
 \mathrm{PE}(\mathrm{pos},\, 2i+1) = \cos\!\left(\frac{\mathrm{pos}}{10000^{2i/d}}\right)
 $$
 
-Low dimensions oscillate slowly (coarse position), high dimensions fast (fine
+> **In plain words:**
+> - $\mathrm{pos}$ is the token's position (0, 1, 2, …) and $d$ is the embedding width.
+> - Dimension pair $i$ uses one wave: sine in the even slot $2i$, cosine in the odd slot
+>   $2i+1$.
+> - The divisor $10000^{2i/d}$ is 1 for the first pair and grows toward 10,000 for the last,
+>   so the first pair's wave is the fastest and later pairs are slower and slower.
+
+The first dimensions oscillate fastest (fine position) and the last dimensions slowest (coarse
 position) — like the hands of many clocks at different speeds, which together encode
 position uniquely. It's parameter-free and extends to lengths unseen in training (in
 principle). Downside: it encodes *absolute* position, while language mostly cares about
 *relative* position ("the adjective two words before the noun").
+
+**Parameter-free** means nothing is learned; the vectors come straight from the formula.
+**Absolute** position is "token number 37"; **relative** position is "3 tokens before this one".
+
+> **Picture it:** a clock with a second hand, a minute hand and an hour hand. The second hand
+> tells fine time but repeats every minute; the hour hand tells coarse time. Reading all the
+> hands together pins down the exact moment.
 
 ```python
 import numpy as np
@@ -58,16 +87,30 @@ position 0 vector  : [0. 1. 0. 1. 0. 1. 0. 1.]
 ```
 
 At position 0, every sine term is $\sin(0) = 0$ and every cosine term is $\cos(0) = 1$
-— a distinctive all-ones pattern that the model associates with "first token."
+— a distinctive alternating 0, 1 pattern that the model can associate with "first token."
+
+The output shows exactly that: `[0. 1. 0. 1. 0. 1. 0. 1.]`, sines in the even slots and cosines
+in the odd ones. The shape $(6, 8)$ means one 8-number stamp for each of the 6 positions, ready to
+be added to the 6 token embeddings.
 
 ## Learned absolute encoding
+
+Instead of a formula, the model can learn one vector per position, the same way it learns one
+vector per word.
 
 Just have a trainable embedding per position (position 0, 1, 2, …), added to the token
 embedding. Simple, used by BERT/GPT-2. Downside: it can't go beyond the maximum length
 seen in training — there's no learned vector for position 2049 if you trained to 2048.
 A real limit for long documents.
 
+> **Watch out:** feeding such a model a longer input does not raise a polite error in every
+> library. Some truncate silently and some crash with an index error. Check `max_position_embeddings`
+> in the model config before you choose `max_length`.
+
 ## RoPE — what modern LLMs use
+
+RoPE does not add anything to the embeddings. It turns the query and key vectors by an angle that
+grows with position, so how two tokens line up depends on how far apart they are.
 
 RoPE encodes position by **rotating** the query and key vectors by an angle proportional
 to their position, in 2-D pairs of dimensions. For a pair $(x_{2i},\, x_{2i+1})$ at
@@ -81,7 +124,15 @@ x_{2i}\sin(m\theta_i) + x_{2i+1}\cos(m\theta_i) \end{pmatrix},
 \quad \theta_i = 10000^{-2i/d}
 $$
 
+> **In plain words:** treat each pair of numbers as an arrow on a flat sheet and turn it by the
+> angle $m\theta_i$. Position 0 is not turned at all; position 5 is turned five times as far as
+> position 1. The angle per position, $\theta_i$, is large for the first pair and tiny for the
+> last, the same "many clock speeds" idea as the sinusoidal version.
+
 ### The relative-position property
+
+The payoff is that when two turned arrows are compared, only the *difference* between their
+turning angles survives, which is the distance between the two tokens.
 
 The beautiful consequence: when you take the dot product $q_m^\top k_n$ inside attention,
 the result depends only on the **relative** position $m - n$.
@@ -91,8 +142,12 @@ For a single 2-D pair, the rotated dot product is:
 $$
 \langle R_m q,\; R_n k \rangle
 = \langle q,\; R_m^\top R_n k \rangle
-= \langle q,\; R_{m-n} k \rangle
+= \langle q,\; R_{n-m} k \rangle
 $$
+
+> **In plain words:** rotating both arrows and then comparing them is the same as un-rotating
+> the query and rotating the key by the *difference* of the two angles. $R_m$ is the rotation
+> for position $m$, and $R_m^\top$ is the same rotation run backwards.
 
 because $R_m^\top R_n = R_{-(m)} R_n = R_{n-m}$ (rotation matrices compose by
 subtraction). Summing over all dimension pairs:
@@ -102,9 +157,20 @@ q_m^\top k_n = \sum_i \langle R_{m\theta_i} q^{(i)},\; R_{n\theta_i} k^{(i)} \ra
 = f(q, k, m - n)
 $$
 
+> **In plain words:** the full score adds up one such comparison per pair, and each depends only
+> on $q$, $k$ and the gap $m - n$. The function $f$ is the same at the start and at the end of a
+> document.
+
 The score is a function of $q$, $k$, and the *difference* $m - n$ only — not of $m$ or $n$
 individually. So "two words apart" means the same thing whether it happens at the start
 or end of the text.
+
+> **Picture it:** two people standing on a turning merry-go-round. However far it spins, the
+> angle *between* them stays the same. RoPE puts every token on a merry-go-round spun by its
+> position, so the angle between two tokens depends only on their distance in the text.
+
+The block checks two claims numerically: rotation does not change a vector's length, and two
+query–key pairs with the same gap get the same score.
 
 ```python
 import numpy as np
@@ -120,6 +186,7 @@ def rope(x, pos, base=10000):
         out[i+1] = x0*s + x1*c
     return out
 
+np.random.seed(0)
 v = np.random.randn(8)
 print("norm preserved by rotation:", round(np.linalg.norm(v), 4),
       "->", round(np.linalg.norm(rope(v, 3)), 4))
@@ -133,14 +200,19 @@ print("score at (7,5):", round(score_7_5, 4), "-> identical (same relative gap)"
 ```
 
 ```output
-norm preserved by rotation: 3.2958 -> 3.2958
-score at (5,3): -2.3052
-score at (7,5): -2.3052 -> identical (same relative gap)
+norm preserved by rotation: 3.8236 -> 3.8236
+score at (5,3): -3.4394
+score at (7,5): -3.4394 -> identical (same relative gap)
 ```
 
 Rotation preserves the norm (it's an isometry), and the dot products at relative
 distance 2 are identical regardless of absolute position — the derivation confirmed
 numerically.
+
+In the output, the length is 3.8236 before and after rotating by position 3. The score at
+positions (5, 3) and at (7, 5) is $-3.4394$ both times, to all four decimals, even though every
+vector involved was rotated by a different amount. An **isometry** is a transformation that
+keeps all lengths and angles unchanged.
 
 Why RoPE won: (1) it gives relative-position awareness, which is what language needs;
 (2) it applies inside attention to $Q$ and $K$ (not added to the input), composing
@@ -149,7 +221,16 @@ frequency can be *scaled* to extend context windows after training (the trick be
 many "now with 128k context" releases). When you see `rope_theta` or "RoPE scaling" in
 a model config, this is it.
 
+`rope_theta` is the base, 10,000 in the formulas above. Raising it slows every rotation down,
+so positions far beyond the training length produce angles the model has already seen.
+
+> **Watch out:** RoPE is applied to $Q$ and $K$ only, never to $V$. The values carry content;
+> position only affects *who attends to whom*, not *what is passed along*.
+
 ## What you actually do in practice
+
+You will rarely write positional encoding yourself, but you will hit its limits whenever an input
+is longer than the model was trained for.
 
 You almost never implement positional encoding — it ships with the model. But you *will*
 meet it: when you hit a model's max-context limit on long inputs, the fix lives here
@@ -157,7 +238,23 @@ meet it: when you hit a model's max-context limit on long inputs, the fix lives 
 without it explains why you can't just "bag" tokens and why sequence truncation loses
 real information.
 
+**Chunking** means cutting a long document into pieces that each fit the context window.
+**Truncation** means cutting off everything past the limit, which throws that text away.
+
+## Recap in plain words
+
+- Attention on its own cannot tell word order, so positions must be added.
+- Sinusoidal encoding adds a fixed pattern of waves, fast in the first dimensions and slow in the
+  last.
+- Learned absolute encoding learns a vector per position but stops at the training length.
+- RoPE rotates queries and keys by an angle that grows with position.
+- With RoPE, the attention score depends only on the distance between two tokens.
+- Scaling RoPE's base frequency is how many models stretch their context window after training.
+
 ## Try it Yourself
+
+This computes RoPE scores for four query–key pairs that are all 2 apart, then two pairs that are 3
+apart.
 
 ```python
 import numpy as np
@@ -169,6 +266,7 @@ def rope(x, pos, base=10000):
     return out
 
 # Confirm: same relative distance -> same attention score, anywhere in the sequence.
+np.random.seed(0)
 q = np.random.randn(8); k = np.random.randn(8)
 print("relative distance vs score:")
 for (m, n) in [(2,0),(5,3),(9,7),(20,18)]:        # all relative distance 2
@@ -180,6 +278,25 @@ for (m, n) in [(3,0),(6,3)]:                      # relative distance 3
 # position, encoded for free inside the dot product.
 ```
 
+```output
+relative distance vs score:
+  pos ( 2, 0) rel=2: +5.9478
+  pos ( 5, 3) rel=2: +5.9478
+  pos ( 9, 7) rel=2: +5.9478
+  pos (20,18) rel=2: +5.9478
+then a DIFFERENT gap, for contrast:
+  pos ( 3, 0) rel=3: +5.4022
+  pos ( 6, 3) rel=3: +5.4022
+```
+
+All four distance-2 pairs, from (2, 0) to (20, 18), score $+5.9478$. Both distance-3 pairs score
+$+5.4022$. The absolute positions changed by up to 18, and the score did not move; changing the
+gap by 1 did move it.
+
+Try a variation: compare pairs `(5, 3)` and `(3, 5)`. The gap has the same size but the
+opposite sign, and the scores differ, so RoPE knows whether the key is before or after the
+query.
+
 ## Exercise
 
 Explain in two sentences why attention *needs* positional information at all (refer to
@@ -187,6 +304,9 @@ the F10 formula), and why RoPE's relative-position property is a better fit for
 language than learned absolute positions. Then state what breaks when an input exceeds
 the model's trained context length, and name two fixes (one from this chapter, one from
 Bengali ch. 12).
+
+> **Hint:** ask what happens to attention's outputs if you shuffle the input tokens, and what a
+> learned-position model has to look up for position 2049.
 
 <details>
 <summary>Check your answer</summary>
@@ -199,4 +319,9 @@ between tokens rather than their absolute indices, matching how language works
 exceeds trained context, learned-absolute models have no position vector for the extra
 tokens and degrade sharply; fixes: **RoPE scaling** to extend the usable window, or
 **chunking** the document and retrieving the relevant pieces (RAG, Bengali ch. 12).
+
+**Permutation-invariant** (more precisely, permutation-equivariant for the outputs) means that
+reordering the inputs only reorders the outputs, with no other change. RoPE models also degrade
+past their trained length, more gently, because they meet rotation angles they never saw in
+training; RoPE scaling is the fix for exactly that.
 </details>

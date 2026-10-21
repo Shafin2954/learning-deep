@@ -7,6 +7,9 @@ order: 10
 
 ## The one-sentence idea
 
+When you read "she" in a sentence, you glance back to find who "she" is. Attention lets every
+word do that: look at all the other words, decide which ones matter, and blend in what they say.
+
 This is the most important chapter in the track. Attention is the mechanism that
 replaced recurrence, powers every LLM you'll fine-tune, and — once you've built it by
 hand — turns the Transformer from a black box into something you can reason about.
@@ -16,13 +19,25 @@ Each token produces a new representation by taking a **weighted average of all t
 values**, where the weights say *how relevant each other token is to it*. "Self"-attention
 because the tokens attend to each other within the same sequence.
 
+A token's **representation** is its current vector (F8). A **weighted average** is an average
+where some items count more than others; here the weights are positive and add up to 1.
+
 ## Query, Key, Value — the search metaphor
+
+Each token plays three roles at once: it asks a question, it advertises what it is about, and it
+holds information to hand over. Matching questions to advertisements decides who listens to
+whom.
 
 For every token we compute three vectors, each via a learned linear layer (F1):
 
 - **Query (Q):** "what am I looking for?"
 - **Key (K):** "what do I offer / what am I about?"
 - **Value (V):** "what information do I carry?"
+
+> **Picture it:** a library search. Your query is what you type into the search box. Each
+> book's key is its catalogue label. Each book's value is its contents. Attention reads a bit
+> of *every* book, in proportion to how well its label matches your search, instead of fetching
+> only the single best one. That is why it is called a *soft* lookup.
 
 The analogy is a soft dictionary lookup. Token $i$'s query is compared against every
 token's key to decide how much to retrieve from each token's value. Concretely:
@@ -37,15 +52,30 @@ token's key to decide how much to retrieve from each token's value. Concretely:
 4. **Weighted sum** — multiply the weights by the values. Each token's output is a blend
    of the values it cared about.
 
+Softmax **saturates** when one input is so much larger than the rest that the output is almost
+exactly one-hot; then small changes to the scores barely change the output, so the gradients are
+nearly zero.
+
 In one equation:
 
 $$
 \mathrm{Attention}(Q, K, V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
 $$
 
+> **In plain words:**
+> - $Q$, $K$, $V$ are matrices with one row per token: the queries, keys and values.
+> - $QK^\top$ is a table of scores: row $i$, column $j$ says how well token $i$'s question
+>   matches token $j$'s label.
+> - Dividing by $\sqrt{d_k}$ keeps those scores at a sensible size.
+> - The softmax, applied to each row, turns scores into weights that add up to 1.
+> - Multiplying by $V$ gives each token the weighted blend of everyone's values.
+
 That formula is the engine of the entire field.
 
 ### Why divide by $\sqrt{d_k}$?
+
+Adding up more random numbers gives a bigger spread. Dividing by the square root of how many you
+added brings the spread back to 1.
 
 With $d_k$-dimensional queries and keys, each dot product $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$
 is a sum of $d_k$ terms. If $q_i, k_i \sim \mathcal{N}(0,1)$, each product has
@@ -55,6 +85,9 @@ $$
 \mathrm{Var}[q \cdot k] = d_k
 $$
 
+> **In plain words:** the variances of independent terms add up, so $d_k$ terms of variance 1
+> give variance $d_k$. With $d_k = 64$, a typical score has a spread of 8 instead of 1.
+
 As $d_k$ grows (typical values: 64–128), the dot products grow as $\sqrt{d_k}$, pushing
 softmax inputs into the saturation region where $\partial \mathrm{softmax}/\partial z \approx 0$.
 Dividing by $\sqrt{d_k}$ restores unit variance:
@@ -63,8 +96,14 @@ $$
 \mathrm{Var}\!\left[\frac{q \cdot k}{\sqrt{d_k}}\right] = \frac{d_k}{d_k} = 1
 $$
 
+> **In plain words:** dividing a random number by $c$ divides its variance by $c^2$. Dividing by
+> $\sqrt{d_k}$ therefore divides the variance $d_k$ by $d_k$, leaving 1.
+
 keeping gradients healthy throughout training. This is why it is called *scaled*
 dot-product attention — not a detail, a stability requirement.
+
+The block builds one attention layer over 4 tokens of width 8, with random projection
+matrices, and checks the shapes and weights.
 
 ```python
 import numpy as np
@@ -103,15 +142,38 @@ token 0 attends to  : [0.   0.99 0.01 0.  ] (over the 4 tokens)
 The weights sum to 1, the output has the right shape, and token 0's output is literally
 a weighted mix of values — dominated by token 1.
 
+Look at the third line: token 0 puts 0.99 of its attention on token 1 and almost none elsewhere.
+That near one-hot pattern is the saturation the scaling is meant to prevent, and it happens here
+because the random weight matrices have std 1. They make each entry of $Q$ and $K$ have a spread
+of about 2.7 rather than 1, so even the scaled scores are large.
+
+> **Watch out:** the $\sqrt{d_k}$ fix assumes queries and keys with unit-sized entries. Real
+> models get that from proper initialization (F5) and normalization before attention. If you
+> initialize `Wq` and `Wk` with std 1 instead of about $1/\sqrt{d}$, attention starts saturated
+> and learns slowly.
+
 ## The causal mask
+
+When the model is learning to predict the next word, it must not be allowed to peek at that word.
+The causal mask hides all later positions from every token.
 
 A language model predicting the next token must not look at future tokens — that would
 be cheating. So for decoder/LLM attention we **mask** the scores: before softmax, set
 every "future" position to $-\infty$ so its weight becomes 0. The result is a
 lower-triangular attention pattern: position $t$ attends only to positions $\le t$.
 
+Setting a score to $-\infty$ works because $e^{-\infty} = 0$, so softmax gives that position zero
+weight. Code uses $-10^9$ as a stand-in for $-\infty$, which avoids `nan` from `inf - inf`.
+**Lower-triangular** means every entry above the main diagonal is zero.
+
 Encoder models (BERT-style) use *no* mask — every token sees every token, which is why
 they're better for understanding tasks and worse for generation.
+
+An **encoder** reads a whole text at once to understand it; a **decoder** generates text one
+token at a time, left to right.
+
+> **Picture it:** reading a mystery novel with a sheet of card that you slide down the page.
+> At each line you can see everything above it but nothing below.
 
 ```python
 # Causal mask: position t sees only tokens <= t (no peeking at the future).
@@ -131,7 +193,15 @@ causal attention weights (upper triangle is 0):
 
 The upper triangle is exactly zero — verified.
 
+Read the matrix row by row. Row 0 can see only itself, so it has 1.0 on itself. Row 1 splits
+0.07 and 0.93 between tokens 0 and 1. Row 2 puts all its weight on itself. Row 3 could look at
+all four tokens but chooses token 1 (0.93). Every number above the diagonal is 0, and every row
+still sums to 1, because softmax renormalizes over the positions that remain.
+
 ## Multi-head attention
+
+Several smaller attention operations side by side can each track a different kind of
+relationship: one follows grammar, another follows who-refers-to-whom, and so on.
 
 One attention operation can only learn one notion of "relevance." Real language needs
 several simultaneously (syntactic agreement, coreference, topic, position…). So we run
@@ -139,6 +209,14 @@ attention $h$ times in parallel on *slices* of the vectors — each slice is a "
 its own learned $Q/K/V$ — then concatenate the heads and pass through a final linear
 layer $W_o$. Same total compute, but the model attends in $h$ different subspaces at
 once. A "12-head" model is doing 12 parallel attentions per layer.
+
+**Coreference** is working out which words refer to the same thing, such as "Rina" and "she".
+To **concatenate** is to glue vectors end to end. With $d = 8$ and $h = 2$, each head works on
+4 of the 8 numbers, and gluing the two 4-number outputs gives 8 again.
+
+> **Picture it:** a panel of specialists reading the same sentence. One marks grammar, one
+> marks names, one marks topic. Their notes are stapled together, and $W_o$ is the editor who
+> combines them into one summary.
 
 ```python
 # Multi-head attention: split d into h heads, attend per head, concat, project.
@@ -160,15 +238,27 @@ print("multi-head output shape:", multihead(X, Wq, Wk, Wv, Wo).shape)   # (4, 8)
 multi-head output shape: (4, 8)
 ```
 
+The output is $(4, 8)$, the same shape as the input. That is what lets a Transformer stack
+dozens of these layers on top of each other.
+
 ## Why this fixes the RNN problems (F9)
+
+The two RNN problems from F9 disappear: every token reaches every other token in one step, and
+all the scores are computed at once.
 
 Token 100 attends to token 1 in a *single* matmul — a length-1 path, so no vanishing
 relay; long-range dependency is trivial. And $QK^\top$ computes *all* pairwise scores at
 once — fully parallel on a GPU.
 
 The price is the $QK^\top$ matrix is $n \times n$: **$O(n^2)$** in sequence length. That
-quadratic cost is the single most important fact about scaling LLMs, the reason long
-documents are expensive, and the problem the Mamba/MoE architectures attack.
+quadratic cost is the single most important fact about scaling LLMs, and the reason long
+documents are expensive. Architectures such as Mamba (F9) attack it by replacing attention with a
+recurrent state. Mixture-of-experts (**MoE**) models attack a different cost, the feed-forward
+compute per token, by running only a few expert sub-networks for each token.
+
+> **Watch out:** the $n \times n$ score matrix is per head and per layer. A 4,096-token input
+> has about 16.8 million scores in *each* head of *each* layer, which is why memory, not
+> arithmetic, is usually what limits context length.
 
 **This is 90% of a Transformer.** A Transformer block (F12) is: multi-head
 self-attention + a residual connection + LayerNorm (F5) + a feed-forward MLP (F2) +
@@ -176,7 +266,21 @@ another residual + LayerNorm. You already have every piece except the wrapper. W
 you fine-tune an LLM, you are nudging the $Q/K/V/W_o$ and MLP weights of dozens of
 these blocks. Understanding this one mechanism is understanding the model.
 
+## Recap in plain words
+
+- Attention gives each token a new vector that is a weighted average of every token's value.
+- The weights come from matching each token's query against every token's key, then applying
+  softmax.
+- Dividing the scores by $\sqrt{d_k}$ stops softmax from saturating into one-hot weights.
+- A causal mask hides future tokens so a language model cannot cheat.
+- Multi-head attention runs several smaller attentions in parallel and combines their outputs.
+- Every pair of tokens is one step apart and all scores are computed at once, at a cost that
+  grows with the square of the length.
+
 ## Try it Yourself
+
+Two experiments on 5 tokens of width 64: how sharp attention is with and without the
+$\sqrt{d_k}$ scaling, and whether the causal mask hides the future.
 
 ```python
 import numpy as np
@@ -202,6 +306,22 @@ _, w = attention(Q, K, V, mask=causal)
 print("\ntoken 2 attention weights:", w[2].round(2), "(positions 3,4 must be 0)")
 ```
 
+```output
+unscaled max weight per row: [0.99 1.   0.8  0.81 0.87]
+scaled   max weight per row: [0.42 0.58 0.38 0.43 0.44]
+
+token 2 attention weights: [0.02 0.39 0.59 0.   0.  ] (positions 3,4 must be 0)
+```
+
+Compare the first two lines. Without scaling, the biggest weight in each row is 0.8 to 1.0: the
+softmax is nearly saturated, with one token taking almost everything. With scaling, the biggest
+weights are 0.38 to 0.58, so attention is spread over several tokens and the gradients can still
+move it. In the last line, token 2's weights on positions 3 and 4 are exactly 0, and the other
+three weights, 0.02, 0.39 and 0.59, add up to 1.
+
+Try a variation: set `d = 512`. The unscaled maxima climb to between 0.97 and 1.0, while the
+scaled ones stay around 0.36 to 0.53, because the scaling grows with $d$.
+
 ## Exercise
 
 Implement `self_attention(X, Wq, Wk, Wv, causal=False)` end to end (projections →
@@ -209,6 +329,9 @@ scaled scores → optional causal mask → softmax → weighted values), then ve
 every attention-weight row sums to 1, and (b) with `causal=True`, the weight matrix is
 lower-triangular. This single function is the heart of every LLM — when you fine-tune
 one, you're adjusting the `Wq`/`Wk`/`Wv` it uses.
+
+> **Hint:** `np.tril(np.ones((T, T)))` gives the lower-triangular mask, and `np.triu(w, 1)`
+> extracts everything strictly above the diagonal, which must be all zeros.
 
 <details>
 <summary>Solution</summary>
@@ -233,4 +356,8 @@ assert np.allclose(w.sum(1), 1)                       # (a)
 assert np.allclose(np.triu(w, 1), 0)                  # (b) upper triangle is 0
 print("verified: rows sum to 1, causal is lower-triangular")
 ```
+
+The function is the earlier `attention` with the three projections moved inside. Both
+`assert` lines pass, so the script prints the "verified" message. Use `np.allclose` rather
+than `==` for the row sums, because floating-point sums are rarely exactly 1.
 </details>

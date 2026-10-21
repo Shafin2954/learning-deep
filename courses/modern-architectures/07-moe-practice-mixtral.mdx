@@ -7,17 +7,32 @@ order: 7
 
 ## The load imbalance problem
 
+Left alone, a router (ch. 6) tends to fall in love with a few experts and ignore the rest. The
+favourites get all the practice, so they get even better, and the others never learn.
+
 A perfectly trained router would distribute tokens evenly across experts: each expert handles
 $T/N$ tokens per batch. In practice the router collapses — a few popular experts receive most
 tokens, others starve. This is *expert collapse*: the rich get richer because popular experts
 train more, become better, attract more tokens, and train even more.
+
+> **Picture it:** a school where pupils may pick any tutor. One tutor is slightly better on
+> day one, so everyone queues for her. She gets more practice and becomes better still, while
+> the other seven tutors sit idle and never improve. The school pays eight salaries for one
+> tutor's work.
 
 Collapsed training is catastrophic: most of the model's capacity goes unused, and throughput
 tanks because the overloaded expert becomes the bottleneck.
 
 ## The auxiliary load-balancing loss
 
+The fix is a small penalty added to the training loss that grows when the load is uneven.
+Gradient descent then nudges the router towards spreading tokens out.
+
 The fix is to add a differentiable proxy for load imbalance to the training loss:
+
+An **auxiliary loss** is an extra term added to the main loss to encourage a side goal. A
+**differentiable proxy** is a smooth stand-in for a quantity that has no useful gradient, so
+training can still push on it.
 
 $$
 \mathcal{L}_{\text{aux}} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \cdot P_i
@@ -29,9 +44,18 @@ where:
 - $\alpha$ is a small coefficient (typically 0.01 – 0.1)
 - $N$ factors out so the magnitude is roughly dataset-invariant
 
+> **In plain words:** for every expert, multiply "how many tokens it actually got" by "how
+> much the router wanted to send it", add these up, and scale. If routing is perfectly even,
+> every $f_i$ and $P_i$ is $1/N$, the sum is $1/N$, and the loss equals $\alpha$. If one
+> expert gets everything, the loss climbs to $\alpha N$.
+
 $f_i$ is not differentiable (it involves argmax), but $P_i$ is. The product $f_i \cdot P_i$
 creates a gradient signal: if expert $i$ receives many tokens ($f_i$ high), the loss penalizes
 high $P_i$, pushing the router to distribute more evenly.
+
+**Argmax** picks the single winner, a jump from one expert to another with no slope in
+between, so its gradient is zero almost everywhere. $f_i$ acts as a constant weight telling the
+gradient *which* $P_i$ to push down hardest.
 
 ```python
 import torch
@@ -63,22 +87,36 @@ loss_bad = load_balance_loss(logits_collapsed, E)
 print(f"Collapsed router loss: {loss_bad:.4f}")
 
 # Balanced router
+torch.manual_seed(0)
 logits_balanced = torch.randn(T, E) * 0.1
 loss_good = load_balance_loss(logits_balanced, E)
 print(f"Balanced router loss:  {loss_good:.4f}")
 ```
 
 ```output
-Collapsed router loss: 0.1250
-Balanced router loss:  0.0141
+Collapsed router loss: 0.0800
+Balanced router loss:  0.0101
 ```
+
+The two numbers match the formula. Collapsed: one expert has $f_i = 1$ and $P_i \approx 1$, so
+the loss is $0.01 \times 8 \times 1 = 0.0800$. Balanced: every term is about $1/8 \times 1/8$,
+eight terms sum to $1/8$, and the loss is $0.01 \times 8 / 8 \approx 0.0101$, which is the floor.
+The collapsed router pays 8 times more.
 
 The collapsed router has a much higher auxiliary loss, creating pressure toward balance during
 training. The total loss is $\mathcal{L} = \mathcal{L}_{\text{LM}} + \mathcal{L}_{\text{aux}}$.
 
+Here $\mathcal{L}_{\text{LM}}$ is the **language-modelling loss**, the usual next-token
+cross-entropy.
+
 ## Mixtral 8×7B
 
+Mixtral is the open model that made MoE mainstream. Its numbers are worth knowing because
+later papers compare against it.
+
 Mixtral (Mistral AI, 2024) is the reference open-weight MoE model. Key numbers:
+
+**Open-weight** means the trained weights are published for anyone to download and run.
 
 | Parameter | Value |
 |-----------|-------|
@@ -92,12 +130,20 @@ Mixtral (Mistral AI, 2024) is the reference open-weight MoE model. Key numbers:
 | Context length | 32,768 |
 
 The "8×7B" naming is slightly misleading: each expert is not a 7B model. The total parameter
-count is 46.7B because non-FFN parameters (embeddings, attention) are shared across all tokens.
+count is 46.7B, not 56B, because only the FFNs are copied per expert; the non-FFN parameters
+(embeddings, attention, norms) are shared by all experts and counted once.
 
-Mixtral uses grouped-query attention (GQA, 8 KV heads for 32 Q heads) to reduce the KV cache,
-and sliding-window attention to handle long contexts efficiently.
+Mixtral uses grouped-query attention (GQA, 8 KV heads for 32 Q heads) to reduce the KV cache.
+Unlike Mistral 7B, which used sliding-window attention, Mixtral attends densely over its full
+32K context.
+
+> **Watch out:** "12.9B active" sets the compute per token, not the memory. To serve Mixtral
+> you still hold all 46.7B parameters, about 93 GB in bfloat16.
 
 ## Switch Transformer and GShard
+
+Two Google systems set the patterns everyone else follows: Switch showed one expert per token
+can be enough, and GShard showed how to spread experts over thousands of chips.
 
 Switch Transformer (Google, 2021) uses top-1 routing for maximum training efficiency.
 The key insight was that top-1 routing works well if the load-balancing loss is tuned
@@ -107,14 +153,26 @@ GShard (Google) scales MoE to 600B parameters across 2,048 TPUs by sharding expe
 devices: each device holds a subset of experts. Tokens are dispatched to the correct device
 with all-to-all communication. This is the real systems challenge for MoE at scale.
 
+**Sharding** means splitting something across devices. **All-to-all communication** means
+every device sends some tokens to every other device and receives some back, twice per MoE
+layer (out to the experts and back). That network traffic, not the arithmetic, is often the
+bottleneck.
+
+> **Picture it:** a postal sorting office. Each town (device) has letters (tokens) for every
+> other town's specialist. Before any specialist can work, every town must swap mail with
+> every other town.
+
 ## Expert Choice routing
+
+Flip the question around: instead of each token picking experts, let each expert pick the
+tokens it likes best. Then every expert gets exactly the same amount of work.
 
 Standard routing: each token picks top-k experts.
 Expert Choice routing (Zhou et al., 2022): each expert picks its top-$c$ tokens from the batch.
 
 This guarantees perfect load balance by construction — each expert always processes exactly
-$c$ tokens. The tradeoff: some tokens may not be processed by any expert (if the batch is
-smaller than expected) and token coverage is no longer guaranteed.
+$c$ tokens. The tradeoff: token coverage is no longer guaranteed. Some tokens may be picked by
+several experts and others by none, and an unpicked token skips the layer through the residual.
 
 ```python
 def expert_choice_routing(router_logits, expert_capacity):
@@ -129,6 +187,7 @@ def expert_choice_routing(router_logits, expert_capacity):
     _, top_tokens = torch.topk(logits_T, k=expert_capacity, dim=-1)  # (E, capacity)
     return top_tokens
 
+torch.manual_seed(0)
 T, E, cap = 32, 4, 8
 logits = torch.randn(T, E)
 selected = expert_choice_routing(logits, cap)
@@ -143,12 +202,22 @@ print(f"Unique tokens covered: {len(covered)} / {T}")
 ```output
 Selected token indices per expert: torch.Size([4, 8])
 Tokens per expert: [8, 8, 8, 8]  (perfectly balanced by construction)
-Unique tokens covered: 29 / 32
+Unique tokens covered: 20 / 32
 ```
 
-29/32 coverage is typical — 3 tokens were not selected by any expert.
+The second line shows the balance: exactly 8 tokens per expert. The third line shows the
+price: only 20 of the 32 tokens were picked by any expert, so 12 tokens got no expert at all.
+Four experts each picking 8 of 32 tokens at random would cover about
+$32 \times (1 - 0.75^4) \approx 22$ tokens on average, so 20 is a typical result.
+
+> **Watch out:** Expert Choice needs the whole batch to decide, because each expert ranks all
+> tokens. That breaks causal, one-token-at-a-time generation, where future tokens do not exist
+> yet. It suits training and encoders better than autoregressive decoding.
 
 ## Practical tips for training MoE models
+
+A few rules of thumb from practice: tune the balancing weight, watch the per-expert counts,
+soften the router early, and budget memory for every expert.
 
 - Start with $\alpha = 0.01$ for the aux loss; increase if experts collapse, decrease if
   quality drops (the loss pulls in opposite directions).
@@ -159,7 +228,22 @@ Unique tokens covered: 29 / 32
 - Inference: all experts must be loaded into memory even if only 2 fire per token. Memory
   bandwidth, not FLOPs, is the bottleneck.
 
+**Temperature** divides the logits before the softmax; a value above 1 flattens the
+probabilities, so the router spreads tokens more evenly while it is still clueless. **Warmup**
+is the first stretch of training.
+
+## Recap in plain words
+
+- Routers tend to collapse onto a few experts, because favoured experts train more and get favoured more.
+- The auxiliary loss multiplies each expert's actual share by the router's average probability; it is 0.0101 when balanced and 0.0800 when collapsed (with $\alpha = 0.01$, 8 experts).
+- Mixtral 8x7B: 8 experts, top-2, 46.7B stored, about 12.9B active per token.
+- At scale, experts live on different devices and tokens travel with all-to-all communication.
+- Expert Choice gives perfect balance but leaves some tokens unprocessed (12 of 32 here).
+
 ## Try it Yourself
+
+The full layer: top-2 routing, four experts, and the auxiliary loss computed in the same
+forward pass and added to a stand-in task loss before `backward()`.
 
 ```python
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -204,6 +288,7 @@ class MoELayerWithAuxLoss(nn.Module):
         P = probs.mean(0)
         return self.alpha * self.num_experts * (f * P).sum()
 
+torch.manual_seed(0)
 layer = MoELayerWithAuxLoss()
 x = torch.randn(2, 8, 128, requires_grad=True)
 out, aux_loss = layer(x)
@@ -214,13 +299,26 @@ print(f"Output: {out.shape}  Aux loss: {aux_loss.item():.4f}")
 ```
 
 ```output
-Output: torch.Size([2, 8, 128])  Aux loss: 0.0243
+Output: torch.Size([2, 8, 128])  Aux loss: 0.0106
 ```
+
+The output keeps the input shape, and the auxiliary loss is 0.0106, a hair above the floor
+of $\alpha = 0.01$. A freshly initialized router is close to balanced, so the penalty is
+almost at its minimum. The `backward()` call shows the aux loss flows gradients into the gate
+alongside the task loss.
+
+Try `alpha=1.0` and print `aux_loss` again: it scales up 100 times. Then initialize the gate's
+weights to large values (`layer.gate.weight.data *= 50`) to force a lopsided router, and watch
+the aux loss rise towards its ceiling of $\alpha N$.
 
 ## Exercise
 
 What happens to the auxiliary loss if you set `alpha = 0`? What if you set `alpha = 10`?
 Explain the tradeoff and implement a training step that monitors both losses separately.
+
+> **Hint:** the aux loss scales linearly with `alpha`. Ask what each extreme makes the
+> router care about. For monitoring, return the task loss and the aux loss as separate
+> numbers rather than only their sum.
 
 <details>
 <summary>Solution</summary>
@@ -243,17 +341,24 @@ def training_step(model, x, target_loss_fn, alpha=0.01):
 # The right alpha keeps aux_loss << task_loss.
 # If aux_loss > 0.1 * task_loss, reduce alpha.
 # If any expert handles < 5% of tokens, increase alpha.
+torch.manual_seed(0)
 layer = MoELayerWithAuxLoss(alpha=0.01)
 x = torch.randn(2, 8, 128)
 out, aux = layer(x)
-task = out.pow(2).mean()
+task = F.mse_loss(out, torch.randn_like(out))  # regression to noise: loss ~1, like a real task
 print(f"Task loss: {task.item():.4f}  Aux loss: {aux.item():.4f}  Ratio: {aux.item()/task.item():.3f}")
 print("Ratio << 1 means aux loss is a gentle regularizer, not dominating training.")
 ```
 
 ```output
-Task loss: 0.9847  Aux loss: 0.0231  Ratio: 0.023
+Task loss: 1.0083  Aux loss: 0.0106  Ratio: 0.010
 Ratio << 1 means aux loss is a gentle regularizer, not dominating training.
 ```
+
+With a task loss of 1.0083 (a regression to noise, about the size of a real loss) and an aux
+loss of 0.0106, the ratio is 0.010: the balancing term is a gentle nudge. At `alpha = 0` the
+aux loss is exactly 0 and nothing stops collapse. At `alpha = 10` the aux loss would be about
+10.6, ten times the task loss, so the router would learn "spread evenly" and stop learning
+"send each token to the expert that helps it most".
 
 </details>

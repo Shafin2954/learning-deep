@@ -7,20 +7,44 @@ order: 9
 
 ## The ODE perspective on recurrence
 
+A normal RNN updates its memory in fixed ticks, like a clock. A liquid network treats memory
+as something that flows in continuous time, and lets the input decide how fast it flows:
+quickly when things change, slowly when they are calm.
+
 Standard RNNs update their hidden state with a fixed, discrete equation:
 $h_t = \tanh(Wh_{t-1} + Ux_t + b)$. Liquid Neural Networks (LNNs) replace this with a
 continuous-time ordinary differential equation whose dynamics depend on the current input:
 
+An **ordinary differential equation** (ODE) describes how fast something changes at each
+moment, instead of what it equals at each tick. You get the actual values by stepping it
+forward in small time slices, which is called **integrating** it.
+
 $$
 \frac{dx}{dt} = -\frac{x(t)}{\tau(x(t), u(t), t)} + f(x(t), u(t), t)
 $$
+
+> **In plain words:**
+> - $x(t)$ is the network's state (its memory) at time $t$, and $u(t)$ is the input;
+> - the first term, $-x/\tau$, pulls the state back towards zero, faster when $\tau$ is small;
+> - the second term, $f$, pushes the state according to the input and the current state;
+> - $\tau$ itself is computed from the state and input, which is what makes it "liquid".
 
 Here $\tau$ is the **liquid time constant** — a learned, input-dependent timescale. When
 the input is loud and changing, $\tau$ becomes small and the state updates quickly. When
 the input is quiet, $\tau$ grows and the state relaxes slowly. This gives LNNs an adaptive
 temporal resolution that fixed-step RNNs cannot achieve.
 
+> **Picture it:** a thermometer whose glass gets thinner when the weather changes fast. Thin
+> glass responds within seconds; thick glass smooths out every flicker. A liquid network
+> chooses its own glass thickness from moment to moment.
+
+This is the same idea as Mamba's input-dependent step $\Delta_t$ (ch. 4), reached from a
+different direction: biology and control theory rather than sequence modelling.
+
 ## Biological inspiration: C. elegans wiring
+
+The designers asked: how does a worm with a few hundred neurons manage to steer around
+obstacles, when our networks need millions of weights for similar control tasks?
 
 LNNs were introduced by Hasani et al. (MIT, 2020) and explicitly inspired by the nervous
 system of *C. elegans*, the nematode worm. Despite having only 302 neurons and roughly 7000
@@ -31,7 +55,13 @@ The key insight: **wiring matters as much as the neuron equations**. LNNs use sp
 structured connectivity learned by an NCP (Neural Circuit Policy) wiring algorithm, not a
 dense weight matrix. This sparsity is what keeps LNN models tiny.
 
+**Sparse connectivity** means most neuron pairs have no connection at all, so there are far
+fewer weights to store and learn.
+
 ## Neural Circuit Policies (NCPs)
+
+An NCP is a wiring diagram with layers that play fixed roles, like a tiny assembly line from
+senses to muscles.
 
 An NCP divides neurons into four functional groups:
 
@@ -44,22 +74,48 @@ Connections between groups follow biologically-inspired rules (inter neurons do 
 directly connect to motor neurons without passing through command neurons, etc.). The
 result is a sparse graph with far fewer edges than a dense RNN of the same size.
 
+> **Picture it:** a company where the front desk (sensory) talks only to analysts (inter),
+> analysts report only to managers (command), and only managers give orders to the workers
+> (motor). Fewer reporting lines than "everyone emails everyone", and each line has a clear job.
+
 A 19-neuron NCP has been shown to control a car-racing agent purely from camera input —
 a task that an LSTM typically needs hundreds of hidden units for.
 
+In that work the camera images first pass through a small convolutional network; the 19
+liquid neurons take its features and do the steering. An **LSTM** (long short-term memory)
+is the classic gated RNN.
+
 ## Closed-form Continuous-time networks (CfC)
+
+Stepping an ODE forward in tiny slices is slow. CfC replaces the slicing with one formula that
+jumps straight to the answer (approximately), which turns out to be a gated RNN update.
 
 Numerically integrating an ODE at every step is expensive. The CfC (Hasani et al., 2022)
 solves the LTC ODE in closed form using a first-order approximation:
+
+**Closed form** means a direct formula rather than an iterative procedure. **LTC** (liquid
+time-constant) is the ODE from the first section.
 
 $$
 x(t + \Delta t) \approx \sigma(-f(x, u, t) \cdot \Delta t) \cdot x(t)
   + (1 - \sigma(-f(x, u, t) \cdot \Delta t)) \cdot g(x, u, t)
 $$
 
+> **In plain words:** the new state is a blend of the old state $x(t)$ and a target state
+> $g$. The blend weight is a sigmoid (a squashing function between 0 and 1)
+> of $-f \cdot \Delta t$. A long time step or a strong $f$ moves the weight towards the target; a tiny time
+> step keeps the old state.
+
 This is a gated update — structurally similar to a GRU but derived from the ODE solution
 rather than designed heuristically. CfC is 10–100× faster than Euler-method integration
 and is the practical form used in real deployments.
+
+A **GRU** (gated recurrent unit) is a popular RNN that blends old state and a candidate state
+with a learned gate. The **Euler method** is the simplest ODE solver: take many small
+straight-line steps.
+
+The code is a simplified CfC cell. Here the gate `f_val` is a plain sigmoid of a linear
+layer, and the `dt` argument is accepted but not used yet; the exercise adds it.
 
 ```python
 import torch
@@ -105,10 +161,16 @@ Output shape: torch.Size([4, 20, 32])
 Cell params: 2624
 ```
 
+The output has one 32-number state for each of 4 sequences at each of 20 steps. The cell has
+2,624 parameters: two linear layers, each $(8 + 32) \times 32$ weights plus 32 biases.
+
 2624 parameters for a 32-hidden-unit CfC cell — compare to a GRU cell with the same
-dimensions which would need about 3 × 32 × (8 + 32) = 3840 parameters.
+dimensions which would need about 3 × 32 × (8 + 32) = 3840 weights, or 4,032 with PyTorch's biases. The CfC cell has two gates' worth of weights where the GRU has three.
 
 ## Robustness properties
+
+A model that has learned *how a system evolves* tends to cope better with new conditions than
+one that has learned surface shortcuts. That is the claim behind LNNs' robustness.
 
 LNNs exhibit unusual robustness to distribution shift. In the MIT autonomous driving
 experiments, an NCP trained on a specific road type generalized better to unseen road
@@ -116,11 +178,21 @@ conditions than LSTM baselines with 10× more parameters. The hypothesis: the OD
 inductive bias discourages shortcut solutions and forces the model to learn the underlying
 temporal dynamics.
 
+**Distribution shift** is when test data differ from training data (new roads, new weather).
+A **shortcut solution** is a cheap pattern that works on the training data for the wrong
+reason, such as steering by the colour of the roadside rather than the road's edge.
+
 This also shows up in time-series forecasting: LNNs are competitive with LSTM and
 sometimes GRU on medical sensor data (ECG, EEG) where the underlying signal has
 continuous dynamics that the ODE naturally captures.
 
+> **Watch out:** most robustness results come from small control and sensor tasks. Do not
+> assume they carry over to large-scale benchmarks without testing.
+
 ## When to use LNNs
+
+LNNs are a specialist tool: excellent when the model must be tiny, run in real time, and be
+inspectable, and a poor fit for giant pretraining.
 
 LNNs shine in **resource-constrained, interpretable, time-critical** applications:
 
@@ -133,7 +205,22 @@ LNNs do **not** compete with Transformers or SSMs on language modeling, vision, 
 any large-scale benchmark. Their parameter count and sequential computation make
 them fundamentally unsuited to the pretraining paradigm.
 
+**Pretraining** means training a large model on a huge generic dataset first. That needs
+massive parallelism, and an RNN-style cell that must step through time one token after another
+cannot supply it the way attention or an SSM's parallel scan can.
+
+## Recap in plain words
+
+- A liquid network describes its memory as an ODE whose time constant depends on the input.
+- Small time constant: react fast. Large time constant: smooth and remember.
+- Sparse, structured NCP wiring, inspired by a 302-neuron worm, keeps the models tiny.
+- CfC replaces slow ODE integration with a closed-form, GRU-like gated update.
+- LNNs suit small, real-time, interpretable control and sensor tasks, not large-scale pretraining.
+
 ## Try it Yourself
+
+Train a 16-unit CfC cell plus a linear head to predict the next value of a sine wave, for 200
+steps of Adam.
 
 ```python
 import torch
@@ -160,6 +247,7 @@ def make_sine(B=32, T=50):
 data = make_sine()
 x, y = data[:, :-1, :], data[:, 1:, :]
 
+torch.manual_seed(0)
 cell = CfCCell(1, 16)
 head = nn.Linear(16, 1)
 opt  = optim.Adam(list(cell.parameters()) + list(head.parameters()), lr=1e-3)
@@ -178,8 +266,15 @@ print(f"Final MSE: {loss.item():.5f}")
 ```
 
 ```output
-Final MSE: 0.00083
+Final MSE: 0.00433
 ```
+
+The final mean squared error is 0.00433. The sine values swing between $-1$ and $1$, so a
+typical prediction is off by about $\sqrt{0.00433} \approx 0.066$, a few percent of the
+range, with only 16 hidden units.
+
+Try 1,000 epochs instead of 200, then a hidden size of 4 (change both `16`s in the cell, the
+head and `h`). Compare the final errors to see how little capacity this task really needs.
 
 ## Exercise
 
@@ -187,6 +282,10 @@ Modify `CfCCell` to add an explicit timestep $\Delta t$ parameter so different s
 in a batch can have different inter-sample intervals. This matters for irregularly-sampled
 medical data. Test that with $\Delta t = 0.1$ the model changes more slowly than with
 $\Delta t = 1.0$.
+
+> **Hint:** the retained fraction of the old state must go to 1 as $\Delta t$ goes to 0. A
+> sigmoid of `f * dt` goes to 0.5 instead, which fails. Use
+> $e^{-\text{rate} \cdot \Delta t}$ with a positive rate (softplus keeps it positive).
 
 <details>
 <summary>Solution</summary>
@@ -201,11 +300,13 @@ class CfCCellDt(nn.Module):
     def forward(self, x, h, dt):
         # dt: (B, 1) — per-sample timestep
         xh = torch.cat([x, h], dim=-1)
-        decay = torch.sigmoid(self.f(xh) * dt)   # slower decay for small dt
+        rate = torch.nn.functional.softplus(self.f(xh))  # positive rate
+        decay = torch.exp(-rate * dt)   # dt -> 0: decay -> 1, state barely moves
         target = torch.tanh(self.g(xh))
         return decay * h + (1.0 - decay) * target
 
 import torch
+torch.manual_seed(0)
 cell = CfCCellDt(4, 16)
 x = torch.randn(8, 4)
 h = torch.zeros(8, 16)
@@ -219,9 +320,14 @@ print(f"State change dt=1.0: {delta_fast:.4f}")
 ```
 
 ```output
-State change dt=0.1: 0.1023
-State change dt=1.0: 0.2847
+State change dt=0.1: 0.0174
+State change dt=1.0: 0.1257
 ```
 
 Smaller $\Delta t$ → smaller state update, exactly the liquid time-constant behavior.
+
+The numbers show it: with the same input, a tenth of the time step changes the state by
+0.0174 instead of 0.1257, about 7 times less. Exactly ten times less is not expected, because
+$1 - e^{-r \Delta t}$ is only roughly proportional to $\Delta t$ for small steps.
+
 </details>

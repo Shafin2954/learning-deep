@@ -7,12 +7,28 @@ order: 8
 
 ## Why embeddings exist
 
+Networks only understand lists of numbers. An **embedding** gives every word piece its own list of
+numbers, arranged so that words used in similar ways get similar lists.
+
 A model can't do math on the word "ভাষা". It does math on vectors. **Embeddings** are
 how text becomes vectors — and they're the input layer of every LLM, the heart of
 semantic search, and the thing your RAG system (Bengali ch. 12) retrieves with. This
 chapter takes you from the naive representation to the one that powers everything.
 
+A **vector** here is a fixed-length list of numbers, such as `[0.2, -1.3, 0.7, 0.0]`.
+**Semantic search** means finding text by meaning rather than by matching exact words. **RAG**
+(retrieval-augmented generation) means fetching relevant documents first and handing them to an
+LLM along with the question.
+
+> **Picture it:** a huge map where every word has a pin. Words that mean similar things, such as
+> "king" and "queen", are pinned close together; "table" sits in a different neighbourhood. An
+> embedding is a word's coordinates on that map, except the map has hundreds of directions
+> instead of two.
+
 ## One-hot: the honest, terrible starting point
+
+The simplest way to turn a word into numbers is to give it its own private slot. That works for
+telling words apart, but it says nothing about which words are alike.
 
 Give every vocabulary token an index, and represent token $i$ as a vector of all
 zeros with a single 1 at position $i$. With a 50,000-token vocab, each token is a
@@ -21,7 +37,14 @@ and (2) *every pair of distinct tokens is equally dissimilar* — the one-hot ve
 for "রাজা" (king) and "রানী" (queen) are exactly as different as "রাজা" and "টেবিল"
 (table). One-hot encodes identity but **zero meaning**. There's no notion of "close."
 
+> **Picture it:** a building where every person has a separate locked room on a separate floor.
+> You can always tell who is who, but the floor numbers tell you nothing about who is friends
+> with whom.
+
 ## Dense embeddings: a learned lookup table
+
+Instead of one huge mostly-zero list per word, give each word a short list where every number
+carries a little information. Training then nudges those numbers until similar words line up.
 
 Instead, map each token id to a short, dense vector of learned real numbers — say 768
 dimensions. This is just a matrix $E$ of shape $(\text{vocab\_size}, d)$; "embedding"
@@ -29,7 +52,15 @@ token $i$ is literally `E[i]` — a row lookup, nothing more. The magic is that 
 numbers are **learned by training**, so the model arranges tokens in space such that
 ones used in similar ways land near each other.
 
+**Dense** means most entries are non-zero, the opposite of one-hot's mostly-zero (**sparse**)
+vectors. $d$ is the **embedding dimension**, the length of each token's list. A **token id** is
+the integer the tokenizer assigns to a token. Looking up `E[i]` is mathematically the same as
+multiplying a one-hot vector by $E$, only far cheaper.
+
 ### Cosine similarity measures meaning
+
+Two vectors are "similar" when they point in nearly the same direction, whatever their lengths.
+Cosine similarity measures that direction match.
 
 Now "close in vector space" means "similar in meaning/usage," and you measure it with
 **cosine similarity** (angle between vectors):
@@ -38,9 +69,16 @@ $$
 \cos(a, b) = \frac{a \cdot b}{\|a\| \cdot \|b\|}
 $$
 
+> **In plain words:** $a \cdot b$ (the **dot product**) multiplies the two lists entry by entry
+> and adds up the results. $\|a\|$ is a vector's length. Dividing by both lengths removes the
+> effect of size, leaving the cosine of the angle between the two arrows.
+
 $1.0$ = identical direction, $0$ = unrelated, $-1$ = opposite. This is the
 representation the input layer of an LLM uses, and the geometry that famously makes
 `king − man + woman ≈ queen` work in classic word embeddings.
+
+The block builds a random 6-word table with 4 numbers per word, looks up three words, and
+compares cosine similarities for dense and one-hot vectors.
 
 ```python
 import numpy as np
@@ -80,7 +118,19 @@ One-hot gives cosine 0 between every distinct pair — no notion of similarity. 
 dense embedding already has structure (the random vectors differ), and learned vectors
 encode meaning.
 
+Check each line. The lookup of 3 ids gives shape `(3, 4)`: one 4-number row per token. A word
+compared with itself scores 1.0. "রাজা" vs "টেবিল" scores 0.4, but that number means nothing
+yet, because the table is random; after training, unrelated words would score near 0. Both
+one-hot lines print 0.0: king-vs-queen and king-vs-table look exactly equally different.
+
+> **Watch out:** cosine similarity is not a probability and does not have a universal
+> threshold. A score of 0.4 can be "very similar" for one embedding model and "unrelated" for
+> another. Compare scores only within one model, and calibrate thresholds on your own data.
+
 ## Static vs contextual embeddings
+
+Older embeddings give a word one fixed vector, no matter where it appears. Modern transformer
+embeddings give a word a different vector in each sentence, shaped by the words around it.
 
 Classic embeddings (Word2Vec, GloVe) are **static**: one fixed vector per word,
 regardless of sentence. That breaks on polysemy — "কল" means both "tap/faucet" and
@@ -91,9 +141,18 @@ token's representation absorb context. So "কল" in a plumbing sentence and "�
 phone sentence get different vectors. This is the entire reason transformer embeddings
 beat the older ones.
 
+**Polysemy** means one word having several unrelated meanings, like "bank" (river bank, money
+bank) in English.
+
+> **Picture it:** a static embedding is a dictionary entry printed once. A contextual embedding
+> is a translator reading the whole sentence before deciding what the word means here.
+
 **Sentence embedding models** (Bengali ch. 5) pool a transformer's contextual token
 vectors into one vector per sentence — what you'll use for Bengali semantic search
 and RAG retrieval.
+
+To **pool** is to combine many vectors into one, most often by averaging them. The block below
+embeds three sentences: two use "কল" as "tap", one as "call".
 
 ```python
 # Real contextual embeddings (run locally with a Bengali-aware model):
@@ -110,10 +169,27 @@ print("tap vs call:", round(float(cos(emb[0], emb[1])), 3))   # lower
 # Contextual models separate the two senses of কল; static embeddings cannot.
 ```
 
+```output
+tap vs tap : 0.626
+tap vs call: 0.293
+```
+
+The two "tap" sentences score 0.626 with each other, while "tap" vs "call" scores only 0.293,
+less than half. The model put the two senses of the same written word in different places,
+which a static embedding cannot do.
+
 This is a RUN-LOCALLY block (requires `sentence_transformers`). Run it locally with a
 Bengali-aware model to verify the contextual vs static gap.
 
+> **Watch out:** the first run downloads the model from the Hugging Face Hub (hundreds of MB),
+> which can take longer than the site's 30-second limit. Run it once locally so the model is
+> cached. Also note that sentence 3 shares the word "পানি" (water) with sentence 1, which helps
+> their score; a fair test of word sense would vary the other words too.
+
 ## Where embeddings show up in your competition
+
+Embeddings appear in three places: inside every model you fine-tune, in search, and as ready-made
+features for simple classifiers.
 
 - **Input layer** of any model you fine-tune — token ids → embedding rows → the stack.
 - **Semantic similarity / retrieval** — embed a Bengali query and documents, rank by
@@ -128,7 +204,23 @@ and pooling matters more. Prefer embedding models with real Bengali coverage
 (multilingual or Bengali-specific, Bengali ch. 4–5), and always evaluate retrieval on
 your own Bengali data — don't trust English-benchmark leaderboards for Bengali.
 
+A **subword token** is a piece of a word, such as a prefix or a suffix. A model that saw little
+Bengali may split one Bengali word into five or six such pieces, each with a weak embedding.
+
+## Recap in plain words
+
+- Models need numbers, and embeddings turn each token into a list of numbers.
+- One-hot vectors tell tokens apart but make every pair equally different.
+- A dense embedding table is a matrix; embedding a token is reading one row.
+- Training moves the rows so tokens used in similar ways end up pointing in similar directions.
+- Cosine similarity compares directions: 1 for the same, 0 for unrelated, $-1$ for opposite.
+- Contextual embeddings give a word a different vector in each sentence, which handles words
+  with several meanings.
+
 ## Try it Yourself
+
+This is the skeleton of semantic search: four "documents" with random vectors, a query placed
+near document 2, and a ranking by cosine similarity.
 
 ```python
 import numpy as np
@@ -159,12 +251,23 @@ for r in order:
 -0.116  ঢাকা বাংলাদেশের রাজধানী
 ```
 
+The machine-learning document ranks first at $+0.903$, because the query was built as its vector
+plus a little noise. The other three score between $-0.116$ and $+0.148$, the range you expect
+for unrelated random directions in 8 dimensions.
+
+Try a variation: raise the noise from `0.3` to `1.5`. The top score drops, and with enough
+noise a different document can overtake document 2. That is what weak embeddings do to
+retrieval.
+
 ## Exercise
 
 Write `top_k(query_vec, doc_matrix, k)` returning the indices of the `k` most similar
 documents by cosine similarity, computed *vectorized* (no Python loop over docs — use
 matrix ops, the F1 way). This exact function is the retrieval core you'll reuse in
 Bengali ch. 12.
+
+> **Hint:** if every vector has length 1, cosine similarity is a plain dot product. Normalize
+> the query and every row of the matrix first; then one matrix–vector product scores them all.
 
 <details>
 <summary>Solution</summary>
@@ -180,4 +283,9 @@ def top_k(q, D, k=3):
 
 Normalizing once, then a single matmul, gives every cosine similarity at once — this
 is how real vector search (FAISS, pgvector) scores thousands of docs fast.
+
+On the Try-it data, `top_k(q, D, 2)` returns indices `[2, 3]` with scores about 0.903 and
+0.148, the same as the loop version. `np.argsort` sorts from smallest to largest, so `[::-1]`
+reverses it to put the best match first. In a real system you normalize the document matrix
+once, when you build the index, not on every query.
 </details>

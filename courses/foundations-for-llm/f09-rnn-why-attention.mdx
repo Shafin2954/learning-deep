@@ -7,12 +7,23 @@ order: 9
 
 ## Why study RNNs at all?
 
+Before transformers, models read text one word at a time, like a person reading through a
+keyhole. Seeing exactly where that approach broke down explains why the transformer looks the way
+it does.
+
 Before attention, sequence models were **recurrent** (RNNs, LSTMs, GRUs). You don't
 need to master them — modern LLMs don't use them — but you need to understand *why
 they failed at scale*, because every design choice in the Transformer (F10–F12) is a
 direct answer to an RNN limitation. Knowing the disease makes the cure obvious.
 
+**Recurrent** means the model feeds its own output back in as input at the next step. An
+**RNN** (recurrent neural network) is the basic version; **LSTMs** and **GRUs** are improved
+versions with extra "gates" that decide what to keep and what to forget.
+
 ## How an RNN works
+
+An RNN keeps a running summary in its head. For each new word, it mixes the word with the old
+summary to make a new summary, and moves on.
 
 Process a sequence one token at a time, carrying a **hidden state** $h$ that's
 supposed to summarize everything seen so far:
@@ -21,8 +32,23 @@ $$
 h_t = \tanh(W_x x_t + W_h h_{t-1} + b)
 $$
 
+> **In plain words:**
+> - $x_t$ is the token (its embedding, F8) at position $t$.
+> - $h_{t-1}$ is the summary after the previous token; $h_t$ is the new one.
+> - $W_x$ mixes in the new token, $W_h$ mixes in the old summary, and $b$ is a bias.
+> - $\tanh$ squashes every number into the range $-1$ to $1$, so the summary cannot grow without
+>   bound.
+> - The same $W_x$, $W_h$ and $b$ are reused at every step.
+
 At each step, the new state depends on the current token *and* the previous state.
 In principle $h_t$ remembers the whole past. In practice, two problems break it.
+
+> **Picture it:** a game of telephone along a line of people. Each person hears a message,
+> adds one word of their own, and whispers the result to the next. The first word has to
+> survive every whisper to reach the end of the line.
+
+The block runs a tiny RNN over 6 tokens, then estimates how much a gradient grows or shrinks
+when it travels back $k$ steps.
 
 ```python
 import numpy as np
@@ -62,7 +88,22 @@ gradient scale 25 steps back ~ 1.84e+05
 gradient scale 50 steps back ~ 3.39e+10
 ```
 
+The first line confirms one 4-number state per timestep, 6 in all, each computed after the one
+before it. The rest tells a story the code's last comment does not: this random $W_h$ has a
+spectral radius of 1.62, *greater* than 1, so the factor *explodes*, from 1.62 at one step to
+$3.39 \times 10^{10}$ at 50 steps. Had the radius been below 1, the same table would have
+collapsed toward 0 instead. Either way, a signal 50 steps back arrives hugely distorted. The Try
+it section shows both cases side by side.
+
+> **Watch out:** "spectral radius to the power $k$" is a rough guide, not an exact gradient.
+> The real backward pass also multiplies by $\tanh$'s slope at each step, which is at most 1 and
+> often much smaller, so in practice shrinking is the more common failure.
+
 ## Problem 1: the vanishing gradient (long-range memory fails)
+
+For the model to learn that the first word mattered for the hundredth, the correction signal
+has to travel back through all 99 steps between them. At each step it gets multiplied, and a
+hundred multiplications by a number a bit off from 1 either crush it or blow it up.
 
 To learn that token 1 matters for token 100, gradients must flow back through 100
 steps of backpropagation through time. Each step multiplies by $W_h^{\top}$, so the
@@ -72,6 +113,13 @@ $$
 \left\|\frac{\partial L}{\partial h_0}\right\| \sim \rho(W_h)^T \cdot \left\|\frac{\partial L}{\partial h_T}\right\|
 $$
 
+> **In plain words:** the gradient that reaches the first state is roughly the gradient at the
+> last state times $\rho(W_h)$ multiplied by itself $T$ times. $\rho = 0.9$ over 100 steps gives
+> $0.9^{100} \approx 0.00003$; $\rho = 1.1$ gives about 13,800.
+
+**Backpropagation through time** is ordinary backprop (F2) applied to the RNN unrolled into one
+long chain, one copy of the layer per token.
+
 where $\rho(W_h)$ is the spectral radius of $W_h$ (largest absolute eigenvalue). If
 $\rho(W_h) < 1$, the gradient vanishes exponentially with sequence length $T$. If
 $\rho(W_h) > 1$, it explodes. Either way, the RNN effectively *cannot learn*
@@ -79,7 +127,15 @@ dependencies more than a few dozen steps apart. LSTMs/GRUs added gates to ease t
 and stretched the range, but never solved it. For a language with long-distance
 agreement and discourse — Bengali included — this is fatal.
 
+An **eigenvalue** of a matrix is a factor by which the matrix stretches some special direction.
+The **spectral radius** is the largest such stretch, so it is the matrix's worst-case growth
+rate when applied over and over. **Long-distance agreement** is when a word must match one far
+away, such as a verb agreeing with a subject many words earlier.
+
 ## Problem 2: sequential computation (can't parallelize)
+
+An RNN cannot start on word 10 until it has finished word 9. A GPU's strength is doing
+thousands of things at once, and an RNN gives it only one thing to do at a time.
 
 $h_t$ needs $h_{t-1}$, which needs $h_{t-2}$… so you must compute the sequence
 strictly left to right. You cannot use a GPU's parallelism across positions — every
@@ -87,7 +143,13 @@ token waits for the one before it. Training on internet-scale text this way is
 hopelessly slow. This isn't a quality problem; it's an economics problem, and it's
 the one that really killed RNNs for large models.
 
+> **Picture it:** a bucket brigade versus a hundred people each fetching their own bucket. The
+> brigade cannot go faster than one handoff at a time, however many people you add to it.
+
 ## The two demands that define the Transformer
+
+Turn the two problems upside down and you get a wish list: every word should see every other
+word in one hop, and all words should be processed at the same time.
 
 Fix those two problems and you've essentially specified attention:
 
@@ -103,12 +165,38 @@ connection to every other token (no vanishing relay). The cost is $O(n^2)$
 (every-token-to-every-token), but for the first time, long-range and parallel came
 together. That combination is why "Attention Is All You Need" replaced recurrence.
 
-**One idea RNNs bequeathed: the hidden state as memory.** The 2025–2026 State Space
-Models (Mamba) revive a recurrent-style compressed state to get linear-time inference
-back — so the RNN idea isn't dead, just reborn with the math fixed. But for your
+$O(n^2)$ means the work grows with the square of the sequence length $n$: 1,000 tokens need a
+million pairwise scores, and 2,000 tokens need four million. "Attention Is All You Need" is the
+2017 paper that introduced the Transformer.
+
+> **Picture it:** instead of a telephone line, everyone sits around one table and can speak to
+> anyone directly. Nothing is whispered through intermediaries, and every conversation can
+> happen at the same moment. The price is that the number of possible conversations grows with
+> the square of the number of people.
+
+**One idea RNNs bequeathed: the hidden state as memory.** State Space Models such as Mamba
+(2023) and their successors revive a recurrent-style compressed state to get linear-time
+inference back — so the RNN idea isn't dead, just reborn with the math fixed. But for your
 competition, the workhorse is attention.
 
+**Linear-time** means the cost grows in proportion to the length: twice the tokens, twice the
+work, rather than four times as with attention.
+
+## Recap in plain words
+
+- An RNN reads tokens one at a time and carries a running summary called the hidden state.
+- Gradients reaching far-back tokens are multiplied once per step, so they shrink to nothing or
+  blow up.
+- That makes dependencies more than a few dozen tokens apart very hard to learn.
+- Each step needs the previous one, so an RNN cannot use a GPU's parallel power across positions.
+- The Transformer's design is the answer: connect every pair of positions directly, and compute
+  all positions at once.
+- The cost of direct connections is work that grows with the square of the sequence length.
+
 ## Try it Yourself
+
+This prints the gradient factor $\rho^k$ for three spectral radii: below 1, exactly 1, and above
+1.
 
 ```python
 import numpy as np
@@ -134,6 +222,14 @@ radius 1.0 edge              : ['1.0e+00', '1.0e+00', '1.0e+00', '1.0e+00']
 radius 1.2 growing (explode) : ['1.2e+00', '6.2e+00', '9.1e+03', '8.3e+07']
 ```
 
+The 0.8 row falls to $1.4 \times 10^{-5}$ after 50 steps and $2.0 \times 10^{-10}$ after 100: a
+signal from 100 tokens back is effectively gone. The 1.2 row climbs to $8.3 \times 10^{7}$ after
+100 steps: an exploding gradient that would wreck training. Only the 1.0 row stays put, and
+nothing forces a learned matrix to sit exactly on that knife edge.
+
+Try a variation: add rows for 0.95 and 1.05. Even these values, within 5% of 1, reach about
+0.006 and 131 after 100 steps.
+
 ## Exercise
 
 In one short paragraph, state the two properties a sequence architecture needs that
@@ -141,6 +237,9 @@ RNNs lack, and explain how a mechanism where "every token directly attends to ev
 other token via matrix multiplication" provides both. (You're predicting the design
 of attention before you build it in F10. If you can write this clearly, F10 will feel
 inevitable rather than surprising.)
+
+> **Hint:** one property is about the *length of the path* a gradient travels between two
+> tokens; the other is about whether position 10 has to *wait* for position 9.
 
 <details>
 <summary>Check your answer</summary>
@@ -152,4 +251,7 @@ GPU. Attention gives both: each token's new representation is a weighted sum ove
 *all* tokens, computed as matrix multiplications over the whole sequence
 simultaneously — every pair connected directly, everything parallel. The price is
 $O(n^2)$ pairwise comparisons.
+
+If your paragraph also named that price, the square-law cost, you have the whole trade-off
+that F10 to F12 are built around.
 </details>

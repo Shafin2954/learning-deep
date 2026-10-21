@@ -7,14 +7,27 @@ order: 9
 
 ## Why pixel-space diffusion is expensive
 
-A 512×512 RGB image has 786,432 values. Running 1000 diffusion steps — each requiring a
+Diffusion on raw pixels makes the network redo a huge amount of work at every one of its many
+steps. Most of that work is spent on fine detail that a good compressor could handle once.
+
+A $512 \times 512$ RGB image has 786,432 values. Running 1000 diffusion steps — each requiring a
 full U-Net forward pass over this tensor — is prohibitively slow and memory-hungry. The
 U-Net must also be large enough to model spatial correlations across the full resolution.
 
+(That is $512 \times 512 \times 3 = 786{,}432$ — height times width times three colour channels.)
+
 The key insight behind latent diffusion: most of the spatial information in a natural image
-is compressible. A trained autoencoder can reduce a 512×512×3 image to a 64×64×4 latent
-with very little perceptual loss. Diffusion in this 256× smaller space costs orders of
+is compressible. A trained autoencoder can reduce a $512 \times 512 \times 3$ image to a $64 \times 64 \times 4$ latent
+with very little perceptual loss. Diffusion in this 48-times smaller space costs orders of
 magnitude less compute per step.
+
+**Perceptual loss** means loss a human would notice; exact pixel values may change, but the
+picture looks the same. A **latent** here is the autoencoder's code from ch. 2 — but a grid of
+$64 \times 64$ positions with 4 numbers each, so it keeps a rough spatial layout.
+
+> **Picture it:** an architect sketches a building on a small floor plan, not by moving bricks
+> on site. Once the plan is right, a builder (the decoder) turns it into the full-size building.
+> Diffusion works on the floor plan; the decoder adds the bricks.
 
 ```python
 import torch
@@ -33,14 +46,24 @@ print(f"Compression ratio:      {pixel_dim / latent_dim:.1f}×")
 
 ```output
 Pixel-space dimension:     786,432
-Latent-space dimension:      16,384
-Compression ratio:           48.0×
+Latent-space dimension:     16,384
+Compression ratio:      48.0×
 ```
 
-The U-Net operating on 64×64 latents instead of 512×512 pixels runs roughly 64× faster
+The latent has 16,384 values against the image's 786,432 — 48.0 times fewer. Note the ratio is
+48, not 64: the latent grid is $8 \times 8 = 64$ times smaller in area, but each position holds 4
+channels instead of 3, which gives back a factor of $4/3$.
+
+The U-Net operating on $64 \times 64$ latents instead of $512 \times 512$ pixels runs roughly 64 times faster
 per step, and you can afford stronger architectures in the latent space.
 
+The "64 times" counts spatial positions, which is what convolution cost mainly scales with;
+actual speed-ups depend on the network's channel widths and attention layers.
+
 ## The latent diffusion architecture
+
+A latent diffusion model is three separately trained parts snapped together: a compressor, a
+diffusion model that works on compressed images, and a text reader that steers it.
 
 Latent Diffusion Models (LDMs) compose three separate pieces:
 
@@ -51,6 +74,10 @@ Latent Diffusion Models (LDMs) compose three separate pieces:
    pipeline, but operating on $z = \mathcal{E}(x)$ instead of $x$.
 3. **Conditioning mechanism** — a text or image encoder whose output is injected into the
    U-Net via cross-attention.
+
+The "adversarial" part of the autoencoder loss is a GAN discriminator (ch. 4) that punishes
+blurry reconstructions — the blur a plain MSE autoencoder produces. Stable Diffusion is the
+best-known LDM; its text encoder is **CLIP**, a model trained to match images with captions.
 
 ```python
 # Conceptual forward pass (shapes only — no real weights)
@@ -86,18 +113,48 @@ Pipeline: image → encoder → z (64×64×4) → diffuse → denoise → decode
 Context:  text  → CLIP encoder → embeddings (77×768) → cross-attn in U-Net
 ```
 
+The block defines the pipeline's structure without running it (no weights exist here, and
+`add_noise` would be the closed-form $q(x_t | x_0)$ from ch. 7). The two printed lines trace the
+data flow: images go through the encoder to a $64 \times 64 \times 4$ latent, and text becomes 77
+token embeddings of 768 numbers each.
+
+> **Watch out:** the factor 0.18215 matters. Stable Diffusion's autoencoder produces latents
+> with a standard deviation of about 5, and diffusion assumes data with std about 1. Encoding
+> multiplies by 0.18215 and decoding divides by it; forgetting either gives washed-out or
+> garbage images.
+
 ## Cross-attention for text conditioning
+
+Cross-attention lets every patch of the image ask "which words of the prompt are about me?"
+and pull in information from those words.
 
 The core conditioning mechanism in Stable Diffusion is cross-attention inside every
 transformer block of the U-Net. The latent features provide **queries**; the text
 embeddings provide **keys** and **values**.
 
+- A **query** is what a position is looking for.
+- A **key** is a label that says what each word offers.
+- A **value** is the information the word hands over when matched.
+
 $$
 \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d}}\right)V
 $$
 
+> **In plain words:** score every query against every key with a dot product, divide by
+> $\sqrt{d}$ (the vector length's square root) so the scores don't get too large, turn each
+> row of scores into weights that sum to 1 with softmax, and use those weights to average the
+> values.
+
 where $Q = W_Q \cdot \phi(z_t)$ (from the latent), $K = W_K \cdot \tau_\theta(y)$,
 $V = W_V \cdot \tau_\theta(y)$ (from the text encoder $\tau_\theta$).
+
+Here $\phi(z_t)$ is the U-Net's feature map, flattened into a list of positions, $y$ is the
+prompt, and $W_Q, W_K, W_V$ are learned matrices. "Cross" means queries and keys come from two
+different sources; in self-attention they come from the same one.
+
+> **Picture it:** a classroom of 4096 students (image positions) and 77 cards on the board
+> (prompt tokens). Each student reads all the cards, decides which few matter for their seat,
+> and copies mostly from those.
 
 ```python
 import torch.nn as nn
@@ -117,10 +174,11 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, context):
         B, N, _ = x.shape
+        M = context.shape[1]          # number of text tokens
         h = self.heads
         Q = self.to_q(x).view(B, N, h, -1).transpose(1, 2)
-        K = self.to_k(context).view(B, -1, h, -1).transpose(1, 2)
-        V = self.to_v(context).view(B, -1, h, -1).transpose(1, 2)
+        K = self.to_k(context).view(B, M, h, -1).transpose(1, 2)
+        V = self.to_v(context).view(B, M, h, -1).transpose(1, 2)
         attn = F.softmax(Q @ K.transpose(-2, -1) * self.scale, dim=-1)
         out  = (attn @ V).transpose(1, 2).contiguous().view(B, N, -1)
         return self.to_out(out)
@@ -138,10 +196,22 @@ CrossAttention output: torch.Size([2, 4096, 320])
 Attends 4096 spatial tokens to 77 text tokens
 ```
 
+The output shape $[2, 4096, 320]$ matches the latent tokens' input: each of the 4096 positions
+($64 \times 64$) gets an updated 320-number feature, now mixed with text information. The 77
+text tokens set how many keys each query compares against, but they don't change the output
+length.
+
+> **Watch out:** `.view()` accepts only one `-1`. The keys and values are reshaped with the
+> context length `M` stated explicitly — writing `.view(B, -1, h, -1)` raises "only one
+> dimension can be inferred".
+
 Each spatial position in the latent can attend to whichever text token is most relevant,
 allowing spatially-aware conditioning ("cat on the left, dog on the right").
 
 ## ControlNet: spatial conditioning
+
+Text is a vague way to say *where* things go. ControlNet adds a second input — an edge map,
+depth map, or body pose — that dictates layout precisely, without retraining the original model.
 
 ControlNet adds a trainable copy of the U-Net encoder that takes a spatial conditioning
 signal (edge map, depth, pose skeleton) and injects its activations into the frozen
@@ -150,6 +220,13 @@ pre-trained U-Net via zero-initialized convolutions.
 - Only the ControlNet encoder weights are trained; the base model is frozen.
 - Zero-init means training starts from the pre-trained distribution.
 - You can combine multiple ControlNets (edge + depth simultaneously).
+
+A **frozen** model has its weights locked. A **zero-initialized convolution** has all weights
+and biases set to 0, so at the start it outputs exactly 0 — the ControlNet adds nothing, and the
+model behaves exactly like the original. Training then slowly opens the tap.
+
+> **Picture it:** fitting a new tap to a working water pipe with the valve fully closed. Nothing
+> changes until you open it, and you open it gradually, so nothing breaks.
 
 ```python
 # ControlNet injection concept (shapes only)
@@ -173,7 +250,14 @@ print(f"ZeroConv output at init (should be all zeros): max={out.abs().max().item
 ZeroConv output at init (should be all zeros): max=0.000000
 ```
 
+The maximum absolute output is exactly 0.000000 for a random input, confirming the "valve
+closed" start. Gradients still flow into the zero weights (they depend on the input, which is
+non-zero), so training can move them away from 0.
+
 ## Resolution analysis
+
+This table compares how many numbers the denoiser must handle per image, in pixel space and in
+latent space.
 
 ```python
 configs = [
@@ -195,23 +279,35 @@ for name, ph, pw, pc, lh, lw, lc in configs:
 ```
 
 ```output
-Config                  Dimensions UNet input (B=1)
+Config                   Dimensions UNet input (B=1)
 -------------------------------------------------------
-Pixel 256×256×3            196,608   256×256×3
-Pixel 512×512×3            786,432   512×512×3
-Latent 32×32×4               4,096   32×32×4
-Latent 64×64×4              16,384   64×64×4
+Pixel 256×256×3             196,608   256×256×3
+Pixel 512×512×3             786,432   512×512×3
+Latent 32×32×4                4,096   32×32×4
+Latent 64×64×4               16,384   64×64×4
 ```
 
-A 512×512 image in latent space shrinks from 786K to 16K values — the U-Net trains and
-runs on 48× less data while the decoder recovers full-resolution quality.
+Read the "Dimensions" column. A $64 \times 64 \times 4$ latent (16,384) is smaller even than a
+$256 \times 256$ pixel image (196,608) — 12 times smaller — while decoding to $512 \times 512$. The
+$32 \times 32 \times 4$ latent, used for $256 \times 256$ images, has only 4,096 values.
+
+A $512 \times 512$ image in latent space shrinks from 786K to 16K values — the U-Net trains and
+runs on 48 times less data while the decoder recovers full-resolution quality.
 
 ## In-painting and out-painting
+
+**In-painting** fills a hole in an image; **out-painting** extends an image past its borders.
+Both work by letting the model generate only where you allow it, while the known part is held
+fixed.
 
 Latent diffusion handles in-painting by masking the known region in latent space and
 running the reverse diffusion only on the masked (unknown) region, concatenating the
 known latent at each step. Out-painting extends the canvas by padding the latent with
 noise and conditioning on the known edge.
+
+A **mask** is a grid of 0s and 1s marking which positions to regenerate. The key trick: the known
+region is re-noised to the current level $t$ at every step, so the model sees a consistent
+noise level everywhere and blends the new content smoothly into the old.
 
 ```python
 def inpaint_step(model, z_t, z_known, mask, t):
@@ -234,7 +330,29 @@ In-painting: blend denoised latent with re-noised known region at each step
 Out-painting: pad latent canvas with noise, condition on known edge context
 ```
 
+The function shows the interface of an in-painting model: it takes the noisy latent, the known
+latent and the mask stacked as extra channels. The commented line is the blending rule: keep
+denoised values inside the mask, and the re-noised known latent outside. The printed lines
+summarize the two techniques.
+
+> **Watch out:** feeding a mask to a model that wasn't trained with mask channels does not
+> work — the U-Net's first layer expects a fixed channel count. Either use an in-painting model
+> trained with those channels, or use the blending rule alone with a standard model.
+
+## Recap in plain words
+
+- Pixel-space diffusion is slow because every step processes the full-resolution image.
+- Latent diffusion compresses images with a pre-trained autoencoder (48 times fewer values for
+  $512 \times 512$) and runs diffusion on the codes.
+- Text steers the U-Net through cross-attention: image positions ask, prompt tokens answer.
+- ControlNet adds spatial control through a trainable copy whose zero-initialized outputs start
+  as "no change".
+- In-painting regenerates only masked regions, re-noising the known part at every step.
+
 ## Try it Yourself
+
+This traces the shapes of the latent-diffusion training path: a fake image, a fake encoder
+output, the 0.18215 scaling, and a jump to $t = 500$.
 
 ```python
 import torch
@@ -266,15 +384,26 @@ print(f"Noise strength  at t=500: {(1-ab[0]).item():.4f}")
 Original pixel: torch.Size([2, 3, 512, 512])
 Encoded latent: torch.Size([2, 4, 64, 64])
 Noised latent:  torch.Size([2, 4, 64, 64])
-Signal strength at t=500: 0.3677
-Noise strength  at t=500: 0.6323
+Signal strength at t=500: 0.0778
+Noise strength  at t=500: 0.9222
 ```
+
+The noise is added to the $[2, 4, 64, 64]$ latent, not the $[2, 3, 512, 512]$ image — that is the
+whole point. The last two lines are variance shares (not amplitudes): at $t = 500$ only 0.0778 of
+the signal variance remains and 0.9222 is noise. They add to 1. Try `t = torch.tensor([50, 900])`
+to put the two images at different noise levels; then multiply `z` by 5 before scaling to see
+why the 0.18215 factor exists — the latent's std moves back near 1.
 
 ## Exercise
 
 You want to fine-tune a latent diffusion model on a new domain (e.g., satellite imagery)
 with limited GPU memory. You have 24 GB VRAM. Describe two training strategies that keep
 memory use tractable, and explain what each sacrifices.
+
+> **Hint:** training memory = weights + gradients + optimizer state + activations. Ask which of
+> the three LDM parts actually need gradients, and whether you can train a small add-on instead
+> of the whole U-Net. **LoRA** (low-rank adaptation) trains two small matrices per layer whose
+> product is added to a frozen weight.
 
 <details>
 <summary>Solution</summary>
@@ -298,12 +427,16 @@ for name, info in strategies.items():
         print(f"  {k}: {v}")
 ```
 
-Strategy 1 (freeze VAE): saves the most total memory since the large encoder/decoder
-don't need gradients. Sacrifice: the model's learned perceptual space may not optimally
+Strategy 1 (freeze VAE): saves memory since the encoder/decoder
+don't need gradients or optimizer state (LoRA, below, typically saves more). Sacrifice: the model's learned perceptual space may not optimally
 encode satellite textures (e.g., spectral signatures differ from natural images).
 
 Strategy 2 (LoRA): trains only rank-r update matrices on the cross-attention projections.
 Sacrifice: cannot alter the U-Net's spatial feature extraction, only how it attends to
 conditioning signals. Effective for style/domain shift via text prompts.
 
+The VRAM percentages in the printed dictionary are rough rules of thumb, not measurements;
+real savings depend on resolution, batch size, and whether you also use mixed precision and
+gradient checkpointing. In practice the two strategies combine: freeze the autoencoder and text
+encoder, and train LoRA adapters on the U-Net.
 </details>

@@ -2,6 +2,8 @@
 
 From recurrent networks to the full transformer — every mechanism derived, then built.
 
+**In plain words:** this course teaches machines to read and write sequences, where order matters. Chapters 1–5 start with recurrent networks that read one token at a time: turning text into numbers, the RNN and how it learns, the LSTM and GRU fixes for fading gradients, reading in both directions, and the encoder-decoder used for translation. Chapters 6–8 introduce attention, which lets every position look directly at every other position, and the positional encodings that tell attention where each token sits. Chapters 9–10 assemble the full Transformer block and the tricks needed to train it (warmup, label smoothing, masks, clipping). Chapters 11–12 cover how a trained model writes text (greedy, beam search, sampling, the KV cache) and the three model families, BERT, GPT and T5. The capstone (ch. 13) has you build, train and speed up a Transformer of your own from scratch.
+
 **Prerequisites:** DL Foundations (ch. 1–12: autograd, PyTorch training loop, backprop). Basic Python/NumPy fluency.
 
 ---
@@ -53,4 +55,4 @@ From recurrent networks to the full transformer — every mechanism derived, the
 torch>=2.0    numpy    matplotlib
 ```
 
-No Hugging Face transformers required until the NLP & LLMs course.
+Ch. 12 uses Hugging Face `transformers` (v5) with pretrained `bert-base-uncased`, `gpt2`, `t5-small`, `textattack/bert-base-uncased-SST-2` and `distilbert-base-uncased-finetuned-sst-2-english`; the first run downloads the weights. Every other chapter needs only PyTorch and NumPy.

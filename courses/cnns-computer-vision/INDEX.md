@@ -5,6 +5,17 @@
 Twelve chapters covering convolutional networks from the raw math through modern architectures.
 Every chapter runs real PyTorch code — no pseudocode.
 
+**In plain words:** this course teaches a computer to see, one building block at a time.
+Chapters 1–3 show how a small sliding window of weights (a convolution) turns pixels into
+features, and how padding, stride, and pooling control the size of what comes out. Chapters
+4–7 stack those blocks into real networks — ResNet's skip connections, BatchNorm and
+mobile-friendly blocks — then show how to reuse pretrained networks and stretch a small
+dataset with augmentation. Chapters 8–10 move from "what is in the image" to "where is it":
+boxes (detection, scored with IoU, NMS and mAP) and per-pixel labels (segmentation with
+U-Net and Mask R-CNN). Chapters 11–12 cover Vision Transformers and self-supervised
+learning, and the capstone (ch. 13) asks you to build a convolution, a CNN, and a detector or
+segmenter largely from scratch.
+
 ---
 
 ## Part 1 — Convolution Fundamentals (ch. 1–3)

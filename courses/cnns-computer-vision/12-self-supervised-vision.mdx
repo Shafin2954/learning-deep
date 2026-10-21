@@ -7,13 +7,26 @@ order: 12
 
 ## The unlabeled data problem
 
-Labels are expensive. Most images in the world have no annotation. Self-supervised learning extracts supervisory signal from the data itself — from structure that exists without human labels. A good self-supervised model learns representations that transfer to downstream tasks (classification, detection, segmentation) with far fewer labelled examples.
+Labelling millions of photos by hand is slow and costly, but unlabelled photos are everywhere.
+**Self-supervised learning (SSL)** invents its own practice questions from the images — "are
+these two crops from the same photo?", "what was under this blacked-out patch?" — and learns
+useful features by answering them.
+
+Labels are expensive. Most images in the world have no annotation. Self-supervised learning extracts supervisory signal from the data itself — from structure that exists without human labels. A good self-supervised model learns representations that transfer to downstream tasks (classification, detection, segmentation) with far fewer labelled examples. (A **representation** or **embedding** is the vector of features a network produces for an image; a **downstream task** is the real job you care about afterwards.)
+
+> **Picture it:** learning a language by doing fill-in-the-blank puzzles from books, with no
+> teacher. Nobody tells you what words mean, but after thousands of puzzles you understand
+> them well enough to learn a new task (say, translation) from a handful of examples.
 
 Two dominant paradigms emerged:
 1. **Contrastive learning** — push representations of related views together, unrelated apart.
 2. **Masked autoencoding** — reconstruct masked parts of the input.
 
 ## SimCLR: contrastive with InfoNCE
+
+SimCLR's practice question is a matching game: take one photo, make two different random edits
+of it (ch. 7 augmentations), and train the network so the two edits land close together while
+all other photos in the batch land far away.
 
 SimCLR (Chen 2020) creates two augmented views of the same image and maximises agreement in embedding space:
 
@@ -22,6 +35,18 @@ $$
 $$
 
 where $\text{sim}$ is cosine similarity and $\tau$ is a temperature. The negative examples come from other images in the batch.
+
+> **In plain words:**
+> - $z_i$ and $z_j$ are the embeddings of the two views of one image (a **positive pair**).
+> - $z_k$ runs over every other embedding in the batch except $z_i$ itself; all of them except
+>   $z_j$ are **negatives**.
+> - **Cosine similarity** is 1 for vectors pointing the same way and $-1$ for opposite ones.
+> - The fraction is a softmax: "what share of $z_i$'s attention goes to its true partner?".
+>   The loss is minus the log of that share, so it is small when the partner wins clearly.
+> - The **temperature** $\tau$ sharpens ($\tau$ small) or softens ($\tau$ large) the competition.
+
+In code this is a cross-entropy where, for row $i$, the "correct class" is the index of its
+partner. Rows $0..B-1$ are view 1 and rows $B..2B-1$ are view 2, so row $i$'s partner is $i + B$.
 
 ```python
 import torch
@@ -45,31 +70,63 @@ def simclr_loss(z: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     labels = torch.cat([torch.arange(B, 2*B), torch.arange(B)]).to(z.device)
     return F.cross_entropy(sim, labels)
 
+torch.manual_seed(0)
 B, D = 32, 128
 z = torch.randn(2 * B, D)
 loss = simclr_loss(z)
 print(f"SimCLR loss (random): {loss.item():.3f}")
-print(f"Min theoretical (perfect): {-torch.tensor(1/(2*B-1)).log().item():.3f}")
+print(f"Chance level (all sims equal): {-torch.tensor(1/(2*B-1)).log().item():.3f}")
 ```
 
 ```output
-SimCLR loss (random): 4.155
-SimCLR loss (perfect): 0.020
+SimCLR loss (random): 4.163
+Chance level (all sims equal): 4.143
 ```
 
-The loss is cross-entropy where the positive pair is the "correct class" among 2B-1 negatives. Lower = more agreement.
+With random embeddings the loss is 4.163, almost exactly the chance level 4.143. That second
+number is $\ln(2B - 1) = \ln 63$: the loss you get when the partner is no more similar than any
+of the 63 other candidates. A trained encoder pushes the loss well below it.
+
+The loss is cross-entropy where the positive pair is the "correct class" among the $2B - 1$
+candidates ($2B - 2$ negatives plus the one partner). Lower = more agreement.
 
 ### The collapse problem
 
-If all embeddings collapse to a constant vector, loss = 0. SimCLR avoids this with a large batch (4096+ images) and a projection head (2-layer MLP) discarded after pretraining. The main encoder representations do not collapse because the projection head absorbs the degenerate solution.
+**Collapse** is the cheating solution where the network maps every image to the same vector.
+Then every pair looks "similar", and a loss that only rewarded agreement would be perfect.
+
+For InfoNCE, collapse does not pay: if every embedding is the same, the partner is no more
+similar than the negatives, and the loss sits at the chance level $\ln(2B-1)$ — the 4.143 above.
+The negatives are what stop collapse, which is why SimCLR wants a large batch (4096+ images):
+more negatives, harder and more informative comparisons. SimCLR also adds a projection head
+(2-layer MLP) that is discarded after pretraining. The loss is computed on the head's output,
+so the head can throw away information the loss does not need (such as colour, which the
+augmentations randomise); the encoder's features before the head keep more of it and
+transfer better.
+
+> **Watch out:** the batch size is part of the loss. Halving the batch halves the negatives
+> and changes the chance level, so loss values are not comparable across batch sizes.
 
 ## MoCo: momentum encoder
+
+MoCo gets many negatives without a giant batch: it keeps a long queue of embeddings from
+earlier batches. To keep those old embeddings comparable with new ones, they come from a second
+encoder that changes very slowly.
 
 Contrastive loss needs many negatives. SimCLR uses a large batch. **MoCo** maintains a queue of negative keys from past batches, using a slowly-updated **momentum encoder** (EMA of the main encoder) to keep key representations consistent:
 
 $$
 \theta_k \leftarrow m \cdot \theta_k + (1-m) \cdot \theta_q \quad (m \approx 0.999)
 $$
+
+> **In plain words:** $\theta_q$ are the weights of the main (query) encoder, trained by
+> gradient descent; $\theta_k$ are the key encoder's weights. Each step, the key encoder moves
+> only $1 - m = 0.1\%$ of the way toward the main encoder. This running blend is an **EMA**
+> (exponential moving average).
+
+> **Picture it:** a long-exposure photo of a moving car. The key encoder is a blurred,
+> slow-changing average of the recent main encoders, so keys computed 50 batches ago still
+> roughly match today's.
 
 ```python
 import torch
@@ -106,17 +163,29 @@ MoCo keys queue: torch.Size([128, 4096])
 Momentum update applied without crash.
 ```
 
+The queue holds 4,096 keys of 128 numbers each, stored as columns and normalised to length 1.
+It is a buffer, not a parameter: it is saved with the model but never trained. The momentum
+update runs under `@torch.no_grad()`, since the key encoder gets no gradients.
+
 ## BYOL: no negative pairs
+
+BYOL drops the negatives entirely: one network tries to predict what a slowly-moving copy of
+itself outputs for another view of the same image. A few asymmetries keep it from collapsing.
 
 **BYOL** (Bootstrap Your Own Latent, Grill 2020) showed that you do not need negatives at all. It uses two networks:
 - **Online network**: predicts the target.
 - **Target network**: EMA of online; not directly trained.
 
-A stop-gradient on the target side prevents collapse. Without the stop-gradient, all outputs go to the same constant.
+A stop-gradient on the target side prevents collapse. Without the stop-gradient, all outputs go to the same constant. (A **stop-gradient** treats a value as a fixed constant during backpropagation, like `.detach()` in PyTorch.)
 
 $$
 \mathcal{L} = 2 - 2 \cdot \frac{\langle q_\theta(z_\theta), z_\xi \rangle}{\|q_\theta(z_\theta)\| \cdot \|z_\xi\|}
 $$
+
+> **In plain words:** $q_\theta(z_\theta)$ is the online network's prediction; $z_\xi$ is the
+> target network's projection of the other view. The fraction is their cosine similarity, so
+> the loss is $2 - 2\cos$: 0 when they point the same way, 2 when they are at right angles,
+> and 4 when they are opposite.
 
 ```python
 import torch, torch.nn as nn, torch.nn.functional as F, copy
@@ -126,6 +195,7 @@ def byol_loss(online_pred: torch.Tensor, target_proj: torch.Tensor) -> torch.Ten
     target_proj   = F.normalize(target_proj, dim=-1)
     return 2 - 2 * (online_pred * target_proj).sum(dim=-1).mean()
 
+torch.manual_seed(0)
 online = F.normalize(torch.randn(16, 128))
 target = F.normalize(torch.randn(16, 128))
 print(f"BYOL loss (random):  {byol_loss(online, target).item():.3f}")
@@ -133,15 +203,32 @@ print(f"BYOL loss (perfect): {byol_loss(online, online.detach()).item():.3f}")
 ```
 
 ```output
-BYOL loss (random):  2.001
+BYOL loss (random):  1.953
 BYOL loss (perfect): 0.000
 ```
 
+Two random 128-dimensional unit vectors are nearly at right angles, so the random loss is close
+to 2 (here 1.953). Comparing a vector with itself gives cosine 1 and loss 0.000.
+
+> **Watch out:** a BYOL loss near 0 early in training is a warning sign, not a success. It
+> usually means the outputs have collapsed to a constant. Track the standard deviation of the
+> embeddings across a batch; if it falls toward 0, the features are dead.
+
 ## MAE: Masked Autoencoder (He 2021)
 
-MAE takes a ViT and masks 75% of patches randomly. Only unmasked tokens pass through the encoder. A lightweight decoder reconstructs pixel values of the masked patches. The task: predict pixel values of hidden patches.
+MAE's practice question is a jigsaw with most pieces missing: hide three quarters of the image
+patches and ask the network to paint them back in.
+
+MAE takes a ViT and masks 75% of patches randomly. Only unmasked tokens pass through the encoder. A lightweight decoder reconstructs pixel values of the masked patches. The task: predict pixel values of hidden patches. (An **autoencoder** compresses an input and rebuilds it; "masked" means part of the input is hidden.)
 
 Why 75% (not 50%): lower mask ratios are easy (the model cheats from neighboring patches). 75% forces true understanding.
+
+> **Picture it:** guessing a painting when only one stamp-sized square in four is visible.
+> With half the squares you could fill gaps by copying neighbours; with a quarter, you must
+> know what dogs and faces look like.
+
+The masking trick: draw a random number per patch, sort, and keep the patches with the
+smallest numbers. Sorting random noise gives a fresh random subset for every image.
 
 ```python
 import torch
@@ -170,17 +257,33 @@ print(f"Total patches: 196  |  Visible: {vis.shape[1]}  |  Masked: {mask_ids.sha
 Total patches: 196  |  Visible: 49  |  Masked: 147
 ```
 
-The encoder runs on only 49 tokens (4× speedup vs full ViT). The decoder is 4–8× smaller than the encoder, and it sees masked tokens as learned mask embeddings.
+Of 196 patches, 49 stay visible and 147 are hidden: $196 \times 0.75 = 147$.
+
+The encoder runs on only 49 tokens (4 times fewer tokens than the full ViT). The decoder is 4 to 8 times smaller than the encoder, and it sees masked tokens as learned mask embeddings. (Attention itself, which grows with the square of the token count, gets $4^2 = 16$ times cheaper.)
 
 ## DINO / DINOv2
 
+DINO trains a student network to give the same answer as a teacher network, where the teacher
+is a slow average of the student. Nobody provides labels; the two networks teach each other.
+
 **DINO** (Caron 2021) uses self-distillation: student and teacher are both ViTs, teacher is EMA of student. No class labels — the student learns to match the teacher's output distribution on different crops. Emergent property: DINO's attention maps naturally segment objects without any segmentation training.
 
-**DINOv2** scales this up with curated data and shows that foundation vision models can emerge from SSL alone, matching supervised models on most benchmarks.
+**DINOv2** scales this up with curated data and shows that foundation vision models can emerge from SSL alone, matching supervised models on most benchmarks. (A **foundation model** is one large pretrained model reused for many tasks.)
+
+> **Picture it:** a student copying the class's best notes, where those best notes are a
+> rolling average of the student's own past notes. The trick that makes it work is that the
+> student sees small crops of the image while the teacher sees large ones, so the student must
+> infer the whole scene from a part.
 
 ## Linear probe evaluation
 
+To grade an SSL model, you freeze it and fit the simplest classifier on its features (ch. 6).
+If a straight line separates the classes, the features did the hard work.
+
 To measure representation quality without fine-tuning: freeze the backbone, train only a linear classifier on top.
+
+`nn.Identity()` replaces the head with a layer that returns its input, so the backbone outputs
+its 2,048 pooled features.
 
 ```python
 from sklearn.linear_model import LogisticRegression
@@ -194,7 +297,8 @@ backbone.fc = nn.Identity()   # remove classification head
 backbone.eval()
 
 # Random data as proxy for downstream task
-X_raw = torch.randn(200, 3, 224, 224)
+torch.manual_seed(0); np.random.seed(0)
+X_raw = torch.randn(200, 3, 112, 112)
 y_raw = np.random.randint(0, 5, 200)
 
 with torch.no_grad():
@@ -207,19 +311,40 @@ print(f"Feature dim: {feats.shape[1]}")
 ```
 
 ```output
-Linear probe accuracy: 37.00%
+Linear probe accuracy: 79.50%
 Feature dim: 2048
 ```
 
-Good SSL representations achieve linear probe accuracy within 5–10% of full fine-tuning on ImageNet (e.g., DINO ViT-B/8: 79.5% linear probe vs 84% fine-tuned).
+The probe scores 79.50% — but on random labels, measured on the same 200 images it was trained
+on. That number is memorisation: 2,048 features are plenty to fit 200 arbitrary labels. The
+honest probe accuracy here would be about 20% (chance for 5 classes) on held-out images.
+
+> **Watch out:** a linear probe is only meaningful on a held-out split with real labels. Report
+> test accuracy, as in the published numbers below.
+
+Good SSL representations achieve linear probe accuracy within 5–10% of full fine-tuning on ImageNet (e.g., DINO ViT-B/8: about 80% linear probe vs about 84% fine-tuned).
 
 ## When self-supervised beats supervised
 
+SSL pays off when you have lots of images but few labels, or images unlike ImageNet.
+
 - **Large unlabelled corpus, small labelled set**: SSL learns general features from unlabelled, adapts with few labels.
-- **Domain shift**: SSL on your domain (medical, satellite) beats ImageNet-supervised transfer.
-- **Few-shot**: linear probe or 1-NN from SSL features often outperforms supervised on rare classes.
+- **Domain shift**: SSL on your domain (medical, satellite) beats ImageNet-supervised transfer. (**Domain shift** means your images look systematically different from the pretraining images.)
+- **Few-shot**: linear probe or 1-NN from SSL features often outperforms supervised on rare classes. (**Few-shot** = only a handful of labelled examples per class; **1-NN** labels an image by its single nearest neighbour in feature space.)
+
+## Recap in plain words
+
+- Self-supervised learning creates its own training signal from unlabelled images.
+- Contrastive methods (SimCLR, MoCo) pull two views of one image together and push other images away; negatives prevent collapse.
+- MoCo keeps a queue of old negatives encoded by a slow EMA copy of the encoder.
+- BYOL and DINO use no negatives; an EMA teacher plus a stop-gradient keeps them from collapsing.
+- MAE hides 75% of patches and learns by reconstructing them, running the encoder on visible patches only.
+- Linear probes measure feature quality, but only on held-out data with real labels.
 
 ## Try it Yourself
+
+The SimCLR loss on two kinds of fake embeddings: pairs where view 2 is view 1 plus a little
+noise, and fully random pairs.
 
 ```python
 import torch
@@ -235,23 +360,32 @@ def simclr_loss(z, temperature=0.5):
     return F.cross_entropy(sim, labels)
 
 # Simulate embeddings from similar vs random views
+torch.manual_seed(0)
 B, D = 16, 64
-z_good = torch.cat([torch.randn(B, D), torch.randn(B, D) * 0.1 + torch.randn(B, D)])
+z1     = torch.randn(B, D)
+z_good = torch.cat([z1, z1 + torch.randn(B, D) * 0.1])   # view2 = view1 + small noise
 z_rand = torch.randn(2 * B, D)
 print(f"SimCLR loss (similar views): {simclr_loss(z_good):.3f}")
 print(f"SimCLR loss (random):        {simclr_loss(z_rand):.3f}")
 ```
 
 ```output
-SimCLR loss (similar views): 3.651
-SimCLR loss (random):        4.135
+SimCLR loss (similar views): 1.627
+SimCLR loss (random):        3.350
 ```
+
+The similar-views loss (1.627) is about half the random one (3.350). Random pairs sit near the
+chance level for $B = 16$, which is $\ln 31 \approx 3.43$; similar pairs are easy to pick out, so
+the partner wins most of the softmax.
 
 Try decreasing temperature from 0.5 to 0.1 and observe how sharply the loss distinguishes the two cases.
 
 ## Exercise
 
 Implement the MAE reconstruction loss: given a model that produces pixel-level predictions for masked patches (`pred`, shape `(B, N_masked, P*P*C)`) and the true pixel values (`target`, same shape), compute the normalized per-patch MSE where each patch is normalized by its own mean and variance before computing loss. This is the exact MAE loss.
+
+> **Hint:** take the mean and variance over the last dimension (the pixels of one patch) with
+> `keepdim=True`, so they broadcast back over that patch. Add a small `eps` before the square root.
 
 <details>
 <summary>Solution</summary>
@@ -270,6 +404,7 @@ def mae_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> tor
     return ((pred - target_norm) ** 2).mean()
 
 B, N_masked, patch_dim = 4, 147, 16 * 16 * 3   # 75% of 196, 16×16 RGB
+torch.manual_seed(0)
 pred   = torch.randn(B, N_masked, patch_dim)
 target = torch.randn(B, N_masked, patch_dim)
 
@@ -281,6 +416,12 @@ print(f"Perfect recon loss:       {mae_loss(target, target).item():.4f}")
 ```
 
 Normalizing per patch removes absolute pixel intensity, making the model focus on relative texture and shape within each patch rather than global brightness — a key reason MAE representations generalize well.
+
+Running it prints about 2.0 for random predictions: two independent standard-normal values
+differ by a squared amount of $1 + 1 = 2$ on average. The "perfect" line prints 0.0019, not
+exactly 0, because it compares the *raw* target with the *normalised* target. Since this
+random target is already almost mean 0 and variance 1, the two nearly match. A model that
+output the normalised target would score exactly 0.
 </details>
 
 ## Under the Trench
@@ -288,11 +429,11 @@ Normalizing per patch removes absolute pixel intensity, making the model focus o
 Rare and advanced topics you should at least know the name of. You won't need them daily,
 but you'll stop being surprised when you meet them.
 
-- **Deformable & dilated convolutions** — flexible/large receptive fields; deformable conv learns offsets for the sampling grid.
-- **Feature Pyramid Networks (FPN)** — multi-scale feature maps for detecting objects of all sizes.
-- **Keypoint & pose estimation** — heatmap regression over joint locations; used in HRNet and MediaPipe.
-- **Optical flow & video models** — PWC-Net, RAFT for dense flow; 3D CNNs and video transformers for temporal modeling.
+- **Deformable & dilated convolutions** — flexible/large receptive fields; deformable conv learns offsets for the sampling grid, so the kernel can bend to fit an object's shape.
+- **Feature Pyramid Networks (FPN)** — multi-scale feature maps for detecting objects of all sizes; the "FPN" in the ch. 9 detectors.
+- **Keypoint & pose estimation** — heatmap regression over joint locations; used in HRNet and MediaPipe. The network paints one "probability blob" per joint (elbow, knee).
+- **Optical flow & video models** — PWC-Net, RAFT for dense flow; 3D CNNs and video transformers for temporal modeling. Optical flow is the per-pixel motion between two frames.
 - **NeRF & 3D / point clouds** — neural radiance fields for view synthesis; PointNet for unordered 3D point sets.
-- **OCR pipelines** — CRNN (detection + CTC recognition); Tesseract and PaddleOCR as baselines.
+- **OCR pipelines** — CRNN (detection + CTC recognition); Tesseract and PaddleOCR as baselines. OCR (optical character recognition) reads text out of images.
 - **Grad-CAM & saliency maps** — visualize which pixels drive a CNN's prediction; useful for debugging and trust.
-- **Model compression for vision (MobileNet, depthwise-separable)** — edge inference with < 5 MB models.
+- **Model compression for vision (MobileNet, depthwise-separable)** — edge inference with < 5 MB models; the ch. 5 blocks plus pruning and quantisation.

@@ -7,6 +7,9 @@ order: 12
 
 ## The block, exactly
 
+A Transformer is one building block copied many times, like identical floors of a tall
+building. Each block lets the tokens talk to each other, then lets each token think on its own.
+
 You have every piece. This chapter assembles them into the **Transformer block** — the
 unit that, stacked $N$ times, *is* the model you'll fine-tune. After this, "a 32-layer
 7B model" means something concrete: 32 of these blocks, with weights you can nudge.
@@ -21,12 +24,26 @@ x &\leftarrow x + \mathrm{FFN}(\mathrm{LayerNorm}(x))
 \end{aligned}
 $$
 
+> **In plain words:** first, normalize the token vectors, run multi-head attention on them, and
+> *add* the result to the original vectors. Then normalize again, run the feed-forward network,
+> and add that result too. The arrow $\leftarrow$ means "replace $x$ with".
+
 The two sub-layers are:
 1. **Multi-head self-attention (F10)** — tokens exchange information; this is where
    context mixing happens.
 2. **Feed-forward MLP (F2)** — applied to each token independently, usually $d \to 4d
    \to d$ with a GELU/ReLU in the middle; this is where most parameters live and where
    per-token "thinking" happens.
+
+A **sub-layer** is one of the two stages inside a block. The **feed-forward network** (FFN) is
+the MLP of F2, applied to each token's vector separately: widen it to $4d$ numbers, apply the
+nonlinearity, shrink it back to $d$. With $d = 4096$, its two matrices hold $2 \times 4096
+\times 16384 \approx 134$ million weights per block, about twice what attention's four
+$d \times d$ matrices hold.
+
+> **Picture it:** a meeting followed by desk work. In the attention sub-layer, everyone in the
+> room shares notes. In the feed-forward sub-layer, each person goes back to their own desk and
+> works through what they heard, alone.
 
 Two wrappers make deep stacks trainable:
 - **Residual connections** ($+ x$): add the sub-layer's output back to its input. This
@@ -37,11 +54,21 @@ Two wrappers make deep stacks trainable:
   put it *before* the sub-layer ("pre-norm," shown above) for stability; this is the
   default you should assume.
 
+> **Picture it:** a residual connection is a document passed down a line of editors, where each
+> editor writes suggestions in the margin instead of retyping the page. The original text always
+> survives, and a useless editor does no harm, because adding zero changes nothing.
+
 Crucially, **the input and output of a block have the same shape** — that's why you can
 stack them. The whole model is: token embeddings (F8) + positional info (F11) → $N$
 identical blocks → a final LayerNorm → a linear head to logits (F1) → softmax.
 
+"Identical" here means identical in *structure*: each block has its own separately learned
+weights.
+
 ## Building the block in code
+
+Every helper here comes from earlier chapters; the new part is `transformer_block`, which wires
+them together with the two residual additions.
 
 ```python
 import numpy as np
@@ -95,7 +122,18 @@ after 6 stacked blocks: (4, 8)
 
 Shape-in equals shape-out — the block can be stacked arbitrarily deep.
 
+All three lines print $(4, 8)$: 4 tokens of width 8 went in, and 4 tokens of width 8 came out,
+both after one block and after six. That fixed shape is the whole reason a model can have 6 or 80
+layers without any other change.
+
+> **Watch out:** this demo reuses the *same* `P` for all six blocks to keep the code short. A
+> real model gives every block its own parameters. Reusing one set (called **weight tying**
+> across layers) is a deliberate, uncommon design choice, not the default.
+
 ## Encoder vs decoder — one bit changes everything: the mask
+
+The three model families use the same block. The only switch is whether each token may look at
+the tokens after it.
 
 The block is the same; what differs is the attention mask (F10):
 - **Encoder** (BERT, BanglaBERT): *no* mask. Every token attends to every token,
@@ -109,10 +147,23 @@ The block is the same; what differs is the attention mask (F10):
   decoder generates the output causally while *cross-attending* to the encoder. The
   classic choice for translation/summarization.
 
+**NER** (named-entity recognition) is tagging names of people, places and organizations.
+**Extractive QA** answers a question by pointing to a span inside a given passage.
+**Cross-attention** is attention where the queries come from the decoder but the keys and
+values come from the encoder's output, so the decoder can look things up in the input text.
+
 Choosing your model family for the competition is mostly choosing among these three —
 driven by whether the task is understanding (encoder) or generation (decoder / enc-dec).
 
+> **Picture it:** an encoder is an editor who reads the whole page before marking it up. A
+> decoder is a storyteller who makes the story up one word at a time and cannot look ahead. An
+> encoder–decoder is a translator: one person reads the source fully, another writes the
+> translation word by word while glancing back at the source.
+
 ## KV-cache — why generation isn't quadratically slow per token
+
+When a decoder writes word 100, the keys and values of words 1 to 99 are the same as they were
+when it wrote word 99. Saving them, instead of recomputing them, makes each new word cheap.
 
 At generation time, a decoder produces tokens one at a time. Naively, generating token
 $t$ re-runs attention over all $t$ previous tokens — and doing that for every new token
@@ -122,7 +173,32 @@ for the new token and attend against the cached $K/V$. This turns per-step cost 
 "re-process everything" into "process one token." It's why `model.generate()` is
 usable — and why long contexts cost *memory* (the cache grows with length).
 
+A **cache** is a store of results kept so they need not be recomputed. Past keys and values stay
+fixed because of the causal mask: a token's representation depends only on earlier tokens, and
+those never change once written.
+
+> **Watch out:** the KV-cache is often the largest memory cost at inference. It stores one key
+> and one value vector per token, per head, per layer. For a 32-layer model with width 4096 in
+> 16-bit floats, that is $2 \times 32 \times 4096 \times 2$ bytes, about 0.5 MB per token, or
+> about 2 GB for a 4,096-token context.
+
+## Recap in plain words
+
+- A Transformer block is attention (tokens share information) followed by a feed-forward network
+  (each token thinks alone).
+- Each sub-layer is wrapped in pre-norm LayerNorm and a residual addition.
+- Residual additions keep the original signal and give gradients a direct path back.
+- A block's output has the same shape as its input, so blocks stack to any depth.
+- Encoders use no mask, decoders use a causal mask, and encoder–decoders combine the two with
+  cross-attention.
+- The KV-cache saves past keys and values so generating each new token is cheap, at the cost
+  of memory.
+
 ## Try it Yourself
+
+This runs one attention layer twice on the same 5 tokens, once as an encoder (no mask) and once
+as a decoder (causal mask), with identity projections so that queries, keys and values all equal
+the input.
 
 ```python
 import numpy as np
@@ -152,6 +228,18 @@ print("decoder token 0 == its own value (attends only to itself)?",
 # token already mixed in the whole sequence. That single mask is the whole difference.
 ```
 
+```output
+encoder token 0 differs from decoder token 0? True
+decoder token 0 == its own value (attends only to itself)? True
+```
+
+Both answers are `True`. The encoder's token 0 differs from the decoder's, because it already
+mixed in the four later tokens. The decoder's token 0 equals its own value exactly, because the
+causal mask left it nobody to attend to but itself.
+
+Try a variation: compare the *last* token instead, `enc[-1]` and `dec[-1]`. They should be
+equal, because the last token sees the whole sequence under both masks.
+
 ## Exercise
 
 Extend `transformer_block` into a tiny end-to-end causal language model: add a token
@@ -160,8 +248,12 @@ LayerNorm, and a linear head to vocab-sized logits. Feed a short integer sequenc
 confirm the output shape is `(T, vocab)` — one next-token distribution per position.
 You will have built, from scratch, the exact architecture you're about to fine-tune.
 
+> **Hint:** the data flow is a straight line: `E[ids]` plus the first `len(ids)` rows of a
+> positional table, then each block in turn, then `layernorm`, then a matrix of shape
+> `(d, vocab)`.
+
 <details>
-<summary>Skeleton</summary>
+<summary>Solution</summary>
 
 ```python
 def tiny_lm(ids, E, pos_enc, blocks_P, W_head):
@@ -172,4 +264,30 @@ def tiny_lm(ids, E, pos_enc, blocks_P, W_head):
     return x @ W_head                         # (T, vocab) logits (F1)
 # Train it with the causal cross-entropy of F3/F13 and you have a real (tiny) LLM.
 ```
+
+To run it, reuse `softmax`, `layernorm` and `transformer_block` from the block above and give
+each layer its own parameters:
+
+```python
+vocab, d, n_layers, max_len = 50, 8, 2, 16
+E = np.random.randn(vocab, d) * 0.1                        # token embedding table (F8)
+pos = np.arange(max_len)[:, None]; div = 10000 ** (np.arange(0, d, 2) / d)
+pos_enc = np.zeros((max_len, d))
+pos_enc[:, 0::2], pos_enc[:, 1::2] = np.sin(pos / div), np.cos(pos / div)   # F11
+def new_block():
+    P = {k: np.random.randn(*s) * 0.1 for k, s in {
+            'Wq':(d,d),'Wk':(d,d),'Wv':(d,d),'Wo':(d,d),'W1':(d,4*d),'W2':(4*d,d)}.items()}
+    P['b1'] = np.zeros(4*d); P['b2'] = np.zeros(d); return P
+blocks_P = [new_block() for _ in range(n_layers)]
+W_head = np.random.randn(d, vocab) * 0.1
+ids = np.array([3, 17, 42, 8, 0])
+logits = tiny_lm(ids, E, pos_enc, blocks_P, W_head)
+probs = softmax(logits)
+print("logits shape:", logits.shape)                       # (T, vocab)
+print("each row sums to 1:", np.allclose(probs.sum(-1), 1))
+```
+
+It prints `logits shape: (5, 50)` and `each row sums to 1: True`: 5 positions, and at each one a
+probability for every one of the 50 vocabulary tokens. Row $t$ is the model's guess for token
+$t+1$, and thanks to the causal mask it used only tokens 0 to $t$ to make it.
 </details>

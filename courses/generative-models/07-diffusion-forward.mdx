@@ -7,11 +7,27 @@ order: 7
 
 ## The Core Idea
 
+Destroying a picture is easy: keep sprinkling static on it until nothing is left. A diffusion
+model learns to run that film backwards, removing a little static at a time, until a clean
+picture appears out of pure noise.
+
 Diffusion models define a **forward process** that destroys data by adding Gaussian noise over $T$ steps, then learn to **reverse** that process — going from pure noise back to clean data.
+
+The **forward process** is fixed — no learning, just a recipe for adding noise. The **reverse
+process** is the learned part: a network that, given a noisy image and how noisy it is, guesses
+a slightly cleaner version. **Gaussian noise** is random values drawn from a bell curve.
+
+> **Picture it:** a drop of ink spreading in a glass of water until the water is evenly grey —
+> that is the forward process (and where the name "diffusion" comes from). The model learns to
+> play the video in reverse: from evenly grey water back to a crisp drop. Where it breaks: real
+> ink can't un-diffuse; the model only manages it because it has seen millions of drops.
 
 Unlike GANs (no explicit density) or VAEs (ELBO bound), diffusion models are trained on a simple denoising objective that happens to maximize a form of the ELBO.
 
 ## The Forward Process
+
+Each step shrinks the image slightly toward zero and adds a small amount of fresh noise. After
+enough steps, nothing of the original is left.
 
 Starting from real data $x_0$, add noise over $T$ steps:
 
@@ -19,19 +35,43 @@ $$
 q(x_t | x_{t-1}) = \mathcal{N}(x_t;\, \sqrt{1-\beta_t}\, x_{t-1},\, \beta_t I)
 $$
 
+> **In plain words:** to get step $t$ from step $t-1$, multiply the current image by
+> $\sqrt{1-\beta_t}$ (a number slightly below 1) and add noise with variance $\beta_t$. The
+> notation $\mathcal{N}(x_t; \text{mean}, \text{variance})$ means "$x_t$ is drawn from a bell curve
+> with this mean and variance". The shrinking keeps the total variance from growing: signal
+> fades at the same rate noise is added.
+
 where $\beta_1, \ldots, \beta_T$ is a **noise schedule** (small values, e.g. 0.0001 to 0.02).
 
+The **noise schedule** is the list of how much noise to add at each step: tiny at first, larger
+later. $T$ is usually 1000.
+
 Define $\alpha_t = 1 - \beta_t$ and $\bar\alpha_t = \prod_{s=1}^t \alpha_s$. Then you can sample $x_t$ directly from $x_0$:
+
+$\alpha_t$ is the fraction of signal variance kept by step $t$, and $\bar\alpha_t$ (read
+"alpha bar") multiplies all of them up to $t$: the total fraction of the original signal's
+variance still present after $t$ steps. $\prod$ means "multiply together".
 
 $$
 q(x_t | x_0) = \mathcal{N}(x_t;\, \sqrt{\bar\alpha_t}\, x_0,\, (1-\bar\alpha_t) I)
 $$
+
+> **In plain words:** you don't need to run $t$ steps one by one. Jumping straight from the clean
+> image to step $t$ gives a bell curve centred on the shrunken clean image $\sqrt{\bar\alpha_t}\,x_0$
+> with variance $1-\bar\alpha_t$.
 
 or equivalently:
 
 $$
 x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1-\bar\alpha_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0,I)
 $$
+
+> **In plain words:** noisy image = (signal weight) times clean image + (noise weight) times fresh
+> noise. The two squared weights always add to 1. As $t$ grows, the signal weight slides from 1
+> toward 0 and the noise weight from 0 toward 1.
+
+This shortcut works because adding several independent Gaussian noises gives one Gaussian noise
+(their variances add). You will prove it numerically in the exercise.
 
 ```python
 import torch
@@ -63,13 +103,24 @@ T=1000
 beta at t=1:   0.000100
 beta at t=1000:0.020000
 alpha_bar at t=1:   0.999900
-alpha_bar at t=500: 0.084934
-alpha_bar at t=1000:0.00000636  ← nearly 0
+alpha_bar at t=500: 0.078587
+alpha_bar at t=1000:0.00004036  ← nearly 0
 
-At t=1000: signal=0.0025, noise=1.0000
+At t=1000: signal=0.0064, noise=1.0000
 ```
 
+The schedule rises from $\beta = 0.0001$ to 0.02. After 500 steps only 0.0786 (7.9%) of the
+signal variance remains; after all 1000 steps, 0.00004. The last line puts that in amplitude
+terms: the signal weight $\sqrt{\bar\alpha_T}$ is 0.0064 and the noise weight is 1.0000. At $t = T$ the
+image is, for practical purposes, pure noise — which is exactly what lets you start sampling
+from pure noise.
+
 ## Visualizing the Forward Process
+
+Watch one simple "image" — 16 pixels all equal to 1 — fade into noise.
+
+The **signal-to-noise ratio (SNR)** is $\bar\alpha_t / (1 - \bar\alpha_t)$: signal variance divided
+by noise variance. Above 1, signal dominates; below 1, noise dominates.
 
 ```python
 import torch
@@ -95,21 +146,38 @@ for t_val in [0, 100, 250, 500, 750, 999]:
 
 ```output
 Noise levels at different timesteps:
-t=   0: xt mean=1.0000, std=0.0000, SNR=9999.000
-t= 100: xt mean=0.9048, std=0.4220, SNR=4.590
-t= 250: xt mean=0.7110, std=0.7030, SNR=1.020
-t= 500: xt mean=0.2915, std=0.9566, SNR=0.093
-t= 750: xt mean=0.0832, std=0.9966, SNR=0.007
-t= 999: xt mean=0.0025, std=0.9999, SNR=0.000
+t=   0: xt mean=0.9983, std=0.0105, SNR=9997.341
+t= 100: xt mean=0.9521, std=0.3262, SNR=8.537
+t= 250: xt mean=0.8441, std=0.6272, SNR=1.090
+t= 500: xt mean=0.4636, std=0.7196, SNR=0.084
+t= 750: xt mean=0.1700, std=1.1713, SNR=0.003
+t= 999: xt mean=0.1263, std=0.9146, SNR=0.000
 ```
 
+Follow the mean column: it should be near $\sqrt{\bar\alpha_t}$, and it falls from 0.9983 at $t = 0$
+to 0.4636 at $t = 500$ (theory: $\sqrt{0.0786} \approx 0.28$), then to the 0.1 range. The std column grows from 0.0105 toward 1.
+The SNR column crosses 1 near $t = 250$ (1.090): from there on, noise outweighs signal. The
+values at $t = 750$ and $t = 999$ wobble (std 1.17, then 0.91) because 16 pixels is a tiny
+sample; the trend is what matters.
+
 ## Cosine Schedule
+
+The linear schedule spends too many of its 1000 steps on images that are already almost pure
+noise. The cosine schedule removes signal more evenly, so every step does useful work.
 
 Linear schedules destroy signal too fast at the start. The **cosine schedule** (Nichol & Dhariwal 2021) is smoother:
 
 $$
 \bar\alpha_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos^2\!\left(\frac{t/T + s}{1+s} \cdot \frac{\pi}{2}\right)
 $$
+
+- $f(t)$ — a cosine-squared curve that starts at about 1 and falls to 0 at $t = T$.
+- $s$ — a small offset (0.008) so that $\beta$ is not too tiny near $t = 0$.
+- $\bar\alpha_t$ — defined as $f(t)/f(0)$, so it equals exactly 1 at $t = 0$.
+
+> **In plain words:** instead of choosing the per-step $\beta_t$ and getting $\bar\alpha_t$ as a
+> by-product, you choose the shape of $\bar\alpha_t$ directly — a gentle S-shaped fade — and work
+> out the $\beta_t$ that produce it.
 
 ```python
 import torch
@@ -133,14 +201,25 @@ for t in [100, 250, 500, 750, 999]:
 
 ```output
 Cosine vs Linear alpha_bar:
-t= 100: cosine=0.9047  linear=0.9047
-t= 250: cosine=0.6913  linear=0.5844
-t= 500: cosine=0.3024  linear=0.0849
-t= 750: cosine=0.0513  linear=0.0028
-t= 999: cosine=0.0001  linear=0.0000
+t= 100: cosine=0.9716  linear=0.8951
+t= 250: cosine=0.8459  linear=0.5214
+t= 500: cosine=0.4923  linear=0.0778
+t= 750: cosine=0.1432  linear=0.0033
+t= 999: cosine=0.0000  linear=0.0000
 ```
 
+Compare the two columns at $t = 500$: the cosine schedule still keeps 0.4923 of the signal
+variance, the linear schedule only 0.0778. At $t = 750$, linear is down to 0.0033 — the last
+quarter of its steps is nearly pure noise, where the model learns little. Cosine is still at
+0.1432 there. Both reach 0 at the end.
+
+> **Watch out:** the cosine $\beta_t$ near the very end can blow up toward 1 (division by an
+> $\bar\alpha$ close to 0). That is why the code clamps $\beta$ at 0.999.
+
 ## The Reverse Process
+
+To go backwards, the model looks at a noisy image, guesses which noise was added, and removes a
+bit of it. Repeat 1000 times and noise turns into a picture.
 
 The reverse process $p_\theta(x_{t-1}|x_t)$ is also Gaussian. With a neural network predicting the noise $\epsilon_\theta(x_t, t)$:
 
@@ -148,13 +227,25 @@ $$
 p_\theta(x_{t-1}|x_t) = \mathcal{N}\!\left(x_{t-1};\, \mu_\theta(x_t, t),\, \tilde\beta_t I\right)
 $$
 
+> **In plain words:** each reverse step draws $x_{t-1}$ from a bell curve. Its centre
+> $\mu_\theta$ comes from the network; its variance $\tilde\beta_t$ is fixed by the schedule. The
+> fact that small reverse steps are nearly Gaussian is why diffusion uses many tiny steps.
+
 where the predicted mean is:
 
 $$
 \mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t, t)\right)
 $$
 
+> **In plain words:** take the noisy image, subtract the network's guess of the noise (scaled by
+> $\beta_t / \sqrt{1-\bar\alpha_t}$, the share of noise this step removes), then undo the forward
+> step's shrinking by dividing by $\sqrt{\alpha_t}$.
+
 The network $\epsilon_\theta$ takes the noisy image $x_t$ and timestep $t$ as input, and predicts the noise that was added.
+
+The timestep matters: at $t = 999$ the input is almost all noise, at $t = 10$ almost all signal,
+so the right correction is very different. The toy model below looks up a learned 16-number
+**embedding** (a vector that stands for the timestep) and concatenates it to the input.
 
 ```python
 import torch
@@ -189,17 +280,48 @@ print(f"params:           {sum(p.numel() for p in model.parameters()):,}")
 x_t shape:        torch.Size([4, 16])
 t shape:          torch.Size([4])
 eps_pred shape:   torch.Size([4, 16])
-params:           5,984
+params:           23,312
 ```
 
+The key line is `eps_pred shape: torch.Size([4, 16])` — the output has exactly the input's
+shape, because it is a noise guess for every pixel. Of the 23,312 parameters, 16,000 are the
+timestep table ($1000 \times 16$); the network itself is small. Real image models replace this
+with a U-Net (ch. 8).
+
 ## Why Diffusion Beats GANs for Image Quality
+
+Diffusion trades speed for reliability: it is slow to sample, but it trains like an ordinary
+regression problem and covers the whole data distribution.
 
 1. **No mode collapse** — training is stable maximum-likelihood (no adversarial game).
 2. **Full coverage** — the denoising objective must handle all noise levels; the model can't ignore parts of the distribution.
 3. **Score matching connection** — denoising at all noise scales amounts to learning the score $\nabla_x \log p(x)$, which determines the distribution completely.
 4. **Trade-off** — slow sampling (1000 steps vs 1 for GAN). DDIM (ch. 8) reduces this.
 
+The **score** $\nabla_x \log p(x)$ is an arrow at every point saying which way the data gets more
+likely. Predicting the noise is (up to a scale factor) the same as predicting that arrow: removing
+noise means stepping toward more likely images.
+
+> **Watch out:** "no mode collapse" is about training dynamics, not a guarantee of perfect
+> samples. Strong guidance (ch. 8) deliberately trades diversity for fidelity and can make
+> diffusion samples repetitive too.
+
+## Recap in plain words
+
+- The forward process gradually mixes data with Gaussian noise according to a schedule
+  $\beta_t$; it has no learned parts.
+- $\bar\alpha_t$ is the share of the original signal's variance left at step $t$, and you can
+  jump to any $t$ in one shot.
+- The cosine schedule fades signal more evenly than the linear one, so fewer steps are wasted
+  on pure noise.
+- The reverse process is learned: a network guesses the noise in $x_t$, and each step removes a
+  bit of it.
+- Diffusion is stable and covers the data well, at the cost of many sampling steps.
+
 ## Try it Yourself
+
+This builds a 200-step cosine schedule, checks its endpoints, and noises a constant signal of
+0.5 to the halfway point. It reuses `q_sample` from earlier on the page.
 
 ```python
 import torch
@@ -229,17 +351,28 @@ print(f"\nAt t=100: x0={x0[0,0]:.2f}, xt mean={xt.mean():.4f}")
 
 ```output
 T=200 cosine schedule:
-  beta[0]  = 0.000102
-  beta[-1] = 0.007761
-  alpha_bar[0]  = 0.999898  (almost 1, signal intact)
-  alpha_bar[-1] = 0.00018635  (almost 0, pure noise)
+  beta[0]  = 0.000255
+  beta[-1] = 0.999000
+  alpha_bar[0]  = 0.999745  (almost 1, signal intact)
+  alpha_bar[-1] = 0.00000000  (almost 0, pure noise)
 
-At t=100: x0=0.50, xt mean=0.1521
+At t=100: x0=0.50, xt mean=0.1414
 ```
+
+The first step adds very little noise ($\beta = 0.000255$, so $\bar\alpha = 0.999745$); the last
+$\beta$ hit the 0.999 clamp, and $\bar\alpha$ ends at exactly 0. At $t = 100$, theory says
+$\bar\alpha \approx 0.486$, so the noisy mean should be near $0.5 \times \sqrt{0.486} \approx 0.35$.
+The printed 0.1414 is lower because 8 pixels with noise std about 0.72 give a mean that can easily
+be 0.2 off. Change `torch.full((1, 8), 0.5)` to `torch.full((1, 10000), 0.5)` and the mean will
+settle near 0.35.
 
 ## Exercise
 
 Show that sampling $x_t$ using the closed-form $q(x_t|x_0)$ gives the same mean and variance as iteratively applying $q(x_t|x_{t-1})$ 5 times starting from $x_0$. Use $T=5$ with a simple linear schedule from $\beta=0.1$ to $\beta=0.5$.
+
+> **Hint:** a single sample can't show that two distributions match. Make many copies of the same
+> $x_0$ (say 100,000), push them through both routes, and compare the mean and std of each column
+> with $\sqrt{\bar\alpha_5}\,x_0$ and $\sqrt{1-\bar\alpha_5}$.
 
 <details>
 <summary>Solution</summary>
@@ -252,25 +385,30 @@ alphas_small = 1 - betas_small
 ab_small = torch.cumprod(alphas_small, dim=0)
 
 torch.manual_seed(42)
-x0 = torch.tensor([[1.0, 0.0, -1.0]])
-
-# Closed form at t=5
+x0 = torch.tensor([[1.0, 0.0, -1.0]]).repeat(100_000, 1)   # many copies of one x0
 t5 = 4   # 0-indexed
+
+# Closed form at t=5: one jump
 xt_closed = ab_small[t5].sqrt() * x0 + (1 - ab_small[t5]).sqrt() * torch.randn_like(x0)
 
-# Iterative
-torch.manual_seed(42)  # same random state won't match exactly, but statistics should
+# Iterative: 5 single steps (different random draws, so compare statistics)
 xt_iter = x0.clone()
 for i in range(5):
     eps = torch.randn_like(xt_iter)
     xt_iter = alphas_small[i].sqrt() * xt_iter + betas_small[i].sqrt() * eps
 
-# Compare means and variances (not exact matches — different random draws)
-print(f"Closed form: mean={xt_closed.mean():.4f}")
-print(f"Iterative:   mean={xt_iter.mean():.4f}")
-print(f"Closed std:  {xt_closed.std():.4f}")
-print(f"Theory std:  {(1-ab_small[t5]).sqrt():.4f}")
+print(f"Theory mean: {(ab_small[t5].sqrt() * x0[0]).numpy().round(4)}")
+print(f"Closed mean: {xt_closed.mean(0).numpy().round(4)}")
+print(f"Iter.  mean: {xt_iter.mean(0).numpy().round(4)}")
+print(f"Theory std:  {(1 - ab_small[t5]).sqrt():.4f}")
+print(f"Closed std:  {xt_closed.std(0).numpy().round(4)}")
+print(f"Iter.  std:  {xt_iter.std(0).numpy().round(4)}")
 ```
 
 The closed-form and iterative processes have the same mean (scaled by $\sqrt{\bar\alpha_t}$) and the same variance ($1-\bar\alpha_t$). This equivalence is what makes training efficient — you can jump to any timestep directly without running the chain.
+
+Running it, both routes land on the theory: means about $[0.388, 0.000, -0.388]$ against the
+theoretical $\sqrt{0.1512} \times [1, 0, -1] = [0.3888, 0, -0.3888]$, and every std within 0.004 of
+the theoretical 0.9213. The two routes use different random draws, so individual samples differ;
+only the distributions match.
 </details>
