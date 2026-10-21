@@ -7,6 +7,10 @@ order: 2
 
 ## The output-size formula
 
+Three dials decide how big a conv layer's output is: how much border you add, how far the
+kernel jumps between stops, and how spread out the kernel's cells are. One formula covers all
+three, so you never need to guess a shape.
+
 Every conv layer shrinks the spatial dimensions unless you add padding. The general formula for
 one spatial dimension:
 
@@ -15,6 +19,14 @@ H_{out} = \left\lfloor \frac{H_{in} + 2p - d(k-1) - 1}{s} + 1 \right\rfloor
 $$
 
 where $p$ = padding, $d$ = dilation, $k$ = kernel size, $s$ = stride.
+
+> **In plain words:**
+> - $H_{in}$ is the input height (the same formula works for width).
+> - $2p$ adds the **padding** — extra rows of zeros on the top and bottom.
+> - $d(k-1) + 1$ is how wide the kernel really reaches once it is dilated (more below).
+> - Subtracting that reach and dividing by the **stride** $s$ (the jump between kernel
+>   positions) counts how many stops fit; $+1$ counts the first stop.
+> - $\lfloor \cdot \rfloor$ means "round down": a stop that would hang off the edge is dropped.
 
 ```python
 import torch
@@ -36,12 +48,29 @@ print("32, k=3, p=1, s=2:", conv_output_size(32, 3, p=1, s=2))
 32, k=3, p=1, s=2: 16
 ```
 
+Read the four lines as four recipes for a $32 \times 32$ input with a $3 \times 3$ kernel.
+No padding shrinks it to 30. One pixel of padding keeps it at 32. Stride 2 without padding
+gives 15, because $(32 - 3) / 2 + 1 = 15.5$ rounds down. Stride 2 with padding gives exactly
+half, 16 — the usual way to downsample.
+
+> **Watch out:** the "round down" step means stride-2 layers on odd sizes quietly lose a
+> row or column. If an encoder-decoder (ch. 10) tries to upsample 15 back to 32, the shapes
+> will not match. Keep sizes divisible by your total stride.
+
 ## Padding
+
+**Padding** is a frame of zeros you glue around the image so the kernel can also sit centred
+on the edge pixels. Without it, edge pixels are visited fewer times and the output shrinks.
 
 **VALID** (no padding): output shrinks by $k-1$. Good when you explicitly want downsampling.
 
 **SAME** (padding = $\lfloor k/2 \rfloor$): output equals input size when stride=1. Standard default
 for convolutions that shouldn't downsample.
+
+> **Picture it:** framing a photo with a white border before you slide a stencil over it.
+> The border lets the stencil's centre reach the photo's corners. The analogy breaks a
+> little: the border is made of zeros, so outputs near the edge see "darkness" and tend to
+> be weaker.
 
 ```python
 import torch
@@ -62,10 +91,23 @@ SAME  output: torch.Size([1, 1, 8, 8])
 SAME (auto): torch.Size([1, 1, 8, 8])
 ```
 
+An $8 \times 8$ input with a $3 \times 3$ kernel becomes $6 \times 6$ without padding and stays
+$8 \times 8$ with `padding=1`. The third line shows that `padding='same'` picks that 1 for you.
+
+> **Watch out:** `padding='same'` only works with `stride=1` in PyTorch. For stride 2 you
+> must set the padding number yourself.
+
 ## Stride
+
+**Stride** is the step size of the slide. Stride 1 visits every position; stride 2 visits
+every other one, so the output is about half as tall and half as wide.
 
 Stride $s > 1$ skips positions, effectively downsampling the output. Stride-2 convolution halves
 the spatial dimensions — a learnable alternative to max pooling, preferred in modern architectures.
+
+> **Picture it:** reading a page by looking at every second word. You cover the page twice
+> as fast and keep half as many notes. A strided conv still learns *what* to note at each
+> stop, which is why it can replace a fixed pooling rule (ch. 3).
 
 ResNet's first conv layer uses a $7 \times 7$ kernel with stride 2 and padding 3, immediately
 halving the $224 \times 224$ image to $112 \times 112$.
@@ -80,12 +122,24 @@ print("ResNet stem output:", conv_s2(x).shape)   # should be (1,64,112,112)
 ResNet stem output: torch.Size([1, 64, 112, 112])
 ```
 
+The shape confirms the formula: $\lfloor (224 + 6 - 6 - 1) / 2 \rfloor + 1 = 111 + 1 = 112$.
+This first layer is called the **stem** — the opening layers that turn raw pixels into the
+first feature maps.
+
 ## Dilation
 
-Dilation $d > 1$ inserts $d-1$ zeros between kernel elements, making a $3 \times 3$ kernel behave
-like a $(2d-1) \times (2d-1)$ kernel but with the same parameter count.
+**Dilation** spreads the kernel's cells apart with gaps between them, so a small kernel covers a
+wider area without gaining any weights. It is how you see more context without shrinking the
+image.
+
+Dilation $d > 1$ inserts $d-1$ zeros between kernel elements, making a $3 \times 3$ kernel
+cover a $(2d+1) \times (2d+1)$ area (the formula below; an easy slip is to write
+$(2d-1) \times (2d-1)$) but with the same parameter count.
 
 Effective kernel size: $k_{\text{eff}} = d(k-1)+1$.
+
+> **In plain words:** each of the $k - 1$ gaps between kernel cells is stretched to $d$
+> pixels, then you add 1 for the starting cell. With $k = 3$, $d = 2$: $2 \cdot 2 + 1 = 5$.
 
 | $k$ | $d$ | $k_{\text{eff}}$ |
 |-----|-----|---------|
@@ -94,7 +148,11 @@ Effective kernel size: $k_{\text{eff}} = d(k-1)+1$.
 | 3 | 4 | 9 |
 
 Used in semantic segmentation (atrous convolution) to aggregate context without downsampling,
-and in WaveNet for large temporal receptive fields in audio.
+and in WaveNet for large temporal receptive fields in audio. ("Atrous" comes from the French
+*à trous*, "with holes".)
+
+> **Picture it:** a fishing net. Dilation does not add more knots (weights); it stretches the
+> same knots wider apart, so the net covers more water but has bigger holes.
 
 ```python
 x = torch.randn(1, 1, 16, 16)
@@ -113,15 +171,31 @@ d=2 output: torch.Size([1, 1, 16, 16])
 d=4 output: torch.Size([1, 1, 16, 16])
 ```
 
-All same output size — but the d=4 layer sees a 9×9 area with only 9 parameters.
+All three outputs stay $16 \times 16$, because each layer's padding equals its dilation
+($p = d$ keeps the size for a $3 \times 3$ kernel).
+
+All same output size — but the d=4 layer sees a $9 \times 9$ area with only 9 parameters.
+
+> **Watch out:** stacking several layers with the same large dilation leaves a "gridding"
+> pattern — some input pixels are never touched by any path, like a checkerboard of blind
+> spots. Mixing dilation rates (for example 1, 2, 5) avoids it.
 
 ## Receptive field grows with depth
+
+A unit's **receptive field** is the patch of the original image that can influence it. One
+$3 \times 3$ layer sees a $3 \times 3$ patch; a second layer on top sees a $3 \times 3$ patch of
+those, which reaches $5 \times 5$ pixels back in the image.
 
 The receptive field of a unit in layer $l$ (with kernel $k$ and stride $s$) relative to the input:
 
 $$
 RF_l = RF_{l-1} + (k-1) \cdot \prod_{i=1}^{l-1} s_i
 $$
+
+> **In plain words:** each new layer adds $k - 1$ more pixels of reach, but measured in the
+> step size of its input. If earlier layers had strides $s_1, s_2, \dots$, one step in the
+> current feature map equals $\prod s_i$ pixels of the image, so the added reach is
+> multiplied by that product.
 
 For a stack of $3 \times 3$, stride-1 convs (no dilation), $RF$ grows linearly: 3, 5, 7, 9, …
 
@@ -149,11 +223,30 @@ for n in range(1, 9):
 8 conv(3×3, s=1): RF = 17
 ```
 
+Each extra stride-1 layer adds exactly 2 to the receptive field: 3, 5, 7, … up to 17 after 8
+layers. To see a whole $224 \times 224$ image that way you would need over 100 layers, which is
+why real networks also use strides and pooling to make the reach grow faster.
+
 Deep networks compensate by stacking many small-kernel layers. Two $3 \times 3$ layers have the
 same theoretical receptive field as one $5 \times 5$ layer but with $2 \times 9 = 18$ vs $25$ params
 and an extra nonlinearity.
 
+> **Watch out:** the *theoretical* receptive field is a maximum. The *effective* receptive
+> field — the pixels that actually change the output much — is smaller and concentrated in
+> the centre, roughly like a bell curve.
+
+## Recap in plain words
+
+- One formula gives every output size: add the padding, subtract the dilated kernel reach, divide by the stride, round down, add 1.
+- Padding of $\lfloor k/2 \rfloor$ with stride 1 keeps the size the same ("same" padding).
+- Stride 2 halves the height and width, and the layer learns how to summarise.
+- Dilation widens a kernel's reach to $d(k-1)+1$ pixels without adding weights.
+- The receptive field grows by $k - 1$ per layer, multiplied by all earlier strides.
+
 ## Try it Yourself
+
+This compares the reach of four standard $3 \times 3$ layers with four dilated ones, then
+confirms that padding keeps all of them at $64 \times 64$.
 
 ```python
 import torch
@@ -184,11 +277,19 @@ Standard output: torch.Size([1, 1, 64, 64])
 Dilated  output: torch.Size([1, 1, 64, 64])
 ```
 
+Four standard layers reach 9 pixels; four layers with $d = 2$ reach 17; with $d = 4$, 33 —
+nearly 4 times the reach for the same 36 weights, and both nets still output $64 \times 64$.
+Try `receptive_field_dilation(4, d=8)`, and build a dilated net with `padding=8, dilation=8`
+to check the shape stays at 64.
+
 ## Exercise
 
 A network has three conv layers: $5 \times 5$ (stride 2), $3 \times 3$ (stride 1), $3 \times 3$
 (stride 1). Compute the receptive field after each layer. Then compute the output size if the
 input is $64 \times 64$ (no padding, dilation=1).
+
+> **Hint:** keep a running product of the strides seen so far. The first layer's stride does
+> not multiply its own jump, only the jumps of the layers after it.
 
 <details>
 <summary>Solution</summary>
@@ -208,8 +309,12 @@ print("Receptive fields and output sizes:")
 rf_and_sizes(layers)
 ```
 
-After layer 1 (5×5, s=2): RF=5, H=30.
-After layer 2 (3×3, s=1): RF=9, H=28.
-After layer 3 (3×3, s=1): RF=13, H=26.
+After layer 1 ($5 \times 5$, s=2): RF=5, H=30.
+After layer 2 ($3 \times 3$, s=1): RF=9, H=28.
+After layer 3 ($3 \times 3$, s=1): RF=13, H=26.
 The key insight: stride multiplies the RF jump of subsequent layers.
+
+Layer 2 adds $(3 - 1) \times 2 = 4$ instead of 2, because one step on the stride-2 feature map
+equals 2 pixels of the input. The output sizes follow $\lfloor (H - k)/s \rfloor + 1$:
+$\lfloor 59/2 \rfloor + 1 = 30$, then $30 - 2 = 28$, then $28 - 2 = 26$.
 </details>
