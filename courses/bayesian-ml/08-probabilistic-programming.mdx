@@ -1,0 +1,556 @@
+---
+course: bayesian-ml
+chapter: 08-probabilistic-programming
+title: "Probabilistic Programming with PyMC and NumPyro"
+order: 8
+---
+
+## A model is a program that generates data
+
+In ch. 4–6 you wrote every sampler by hand. You coded the log density, its gradient, the
+leapfrog integrator, dual averaging and the U-turn rule. A **probabilistic programming language**
+(PPL) automates all of that. You write the *generative story*: draw parameters from priors, push
+them through a function, draw data from a likelihood. The PPL then:
+
+1. collects every random variable you declared, and splits them into observed and latent ones;
+2. builds the joint log density $\log p(\theta, y) = \log p(\theta) + \log p(y \mid \theta)$ as a
+   computational graph, after mapping each constrained parameter to $\mathbb{R}$;
+3. differentiates that graph (PyTensor in PyMC, JAX in NumPyro), and
+4. hands $\log p$ and $\nabla \log p$ to NUTS (ch. 6) with dual averaging and a diagonal mass
+   matrix tuned during warmup.
+
+The running example is churn. You have 400 subscription customers with two standardised features
+(tenure and support tickets) and a binary outcome:
+
+$$
+\alpha \sim \mathcal{N}(0, 1.5), \quad \beta_j \sim \mathcal{N}(0, 1), \quad
+y_i \sim \mathrm{Bernoulli}\big(\sigma(\alpha + x_i^{\top}\beta)\big).
+$$
+
+```python
+import logging, warnings
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy import stats
+from scipy.special import expit, log_expit
+logging.getLogger("pymc").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
+
+rng = np.random.default_rng(8)
+N = 400
+X = rng.standard_normal((N, 2))                          # tenure_z, tickets_z
+true_a, true_b = -1.0, np.array([-0.9, 0.7])
+y = rng.binomial(1, expit(true_a + X @ true_b))
+
+with pm.Model() as churn:
+    a = pm.Normal("a", 0, 1.5)
+    b = pm.Normal("b", 0, 1, shape=2)
+    pm.Bernoulli("y", logit_p=a + X @ b, observed=y)
+
+print("free RVs:", churn.free_RVs, "| observed:", churn.observed_RVs)
+print("value vars (what NUTS moves):", churn.value_vars)
+logp_fn, dlogp_fn = churn.compile_logp(), churn.compile_dlogp()
+pt = {"a": np.array(0.3), "b": np.array([0.5, -0.2])}
+
+def logp_by_hand(a_, b_):                                # the joint density, written out
+    eta = a_ + X @ b_
+    return (stats.norm.logpdf(a_, 0, 1.5) + stats.norm.logpdf(b_, 0, 1).sum()
+            + np.sum(y * log_expit(eta) + (1 - y) * log_expit(-eta)))
+
+def grad_by_hand(a_, b_):
+    r = y - expit(a_ + X @ b_)
+    return np.r_[r.sum() - a_ / 1.5 ** 2, X.T @ r - b_]
+
+print(f"logp  PyMC {logp_fn(pt):.6f} | by hand {logp_by_hand(0.3, pt['b']):.6f}")
+print("dlogp PyMC", np.round(dlogp_fn(pt), 6), "| by hand", np.round(grad_by_hand(0.3, pt["b"]), 6))
+print(f"churn rate in data: {y.mean():.3f}")
+```
+
+```output
+```
+
+The PyMC object is not a sampler. It is a symbolic description of a joint density, and
+`compile_logp` and `compile_dlogp` turn it into exactly the two functions you hand-coded in
+ch. 6. The gradient came from automatic differentiation of the graph, not from you. Everything
+below (sampling, prediction, model checking) is built on these two functions plus a forward
+simulator of the same graph.
+
+## Prior predictive sampling: what your priors say about data
+
+Because the model is a generative program, you can run it forward *before* conditioning on
+anything. Draw $\theta$ from the prior, then draw a fake dataset given $\theta$. This is the
+**prior predictive** distribution $p(\tilde y) = \int p(\tilde y \mid \theta) p(\theta) d\theta$.
+It is the cheapest way to find out whether your priors encode nonsense. On the logit scale,
+"vague" priors are not vague. A $\mathcal{N}(0, 10)$ prior on a coefficient puts most of its mass on
+probabilities that are almost exactly 0 or 1.
+
+```python
+def prior_churn_probs(scale_a, scale_b, seed):
+    with pm.Model():
+        a_ = pm.Normal("a", 0, scale_a)
+        b_ = pm.Normal("b", 0, scale_b, shape=2)
+        pm.Deterministic("p", pm.math.sigmoid(a_ + X @ b_))
+        pm.Bernoulli("y", logit_p=a_ + X @ b_, observed=y)
+        pri = pm.sample_prior_predictive(draws=1000, random_seed=seed)
+    return pri.prior["p"].values.ravel(), pri.prior_predictive["y"].values.mean(axis=-1).ravel()
+
+for sa, sb in ((10, 10), (1.5, 1)):
+    p, rate = prior_churn_probs(sa, sb, seed=11)
+    print(f"a~N(0,{sa:>4}), b~N(0,{sb:>2}) | P(p<0.01 or p>0.99) = {np.mean((p < .01) | (p > .99)):.3f} "
+          f"| simulated churn rate 5-50-95%: {np.round(np.quantile(rate, [.05, .5, .95]), 3)}")
+```
+
+```output
+```
+
+TODO_PRIOR
+
+## Sampling and reading `az.summary`
+
+`pm.sample` inspects the free variables, sees that they are all continuous, and assigns NUTS. It
+then runs warmup (step-size dual averaging plus mass-matrix estimation), keeps the draws, and
+returns a `DataTree` with `posterior`, `sample_stats` and `observed_data` groups.
+
+```python
+with churn:
+    idata = pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=1, progressbar=False, quiet=True)
+
+summ = az.summary(idata, ci_kind="hdi", ci_prob=0.94, round_to=3)
+print(summ.to_string())
+ss = idata.sample_stats
+print(f"\nstep size {float(ss['step_size'].values.mean()):.3f} | mean tree depth "
+      f"{float(ss['tree_depth'].values.mean()):.2f} | divergences {int(ss['diverging'].values.sum())}")
+b0 = idata.posterior["b"].values[..., 0]
+print(f"check: sd/sqrt(ess_bulk) for b[0] = {b0.std() / np.sqrt(summ.loc['b[0]', 'ess_bulk']):.4f}"
+      f" vs mcse_mean {summ.loc['b[0]', 'mcse_mean']:.4f}")
+```
+
+```output
+```
+
+TODO_SUMMARY
+
+## The same model in NumPyro
+
+NumPyro writes the model as a plain Python function. `numpyro.sample(name, dist)` declares a
+random variable, and `obs=` marks it observed. There is no model object. The function *is* the
+model. The log density is recovered by running the function under effect handlers (later
+in this chapter). JAX then differentiates it and compiles NUTS end to end with XLA.
+
+```python
+import jax, jax.numpy as jnp
+import numpyro, numpyro.distributions as dist
+from numpyro.infer import MCMC, NUTS, Predictive
+numpyro.set_platform("cpu")
+
+def churn_np(X, y=None):
+    a = numpyro.sample("a", dist.Normal(0, 1.5))
+    b = numpyro.sample("b", dist.Normal(0, 1).expand([2]))
+    numpyro.sample("y", dist.Bernoulli(logits=a + X @ b), obs=y)
+
+mcmc = MCMC(NUTS(churn_np), num_warmup=1000, num_samples=1000, num_chains=4,
+            chain_method="sequential", progress_bar=False)
+mcmc.run(jax.random.PRNGKey(1), X, y)
+s_np = {k: np.asarray(v) for k, v in mcmc.get_samples(group_by_chain=True).items()}
+s_pm = {k: idata.posterior[k].values for k in ("a", "b")}
+print(f"{'param':6} {'PyMC mean':>10} {'NumPyro mean':>13} {'PyMC sd':>8} {'NumPyro sd':>11} {'|diff|/mcse':>12}")
+for name, i in (("a", None), ("b[0]", 0), ("b[1]", 1)):
+    u = s_pm["a"] if i is None else s_pm["b"][..., i]
+    v = s_np["a"] if i is None else s_np["b"][..., i]
+    mcse = np.hypot(az.mcse(u), az.mcse(v))
+    print(f"{name:6} {u.mean():10.3f} {v.mean():13.3f} {u.std():8.3f} {v.std():11.3f} {abs(u.mean() - v.mean()) / mcse:12.2f}")
+print("truth:  a =", true_a, " b =", true_b.tolist())
+```
+
+```output
+```
+
+TODO_NUMPYRO
+
+## Transforms: the sampler lives on $\mathbb{R}^d$
+
+HMC needs an unconstrained space. A leapfrog step that pushes $\sigma$ below zero gives an
+undefined density. So every PPL reparameterises bounded variables automatically: $\sigma > 0$ is
+sampled as $z = \log \sigma$, and $\pi \in (0,1)$ as $z = \mathrm{logit}\,\pi$. The density must
+then be corrected by the Jacobian of the inverse map.
+
+### The change-of-variables correction
+
+If $\sigma = g(z) = e^{z}$, then for any density $p_\sigma$:
+
+$$
+p_z(z) = p_\sigma\big(g(z)\big)\,\left|\frac{dg}{dz}\right| = p_\sigma(e^{z})\,e^{z}
+\quad\Longrightarrow\quad
+\log p_z(z) = \log p_\sigma(e^{z}) + z.
+$$
+
+For the logit transform $\pi = \sigma(z)$, $d\pi/dz = \pi(1-\pi)$, so the correction is
+$\log \pi + \log(1 - \pi)$. Drop this term and NUTS samples the wrong distribution. It
+samples $p_\sigma(e^{z})$ treated as a density in $z$, which is not normalised the same way and
+is not the posterior.
+
+```python
+with pm.Model() as tmodel:
+    sigma = pm.HalfNormal("sigma", 2.0)
+    pi = pm.Beta("pi", 2, 5)
+    mu = pm.Normal("mu", 0, 5)
+print("value vars:", tmodel.value_vars)
+z = {"sigma_log__": np.array(0.4), "pi_logodds__": np.array(-1.1), "mu": np.array(0.7)}
+s_, p_ = np.exp(0.4), expit(-1.1)
+manual_nojac = stats.halfnorm.logpdf(s_, scale=2) + stats.beta.logpdf(p_, 2, 5) + stats.norm.logpdf(0.7, 0, 5)
+manual_jac = manual_nojac + 0.4 + np.log(p_) + np.log1p(-p_)
+print(f"PyMC logp jacobian=False {tmodel.compile_logp(jacobian=False)(z):.6f} | by hand {manual_nojac:.6f}")
+print(f"PyMC logp jacobian=True  {tmodel.compile_logp(jacobian=True)(z):.6f} | by hand {manual_jac:.6f}")
+
+with tmodel:
+    tr = pm.sample(1000, tune=1000, chains=2, cores=1, random_seed=3, progressbar=False, quiet=True)
+print(f"posterior = prior here (no data): sigma mean {tr.posterior['sigma'].values.mean():.3f} "
+      f"(exact {stats.halfnorm(scale=2).mean():.3f}) | pi mean {tr.posterior['pi'].values.mean():.3f} (exact {2/7:.3f})")
+```
+
+```output
+```
+
+TODO_TRANSFORM
+
+## Data containers, deterministics and out-of-sample prediction
+
+Two more pieces make a PPL model reusable. `pm.Data` wraps an array in a shared variable that
+you can swap later without rebuilding the graph. `pm.Deterministic` records a function of the
+parameters (here the churn probability) at every draw, so it appears in the trace. To predict for
+new customers you call `pm.set_data` and then `pm.sample_posterior_predictive`. The parameter draws
+are reused, and only the likelihood node is re-simulated:
+
+$$
+p(\tilde y \mid \tilde x, y) = \int p(\tilde y \mid \tilde x, \theta)\, p(\theta \mid y)\, d\theta .
+$$
+
+```python
+with pm.Model() as churn_d:
+    Xd = pm.Data("Xd", X)
+    yd = pm.Data("yd", y)
+    a = pm.Normal("a", 0, 1.5)
+    b = pm.Normal("b", 0, 1, shape=2)
+    p = pm.Deterministic("p", pm.math.sigmoid(a + Xd @ b))
+    pm.Bernoulli("y", p=p, observed=yd, shape=Xd.shape[0])
+    idata_d = pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=1, progressbar=False, quiet=True)
+    ppc = pm.sample_posterior_predictive(idata_d, random_seed=2, progressbar=False)
+
+rep_rate = ppc.posterior_predictive["y"].values.mean(axis=-1).ravel()
+print(f"in-sample: observed churn {y.mean():.3f} | replicated 94% interval "
+      f"{np.round(np.quantile(rep_rate, [.03, .97]), 3)}")
+
+X_new = np.array([[-1.5, 2.0], [0.0, 0.0], [1.5, -1.0]])   # new, average, loyal
+with churn_d:
+    pm.set_data({"Xd": X_new, "yd": np.zeros(3, dtype=int)})
+    pred = pm.sample_posterior_predictive(idata_d, var_names=["p", "y"], predictions=True,
+                                          random_seed=3, progressbar=False)
+p_new = pred.predictions["p"].values.reshape(-1, 3)
+y_new = pred.predictions["y"].values.reshape(-1, 3)
+for i, lab in enumerate(("new, many tickets", "average", "loyal, few tickets")):
+    lo, hi = np.quantile(p_new[:, i], [.03, .97])
+    print(f"{lab:18} P(churn) mean {p_new[:, i].mean():.3f} [{lo:.3f}, {hi:.3f}] | "
+          f"share of y~=1 draws {y_new[:, i].mean():.3f} | true {expit(true_a + X_new[i] @ true_b):.3f}")
+```
+
+```output
+```
+
+TODO_DATA
+
+## Robust regression: swapping the likelihood is one line
+
+A PPL makes the likelihood a modelling choice and not a fixed property of the estimator. You
+are fitting request latency against payload size, and 8 of 80 requests hit a cold cache and are
+40–70 ms slower. A Normal likelihood has to absorb those points by moving the line and inflating
+$\sigma$. A Student-t likelihood with unknown degrees of freedom $\nu$ treats them as tail
+events instead, because its log density decays like $-(\nu+1)/2 \cdot \log(1 + r^2/\nu\sigma^2)$
+and not like $-r^2/2\sigma^2$.
+
+```python
+rng = np.random.default_rng(21)
+n = 80
+x = rng.uniform(0, 10, n)
+yl = 20 + 3.0 * x + rng.normal(0, 2.0, n)
+bad = rng.choice(np.where(x > 6)[0], 8, replace=False)       # outliers at large payloads
+yl[bad] += rng.uniform(40, 70, 8)
+
+def fit_line(robust, seed=4):
+    with pm.Model() as mdl:
+        a_ = pm.Normal("a", 20, 20)
+        b_ = pm.Normal("b", 0, 10)
+        s_ = pm.HalfNormal("sigma", 10)
+        mu_ = a_ + b_ * x
+        if robust:
+            nu = pm.Gamma("nu", 2, 0.1)
+            pm.StudentT("y", nu=nu, mu=mu_, sigma=s_, observed=yl)
+        else:
+            pm.Normal("y", mu=mu_, sigma=s_, observed=yl)
+        return pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=seed,
+                         progressbar=False, quiet=True)
+
+ols = np.polyfit(x, yl, 1)
+print(f"OLS: slope {ols[0]:.3f} intercept {ols[1]:.3f}   (truth: slope 3.000, intercept 20.000)")
+for robust in (False, True):
+    post = fit_line(robust).posterior
+    msg = (f"{'Student-t' if robust else 'Normal':9} slope {post['b'].values.mean():.3f} "
+           f"[{np.quantile(post['b'].values, .03):.3f}, {np.quantile(post['b'].values, .97):.3f}] | "
+           f"sigma {post['sigma'].values.mean():.2f}")
+    if robust:
+        msg += f" | nu median {np.median(post['nu'].values):.2f}"
+    print(msg)
+```
+
+```output
+```
+
+TODO_ROBUST
+
+## A Poisson GLM with an exposure offset
+
+Counts observed over different exposures (incidents per store over a different number of open
+days, claims per policy-year) need an **offset**. If store $i$ was open $E_i$ days and its daily
+rate is $\lambda_i = \exp(\alpha + \beta x_i)$, then
+
+$$
+y_i \sim \mathrm{Poisson}(E_i \lambda_i), \qquad \log \mathbb{E}[y_i] = \log E_i + \alpha + \beta x_i ,
+$$
+
+so $\log E_i$ enters the linear predictor with its coefficient fixed at 1. Leave it out and the
+regression attributes exposure differences to whatever covariate correlates with exposure.
+
+```python
+rng = np.random.default_rng(5)
+m_st = 120
+size_z = rng.standard_normal(m_st)                            # standardised floor area
+days = np.round(np.exp(3.5 + 0.6 * size_z + rng.normal(0, 0.4, m_st))).clip(5, 365)  # big stores open longer in-sample
+incidents = rng.poisson(days * np.exp(-2.5 + 0.3 * size_z))
+
+def fit_pois(offset):
+    with pm.Model():
+        a_ = pm.Normal("a", 0, 2)
+        b_ = pm.Normal("b", 0, 1)
+        eta = a_ + b_ * size_z + (np.log(days) if offset else 0.0)
+        pm.Poisson("y", mu=pm.math.exp(eta), observed=incidents)
+        return pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=6,
+                         progressbar=False, quiet=True).posterior
+
+print(f"open days: min {days.min():.0f}, median {np.median(days):.0f}, max {days.max():.0f} | "
+      f"corr(size, log days) {np.corrcoef(size_z, np.log(days))[0, 1]:.2f}")
+for off in (True, False):
+    po = fit_pois(off)
+    print(f"offset={off!s:5} | a {po['a'].values.mean():+.3f} | b (size effect on daily rate) "
+          f"{po['b'].values.mean():.3f} [{np.quantile(po['b'].values, .03):.3f}, {np.quantile(po['b'].values, .97):.3f}]"
+          f"   truth a -2.5, b 0.3")
+```
+
+```output
+```
+
+TODO_OFFSET
+
+## Effect handlers: what "a model is a program" means
+
+A NumPyro model is just a function that calls `numpyro.sample`. What that call *does* depends on
+which **handlers** are active around it. Handlers form a stack of context managers, and each one
+intercepts the message `{name, fn, value, ...}` that every `sample` statement emits:
+
+- `seed` supplies a PRNG key, so unobserved sites draw values;
+- `trace` records every message into an ordered dict;
+- `condition` pins a site's value (as if observed);
+- `substitute` replaces a value without marking it observed.
+
+Inference algorithms are compositions of these. `log_density` is "run under `substitute(params)`
+and `trace`, then sum `fn.log_prob(value)` over the sites". `Predictive` is "run under `seed` and
+`substitute(posterior draw)`".
+
+```python
+from numpyro import handlers
+from numpyro.infer.util import log_density
+
+X_small, y_small = X[:5], y[:5]
+tr = handlers.trace(handlers.seed(churn_np, rng_seed=0)).get_trace(X_small, y_small)
+for name, site in tr.items():
+    print(f"{name:2} {type(site['fn']).__name__:22} observed={site['is_observed']!s:5} value={np.round(np.asarray(site['value']), 3)}")
+
+cond = handlers.condition(churn_np, data={"a": 0.3, "b": jnp.array([0.5, -0.2])})
+tr_c = handlers.trace(handlers.seed(cond, rng_seed=0)).get_trace(X_small, y_small)
+manual = sum(float(jnp.sum(s["fn"].log_prob(s["value"]))) for s in tr_c.values())
+ld, _ = log_density(churn_np, (X, y), {}, {"a": 0.3, "b": jnp.array([0.5, -0.2])})
+print(f"\nconditioned joint log density on 5 rows (sum over trace) {manual:.4f}")
+print(f"numpyro log_density on all 400 rows {float(ld):.4f} | PyMC compile_logp {logp_fn(pt):.4f}")
+```
+
+```output
+```
+
+TODO_HANDLERS
+
+### A tracer in 40 lines of pure Python
+
+There is no magic in this. Here is the whole mechanism, with scipy distributions and a global
+handler stack. `sample` builds a message, passes it down the stack (innermost handler first), and
+draws from `fn` only if no handler has supplied a value.
+
+```python
+_STACK = []
+
+class Handler:
+    def __init__(self, fn): self.fn = fn
+    def __enter__(self): _STACK.append(self)
+    def __exit__(self, *a): _STACK.pop()
+    def process(self, msg): pass
+    def __call__(self, *args, **kw):
+        with self:
+            return self.fn(*args, **kw)
+
+class seed(Handler):
+    def __init__(self, fn, s): super().__init__(fn); self.rng = np.random.default_rng(s)
+    def process(self, msg): msg.setdefault("rng", self.rng)
+
+class condition(Handler):
+    def __init__(self, fn, data): super().__init__(fn); self.data = data
+    def process(self, msg):
+        if msg["name"] in self.data:
+            msg["value"], msg["observed"] = self.data[msg["name"]], True
+
+class trace(Handler):
+    def __init__(self, fn): super().__init__(fn); self.sites = {}
+    def process(self, msg): self.sites[msg["name"]] = msg
+    def get_trace(self, *args, **kw):
+        self(*args, **kw)
+        return self.sites
+
+def sample(name, fn, obs=None):
+    msg = {"name": name, "fn": fn, "value": obs, "observed": obs is not None}
+    for h in reversed(_STACK):                     # innermost handler sees the message first
+        h.process(msg)
+    if msg["value"] is None:
+        msg["value"] = fn.rvs(random_state=msg["rng"])
+    return msg["value"]
+
+def log_joint(model, params, *args):
+    sites = trace(condition(model, params)).get_trace(*args)
+    return sum(np.sum(s["fn"].logpdf(s["value"]) if hasattr(s["fn"], "logpdf")
+                      else s["fn"].logpmf(s["value"])) for s in sites.values())
+
+def churn_py(X, y=None):                           # same generative story, our own PPL
+    a = sample("a", stats.norm(0, 1.5))
+    b = sample("b", stats.norm(np.zeros(2), 1))
+    return sample("y", stats.bernoulli(expit(a + X @ b)), obs=y)
+
+prior_tr = trace(seed(churn_py, 0)).get_trace(X_small)        # y unobserved -> simulated
+print({k: (np.round(v["value"], 3), v["observed"]) for k, v in prior_tr.items()})
+print(f"our log_joint {log_joint(churn_py, {'a': 0.3, 'b': np.array([0.5, -0.2])}, X, y):.6f}"
+      f" | PyMC {logp_fn(pt):.6f}")
+```
+
+```output
+```
+
+TODO_TRACER
+
+## The Bayesian workflow as a checklist
+
+Gelman et al. (2020, "Bayesian Workflow") argue that fitting is one step in a loop, and that the
+failures are informative. A PPL makes each step cheap, so run all of them:
+
+1. **Write the generative story first**, including measurement process, exposure and censoring
+   (the offset section above).
+2. **Prior predictive check.** Simulate data from the priors. Kill priors that put mass on
+   impossible data (the $\mathcal{N}(0,10)$ logit case above).
+3. **Fit simulated data with known parameters** and check that you recover them. Simulation-based
+   calibration (Talts et al. 2018) does this systematically.
+4. **Fit the real data, then read the diagnostics** before any estimate: $\hat R$, bulk and tail ESS,
+   divergences, tree depth (ch. 7, ch. 6). Divergences mean you should reparameterise (ch. 10).
+5. **Posterior predictive check.** Do replicated datasets look like the observed one on the
+   statistics you care about? (ch. 9)
+6. **Expand or modify the model** (robust likelihood, offset, hierarchy) and **compare** with
+   PSIS-LOO (ch. 9), not with in-sample fit.
+7. **Check sensitivity** to priors and to influential points, then report the whole posterior, not
+   a point.
+
+## Try it Yourself
+
+```python
+import numpy as np, jax, numpyro, numpyro.distributions as dist
+from numpyro.infer import MCMC, NUTS, Predictive
+
+rng = np.random.default_rng(0)
+n = 150
+x = rng.standard_normal(n)
+mu_true = np.exp(1.0 + 0.5 * x)
+y = rng.negative_binomial(n=2.0, p=2.0 / (2.0 + mu_true))       # overdispersed counts, phi = 2
+
+def model(x, y=None, nb=True):
+    a = numpyro.sample("a", dist.Normal(0, 2))
+    b = numpyro.sample("b", dist.Normal(0, 1))
+    mu = jax.numpy.exp(a + b * x)
+    if nb:
+        phi = numpyro.sample("phi", dist.Exponential(0.5))
+        numpyro.sample("y", dist.NegativeBinomial2(mu, phi), obs=y)
+    else:
+        numpyro.sample("y", dist.Poisson(mu), obs=y)
+
+print(f"observed var/mean = {y.var() / y.mean():.2f}")
+for nb in (False, True):
+    mc = MCMC(NUTS(model), num_warmup=500, num_samples=500, num_chains=2,
+              chain_method="sequential", progress_bar=False)
+    mc.run(jax.random.PRNGKey(0), x, y, nb=nb)
+    s = mc.get_samples()
+    yrep = Predictive(model, s)(jax.random.PRNGKey(1), x, nb=nb)["y"]
+    ratio = np.asarray(yrep.var(axis=1) / yrep.mean(axis=1))
+    print(f"{'NegBin ' if nb else 'Poisson'} b = {float(s['b'].mean()):.3f} +- {float(s['b'].std()):.3f} | "
+          f"replicated var/mean 5-95%: [{np.quantile(ratio, .05):.2f}, {np.quantile(ratio, .95):.2f}]")
+```
+
+```output
+```
+
+TODO_TRY
+
+## Exercise
+
+Extend the 40-line tracer so it does what a PPL does for HMC. Add a `log_joint_unconstrained(model,
+z, *args)` that takes the scale parameter on the log scale. Use the model $\mu \sim \mathcal{N}(0, 5)$,
+$\sigma \sim \mathrm{HalfNormal}(2)$, $y_i \sim \mathcal{N}(\mu, \sigma)$, where `z = {"mu": ..., "sigma_log__": ...}`.
+Map $\sigma = e^{z}$, add the Jacobian term, and check that your number matches
+`model.compile_logp()` of the equivalent PyMC model at the same point, both with and without the
+Jacobian. Use `y = [1.2, 0.4, 2.2, 1.7]`, `mu = 1.0`, `sigma_log__ = -0.3`.
+
+<details>
+<summary>Solution</summary>
+
+```python
+y_ex = np.array([1.2, 0.4, 2.2, 1.7])
+
+def normal_model(y=None):
+    mu = sample("mu", stats.norm(0, 5))
+    sigma = sample("sigma", stats.halfnorm(scale=2))
+    return sample("y", stats.norm(mu, sigma), obs=y)
+
+def log_joint_unconstrained(model, z, *args, jacobian=True):
+    sigma = np.exp(z["sigma_log__"])                          # inverse transform to the constrained space
+    lp = log_joint(model, {"mu": z["mu"], "sigma": sigma}, *args)
+    return lp + (z["sigma_log__"] if jacobian else 0.0)       # log |d sigma / d z| = z
+
+with pm.Model() as normal_pm:
+    mu_ = pm.Normal("mu", 0, 5)
+    sg_ = pm.HalfNormal("sigma", 2)
+    pm.Normal("y", mu_, sg_, observed=y_ex)
+
+z_ex = {"mu": np.array(1.0), "sigma_log__": np.array(-0.3)}
+for jac in (True, False):
+    print(f"jacobian={jac!s:5} tracer {log_joint_unconstrained(normal_model, z_ex, y_ex, jacobian=jac):.6f}"
+          f" | PyMC {normal_pm.compile_logp(jacobian=jac)(z_ex):.6f}")
+```
+
+```output
+```
+
+The PPL never samples $\sigma$ directly. It samples $z = \log \sigma$ on $\mathbb{R}$ and adds
+$\log|d\sigma/dz| = z$ to the target, which is the only difference between the two rows. A
+hand-written HMC that forgets the term samples a different distribution, and nothing in its
+diagnostics will warn you.
+</details>

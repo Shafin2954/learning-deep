@@ -440,18 +440,22 @@ print(pd.DataFrame(rows).to_string(index=False))
   4.0  80 10095 -0.0093 / 0.0164 -0.0012 / 0.1571 +0.0181 / 0.0794 -0.0058 / 0.0997
 ```
 
-Read down the IPS column. As logging gets greedier the largest weight goes from 30 to 10,095 and
-the standard deviation from 0.028 to 0.157: at $\beta = 4$ one 3,000-event log can miss by more than
-the value itself. IPS stays unbiased (every bias is under 0.01), which is no comfort when you have one
-log. SNIPS roughly halves the spread at $\beta \ge 2$.
+Read down the IPS column. The largest weight goes from 30 under uniform logging to 10,095 at
+$\beta = 4$, and the standard deviation from 0.047 to 0.157: one 3,000-event log can then miss by
+more than half the value itself. ($\beta = 1$ is the sweet spot, because there the logger happens to
+agree with the target most often, and the ESS peaks at 183.) IPS stays unbiased throughout, every
+bias under 0.01, which is no comfort when you have one log. SNIPS cuts the spread by a third to a
+half at $\beta \ge 2$, and DR has lower variance than IPS in every row.
 
-The direct method is the mirror image: the largest bias in the table under uniform logging
-($-0.047$, a linear model of a logistic truth underestimates exactly the high-CTR pairs the target
-picks) but a standard deviation never above 0.017, so at $\beta = 4$ the *biased* DM has the lowest
-error. DR beats IPS everywhere and is best for $\beta \le 2$; at $\beta = 4$ it inherits the
-weights through $w_i(r_i - \hat q)$ and loses to SNIPS (0.100 against 0.079), which is why SWITCH,
-clipped DR and MRDR exist. Practical rules: always log propensities, and keep enough randomisation in
-production that the policies you will want to evaluate have support.
+The direct method is the mirror image. Its standard deviation never exceeds 0.023, and for
+$\beta \ge 1$ it has the lowest RMSE in the table. Under uniform logging, though, it has the largest
+error of all ($-0.047$ bias), because a linear model of a logistic truth underestimates exactly the
+high-CTR pairs the target picks, and nothing in the log tells you that. That asymmetry is the
+argument for DR as the default: IPS's variance is visible (ESS, max weight) and DM's bias is not.
+At $\beta = 4$, DR inherits the weights through $w_i(r_i - \hat q)$ and loses to SNIPS (0.100
+against 0.079), which is why SWITCH, clipped DR and MRDR exist. Practical rules: always log
+propensities, and keep enough randomisation in production that the policies you will want to
+evaluate have support.
 
 ## Slates and position bias
 
@@ -462,11 +466,12 @@ $$
 P(\text{click} \mid i, k) = \underbrace{P(\text{examined} \mid k)}_{\theta_k}\cdot \underbrace{P(\text{relevant} \mid i)}_{\rho_i}
 $$
 
-so naive CTR estimates $\theta_k\rho_i$, and an item the old ranker kept at slot 6 looks a quarter
-as good as it is; train on it and the next ranker keeps it there. If the $\theta_k$ are known
+so naive CTR estimates $\theta_k\rho_i$. If only 20% of users look at slot 6, an item the old ranker
+kept there looks a fifth as good as it is; train on that and the next ranker keeps it there. If the $\theta_k$ are known
 (estimated from small randomised swaps of adjacent results, Joachims et al., 2017), weighting each
 click by $1/\theta_k$ is IPS again with position as the action, and $\sum \text{clicks}_i / \sum_k \theta_{k}$
 over the item's impressions is unbiased for $\rho_i$, with the familiar variance cost at low slots.
+
 Full slate OPE is harder, because the action space is every ordered list: the **pseudo-inverse
 estimator** (Swaminathan et al., 2017) assumes the slate reward is additive over positions, and
 **cascading bandits** model a user scanning top-down and stopping at the first click. Both reduce a
@@ -474,14 +479,16 @@ combinatorial action space to per-position quantities.
 
 ## Running a bandit in production
 
-**Exploration budget.** Exploration is spent on real users; cap it as a traffic percentage (the 5%
+- **Exploration budget.** Exploration is spent on real users; cap it as a traffic percentage (the 5%
 above) or as a regret guardrail against the current policy (conservative bandits), and report it.
-**Delayed and batched feedback.** Conversions arrive days later and models refresh hourly; within one
+- **Delayed and batched feedback.** Conversions arrive days later and models refresh hourly; within one
 refresh a deterministic UCB serves the same arm to everyone, while Thompson keeps randomising, so
 prefer posterior sampling and model the delay explicitly (Chapelle, 2014) rather than counting
 not-yet-converted impressions as negatives.
-**Non-stationarity.** Items age and tastes drift. **Discounting** multiplies counts by $\gamma$ each
+- **Non-stationarity.** Items age and tastes drift. **Discounting** multiplies counts by $\gamma$ each
 step (memory $1/(1-\gamma)$); a **sliding window** keeps only the last $W$ events.
+
+Simulate the drift case: ten items, and halfway through the winner fades while another rises.
 
 ```python
 from collections import deque
@@ -539,6 +546,7 @@ items actually change, not from a default.
 
 ```python
 import numpy as np
+import pandas as pd
 
 rng = np.random.default_rng(0)
 n_seg, n_arms = 20, 10                                  # user segments x items
@@ -586,7 +594,7 @@ SNIPS         0.0023  0.0318  0.0318
 With $\beta = 4$ the logging policy almost never takes the action the target wants for one
 segment (smallest propensity 0.0008). Unclipped IPS is nearly unbiased but has a standard deviation
 of 0.040 on a value of 0.139. Clipping weights at 50 cuts the RMSE to 0.012 at a cost of a 0.003
-bias. Clipping at 10 cuts the variance further, but the bias (−0.0087) now dominates and the RMSE
+bias. Clipping at 10 cuts the variance further, but the bias ($-0.0087$) now dominates and the RMSE
 rises again. SNIPS helps only a little (0.032), because the problem is a handful of huge weights, not their
 total. Set `beta=0.0` to see every estimator agree, then raise it to 6.0. Also try making the target
 policy disagree more with the logger: the support condition is what breaks first.
@@ -611,30 +619,35 @@ feat_all = np.r_[item_feat, np.c_[np.ones(K_new), rng.normal(0, 1, (K_new, d_i -
 theta_all = feat_all @ B.T                                  # same B: new items obey the same rule
 K_all = K + K_new
 
-def run_catalogue(F, T=15_000, t_new=5_000, alpha=0.5, lam=1.0, seed=0):
-    """LinUCB on z(x, a) = vec(x f_a^T). F = item features -> shared; F = identity -> disjoint."""
+def run_catalogue(shared, T=15_000, t_new=5_000, alpha=0.5, lam=1.0, seed=0):
+    """Disjoint: one (d_u x d_u) ridge per item. Shared: one ridge on z(x, a) = vec(x f_a^T)."""
     r = np.random.default_rng(seed)
     X = draw_users(T, r)
     Pt, U = 1 / (1 + np.exp(-(X @ theta_all.T))), r.random(T)
-    dz = d_u * F.shape[1]
-    A_inv, b = np.eye(dz) / lam, np.zeros(dz)
+    dim, n_models = (d_u * d_i, 1) if shared else (d_u, K_all)
+    A_inv, b = np.tile(np.eye(dim) / lam, (n_models, 1, 1)), np.zeros((n_models, dim))
     regret, new_pulls = np.zeros(T), 0
     for t in range(T):
         live = K_all if t >= t_new else K
-        Z = (X[t][None, :, None] * F[:live, None, :]).reshape(live, dz)
-        ZA = Z @ A_inv
-        a = int(np.argmax(ZA @ b + alpha * np.sqrt((ZA * Z).sum(1))))
-        y = float(U[t] < Pt[t, a])
-        Az = A_inv @ Z[a]
-        A_inv -= np.outer(Az, Az) / (1 + Z[a] @ Az)
-        b += y * Z[a]
+        if shared:
+            Z = (X[t][None, :, None] * feat_all[:live, None, :]).reshape(live, -1)
+            m = np.zeros(live, int)
+        else:
+            Z, m = np.tile(X[t], (live, 1)), np.arange(live)
+        mean = np.einsum("ki,kij,kj->k", Z, A_inv[m], b[m])                  # z . theta_hat
+        width = np.sqrt(np.einsum("ki,kij,kj->k", Z, A_inv[m], Z))
+        a = int(np.argmax(mean + alpha * width))
+        y, z, k = float(U[t] < Pt[t, a]), Z[a], m[a]
+        Az = A_inv[k] @ z                                   # Sherman-Morrison on the model used
+        A_inv[k] -= np.outer(Az, Az) / (1 + z @ Az)
+        b[k] += y * z
         regret[t] = Pt[t, :live].max() - Pt[t, a]
         new_pulls += a >= K
     return regret, new_pulls
 
 rows = []
-for name, F in (("disjoint (one-hot items)", np.eye(K_all)), ("shared (item features)", feat_all)):
-    reg, new_pulls = run_catalogue(F)
+for name, shared in (("disjoint (per item)", False), ("shared (item features)", True)):
+    reg, new_pulls = run_catalogue(shared)
     rows.append({"model": name, "regret before launch": reg[:5_000].sum(),
                  "regret 1k after": reg[5_000:6_000].sum(), "regret 10k after": reg[5_000:].sum(),
                  "pulls of new items": new_pulls})
@@ -642,18 +655,19 @@ print(pd.DataFrame(rows).round(1).to_string(index=False))
 ```
 
 ```output
-                   model  regret before launch  regret 1k after  regret 10k after  pulls of new items
-disjoint (one-hot items)                 139.9             77.3             219.8                4577
-  shared (item features)                  77.6              9.9              60.8                2797
+                 model  regret before launch  regret 1k after  regret 10k after  pulls of new items
+   disjoint (per item)                 283.3             79.6             321.4                5011
+shared (item features)                  74.2              6.6              49.7                4131
 ```
 
-The shared model is better at every stage. After the launch it loses 9.9 clicks in the first 1,000
-rounds against 73.5 for the disjoint model, and 60.8 against 198.8 over the following 10,000. It
-also spends fewer impressions on the new items (2,797 against 3,671), because it does not need to
-explore them blindly: each new item's score comes from its features via the shared
-$d_u \times d_i = 30$-parameter model, and the bonus is already small in directions the model has
-seen. The disjoint model must learn each new item's 6 parameters from scratch. The shared model is also better *before* the launch (77.6 against 112.8), since 30 parameters
-in total learn faster than $30 \times 6 = 180$.
+The shared model wins at every stage, and the first column is the surprise: it loses 74 clicks
+before any launch against 283 for the disjoint model, because one 30-parameter model learns faster
+than 40 separate 6-parameter ones (only 30 of them live) that each need their own exploration.
+After the launch the gap is starker: 6.6 clicks lost in the first 1,000 rounds against 79.6, and
+49.7 against 321.4 over the next 10,000. A new item's score comes from its features through
+weights already learned, and its bonus is small in directions the model has already seen, so the
+shared model spends fewer impressions finding out about the new items (4,131 against 5,011) and
+loses far less while doing it.
 
 This is the hybrid LinUCB of Li et al. (2010), which combines shared feature-cross terms with
 per-arm residuals, and it is the bandit version of the cold-start argument of ch. 9. The shared

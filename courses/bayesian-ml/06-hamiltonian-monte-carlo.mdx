@@ -600,23 +600,96 @@ HMC, T = 4.0                  8.1       0.0783         0.0242
 HMC, T = 6.0                 11.9       0.0383         0.0156
 ```
 
-### NUTS on the funnel and the banana
+### NUTS on the funnel and on the logistic regression
 
 ```python
-for name, tgt, f_v in (("banana", banana, None), ("funnel, centred", funnel, 1), ("funnel, non-centred", funnel_nc, 3)):
-    dr, st, e_n = run_nuts(one(tgt), rng.standard_normal((4, tgt is banana and 2 or 10)), 300, 1000, rng=rng)
-    ng = st[:, 1].sum()
-    msg = f"{name:20} eps {e_n:.3f} | steps/iter {ng / 4000:5.1f} | divergent {st[:, 3].mean():6.2%} | "
-    if f_v is None:
-        msg += f"Var x1 {dr[..., 0].var():6.1f} (100) | Var x2 {dr[..., 1].var():5.2f} (19.00) | min ESS/grad {ess_chains(dr).min() / ng:.4f}"
-    else:
-        v = f_v * dr[..., 0]
-        msg += f"5% of v {np.quantile(v, .05):+.2f} (-4.93) | P(v<-3) {np.mean(v < -3):.3f} (0.159)"
-    print(msg)
+def logit_hand(B):                                           # numpy log density + hand gradient, (C, 13)
+    eta = B @ Xd.T
+    return ((y_lr * eta - np.logaddexp(0, eta)).sum(1) - 0.5 * np.sum(B ** 2, 1) / 2.5 ** 2,
+            (y_lr - special.expit(eta)) @ Xd - B / 2.5 ** 2)
+
+dr, st, e_n = run_nuts(one(logit_hand), mode + 0.5 * rng.standard_normal((4, 13)), 300, 1000,
+                       Minv=np.diag(Minv_lr), rng=rng)
+ng, e = st[:, 1].sum(), ess_chains(dr)
+z = np.abs(dr.reshape(-1, 13).mean(0) - ref_mean) / (ref_sd / np.sqrt(e))
+print(f"{'logistic regression':20} eps {e_n:.3f} | steps/iter {ng / 4000:5.1f} | divergent {st[:, 3].mean():6.2%} | "
+      f"ESS/grad {e.min() / ng:.4f} | max |err|/MCSE {z.max():.2f}")
+for name, tgt, f_v in (("funnel, centred", funnel, 1), ("funnel, non-centred", funnel_nc, 3)):
+    dr, st, e_n = run_nuts(one(tgt), rng.standard_normal((4, 10)), 300, 1000, rng=rng)
+    v = f_v * dr[..., 0]
+    print(f"{name:20} eps {e_n:.3f} | steps/iter {st[:, 1].mean():5.1f} | divergent {st[:, 3].mean():6.2%} | "
+          f"5% of v {np.quantile(v, .05):+.2f} (-4.93) | P(v<-3) {np.mean(v < -3):.3f} (0.159) | min v {v.min():+.2f}")
 ```
 
-```output
-banana               eps 1.144 | steps/iter   9.7 | divergent  0.00% | Var x1   77.0 (100) | Var x2 10.64 (19.00) | min ESS/grad 0.0166
-funnel, centred      eps 0.323 | steps/iter  27.5 | divergent  0.45% | 5% of v -3.30 (-4.93) | P(v<-3) 0.152 (0.159)
-funnel, non-centred  eps 0.863 | steps/iter   5.2 | divergent  0.00% | 5% of v -4.85 (-4.93) | P(v<-3) 0.148 (0.159)
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+d, rho = 20, 0.9                             # equicorrelated Gaussian; try rho = 0.99 or d = 100
+Sigma = rho * np.ones((d, d)) + (1 - rho) * np.eye(d)
+P = np.linalg.inv(Sigma)
+logp = lambda q: -0.5 * q @ P @ q
+grad = lambda q: -P @ q
+
+eps, L, n_iter = 0.1, 30, 2000               # try eps = 0.3, 0.6, 0.7 and L = 5, 60
+print(f"scales: smallest {np.sqrt(1 - rho):.3f} (stability limit eps < {2 * np.sqrt(1 - rho):.3f}), "
+      f"largest {np.sqrt(1 + (d - 1) * rho):.2f}")
+q, draws, acc, dHs = rng.standard_normal(d), [], 0, []
+for t in range(n_iter):
+    p = rng.standard_normal(d)
+    H0 = -logp(q) + 0.5 * p @ p
+    n_steps = rng.integers(L // 2, 3 * L // 2 + 1)            # jittered path length
+    qn, pn = q.copy(), p + 0.5 * eps * grad(q)
+    for s in range(n_steps):
+        qn = qn + eps * pn
+        pn = pn + (eps if s < n_steps - 1 else 0.5 * eps) * grad(qn)
+    dH = -logp(qn) + 0.5 * pn @ pn - H0
+    dHs.append(dH)
+    if np.log(rng.random()) < -dH:
+        q, acc = qn, acc + 1
+    draws.append(q)
+draws, dHs = np.array(draws[200:]), np.array(dHs)
+tot = draws.sum(1)                                            # the slowest direction
+ac = lambda z: np.corrcoef(z[:-1], z[1:])[0, 1]
+print(f"accept {acc / n_iter:.3f} | mean |dH| {np.abs(dHs).mean():.3f} | E[exp(-dH)] {np.exp(-dHs).mean():.3f} (theory 1)")
+print(f"Var(sum x) {tot.var():.1f} (truth {d + d * (d - 1) * rho:.1f}) | lag-1 autocorr: x1 {ac(draws[:, 0]):+.3f}, sum x {ac(tot):+.3f}")
 ```
+
+## Exercise
+
+<details>
+<summary>Solution</summary>
+
+```python
+rng = np.random.default_rng(10)
+n_rr = 200
+X_rr = np.column_stack([np.ones(n_rr), rng.standard_normal((n_rr, 2))])
+y_rr = X_rr @ np.array([1.0, 2.0, -0.5]) + 0.8 * rng.standard_t(3, n_rr)
+Xr_t, yr_t = torch.tensor(X_rr), torch.tensor(y_rr)
+st4 = torch.distributions.StudentT(4.0, validate_args=False)   # let inf/nan reach the energy check
+
+def lp_robust(B):                                            # B[:, :3] = beta, B[:, 3] = log sigma
+    beta, ls = B[:, :3], B[:, 3]
+    r = (yr_t - beta @ Xr_t.T) / torch.exp(ls)[:, None]
+    ll = st4.log_prob(r).sum(1) - n_rr * ls                  # t_4 likelihood with scale sigma
+    prior = -0.5 * (beta ** 2).sum(1) / 25 - 0.5 * torch.exp(2 * ls) / 4
+    return ll + prior + ls                                   # + log|d sigma / d log sigma| (ch. 4)
+
+lp_rr = autograd(lp_robust)
+x0 = rng.standard_normal((4, 4))
+xw, Minv_rr, eps_rr, ngw = warmup(lp_rr, x0, "dense", lambda M: 1.5 * np.sqrt(np.max(M)), rng=rng)
+r = hmc(lp_rr, xw, 800, eps_rr, T=1.5, Minv=Minv_rr, jitter=True, rng=rng)
+dr_n, st, e_n = run_nuts(one(lp_rr), x0, 300, 800, Minv=np.diag(Minv_rr), rng=rng)
+names = ["b0", "b1", "b2", "sigma"]
+for label, dr, ng, div in (("HMC dense", r["draws"], r["n_grad"], r["div"].mean()),
+                           ("NUTS diag", dr_n, st[:, 1].sum(), st[:, 3].mean())):
+    th = dr.reshape(-1, 4).copy(); th[:, 3] = np.exp(th[:, 3])
+    print(f"{label:10} " + " ".join(f"{n} {m:+.3f}+-{s:.3f}" for n, m, s in zip(names, th.mean(0), th.std(0)))
+          + f" | min ESS/grad {ess_chains(dr).min() / ng:.4f} | divergent {div:.1%}")
+ols = np.linalg.lstsq(X_rr, y_rr, rcond=None)[0]
+print(f"OLS fit    " + " ".join(f"{n} {m:+.3f}" for n, m in zip(names[:3], ols)) + "   (truth +1, +2, -0.5)")
+```
+
+</details>

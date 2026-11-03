@@ -1,0 +1,746 @@
+---
+course: bayesian-ml
+chapter: 07-convergence-diagnostics
+title: "Convergence Diagnostics: R-hat, ESS, and Trace Forensics"
+order: 7
+---
+
+## What can go wrong, and why one chain cannot tell you
+
+Every MCMC estimate rests on two assumptions. The chain has reached its stationary distribution,
+and it has explored that distribution well enough for averages to be accurate. Four failures break
+them in practice. **Non-convergence**: the chain is still drifting away from a bad start.
+**Poor mixing**: the chain is in the right place but moves so slowly that 2000 draws are worth 20.
+**Multimodality**: the chain explores one mode thoroughly and never visits the other.
+**Heavy tails**: the chain mixes, but means and variances are unstable or do not exist.
+
+Below are five random-walk samplers (ch. 4) with 4 chains each, started from the overdispersed
+points $-6, -2, 2, 6$. One is healthy and four are broken in one of these ways. The question is
+whether you could tell from one chain alone.
+
+```python
+import numpy as np
+from scipy import stats
+import arviz as az
+
+rng = np.random.default_rng(7)
+
+def rwm1(logp, x0, n, step, rng):                      # 1-D random-walk Metropolis, all chains in lockstep
+    x = np.array(x0, float); lp = logp(x); out = np.empty((len(x), n))
+    for t in range(n):
+        prop = x + step * rng.standard_normal(len(x)); lpp = logp(prop)
+        acc = np.log(rng.random(len(x))) < lpp - lp
+        x, lp = np.where(acc, prop, x), np.where(acc, lpp, lp)
+        out[:, t] = x
+    return out
+
+starts, N = np.array([-6.0, -2.0, 2.0, 6.0]), 2000
+std_normal = lambda x: -0.5 * x ** 2
+samplers = {                                            # each value: (chains, draws) after 1000 warmup
+    "healthy":  rwm1(std_normal, starts, N + 1000, 2.4, rng)[:, 1000:],
+    "sticky":   rwm1(std_normal, starts, N + 1000, 0.05, rng)[:, 1000:],          # tiny step
+    "bimodal":  rwm1(lambda x: np.logaddexp(-0.5 * (x + 5) ** 2, -0.5 * (x - 5) ** 2),
+                     starts, N + 1000, 1.0, rng)[:, 1000:],                       # modes at -5, +5
+    "drifting": rwm1(std_normal, starts - 12, N, 0.06, rng),                      # bad init, no warmup
+    "heavy":    rwm1(lambda x: -np.log1p(x ** 2), starts, N + 1000, 3.0, rng)[:, 1000:],  # Cauchy target
+}
+x1 = samplers["bimodal"][3]                             # one chain of the bimodal sampler, alone
+print(f"bimodal chain 4 alone: mean {x1.mean():+.2f} | sd {x1.std():.2f} | "
+      f"first-half mean {x1[:N//2].mean():+.2f} | second-half mean {x1[N//2:].mean():+.2f}")
+print("truth: mean +0.00 | sd 5.10")
+for name, x in samplers.items():
+    print(f"{name:9} chain means {np.array2string(x.mean(1), precision=2, sign='+'):34} "
+          f"chain sds {np.array2string(x.std(1), precision=2)}")
+```
+
+```output
+bimodal chain 4 alone: mean +5.03 | sd 1.01 | first-half mean +4.94 | second-half mean +5.12
+truth: mean +0.00 | sd 5.10
+healthy   chain means [-0.04 -0.05 -0.02 -0.09]          chain sds [0.99 0.93 1.04 0.99]
+sticky    chain means [-0.84 -0.7  +0.46 +0.62]          chain sds [0.73 0.48 0.56 0.77]
+bimodal   chain means [-4.91 -4.97 +5.   +5.03]          chain sds [1.02 1.03 1.03 1.01]
+drifting  chain means [-7.51 -5.98 -2.92 -1.19]          chain sds [4.66 3.41 2.92 2.  ]
+heavy     chain means [-1.25 +2.61 +0.05 +0.06]          chain sds [ 4.63 10.17  4.87  2.76]
+```
+
+Chain 4 of the bimodal sampler is a perfect-looking sample from $\mathcal{N}(5, 1)$: stable halves,
+the right local spread, nothing suspicious. No statistic computed from that chain alone can
+reveal a mode it never visited. Several chains started from points spread wider than the
+posterior can, because they will disagree. That disagreement is what $\hat R$ measures. The chain
+means also show the other failures. The sticky and drifting chains have means spread over
+several units on a target of sd 1, and the heavy-tailed chains have sds that differ by a factor of three or more.
+
+## Classic R-hat: between-chain against within-chain variance
+
+Gelman and Rubin (1992) compared two estimates of the posterior variance. One is computed within
+chains and is too small before convergence, because each chain has not yet explored the whole
+target. The other is computed across chains and is too large, because the overdispersed starts
+inflate it. As the chains converge both tend to the same value, so their ratio tends to 1.
+
+### Deriving var+ and R-hat
+
+Take $M$ chains of $N$ draws $\theta_{nm}$, with chain means $\bar\theta_{\cdot m}$, grand mean
+$\bar\theta_{\cdot\cdot}$ and chain variances $s_m^2$. The between-chain and within-chain
+variances are
+
+$$
+B = \frac{N}{M-1}\sum_{m=1}^{M}\big(\bar\theta_{\cdot m} - \bar\theta_{\cdot\cdot}\big)^2,
+\qquad
+W = \frac{1}{M}\sum_{m=1}^{M} s_m^2 .
+$$
+
+$B$ is scaled by $N$ because $\mathrm{Var}(\bar\theta_{\cdot m}) \approx \sigma^2/N$ for
+independent draws, so $B$ estimates $\sigma^2$ when all chains share one distribution. The pooled
+estimate of the marginal posterior variance is the weighted average
+
+$$
+\widehat{\mathrm{var}}^{+} = \frac{N-1}{N}\,W + \frac{1}{N}\,B,
+\qquad
+\hat R = \sqrt{\frac{\widehat{\mathrm{var}}^{+}}{W}} = \sqrt{\frac{N-1}{N} + \frac{B}{N\,W}} .
+$$
+
+$\widehat{\mathrm{var}}^{+}$ is unbiased under stationarity and an overestimate under
+overdispersed starts. $W$ is an underestimate for any finite $N$ before convergence. So
+$\hat R \ge 1$ in expectation and $\hat R \to 1$ as $N \to \infty$ for converged chains. **Split
+$\hat R$** (Gelman et al., BDA3) cuts every chain in half and treats the halves as $2M$ chains.
+A chain that drifts then has two halves that disagree, which raises $B$, even if every chain drifts
+the same way and the full-chain means agree.
+
+```python
+def split(x):                                           # (M, N) -> (2M, N // 2): first and last halves
+    h = x.shape[1] // 2
+    return np.vstack([x[:, :h], x[:, -h:]])
+
+def rhat_basic(x):
+    M, n = x.shape
+    B = n * x.mean(1).var(ddof=1)
+    W = x.var(1, ddof=1).mean()
+    return np.sqrt((n - 1) / n + B / (n * W))
+
+same_drift = samplers["drifting"] - samplers["drifting"].mean(1, keepdims=True) + 0.0   # equalise chain means
+for name, x in (*samplers.items(), ("drift, equal means", same_drift)):
+    print(f"{name:19} classic R-hat {rhat_basic(x):6.3f} (arviz {az.rhat(x, method='identity'):6.3f}) | "
+          f"split R-hat {rhat_basic(split(x)):6.3f} (arviz {az.rhat(x, method='split'):6.3f})")
+```
+
+```output
+healthy             classic R-hat  1.000 (arviz  1.000) | split R-hat  1.004 (arviz  1.004)
+sticky              classic R-hat  1.544 (arviz  1.544) | split R-hat  1.588 (arviz  1.588)
+bimodal             classic R-hat  5.714 (arviz  5.714) | split R-hat  5.319 (arviz  5.319)
+drifting            classic R-hat  1.310 (arviz  1.310) | split R-hat  2.102 (arviz  2.102)
+heavy               classic R-hat  1.033 (arviz  1.033) | split R-hat  1.061 (arviz  1.061)
+drift, equal means  classic R-hat  1.000 (arviz  1.000) | split R-hat  1.680 (arviz  1.680)
+```
+
+Classic and split $\hat R$ match ArviZ to three decimals. Classic $\hat R$ already flags the sticky
+and bimodal samplers. The last row isolates the drift problem: each drifting chain is shifted so the four
+full-chain means agree exactly. The chains still trend, so the halves differ, and only split
+$\hat R$ sees it. The heavy-tailed sampler passes both. The next section shows why that verdict
+cannot be trusted.
+
+## Rank normalisation and folding
+
+Classic $\hat R$ compares means and variances. That has two blind spots, documented by Vehtari,
+Gelman, Simpson, Carpenter and Bürkner (2021). First, when the target has heavy tails the
+variances are dominated by a few extreme draws, or do not exist at all (Cauchy), so $B/W$ is pure
+noise. Second, chains with the *same mean but different spread* have $B \approx 0$ and pass, even
+though they sample different distributions.
+
+The fix is **rank normalisation**. Pool all $S = MN$ draws, replace each by its rank $r$, and map
+the ranks to normal scores:
+
+$$
+z_{nm} = \Phi^{-1}\!\left(\frac{r_{nm} - 3/8}{S + 1/4}\right).
+$$
+
+The $3/8$ offset is Blom's approximation to normal order-statistic means. The $z$ values are
+finite and approximately normal whatever the original distribution, and the transform is monotone,
+so a mixing failure in $\theta$ is still a mixing failure in $z$. Split $\hat R$ on $z$ is the
+**bulk** $\hat R$. For scale differences, **fold** the draws around the pooled median,
+$\zeta = |\theta - \mathrm{median}(\theta)|$, then rank-normalise and apply split $\hat R$ again.
+This **folded** $\hat R$ measures disagreement in spread, that is, in the tails. The reported
+statistic is $\max(\hat R_{\text{bulk}}, \hat R_{\text{folded}})$.
+
+```python
+def znorm(x):                                           # rank-normalise jointly across all chains
+    r = stats.rankdata(x, method="average").reshape(x.shape)
+    return stats.norm.ppf((r - 3 / 8) / (x.size + 1 / 4))
+
+def rhat_rank(x):
+    s = split(x)
+    return max(rhat_basic(znorm(s)), rhat_basic(znorm(np.abs(s - np.median(s)))))
+
+def rhat_folded(x):
+    s = split(x)
+    return rhat_basic(znorm(np.abs(s - np.median(s))))
+
+rng = np.random.default_rng(1)
+cases = {
+    "iid Cauchy, 4 identical chains": lambda: rng.standard_cauchy((4, 1000)),
+    "Cauchy, chain 1 shifted by +1":  lambda: rng.standard_cauchy((4, 1000)) + np.array([[1], [0], [0], [0]]),
+    "Normal, chain 1 has sd 3":       lambda: rng.standard_normal((4, 1000)) * np.array([[3], [1], [1], [1]]),
+}
+print(f"{'200 replicates each':32} {'statistic':>9} {'median':>7} {'90% range':>16} {'P(>1.01)':>9}")
+for name, gen in cases.items():
+    reps = [gen() for _ in range(200)]
+    for stat, f in (("split", lambda x: rhat_basic(split(x))), ("rank", rhat_rank)):
+        r = np.array([f(x) for x in reps])
+        lo, hi = np.quantile(r, [0.05, 0.95])
+        print(f"{name:32} {stat:>9} {np.median(r):7.3f}   [{lo:6.3f}, {hi:6.3f}] {np.mean(r > 1.01):9.2f}")
+x_test = cases["Normal, chain 1 has sd 3"]()
+print(f"\narviz check: mine {rhat_rank(x_test):.6f} | az.rhat {az.rhat(x_test):.6f} | "
+      f"folded mine {rhat_folded(x_test):.6f} | az folded {az.rhat(x_test, method='folded'):.6f}")
+```
+
+```output
+200 replicates each              statistic  median        90% range  P(>1.01)
+iid Cauchy, 4 identical chains       split   1.000   [ 0.999,  1.000]      0.00
+iid Cauchy, 4 identical chains        rank   1.000   [ 1.000,  1.001]      0.00
+Cauchy, chain 1 shifted by +1        split   1.000   [ 0.999,  1.001]      0.00
+Cauchy, chain 1 shifted by +1         rank   1.020   [ 1.015,  1.028]      1.00
+Normal, chain 1 has sd 3             split   1.000   [ 0.999,  1.002]      0.00
+Normal, chain 1 has sd 3              rank   1.146   [ 1.129,  1.164]      1.00
+
+arviz check: mine 1.133051 | az.rhat 1.133051 | folded mine 1.133051 | az folded 1.133051
+```
+
+These three rows are the cases where classic $\hat R$ gets it wrong. With four *identical* Cauchy
+chains, split $\hat R$ has a long right tail of false alarms, while rank $\hat R$ stays close to 1.
+With one Cauchy chain shifted by a whole unit, which is a real failure (the median is off by 1),
+split $\hat R$ misses it most of the time and rank $\hat R$ flags it every time. With one Normal
+chain three times wider than the others, the means agree, so split $\hat R$ is blind. The folded
+half of rank $\hat R$ catches it in every replicate. The implementation agrees with
+`az.rhat` to six decimals.
+
+## Effective sample size across chains
+
+$\hat R$ answers "have the chains converged?" ESS answers "how much information do the draws
+carry?". Chapter 4 built a single-chain ESS. The version used in practice combines chains, uses
+the same rank normalisation, and is computed separately for the bulk and the tails.
+
+### Autocorrelation and the multi-chain estimator
+
+For a stationary chain with lag-$t$ autocorrelation $\rho_t$, the variance of the mean of $S$
+draws is $\sigma^2 \tau / S$ with $\tau = 1 + 2\sum_{t \ge 1}\rho_t$, so
+$\mathrm{ESS} = S/\tau$. With $M$ chains, each chain's autocovariance $\hat\gamma_{t,m}$
+underestimates the true value if the chains have not mixed, because it is measured around the
+chain's own mean. Vehtari et al. combine the chains through $\widehat{\mathrm{var}}^{+}$:
+
+$$
+\hat\rho_t = 1 - \frac{W - \frac{1}{M}\sum_{m}\hat\gamma_{t,m}}{\widehat{\mathrm{var}}^{+}} .
+$$
+
+When the chains agree, $\widehat{\mathrm{var}}^{+} \approx W$ and this reduces to the average
+autocorrelation. When they disagree, the between-chain part of $\widehat{\mathrm{var}}^{+}$
+pushes every $\hat\rho_t$ toward 1, and ESS falls. So ESS also detects non-convergence, not only
+slow mixing.
+
+### Geyer's initial monotone sequence
+
+The tail of $\hat\rho_t$ is noise, and summing it all gives $\tau \approx 0$. Geyer (1992)
+showed that for a reversible chain the pair sums $P_k = \rho_{2k} + \rho_{2k+1}$ are positive and
+decreasing. The estimator therefore stops at the first $k$ with $\hat P_k \le 0$ (initial
+positive sequence) and replaces each $\hat P_k$ by $\min(\hat P_0, \dots, \hat P_k)$ (initial
+monotone sequence):
+
+$$
+\hat\tau = -1 + 2\sum_{k=0}^{K}\min_{j \le k}\hat P_j, \qquad \mathrm{ESS} = \frac{MN}{\hat\tau}.
+$$
+
+**Bulk-ESS** is this on rank-normalised split chains. **Tail-ESS** is the minimum of the ESS of
+the indicators $I(\theta \le q_{0.05})$ and $I(\theta \le q_{0.95})$, which is the ESS that
+governs the 5% and 95% quantile estimates and hence the 90% interval.
+
+```python
+def autocov(x):                                         # per-chain autocovariance by FFT, all lags
+    n = x.shape[1]
+    f = np.fft.rfft(x - x.mean(1, keepdims=True), 2 * n)
+    return np.fft.irfft(f * np.conj(f), 2 * n)[:, :n] / n
+
+def ess_core(x):                                        # x: (chains, draws), already split/transformed
+    M, n = x.shape
+    if np.ptp(x) == 0: return float(x.size)
+    acov = autocov(x)
+    W = acov[:, 0].mean() * n / (n - 1)
+    var_plus = W * (n - 1) / n + (x.mean(1).var(ddof=1) if M > 1 else 0.0)
+    rho = 1 - (W - acov.mean(0)) / var_plus
+    rho[0] = 1.0
+    P = (rho[:-1:2] + rho[1::2])[: (n - 3) // 2 + 1]    # pair sums P_k = rho_2k + rho_2k+1
+    neg = np.flatnonzero(P <= 0)                        # initial positive sequence: stop at first P_k <= 0
+    K = max(1, neg[0]) if len(neg) else len(P) - 1
+    P = np.minimum.accumulate(P[:K])                    # initial monotone sequence
+    tau = -1 + 2 * P.sum() + max(rho[2 * K], 0)         # + the leftover even lag, as Stan and ArviZ do
+    return x.size / max(tau, 1 / np.log10(x.size))
+
+ess_mean = lambda x: ess_core(split(x))
+ess_bulk = lambda x: ess_core(znorm(split(x)))
+ess_q = lambda x, p: ess_core(split((x <= np.quantile(x, p)).astype(float)))
+ess_tail = lambda x: min(ess_q(x, 0.05), ess_q(x, 0.95))
+
+def ar1(phi, M, n, rng):                                # stationary AR(1), unit marginal variance
+    z = np.empty((M, n)); e = rng.standard_normal((M, n)) * np.sqrt(1 - phi ** 2)
+    z[:, 0] = rng.standard_normal(M)
+    for t in range(1, n):
+        z[:, t] = phi * z[:, t - 1] + e[:, t]
+    return z
+
+rng = np.random.default_rng(2)
+print(f"{'4 x 5000 AR(1)':16} {'theory':>7} {'mean':>7} {'bulk':>7} {'tail':>7}   max |mine - arviz|")
+for phi in (0.0, 0.5, 0.9, 0.99):
+    x = ar1(phi, 4, 5000, rng)
+    mine = [ess_mean(x), ess_bulk(x), ess_tail(x)]
+    ref = [az.ess(x, method="mean"), az.ess(x), az.ess(x, method="tail", prob=(0.05, 0.95))]
+    print(f"phi = {phi:<10} {20000 * (1 - phi) / (1 + phi):7.0f} " + " ".join(f"{v:7.0f}" for v in mine)
+          + f"   {max(abs(a - b) for a, b in zip(mine, ref)):.1e}")
+```
+
+```output
+4 x 5000 AR(1)    theory    mean    bulk    tail   max |mine - arviz|
+phi = 0.0          20000   20025   20024   18973   0.0e+00
+phi = 0.5           6667    6508    6504   11231   1.8e-12
+phi = 0.9           1053    1187    1188    2293   4.5e-13
+phi = 0.99           101     116     116     267   2.8e-14
+```
+
+The three ESS flavours agree with theory for a Gaussian AR(1), where they should, and with ArviZ
+to floating-point noise. The tail-ESS is lower than the bulk-ESS at every $\phi$ above 0. An
+indicator of a 5% event is mostly 0 with rare runs of 1s, and a correlated chain revisits the tail in
+clumps, so the information about tail quantiles accumulates more slowly than the information
+about the centre.
+
+## Monte Carlo standard error for means and quantiles
+
+ESS turns into an error bar. For the mean, $\mathrm{MCSE}(\bar\theta) = \hat\sigma/\sqrt{\mathrm{ESS}_{\text{mean}}}$.
+For a quantile $q_p$ there is no $\sigma$ to divide. Instead, the number of draws below $q_p$ behaves
+like a binomial count from $\mathrm{ESS}_p$ trials, so the posterior for the probability level is
+approximately $\mathrm{Beta}(\mathrm{ESS}_p\, p + 1,\ \mathrm{ESS}_p(1-p) + 1)$. Take its 15.9% and 84.1%
+points ($\pm 1$ sd), read the matching order statistics of the sorted draws, and use half the gap
+as the MCSE. The check below runs 500 independent replications of 4 chains and compares the
+average MCSE with the actual spread of the estimates across replications.
+
+```python
+def mcse_mean(x):
+    return x.std(ddof=1) / np.sqrt(ess_mean(x))
+
+def mcse_quantile(x, p):
+    e = ess_q(x, p)
+    a, b = stats.beta.ppf([0.1586553, 0.8413447], e * p + 1, e * (1 - p) + 1)
+    s = np.sort(x.ravel()); S = s.size
+    return (s[int(np.ceil(min(b * S - 1, S - 1)))] - s[int(np.floor(max(a * S - 1, 0)))]) / 2
+
+rng = np.random.default_rng(3)
+reps = [ar1(0.8, 4, 1000, rng) for _ in range(500)]
+for label, est, mc in (("mean", np.mean, mcse_mean),
+                       ("5% quantile", lambda x: np.quantile(x, 0.05), lambda x: mcse_quantile(x, 0.05))):
+    e = np.array([est(x) for x in reps]); m = np.array([mc(x) for x in reps])
+    print(f"{label:12} actual sd of estimate {e.std():.4f} | average MCSE {m.mean():.4f}")
+x = reps[0]
+print(f"arviz check: mcse mean {mcse_mean(x):.6f} vs {az.mcse(x):.6f} | "
+      f"mcse q05 {mcse_quantile(x, 0.05):.6f} vs {az.mcse(x, method='quantile', prob=0.05):.6f}")
+```
+
+```output
+mean         actual sd of estimate 0.0423 | average MCSE 0.0479
+5% quantile  actual sd of estimate 0.0659 | average MCSE 0.0680
+arviz check: mcse mean 0.045150 vs 0.045150 | mcse q05 0.053300 vs 0.053300
+```
+
+Both standard errors are calibrated: the MCSE you compute from one run predicts how much the
+estimate would move if you reran the sampler. The 5% quantile has more than twice the Monte Carlo error of
+the mean for the same draws. Report every posterior summary to the precision its MCSE supports:
+a mean of 0.0312 with MCSE 0.02 is "0.03 ± 0.02", not four significant figures.
+
+## Why R-hat < 1.01 and ESS > 400
+
+The thresholds have arguments behind them. For $\hat R$, write $s_b^2 = B/N$ for the variance of
+the chain means and assume $N$ is large:
+
+$$
+\hat R^2 \approx 1 + \frac{s_b^2}{W}
+\quad\Longrightarrow\quad
+\frac{s_b}{\sqrt W} \approx \sqrt{\hat R^2 - 1}.
+$$
+
+The old threshold $\hat R < 1.1$ allows the chain means to scatter by $\sqrt{0.21} \approx 0.46$
+posterior sds, which can be a whole unconverged mode. The threshold $1.01$ allows $0.14$ sds. The
+threshold cannot be lower than the sampling noise of $\hat R$ for chains that *have* converged,
+and that noise depends on ESS. The simulation below measures it.
+
+```python
+rng = np.random.default_rng(4)
+print(f"{'4 iid chains of n':18} {'total ESS':>9} {'95th pct R-hat':>15} {'P(R-hat > 1.01)':>16} {'MCSE / sd':>10}")
+for n in (25, 50, 100, 400, 1000):
+    r = np.array([rhat_rank(rng.standard_normal((4, n))) for _ in range(300)])
+    print(f"{n:18} {4 * n:9} {np.quantile(r, 0.95):15.3f} {np.mean(r > 1.01):16.2f} {1 / np.sqrt(4 * n):10.3f}")
+for d in (0.46, 0.14):
+    print(f"chain-mean scatter of {d} sd  ->  R-hat about {np.sqrt(1 + d ** 2):.3f}")
+```
+
+```output
+4 iid chains of n  total ESS  95th pct R-hat  P(R-hat > 1.01)  MCSE / sd
+                25       100           1.063             0.49      0.100
+                50       200           1.024             0.34      0.071
+               100       400           1.015             0.12      0.050
+               400      1600           1.003             0.00      0.025
+              1000      4000           1.001             0.00      0.016
+chain-mean scatter of 0.46 sd  ->  R-hat about 1.101
+chain-mean scatter of 0.14 sd  ->  R-hat about 1.010
+```
+
+At a total ESS of 100, perfectly converged chains exceed 1.01 most of the time, so the 1.01 rule
+would be meaningless there. At an ESS of a few hundred the noise of rank $\hat R$ falls below the
+threshold, and that is where the rule ESS $> 400$ (about 100 per chain for 4 chains) comes from. It
+gives three things together: $\hat R$ is precise enough to be compared with 1.01, the
+autocorrelation estimates behind ESS are stable, and the MCSE of a mean is $\sigma/20$, which is 5% of a
+posterior sd. Apply the ESS rule to both bulk and tail ESS, and to *every* parameter. The worst
+parameter decides.
+
+## Trace forensics without pictures
+
+Trace plots are useful, but they do not scale to 300 parameters and they cannot be checked in a CI
+log. Two numerical summaries carry most of what the eye takes from a trace. **Running means** per
+chain, measured in pooled-sd units at 10%, 25%, 50% and 100% of the run, show drift as a trend and
+stickiness as chains that do not agree. **Rank histograms**: rank all draws jointly, then for each
+chain count its draws in 20 equal rank bins. If the chains sample the same distribution, every
+chain's histogram is uniform. Summarise each chain by a chi-square statistic against uniform.
+Autocorrelation inflates the statistic by about $\tau$, so it is divided by $N/\mathrm{ESS}$ of that
+chain before the p-value is read off a $\chi^2_{19}$.
+
+```python
+def forensics(x, bins=20):
+    M, n = x.shape
+    sd = x.std()
+    run = [(x[:, :int(f * n)].mean(1) - x.mean()) / sd for f in (0.1, 0.25, 0.5, 1.0)]
+    r = stats.rankdata(x).reshape(x.shape)
+    counts = np.array([np.histogram(r[m], bins=bins, range=(0.5, x.size + 0.5))[0] for m in range(M)])
+    chi2 = ((counts - n / bins) ** 2 / (n / bins)).sum(1)
+    return np.array(run), chi2 / (bins - 1)
+
+for name in ("healthy", "drifting", "heavy"):
+    run, c = forensics(samplers[name])
+    print(f"{name}: running means (pooled-sd units), rows = 10/25/50/100% of run, cols = chains")
+    print(np.array2string(run, precision=2, sign="+", suppress_small=True))
+    print(f"  rank-histogram chi2/df per chain: {np.array2string(c, precision=1)}")
+```
+
+```output
+healthy: running means (pooled-sd units), rows = 10/25/50/100% of run, cols = chains
+[[+0.22 +0.08 +0.13 -0.04]
+ [+0.03 +0.07 +0.2  -0.15]
+ [-0.   +0.1  +0.13 -0.13]
+ [+0.01 +0.   +0.03 -0.04]]
+  rank-histogram chi2/df per chain: [3.  3.3 3.7 4. ]
+drifting: running means (pooled-sd units), rows = 10/25/50/100% of run, cols = chains
+[[-2.88 -2.13 -1.   -0.3 ]
+ [-2.38 -1.62 -0.74 +0.05]
+ [-1.66 -0.99 -0.18 +0.46]
+ [-0.74 -0.38 +0.35 +0.76]]
+  rank-histogram chi2/df per chain: [ 82.7  77.2  67.7 122.6]
+heavy: running means (pooled-sd units), rows = 10/25/50/100% of run, cols = chains
+[[-0.23 -0.08 +0.03 -0.1 ]
+ [-0.1  -0.05 -0.45 -0.  ]
+ [-0.25 +0.78 -0.19 +0.01]
+ [-0.25 +0.35 -0.05 -0.05]]
+  rank-histogram chi2/df per chain: [9.9 6.8 6.1 5.2]
+```
+
+The healthy sampler's running means settle near 0 and its rank histograms are consistent with
+uniform. The drifting sampler's running means rise steadily in every chain, the fingerprint of
+non-convergence. Its rank p-values are tiny, because each chain occupies its own band of ranks. The
+heavy-tailed sampler is subtler. Its running means jump whenever a chain makes a long excursion,
+and some chains fail the uniformity test because over 2000 draws a chain may have explored
+one tail far more than the others. That is the situation the folded $\hat R$ was built for.
+
+## HMC-specific diagnostics: divergences, E-BFMI, tree depth
+
+HMC (ch. 6) adds three diagnostics that random-walk samplers do not have, and they detect problems
+the generic statistics can miss. A **divergence** is a trajectory whose energy error blows up
+(here, above 1000). It means the step size is too large for the local curvature, and the region
+where it happens is under-sampled. Even a handful of divergences means the estimates are biased.
+**E-BFMI** (energy Bayesian fraction of missing information, Betancourt 2016) asks whether
+momentum resampling can move the chain across the energy levels of the target. Each iteration
+changes the energy $E$ only through the fresh momentum. If the marginal energy distribution is
+much wider than the per-iteration changes, the chain random-walks between energy levels:
+
+$$
+\widehat{\mathrm{E\text{-}BFMI}} = \frac{\sum_{n=2}^{N}(E_n - E_{n-1})^2 / (N-1)}{\sum_{n=1}^{N}(E_n - \bar E)^2 / (N-1)} ,
+$$
+
+and values below 0.3 indicate that the tails will be under-explored. Below, a compact HMC with
+energy logging runs on Neal's funnel from ch. 6, in the centred and the non-centred
+parameterisation.
+
+```python
+def funnel(x):                                          # v ~ N(0, 3), x_i | v ~ N(0, e^{v/2}), 9 x's
+    v, z = x[:, 0], x[:, 1:]
+    s2, e = np.sum(z * z, 1), np.exp(-v)
+    return -v ** 2 / 18 - 0.5 * s2 * e - 4.5 * v, np.column_stack([-v / 9 + 0.5 * s2 * e - 4.5, -z * e[:, None]])
+
+def funnel_nc(x):                                       # non-centred: everything N(0, 1), v = 3 x_0
+    return -0.5 * np.sum(x * x, 1), -x
+
+def hmc(f, x0, n, eps, L, rng):
+    x = x0.copy(); C, d = x.shape; lp, g = f(x)
+    out, E, div = np.empty((C, n, d)), np.empty((C, n)), np.zeros((C, n), bool)
+    for t in range(n):
+        p = rng.standard_normal((C, d)); H0 = -lp + 0.5 * np.sum(p * p, 1)
+        e = eps * rng.uniform(0.8, 1.2)                 # jittered step size
+        q, pq = x.copy(), p + 0.5 * e * g
+        with np.errstate(all="ignore"):
+            for l in range(L):
+                q = q + e * pq; lq, gq = f(q)
+                pq = pq + (e if l < L - 1 else 0.5 * e) * gq
+            dH = np.nan_to_num(-lq + 0.5 * np.sum(pq * pq, 1) - H0, nan=np.inf)
+        acc = np.log(rng.random(C)) < -dH
+        x, lp, g = np.where(acc[:, None], q, x), np.where(acc, lq, lp), np.where(acc[:, None], gq, g)
+        out[:, t], E[:, t], div[:, t] = x, H0, dH > 1000
+    return out, E, div
+
+def ebfmi(E):
+    return np.mean(np.diff(E, axis=1) ** 2, 1) / E.var(1, ddof=1)
+
+rng = np.random.default_rng(5)
+for name, f, scale in (("centred", funnel, 1), ("non-centred", funnel_nc, 3)):
+    out, E, div = hmc(f, rng.standard_normal((4, 10)), 3000, 0.5, 6, rng)
+    v, E, div = out[:, 500:, 0] * scale, E[:, 500:], div[:, 500:]
+    print(f"{name:11} divergent {div.mean():6.2%} | E-BFMI {np.array2string(ebfmi(E), precision=2)} "
+          f"(az {np.array2string(np.asarray(az.bfmi(E)), precision=2)}) | R-hat(v) {rhat_rank(v):.3f} | "
+          f"bulk-ESS {ess_bulk(v):5.0f} | tail-ESS {ess_tail(v):5.0f} | sd(v) {v.std():.2f} (truth 3)")
+```
+
+```output
+centred     divergent  0.45% | E-BFMI [0.08 0.04 0.1  0.12] (az [0.08 0.04 0.1  0.12]) | R-hat(v) 1.115 | bulk-ESS    28 | tail-ESS    21 | sd(v) 2.49 (truth 3)
+non-centred divergent  0.00% | E-BFMI [1.03 0.98 0.97 0.97] (az [1.03 0.98 0.97 0.97]) | R-hat(v) 1.003 | bulk-ESS 40000 | tail-ESS  1871 | sd(v) 3.09 (truth 3)
+```
+
+The centred funnel trips every alarm at once. It has divergences, E-BFMI far below 0.3 in all four
+chains, $\hat R$ above 1.01 and a tail-ESS in the tens. The non-centred version of the *same
+model* has no divergences, E-BFMI near 1, and an ESS in the thousands. HMC diagnostics usually point to a fix in the model's
+geometry (reparameterise, ch. 10), not to running longer. ArviZ's `bfmi` returns the same
+numbers.
+
+### Tree-depth saturation
+
+NUTS (ch. 6) doubles its trajectory until it makes a U-turn, up to a maximum depth (10 in Stan
+and PyMC, so 1023 leapfrog steps). If many transitions hit the cap, the sampler is not
+divergent, only inefficient: the step size is set by the narrowest direction and the U-turn by the
+widest, so the ratio of the widest to the narrowest posterior sd sets the number of steps. The sketch counts leapfrog
+steps until the U-turn condition $p \cdot (q - q_0) < 0$ on 2-D Gaussians of growing anisotropy,
+using a step size that is stable for the narrow direction.
+
+```python
+def steps_to_uturn(sds, eps=0.5, rng=np.random.default_rng(6), reps=200):
+    prec = 1 / np.asarray(sds) ** 2
+    out = []
+    for _ in range(reps):
+        q0 = rng.standard_normal(2) * sds; q, p = q0.copy(), rng.standard_normal(2)
+        for k in range(1, 100_000):
+            p = p - 0.5 * eps * prec * q; q = q + eps * p; p = p - 0.5 * eps * prec * q
+            if p @ (q - q0) < 0: break
+        out.append(k)
+    return np.median(out)
+
+for sds in ((1, 1), (1, 10), (1, 100), (1, 1000)):
+    k = steps_to_uturn(sds)
+    print(f"sds {str(sds):10} median steps to U-turn {k:7.0f} -> tree depth {int(np.ceil(np.log2(k + 1))):2d}"
+          + ("  SATURATES depth 10" if k > 1023 else ""))
+```
+
+```output
+sds (1, 1)     median steps to U-turn       6 -> tree depth  3
+sds (1, 10)    median steps to U-turn      19 -> tree depth  5
+sds (1, 100)   median steps to U-turn     113 -> tree depth  7
+sds (1, 1000)  median steps to U-turn    1748 -> tree depth 11  SATURATES depth 10
+```
+
+The number of steps grows linearly with the scale ratio, and somewhere between a ratio of 100 and 1000 it
+crosses the depth-10 cap. Saturated trees are silent: estimates stay unbiased, but each draw costs
+1023 gradients and travels less than a full orbit, so ESS per gradient collapses. The fix is a mass
+matrix adapted during warmup (ch. 6) or rescaling the parameters, not raising the cap.
+
+## A full diagnosis of four broken samplers
+
+All the pieces now go into one table: classic, split, bulk and folded $\hat R$; bulk-ESS and
+tail-ESS; the worst chain's rank-uniformity p-value; and MCSE of the mean, for the five samplers
+from the first section. Every number is checked against ArviZ in the last line.
+
+```python
+rows, worst = [], 0.0
+print(f"{'sampler':9} {'classic':>7} {'split':>6} {'bulk':>6} {'folded':>6} {'ESS_b':>6} {'ESS_t':>6} "
+      f"{'chi2/df':>7} {'MCSE':>6}  verdict")
+for name, x in samplers.items():
+    s = split(x)
+    bulk, fold = rhat_basic(znorm(s)), rhat_folded(x)
+    eb, et = ess_bulk(x), ess_tail(x)
+    _, c = forensics(x)
+    ok = max(bulk, fold) < 1.01 and min(eb, et) > 400
+    print(f"{name:9} {rhat_basic(x):7.3f} {rhat_basic(s):6.3f} {bulk:6.3f} {fold:6.3f} {eb:6.0f} {et:6.0f} "
+          f"{c.max():7.1f} {mcse_mean(x):6.3f}  {'ok' if ok else 'FAIL'}")
+    worst = max(worst, abs(max(bulk, fold) - az.rhat(x)), abs(eb - az.ess(x)),
+                abs(et - az.ess(x, method="tail", prob=(0.05, 0.95))))
+print(f"max |mine - arviz| over all R-hat and ESS entries: {worst:.1e}")
+```
+
+```output
+sampler   classic  split   bulk folded  ESS_b  ESS_t chi2/df   MCSE  verdict
+healthy     1.000  1.004  1.004  1.002   1737   2164     4.0  0.024  ok
+sticky      1.544  1.588  1.543  1.119      7     33    87.7  0.348  FAIL
+bimodal     5.714  5.319  1.740  1.007      6    272   106.5  2.488  FAIL
+drifting    1.310  2.102  2.228  1.751      5     14   122.6  1.832  FAIL
+heavy       1.033  1.061  1.025  1.007    224    134     9.9  0.714  FAIL
+max |mine - arviz| over all R-hat and ESS entries: 8.5e-14
+```
+
+Reading the table row by row gives the diagnosis.
+
+- **Healthy.** Every $\hat R$ is below 1.01, both ESS values are in the thousands, and the
+  rank histograms are uniform. The mean can be reported with MCSE about 0.02.
+- **Sticky.** $\hat R$ is high on every variant and the ESS is in single or low double digits from 8000
+  draws. The chains are in the right region but crawl. A longer run would eventually work, but
+  the real fix is a better step size (ch. 4).
+- **Bimodal.** $\hat R$ is enormous and the ESS is minimal. The chains split between the modes, and
+  each mode taken alone looked perfect (first section). The mean is then an average of the modes
+  weighted by how many chains each attracted. A longer run does not help. You need a multimodal
+  method, or a model that does not have the symmetry.
+- **Drifting.** Classic $\hat R$ is fooled most here, because the chains started together and
+  drift together. Split and rank $\hat R$ catch it. Running means trend (previous section). The fix is warmup.
+- **Heavy.** The bulk looks acceptable, but folded $\hat R$ and tail-ESS show that the tails are
+  not yet estimated, and the "MCSE of the mean" is meaningless because a Cauchy distribution has no mean. Report medians
+  and quantiles with their quantile MCSE, and check the tail-ESS before you quote a 95% interval.
+
+## Thinning is (mostly) pointless
+
+Keeping every $k$-th draw cannot increase the information in a chain. Thinning throws away draws
+that are correlated but still informative, and the ESS of the thinned chain is always below the
+ESS of the full chain (Geyer 1992; MacEachern and Berliner 1994). The cost of producing the draws
+does not change, so ESS per second of sampling only falls. Thinning pays off only when *each
+stored draw* has a large cost of its own downstream. Examples are a posterior-predictive simulation per
+draw, a memory limit, or disk. The cost model below charges one unit per sampler iteration and
+$c$ units per stored draw.
+
+```python
+rng = np.random.default_rng(8)
+x = ar1(0.95, 4, 50_000, rng)                           # tau about 39
+print(f"{'thin k':>6} {'stored':>7} {'bulk-ESS':>9} {'ESS/iter':>9} {'ESS/cost, c=0':>14} {'ESS/cost, c=50':>15}")
+for k in (1, 2, 5, 10, 40, 100):
+    xs = x[:, ::k]; e = ess_bulk(xs); iters = x.size
+    print(f"{k:6} {xs.size:7} {e:9.0f} {e / iters:9.4f} {e / iters:14.4f} {e / (iters + 50 * xs.size):15.5f}")
+```
+
+```output
+thin k  stored  bulk-ESS  ESS/iter  ESS/cost, c=0  ESS/cost, c=50
+     1  200000      4969    0.0248         0.0248         0.00049
+     2  100000      4978    0.0249         0.0249         0.00096
+     5   40000      4971    0.0249         0.0249         0.00226
+    10   20000      4891    0.0245         0.0245         0.00408
+    40    5000      3712    0.0186         0.0186         0.00825
+   100    2000      1992    0.0100         0.0100         0.00664
+```
+
+With no downstream cost, thinning only loses ESS: almost nothing at $k = 2$ or $5$ (neighbouring
+draws are nearly duplicates when $\tau \approx 39$), and a lot once $k$ approaches $\tau$ and beyond. If every stored draw
+feeds a computation 50 times as expensive as a sampler step, thinning to about $\tau$ maximises
+ESS per unit of cost. Thin for storage and downstream compute, never "to reduce
+autocorrelation" for its own sake. Autocorrelation is already accounted for by ESS.
+
+## Try it Yourself
+
+Two chains are stuck in each of two modes at $\pm\delta$, with the mixture weights unknown to
+the sampler. Shrink $\delta$ and watch the point at which rank $\hat R$ and bulk-ESS stop seeing the
+problem. Then change the chain length, or make one chain's mode wider, and see which statistic reacts.
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(0)
+
+def split(x):
+    h = x.shape[1] // 2
+    return np.vstack([x[:, :h], x[:, -h:]])
+
+def rhat(x):
+    M, n = x.shape
+    return np.sqrt((n - 1) / n + x.mean(1).var(ddof=1) / x.var(1, ddof=1).mean())
+
+def znorm(x):
+    r = stats.rankdata(x).reshape(x.shape)
+    return stats.norm.ppf((r - 3 / 8) / (x.size + 1 / 4))
+
+def rank_rhat(x):
+    s = split(x)
+    return max(rhat(znorm(s)), rhat(znorm(np.abs(s - np.median(s)))))
+
+n = 1000                                                # draws per chain; try 200 or 5000
+for delta in (3.0, 1.0, 0.5, 0.25, 0.1):                # half-distance between the stuck modes
+    x = rng.standard_normal((4, n)) + np.array([[-delta], [-delta], [delta], [delta]])
+    print(f"delta {delta:4}: classic R-hat {rhat(x):.3f} | rank R-hat {rank_rhat(x):.3f} | "
+          f"implied chain-mean scatter {np.sqrt(rank_rhat(x) ** 2 - 1):.2f} sd")
+```
+
+```output
+delta  3.0: classic R-hat 3.626 | rank R-hat 1.734 | implied chain-mean scatter 1.42 sd
+delta  1.0: classic R-hat 1.512 | rank R-hat 1.417 | implied chain-mean scatter 1.00 sd
+delta  0.5: classic R-hat 1.148 | rank R-hat 1.129 | implied chain-mean scatter 0.52 sd
+delta 0.25: classic R-hat 1.044 | rank R-hat 1.039 | implied chain-mean scatter 0.28 sd
+delta  0.1: classic R-hat 1.006 | rank R-hat 1.006 | implied chain-mean scatter 0.11 sd
+```
+
+The detection limit is set by sampling noise. Two chains stuck $2\delta = 0.2$ apart still give
+rank $\hat R$ above 1.01 at $n = 1000$, but the same offset with $n = 200$ is near the noise
+floor. This is the ESS $> 400$ argument from the inside. The next chapter hands sampling to a
+probabilistic programming language, and ArviZ's `summary` prints exactly the columns you built here.
+
+## Exercise
+
+A Gibbs sampler (ch. 5) for a bivariate Normal with correlation $\rho$ updates
+$\theta_1 \mid \theta_2 \sim \mathcal{N}(\rho\theta_2, 1-\rho^2)$ and then
+$\theta_2 \mid \theta_1$ likewise. Its $\theta_1$ chain is an AR(1) with coefficient $\rho^2$.
+
+1. Run 4 chains of 2000 iterations from overdispersed starts $(\pm 5, \pm 5)$ with $\rho = 0.995$, discarding the first 500.
+2. Compute rank $\hat R$, bulk-ESS, tail-ESS, the MCSE of the posterior mean, and the MCSE of the 95% quantile of $\theta_1$ with your functions, and check them against ArviZ.
+3. Use the theoretical $\tau = (1+\rho^2)/(1-\rho^2)$ to predict how many iterations per chain are needed for bulk-ESS $> 400$, then run that many and verify both thresholds.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def gibbs_bvn(rho, n, starts, rng):
+    t1, t2 = starts[:, 0].copy(), starts[:, 1].copy(); out = np.empty((len(t1), n))
+    s = np.sqrt(1 - rho ** 2)
+    for t in range(n):
+        t1 = rho * t2 + s * rng.standard_normal(len(t1))
+        t2 = rho * t1 + s * rng.standard_normal(len(t1))
+        out[:, t] = t1
+    return out
+
+rng = np.random.default_rng(9)
+rho, st = 0.995, np.array([[-5.0, -5.0], [-5.0, 5.0], [5.0, -5.0], [5.0, 5.0]])
+x = gibbs_bvn(rho, 2000, st, rng)[:, 500:]
+print(f"1500 iters: rank R-hat {rhat_rank(x):.3f} | bulk {ess_bulk(x):.0f} | tail {ess_tail(x):.0f} | "
+      f"MCSE mean {mcse_mean(x):.3f} | MCSE q95 {mcse_quantile(x, 0.95):.3f}")
+print(f"   arviz:  rank R-hat {az.rhat(x):.3f} | bulk {az.ess(x):.0f} | "
+      f"tail {az.ess(x, method='tail', prob=(0.05, 0.95)):.0f} | MCSE mean {az.mcse(x):.3f} | "
+      f"MCSE q95 {az.mcse(x, method='quantile', prob=0.95):.3f}")
+tau = (1 + rho ** 2) / (1 - rho ** 2)
+need = int(np.ceil(400 * tau / 4 * 1.5))               # 1.5x margin: tail-ESS runs below bulk-ESS
+print(f"tau = {tau:.0f}; ESS 400 over 4 chains needs about {400 * tau / 4:.0f} iters/chain, use {need}")
+x = gibbs_bvn(rho, need + 500, st, rng)[:, 500:]
+print(f"{need} iters: rank R-hat {rhat_rank(x):.3f} | bulk {ess_bulk(x):.0f} | tail {ess_tail(x):.0f} | "
+      f"posterior mean {x.mean():+.3f} +- {mcse_mean(x):.3f} (truth 0)")
+```
+
+```output
+1500 iters: rank R-hat 1.102 | bulk 45 | tail 100 | MCSE mean 0.143 | MCSE q95 0.177
+   arviz:  rank R-hat 1.102 | bulk 45 | tail 100 | MCSE mean 0.143 | MCSE q95 0.177
+tau = 200; ESS 400 over 4 chains needs about 19950 iters/chain, use 29926
+29926 iters: rank R-hat 1.002 | bulk 641 | tail 1336 | posterior mean +0.073 +- 0.038 (truth 0)
+```
+
+With 1500 kept iterations per chain and $\tau \approx 200$ the run carries an ESS of about 30, and
+$\hat R$ is above 1.01, even though each Gibbs update is an exact conditional draw. The theory predicts
+$400\tau/4 \approx 20{,}000$ iterations per chain. The 1.5x margin covers the tail-ESS, which runs below
+the bulk. At that length both thresholds pass and the mean is within its MCSE of the truth. For a
+correlation this strong the real fix is a joint update or a reparameterisation, not 30,000
+iterations, but the diagnostics tell you that honestly instead of letting the short run look fine.
+</details>
