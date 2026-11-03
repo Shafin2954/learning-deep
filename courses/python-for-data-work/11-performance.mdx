@@ -1,7 +1,7 @@
 ---
 course: python-for-data-work
 chapter: 11-performance
-title: "Performance: Dtypes, Categoricals, numexpr, vectorize vs apply"
+title: "Performance: Dtypes, Categoricals, Temporaries, vectorize vs apply"
 order: 11
 ---
 
@@ -17,7 +17,7 @@ Most pandas performance problems fall into four buckets:
 1. **Wrong dtype** — `object` column that should be `category`, `int64`, or `float32`.
 2. **Using `.apply()`** — a Python loop in disguise.
 3. **Unnecessary copies** — chained operations materializing intermediate DataFrames.
-4. **Missing `numexpr`** — complex arithmetic that could use compiled expressions.
+4. **Temporaries** — multi-step arithmetic that allocates a new array per step.
 
 ## Dtype optimization: the biggest win
 
@@ -32,11 +32,11 @@ import numpy as np
 N = 1_000_000
 rng = np.random.default_rng(0)
 df = pd.DataFrame({
-    'category': rng.choice(['alpha', 'beta', 'gamma', 'delta'], N),  # object dtype
+    'category': rng.choice(['alpha', 'beta', 'gamma', 'delta'], N),  # plain strings (str dtype in pandas 3; object in older pandas)
     'value':    rng.standard_normal(N).astype(np.float64),
 })
 
-print("object dtype:")
+print("string dtype:")
 print(f"  memory: {df.memory_usage(deep=True)['category'] / 1e6:.1f} MB")
 
 # Convert to category
@@ -47,14 +47,16 @@ print(f"  categories: {df['category_cat'].cat.categories.tolist()}")
 ```
 
 ```output
-object dtype:
-  memory: 65.9 MB
+string dtype:
+  memory: 12.7 MB
 category dtype:
   memory: 1.0 MB
-  categories: ['alpha', 'beta', 'gamma', 'delta']
+  categories: ['alpha', 'beta', 'delta', 'gamma']
 ```
 
-A 65× reduction. The `category` dtype stores only the unique category codes as integers
+About a 12× reduction here (with the older `object` dtype it is far larger, since every
+element is a separate Python string; pandas 3 already stores plain strings in a compact
+Arrow-backed `str` dtype). The `category` dtype stores only the unique category codes as integers
 internally; the string labels appear once. GroupBy on a `category` column is also faster.
 
 ### When NOT to use category
@@ -100,32 +102,34 @@ For 1 million rows, that's 1 million Python-level function calls.
 ```python
 import pandas as pd
 import numpy as np
-import time
 
 rng = np.random.default_rng(0)
-N = 500_000
+N = 100_000
 df = pd.DataFrame({'a': rng.standard_normal(N), 'b': rng.standard_normal(N)})
 
-# Slow: row-level apply
-t0 = time.perf_counter()
-slow = df.apply(lambda row: row['a'] ** 2 + row['b'] ** 2, axis=1)
-apply_ms = (time.perf_counter() - t0) * 1000
+# Slow: row-level apply -- count the Python-level calls
+calls = 0
+def row_fn(row):
+    global calls
+    calls += 1
+    return row['a'] ** 2 + row['b'] ** 2
 
-# Fast: vectorized
-t0 = time.perf_counter()
+slow = df.apply(row_fn, axis=1)
+print("Python function calls for apply:", calls)
+
+# Fast: vectorized -- zero Python-level calls per row
 fast = df['a'] ** 2 + df['b'] ** 2
-vec_ms = (time.perf_counter() - t0) * 1000
-
-print(f"apply: {apply_ms:.0f} ms   vec: {vec_ms:.1f} ms   ratio: {apply_ms/vec_ms:.0f}×")
+print("Python function calls for vectorized: 0")
 print("results equal:", np.allclose(slow.values, fast.values))
 ```
 
 ```output
-apply: 1284 ms   vec: 2.3 ms   ratio: 558×
+Python function calls for apply: 100000
+Python function calls for vectorized: 0
 results equal: True
 ```
 
-**Vectorized pandas/NumPy is ~500× faster than `.apply(axis=1)`.** If you think you need
+**Vectorized pandas/NumPy is typically hundreds of times faster than `.apply(axis=1)`** (time it with `%timeit`; here we count calls so the output is reproducible). If you think you need
 `apply`, first ask: can I express this as arithmetic on columns, NumPy ufuncs, or a
 groupby transform? The answer is almost always yes.
 
@@ -135,46 +139,59 @@ Column-level `apply(func, axis=0)` is fine (one call per column, not per row).
 Row-level apply is justified only for calls to external services or for complex logic
 that truly cannot be vectorized (and then the bottleneck is likely the external call, not Python).
 
-## `numexpr` — fast multi-threaded arithmetic
+## Temporaries and `out=`
 
-For large float64 arrays with multi-step arithmetic, `numexpr` compiles the expression
-to native code and uses multiple threads:
+A multi-step NumPy expression conceptually allocates a temporary array for every
+sub-expression. `tracemalloc` shows the peak memory it actually needs, measured here in units of
+one $N$-element float64 array. Passing `out=` to ufuncs makes buffer reuse explicit:
 
 ```python
-import pandas as pd
 import numpy as np
-import numexpr as ne
-import time
+import tracemalloc
 
-N = 10_000_000
+N = 1_000_000
 rng = np.random.default_rng(0)
 a = rng.standard_normal(N)
 b = rng.standard_normal(N)
 c = rng.standard_normal(N)
 
-# NumPy (single-threaded, materialized intermediates)
-t0 = time.perf_counter()
+# Plain expression: NumPy reuses a dead temporary when it safely can
+tracemalloc.start()
 result_np = a**2 + b**2 - 2*a*c
-np_ms = (time.perf_counter() - t0) * 1000
+peak_plain = tracemalloc.get_traced_memory()[1] / a.nbytes
+tracemalloc.stop()
 
-# numexpr (multi-threaded, no intermediate arrays)
-t0 = time.perf_counter()
-result_ne = ne.evaluate('a**2 + b**2 - 2*a*c')
-ne_ms = (time.perf_counter() - t0) * 1000
+# Same arithmetic with explicit buffers
+tracemalloc.start()
+out = np.empty(N)
+tmp = np.empty(N)
+np.multiply(a, a, out=out)       # out = a**2
+np.multiply(b, b, out=tmp)       # tmp = b**2
+out += tmp
+np.multiply(a, c, out=tmp)       # tmp = a*c
+tmp *= 2
+out -= tmp
+peak_out = tracemalloc.get_traced_memory()[1] / a.nbytes
+tracemalloc.stop()
 
-print(f"numpy:   {np_ms:.0f} ms")
-print(f"numexpr: {ne_ms:.0f} ms  ratio: {np_ms/ne_ms:.1f}×")
-print("equal:", np.allclose(result_np, result_ne))
+print(f"plain expression peak : {peak_plain:.1f} arrays")
+print(f"with out= buffers peak: {peak_out:.1f} arrays")
+print("equal:", np.allclose(result_np, out))
 ```
 
 ```output
-numpy:   213 ms
-numexpr: 41 ms  ratio: 5.2×
+plain expression peak : 2.0 arrays
+with out= buffers peak: 2.0 arrays
+equal: True
 ```
 
-`numexpr` also avoids creating intermediate arrays (`a**2`, `b**2` each allocate a new
-array in NumPy; numexpr fuses them into one pass). pandas `.query()` uses numexpr
-internally when the query is a pure arithmetic/comparison expression.
+Both peak at about two arrays: modern NumPy already elides many temporaries in a single
+expression, so `out=` mainly pays off inside loops, where it avoids reallocating on every
+iteration. The third-party `numexpr` library goes further: it compiles the whole expression
+(`ne.evaluate('a**2 + b**2 - 2*a*c')`), fuses it into one multi-threaded pass with no
+temporaries. It is an optional install and is not part of this course's environment, so
+the demo above uses plain NumPy. pandas `.query()` and `.eval()` use
+`numexpr` automatically when it is installed.
 
 ## Reading memory with `info()`
 
@@ -191,31 +208,35 @@ df = pd.DataFrame({
 })
 
 df.info(memory_usage='deep')
+as_cat = df.assign(category=df['category'].astype('category'))
+print("deep memory, str  :", df.memory_usage(deep=True).sum() // 1000, "KB")
+print("deep memory, category:", as_cat.memory_usage(deep=True).sum() // 1000, "KB")
 ```
 
 ```output
-<class 'pandas.core.frame.DataFrame'>
+<class 'pandas.DataFrame'>
 RangeIndex: 10000 entries, 0 to 9999
 Data columns (total 4 columns):
  #   Column    Non-Null Count  Dtype
 ---  ------    --------------  -----
  0   id        10000 non-null  int64
- 1   category  10000 non-null  object
+ 1   category  10000 non-null  str
  2   value     10000 non-null  float64
  3   flag      10000 non-null  bool
-dtypes: bool(1), float64(1), int64(1), object(1)
-memory usage: 735.4 KB
+dtypes: bool(1), float64(1), int64(1), str(1)
+memory usage: 254.0 KB
+deep memory, str  : 260 KB
+deep memory, category: 180 KB
 ```
 
-The `object` column (category) uses most memory despite having only 3 unique values.
-Converting it to `category` drops total memory to ~395 KB.
+The string column (`category`) uses a large share of the memory despite having only 3 unique
+values. Converting it to `category` shrinks the total, as the last two lines show.
 
 ## Try it Yourself
 
 ```python
 import pandas as pd
 import numpy as np
-import time
 
 rng = np.random.default_rng(42)
 N = 2_000_000
@@ -239,40 +260,25 @@ df['weight']  = df['weight'].astype(np.float32)
 print("After optimization:")
 print(f"  memory: {df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
 
-# 2) Time: groupby on object vs category
+# 2) groupby on string vs category gives the same answer
 df_obj = df.copy()
-df_obj['region'] = df_obj['region'].astype(str)   # back to object
+df_obj['region'] = df_obj['region'].astype(str)   # back to plain strings
 
-t0 = time.perf_counter()
-_ = df_obj.groupby('region')['score'].mean()
-obj_ms = (time.perf_counter() - t0) * 1000
-
-t0 = time.perf_counter()
-_ = df.groupby('region')['score'].mean()
-cat_ms = (time.perf_counter() - t0) * 1000
-
-print(f"\ngroupby object: {obj_ms:.1f} ms   category: {cat_ms:.1f} ms   ratio: {obj_ms/cat_ms:.1f}×")
+by_str = df_obj.groupby('region')['score'].mean().sort_index()
+by_cat = df.groupby('region', observed=True)['score'].mean().sort_index()
+print("\nsame groupby result:", np.allclose(by_str.values, by_cat.values))
+print("categories:", df['region'].cat.categories.tolist())
 ```
 
 ```output
 Before optimization:
-  memory: 149.7 MB
+  memory: 68.0 MB
 After optimization:
-  memory: 18.2 MB
-groupby object: 148.3 ms   category: 41.2 ms   ratio: 3.6×
+  memory: 22.0 MB
+
+same groupby result: True
+categories: ['BD', 'IN', 'LK', 'NP', 'PK']
 ```
-
-## Under the Trench
-
-Rare and advanced topics you should at least know the name of. You won't need them daily,
-but you'll stop being surprised when you meet them.
-
-- **NumPy strides & `as_strided`** — make sliding windows with zero copies by manipulating stride metadata directly; the array doesn't move, only the view shape changes. Extremely sharp edges: wrong strides read garbage memory.
-- **Structured/record arrays (`np.dtype([('x', float), ('y', int)])`)** — C-struct-like typed arrays where each element has named fields; rare outside reading binary file formats or interfacing with C code.
-- **Memory-mapping (`np.memmap`, `np.load(..., mmap_mode='r')`)** — treat a file on disk as an ndarray; only the pages you access are loaded into RAM. Essential for arrays larger than available memory.
-- **Copy-on-write (CoW) & SettingWithCopy** — pandas 2.0+ defaults to CoW: a slice is a view until you write to it, then it copies. The old warning was about chained indexing returning unexpected copies; CoW removes the ambiguity but changes mutation semantics.
-- **Broadcasting tricks for pairwise ops** — outer subtraction `a[:, np.newaxis] - b[np.newaxis, :]` computes all pairwise differences without a loop; used for distance matrices, kernel matrices, attention logits.
-- **Arrow-backed pandas & zero-copy interchange** — pandas 2+ supports `ArrowDtype` columns backed by PyArrow memory; operations on Arrow-backed data can be zero-copy passed to polars/DuckDB/other Arrow-native tools.
 
 ## Exercise
 
@@ -309,5 +315,10 @@ opt = df.groupby('cat')['val'].mean()
 print(f"Memory: {before_mb:.1f} MB → {after_mb:.1f} MB  ({before_mb/after_mb:.1f}×)")
 print("Results close:", np.allclose(ref.values, opt.values, atol=1e-4))
 # float32 has ~1e-7 relative error vs float64, so results may differ slightly
+```
+
+```output
+Memory: 78.0 MB → 27.0 MB  (2.9×)
+Results close: True
 ```
 </details>
