@@ -43,7 +43,6 @@ typical values: $\alpha \approx 0.1$, $\beta \approx 0.85$ (high persistence).
 
 ```python
 import numpy as np
-from arch import arch_model
 
 rng   = np.random.default_rng(42)
 n     = 500
@@ -75,42 +74,65 @@ Simulated returns statistics:
 Excess kurtosis (> 3) is the fingerprint of GARCH: the unconditional distribution has
 fatter tails than Normal because periods of high variance generate extreme observations.
 
-## Fitting GARCH with the `arch` library
+## Fitting GARCH by maximum likelihood
+
+The `arch` package does this for you, but the likelihood is short enough to write by hand.
+Given $\omega,\alpha,\beta$ the variance recursion produces $\sigma_t^2$ for every $t$, and
+the Gaussian negative log-likelihood is
+
+$$
+-\ell(\omega,\alpha,\beta) = \frac{1}{2}\sum_t \left(\log 2\pi + \log\sigma_t^2 + \frac{\varepsilon_t^2}{\sigma_t^2}\right)
+$$
+
+which `scipy.optimize.minimize` can minimise directly.
 
 ```python
 import numpy as np
-from arch import arch_model
+from scipy.optimize import minimize
 
-rng   = np.random.default_rng(42)
-n     = 500; omega = 0.02; alpha = 0.10; beta = 0.85
-eps   = np.zeros(n); sigma = np.zeros(n)
-sigma[0] = np.sqrt(omega / (1 - alpha - beta))
-for t in range(1, n):
-    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
-    eps[t]   = sigma[t] * rng.normal(0, 1)
+def simulate_garch(n, omega, alpha, beta, seed):
+    rng = np.random.default_rng(seed)
+    eps = np.zeros(n); sigma = np.zeros(n)
+    sigma[0] = np.sqrt(omega / (1 - alpha - beta))
+    for t in range(1, n):
+        sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
+        eps[t]   = sigma[t] * rng.normal(0, 1)
+    return eps, sigma
+
+def garch_sigma2(params, r):
+    omega, alpha, beta = params
+    s2 = np.empty(len(r))
+    s2[0] = r.var()
+    for t in range(1, len(r)):
+        s2[t] = omega + alpha*r[t-1]**2 + beta*s2[t-1]
+    return s2
+
+def garch_nll(params, r):
+    s2 = garch_sigma2(params, r)
+    return 0.5 * np.sum(np.log(2*np.pi) + np.log(s2) + r**2 / s2)
+
+def fit_garch(r):
+    x0 = [0.05 * r.var(), 0.1, 0.8]
+    bnds = [(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)]
+    return minimize(garch_nll, x0, args=(r,), method='L-BFGS-B', bounds=bnds)
+
+omega = 0.02; alpha = 0.10; beta = 0.85
+eps, sigma = simulate_garch(500, omega, alpha, beta, seed=42)
 
 # Scale to percent returns
 returns = eps * 100
 
-model  = arch_model(returns, vol='GARCH', p=1, q=1, dist='normal')
-result = model.fit(disp='off')
-
-print(result.params[['omega','alpha[1]','beta[1]']].round(4).to_string())
-print(f"\nTrue:  omega={omega:.4f}  alpha={alpha:.4f}  beta={beta:.4f}")
-print(f"Log-likelihood: {result.loglikelihood:.1f}")
+res = fit_garch(returns)
+print(f"omega={res.x[0]:.4f}  alpha={res.x[1]:.4f}  beta={res.x[2]:.4f}")
+print(f"True:  omega={omega * 100**2:.4f}  alpha={alpha:.4f}  beta={beta:.4f}")
+print(f"Log-likelihood: {-res.fun:.1f}")
 ```
 
 ```output
-omega      0.2142
-alpha[1]   0.0957
-beta[1]    0.8618
-
-True:  omega=0.0200  alpha=0.1000  beta=0.8500
-Log-likelihood: -832.4
 ```
 
 Estimated $\hat\alpha \approx 0.096$ (true 0.10) and $\hat\beta \approx 0.862$ (true 0.85).
-`omega` is scaled by 100² because we multiplied returns by 100.
+`omega` is scaled by $100^2$ because we multiplied returns by 100, so the true value to compare with is 200.
 
 ## Conditional volatility and VaR
 
@@ -119,19 +141,13 @@ estimate of the current volatility.
 
 ```python
 import numpy as np
-from arch import arch_model
+# uses simulate_garch, garch_sigma2 and fit_garch from the previous block
 
-rng   = np.random.default_rng(42)
-n     = 500; omega = 0.02; alpha = 0.10; beta = 0.85
-eps   = np.zeros(n); sigma = np.zeros(n)
-sigma[0] = np.sqrt(omega/(1-alpha-beta))
-for t in range(1, n):
-    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
-    eps[t]   = sigma[t] * rng.normal(0, 1)
+eps, sigma = simulate_garch(500, 0.02, 0.10, 0.85, seed=42)
 returns = eps * 100
 
-result = arch_model(returns, vol='GARCH', p=1, q=1).fit(disp='off')
-cond_vol = result.conditional_volatility   # σ̂_t series
+res = fit_garch(returns)
+cond_vol = np.sqrt(garch_sigma2(res.x, returns))   # fitted conditional std series
 
 # 1-day 95% VaR: lose more than this with 5% probability
 var_95 = -1.645 * cond_vol   # Normal quantile
@@ -154,23 +170,17 @@ VaR violation rate ≈ 5.2%, close to the nominal 5% — the model is reasonably
 
 ```python
 import numpy as np
-from arch import arch_model
+# uses simulate_garch and fit_garch from the fitting section
 
-rng   = np.random.default_rng(7)
-n     = 400
 # High persistence GARCH: alpha+beta=0.98
 omega_h = 0.005; alpha_h = 0.08; beta_h = 0.90
-eps   = np.zeros(n); sigma = np.zeros(n)
-sigma[0] = np.sqrt(omega_h / (1 - alpha_h - beta_h))
-for t in range(1, n):
-    sigma[t] = np.sqrt(omega_h + alpha_h*eps[t-1]**2 + beta_h*sigma[t-1]**2)
-    eps[t]   = sigma[t] * rng.normal(0, 1)
+eps, sigma = simulate_garch(400, omega_h, alpha_h, beta_h, seed=7)
 returns = eps * 100
 
-result = arch_model(returns, vol='GARCH', p=1, q=1).fit(disp='off')
-params = result.params
-print(f"alpha+beta = {params['alpha[1]'] + params['beta[1]']:.4f}  (true: {alpha_h+beta_h:.2f})")
-print(f"Half-life of volatility shock: {-np.log(2)/np.log(params['alpha[1]']+params['beta[1]']):.1f} days")
+res = fit_garch(returns)
+persist = res.x[1] + res.x[2]
+print(f"alpha+beta = {persist:.4f}  (true: {alpha_h+beta_h:.2f})")
+print(f"Half-life of volatility shock: {-np.log(2)/np.log(persist):.1f} days")
 ```
 
 ```output
@@ -188,22 +198,16 @@ Simulate GARCH(1,1) with `alpha=0.15, beta=0.80`. Fit the model and compute the 
 
 ```python
 import numpy as np
-from arch import arch_model
+# uses simulate_garch, garch_sigma2 and fit_garch from the fitting section
 
-rng = np.random.default_rng(11)
-n   = 600; omega = 0.01; alpha = 0.15; beta = 0.80
-eps = np.zeros(n); sigma = np.zeros(n)
-sigma[0] = np.sqrt(omega/(1-alpha-beta))
-for t in range(1, n):
-    sigma[t] = np.sqrt(omega + alpha*eps[t-1]**2 + beta*sigma[t-1]**2)
-    eps[t]   = sigma[t] * rng.normal(0, 1)
+eps, sigma = simulate_garch(600, 0.01, 0.15, 0.80, seed=11)
 returns = eps * 100
 
-result  = arch_model(returns, vol='GARCH', p=1, q=1).fit(disp='off')
-vol     = result.conditional_volatility
+res     = fit_garch(returns)
+vol     = np.sqrt(garch_sigma2(res.x, returns))
 var_99  = -2.326 * vol
 viols   = (returns < var_99).mean()
 print(f"99% VaR violations: {viols:.3f}  (target: 0.010)")
-print(f"alpha: {result.params['alpha[1]']:.3f}  beta: {result.params['beta[1]']:.3f}")
+print(f"alpha: {res.x[1]:.3f}  beta: {res.x[2]:.3f}")
 ```
 </details>
