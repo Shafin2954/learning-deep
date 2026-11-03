@@ -143,7 +143,7 @@ $a_n/b_n + a_n/b_n^2$: the Poisson variance plus the posterior variance of $\lam
 total variance, parameter uncertainty always *adds* spread to predictions.
 
 ```python
-pred = stats.nbinom(a_n, b_n / (b_n + 1))           # scipy: pmf ∝ C(k+r-1,k) p^r (1-p)^k
+pred = stats.nbinom(a_n, b_n / (b_n + 1))           # scipy: pmf = C(k+r-1,k) p^r (1-p)^k
 lam_draws = rng.gamma(a_n, 1 / b_n, 400_000)        # two-stage simulation: lambda, then x
 x_new = rng.poisson(lam_draws)
 plug = stats.poisson(x1.mean())                      # the "just use the MLE" predictive
@@ -171,6 +171,12 @@ mean      formula 3.9231  sim 3.9287  plug-in 4.0000
 variance  formula 4.2249  sim 4.2248  plug-in 4.0000
 P(x >= 10)  NB 0.0096   plug-in Poisson 0.0081
 ```
+
+The two-stage simulation reproduces the closed-form pmf to the third decimal and the variance
+exactly (4.2249 against 4.2248). The plug-in Poisson has nearly the same centre but the wrong shape: it
+is too thin at 0 and 1 and in the right tail ($P(x \ge 10)$ of 0.0081 against 0.0096). With 12
+observations the extra variance $a_n/b_n^2 \approx 0.30$ is modest, but it is the reason the negative binomial,
+not the Poisson, is the default count model whenever rates vary across units (the Exercise).
 
 ## Dirichlet-Multinomial: Laplace smoothing is a posterior mean
 
@@ -243,6 +249,13 @@ unseen in training: 46.9% of vocabulary, 8.4% of test tokens
 alpha maximising evidence (train only): 0.2472 -> test log-loss 4.8288
 alpha minimising test log-loss (oracle): 0.4601 -> test log-loss 4.8163
 ```
+
+Almost half of the vocabulary never appears in 3,000 training tokens, yet those words make up 8.4%
+of the test stream, so the MLE ($\alpha = 0$) assigns them probability zero and the log-loss is
+infinite. Any $\alpha > 0$ fixes that; the question is how much. The evidence, computed from the
+training counts alone, picks $\alpha \approx 0.25$, and lands within 0.013 nats of the oracle
+choice that peeked at 100,000 test tokens. Add-one smoothing, the textbook default, is not the
+right prior here: with $K = 1000$ it injects 1,000 pseudo-tokens against 3,000 real ones.
 
 ## Unknown mean and variance: the Normal-Inverse-Gamma model
 
@@ -331,6 +344,13 @@ improper-prior 95% credible interval: [9.1919, 11.8942]
 classical 95% t confidence interval:  [9.1919, 11.8942]
 ```
 
+The Student-t quantiles match the two-stage Monte Carlo to two decimals across the whole range,
+including the 0.5% tails. The Normal plug-in agrees near the median and is too narrow in the
+tails (99% interval $[8.89, 11.69]$ against $[8.65, 11.93]$): it treats $\sigma^2$ as known when
+13 effective degrees of freedom do not justify that. The last two lines show the improper-prior
+limit equals the classical interval to four decimals. Here the two schools give the same numbers;
+they disagree only about what the interval means.
+
 ## Bayesian linear regression with known noise
 
 Put a Gaussian prior on weights, $\mathbf{w} \sim \mathcal{N}(\mathbf{0}, \alpha^{-1}I)$, with
@@ -402,6 +422,16 @@ max |m_N - ridge(lambda = alpha/beta)| = 9.4e-14
   2.0 extrapolate  -31.780    0.041   13.728    13.726
 ```
 
+The posterior mean equals sklearn's ridge coefficients to machine precision. The standard
+deviations are the part ridge does not give you. Inside the data the predictive sd is 0.21–0.26,
+slightly above the noise floor of 0.20. In the gap at $x = 0$ the parameter term doubles
+(0.132 against 0.065 at $x = \pm 0.6$). Outside $[-1, 1]$ it grows like $|x|^5$, because a degree-5
+basis does that: at $x = \pm 2$ the mean is off by 32–40 and the sd is 14. The model is
+wrong there, and it *says* so with an sd that large — something the ridge point estimate cannot do. Note the
+limitation, though: in the gap the sd grows only modestly, because a global polynomial is
+confident about interpolation. Local basis functions (and Gaussian processes, ch. 12) let
+uncertainty rise wherever data are absent.
+
 ## Unknown noise: the conjugate prior on weights and variance
 
 Assuming you know $\beta$ is the regression analogue of the known-variance Normal. The fix is the
@@ -444,7 +474,8 @@ def nig_regression(X, y, m0, V0, a0, b0):
 rng = np.random.default_rng(3)
 reps, n_small, x_star, z90 = 4000, 8, 1.3, stats.norm.ppf(0.95)
 m0, V0 = np.zeros(2), 100 * np.eye(2)
-hits = {"NIG Student-t": [], "known sigma, Gaussian": [], "plug-in OLS +/- z*sigma_hat": []}
+hits = {"NIG, a0=b0=0.01": [], "NIG, a0=-p/2, b0=0": [], "known sigma, Gaussian": [],
+        "plug-in OLS +/- z*sigma_hat": []}
 widths = {k: [] for k in hits}
 for _ in range(reps):
     x = rng.uniform(-1, 1, n_small)
@@ -455,12 +486,15 @@ for _ in range(reps):
     mn_, Vn_, an_, bn_ = nig_regression(X, yy, m0, V0, 0.01, 0.01)
     sc = np.sqrt(bn_ / an_ * (1 + xs @ Vn_ @ xs))
     half_t = stats.t.ppf(0.95, 2 * an_) * sc
+    mr_, Vr_, ar_, br_ = nig_regression(X, yy, m0, V0, -1.0, 0.0)    # reference-prior limit, p = 2
+    half_r = stats.t.ppf(0.95, 2 * ar_) * np.sqrt(br_ / ar_ * (1 + xs @ Vr_ @ xs))
     Sk = np.linalg.inv(X.T @ X / 1.0 + np.eye(2) / 100)       # known sigma = 1, same prior scale
     mk = Sk @ X.T @ yy
     half_k = z90 * np.sqrt(1 + xs @ Sk @ xs)
     w_ols = np.linalg.lstsq(X, yy, rcond=None)[0]
     half_p = z90 * np.sqrt(np.mean((yy - X @ w_ols) ** 2))
-    for name, centre, half in [("NIG Student-t", xs @ mn_, half_t),
+    for name, centre, half in [("NIG, a0=b0=0.01", xs @ mn_, half_t),
+                               ("NIG, a0=-p/2, b0=0", xs @ mr_, half_r),
                                ("known sigma, Gaussian", xs @ mk, half_k),
                                ("plug-in OLS +/- z*sigma_hat", xs @ w_ols, half_p)]:
         hits[name].append(abs(y_star - centre) <= half)
@@ -472,10 +506,21 @@ for name in hits:
 
 ```output
 nominal 90% predictive interval at x* = 1.3, n = 8, 4000 replications
-  NIG Student-t                coverage 0.839   median width 4.23
+  NIG, a0=b0=0.01              coverage 0.839   median width 4.23
+  NIG, a0=-p/2, b0=0           coverage 0.898   median width 5.11
   known sigma, Gaussian        coverage 0.894   median width 4.45
   plug-in OLS +/- z*sigma_hat  coverage 0.649   median width 2.69
 ```
+
+The plug-in interval covers 65% of the time instead of 90%: it uses the downward-biased MLE of
+$\sigma$ and ignores parameter uncertainty at a point beyond the data. The known-$\sigma$ Gaussian
+is right (0.894) but needs $\sigma$ you do not have. The NIG model with an "uninformative"
+$\mathrm{IG}(0.01, 0.01)$ still undercovers at 0.839. The reason is a subtle point worth knowing:
+because the weight prior is scaled by $\sigma^2$, the $p$ weights do not consume degrees of freedom in
+$a_n = a_0 + n/2$, so a near-zero $a_0$ gives $2a_n \approx n$ degrees of freedom and divides the residual sum of
+squares by $n$ rather than $n - p$. The reference prior $p(\mathbf{w}, \sigma^2) \propto 1/\sigma^2$
+corresponds to $a_0 = -p/2$, $b_0 = 0$, gives $t_{n-p}$, and hits 0.898 — the exact frequentist
+prediction interval, again recovered as a posterior. "Vague" is not "neutral".
 
 ## The evidence: marginal likelihood in closed form
 
@@ -537,6 +582,14 @@ degree  train RMSE  5-fold CV  log evidence  test RMSE
      8      0.2674     0.3338       -19.521     0.3682
      9      0.2675     0.3379       -19.955     0.3677
 ```
+
+Training error falls monotonically, as it must. The evidence rises from degree 0 to a peak at
+degree 4 ($-17.19$) and then declines steadily. Every extra coefficient spreads the prior over
+functions the data rule out. Five-fold CV also picks degree 4 (0.3112), from the same 20
+points, with no held-out data needed by the evidence. With $\alpha = 5 \times 10^{-3}$ the prior
+keeps high degrees from exploding, so test RMSE is nearly flat from degree 3 to 9. The evidence
+penalises them anyway: a model that *could* have fitted many datasets is a less specific
+explanation of this one.
 
 ### Empirical Bayes: let the evidence set the prior
 
@@ -614,6 +667,21 @@ for name, basis in bases.items():
  Legendre P_j(2x-1)   0.3635   0.3649    0.4403    0.4253     8/20
 ```
 
+This is the honest version of "type-II ML replaces cross-validation". With a Legendre basis,
+where an isotropic prior on coefficients is a sensible statement, empirical Bayes and CV pick
+similar $\lambda$ (0.65 against 0.79), and over 20 fresh datasets their average test RMSE is the
+same (0.3635 against 0.3649). The evidence also estimated the noise sd (0.312 against a true 0.300)
+and the effective parameter count ($\gamma = 6.4$ of 10) as by-products, using no held-out data.
+
+With raw monomials the picture splits. On this dataset EB over-shrinks ($\gamma = 3.3$, test 0.453
+against CV's 0.350). A single $\alpha$ shared by $1, x, \ldots, x^9$ on $[0, 1]$ is a bad prior, and the
+evidence can only choose the best member of the family you give it. But across 20 datasets CV is
+the one that fails badly: averaging 0.825 with a worst case of 9.66, because with $n = 20$ and
+five folds it sometimes chooses $\lambda \approx 0$ and returns an interpolating polynomial. The evidence
+uses all 20 points at once and is never that unstable. Use the evidence for cheap, smooth tuning of
+many hyperparameters (ARD gives every weight its own $\alpha$). Keep CV as the check that the prior
+family is not misspecified.
+
 ## A Beta-Bernoulli A/B test, decision included
 
 The question an A/B test answers is not "is the difference significant" but "which variant do I
@@ -642,7 +710,7 @@ tA, tB = post_A.rvs(1_000_000, random_state=rng), post_B.rvs(1_000_000, random_s
 exact, _ = integrate.quad(lambda t: post_B.pdf(t) * post_A.cdf(t), 0.02, 0.07, points=[0.04, 0.044])
 lift = tB / tA - 1
 print(f"observed: A {c_A / n_A:.4f}  B {c_B / n_B:.4f}  (relative lift {c_B * n_A / (c_A * n_B) - 1:+.2%})")
-print(f"P(B > A): Monte Carlo {np.mean(tB > tA):.4f}   quadrature {1 - exact:.4f}")
+print(f"P(B > A): Monte Carlo {np.mean(tB > tA):.4f}   quadrature {exact:.4f}")
 print(f"relative lift 90% credible interval: [{np.quantile(lift, 0.05):+.2%}, {np.quantile(lift, 0.95):+.2%}]")
 print(f"expected loss if ship B: {np.mean(np.maximum(tA - tB, 0)):.6f}")
 print(f"expected loss if keep A: {np.mean(np.maximum(tB - tA, 0)):.6f}")
@@ -650,11 +718,19 @@ print(f"expected loss if keep A: {np.mean(np.maximum(tB - tA, 0)):.6f}")
 
 ```output
 observed: A 0.0400  B 0.0442  (relative lift +10.62%)
-P(B > A): Monte Carlo 0.9493   quadrature 0.0507
+P(B > A): Monte Carlo 0.9493   quadrature 0.9493
 relative lift 90% credible interval: [-0.04%, +22.42%]
 expected loss if ship B: 0.000055
 expected loss if keep A: 0.004303
 ```
+
+Monte Carlo and one-dimensional quadrature,
+$P(\theta_B > \theta_A) = \int p_B(t)\,F_A(t)\,dt$, agree at 0.9493. This is the case that separates
+the two rules. A "95% probability to beat control" threshold says *not yet*. The expected-loss rule says
+*ship B*: in the 5% of worlds where B is worse, it is worse by so little that the expected cost is
+0.0055 percentage points, below a 0.01-point threshold. Keeping A, by contrast, expects to forgo
+0.43 points. The lift interval $[-0.04\%, +22.4\%]$ makes the same point: the downside is tiny
+and the upside is large.
 
 ### What peeking does to each rule
 
@@ -696,6 +772,15 @@ for label, pA, pB in [("A/A (identical)", 0.040, 0.040), ("B 3% worse", 0.040, 0
         B 3% worse exp. loss < 1e-4   0.105                   0.126
 ```
 
+Under peeking, "stop at $P(B > A) > 0.95$" declares B the winner in 20% of A/A tests, four times
+the 5% the threshold seems to promise. Posterior probabilities stay valid at every look, but a
+rule that stops on the first look that crosses a threshold gets more chances to cross it.
+The expected-loss rule ships B even more often in the A/A case (25.8%), and that is fine: when the
+arms are identical, either decision costs nothing, which is what the regret column shows. Where B is
+truly 3% worse, the loss rule ships it less often (10.5% against 13.5%) and gives up less (0.126
+against 0.162 conversions per 1,000 future visitors). The loss rule does not control a false-positive
+rate. It controls the expected cost of the decision, which is the quantity the business pays for.
+
 ## Try it Yourself
 
 ```python
@@ -728,6 +813,12 @@ for alpha in [1e-3, 1e-2, 1e-1, 1.0, 10.0]:
     1.0        -1.361               0.179        3.899
    10.0        -8.227               0.164        2.123
 ```
+
+The evidence peaks at $\alpha = 1$ on this grid, and the predictive sd shrinks everywhere as
+$\alpha$ grows, which is the prior pulling weights to zero. Change the gap position, the basis
+(try `np.polynomial.legendre.legvander(x, deg)`), or $n$, and watch whether the evidence-optimal
+$\alpha$ still gives a sensible sd beyond the data. Then replace the fixed grid with the
+fixed-point iteration from the empirical-Bayes section.
 
 ## Exercise
 
@@ -775,5 +866,10 @@ fitted prior Gamma(a=3.81, b=1.89): mean 2.014  (true 4, 2, mean 2.000)
      RMSE t >= 5    0.4076          0.3340
 ```
 
-PLACEHOLDER
+Empirical Bayes recovers the population prior well ($a = 3.81$, $b = 1.89$ against 4 and 2) from
+counts alone. Shrinking each store toward it cuts overall RMSE from 0.92 to 0.56. The gain is
+concentrated where data are thin: stores open under 5 days drop from 1.32 to 0.76, and stores with
+long histories barely move (0.41 to 0.33), because $(a + x_i)/(b + t_i)$ weights the store's own
+rate by $t_i/(b + t_i)$. The prior counts as $b \approx 1.9$ pseudo-days. The full hierarchical
+treatment (ch. 10) also puts uncertainty on $(a, b)$ instead of plugging in point estimates.
 </details>
