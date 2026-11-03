@@ -1,0 +1,469 @@
+---
+course: bayesian-ml
+chapter: 13-bayesian-deep-learning
+title: "Bayesian Deep Learning: Uncertainty You Can Use"
+order: 13
+---
+
+## Two kinds of not knowing
+
+S1
+
+```python
+import copy
+import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+from sklearn.datasets import make_moons
+from sklearn.metrics import roc_auc_score
+torch.set_num_threads(1)
+
+f = lambda x: x * np.sin(x)                               # true regression function
+noise_sd = lambda x: 0.1 + 0.25 * np.abs(x) / 4           # aleatoric sd: 0.10 at x = 0, 0.35 at |x| = 4
+rng = np.random.default_rng(0)
+def draw(n):                                              # x in [-4, -1.5] U [1.5, 4]: no data in the middle
+    x = rng.uniform(1.5, 4.0, n) * rng.choice([-1, 1], n)
+    return x, f(x) + noise_sd(x) * rng.standard_normal(n)
+xtr, ytr = draw(160); xte, yte = draw(1000)
+xgap = rng.uniform(-1.5, 1.5, 1000); ygap = f(xgap) + noise_sd(xgap) * rng.standard_normal(1000)
+T = lambda a: torch.tensor(a, dtype=torch.float32).reshape(len(a), -1)
+Xtr, Ytr, Xte, Yte, Xgap, Ygap = map(T, (xtr, ytr, xte, yte, xgap, ygap))
+
+xc_tr, yc_tr = make_moons(400, noise=0.2, random_state=0)            # 2-D classification
+xc_te, yc_te = make_moons(1000, noise=0.2, random_state=1)
+ang, rad = rng.uniform(0, 2 * np.pi, 1000), rng.uniform(2.5, 4.5, 1000)
+xc_ood = np.c_[0.5 + rad * np.cos(ang), 0.25 + rad * np.sin(ang)]   # a ring of inputs far from both moons
+Xc_tr, Yc_tr, Xc_te, Xc_ood = T(xc_tr), T(yc_tr), T(xc_te), T(xc_ood)
+dist = np.sqrt(((xc_ood[:, None] - xc_tr[None]) ** 2).sum(-1)).min(1)
+print(f"regression: {len(xtr)} train points, |x| in [{np.abs(xtr).min():.2f}, {np.abs(xtr).max():.2f}], "
+      f"gap test set x in [-1.5, 1.5], truth there ranges {f(xgap).min():.2f} .. {f(xgap).max():.2f}")
+print(f"classification: {len(xc_tr)} train points, class balance {yc_tr.mean():.2f}, "
+      f"OOD ring distance to nearest train point {dist.min():.2f} .. {dist.max():.2f}")
+```
+
+```output
+```
+
+S1b
+
+## A heteroscedastic head learns the noise, not the ignorance
+
+S2
+
+### Deriving the Gaussian negative log-likelihood
+
+S2d
+
+```python
+def reg_net(p=0.0, h=50):                                 # 1 -> 50 tanh -> (mean, log-variance)
+    return nn.Sequential(nn.Linear(1, h), nn.Tanh(), nn.Dropout(p), nn.Linear(h, 2))
+def cls_net(p=0.0, h=64):                                 # 2 -> 64 -> 64 ReLU -> logit
+    return nn.Sequential(nn.Linear(2, h), nn.ReLU(), nn.Dropout(p),
+                         nn.Linear(h, h), nn.ReLU(), nn.Dropout(p), nn.Linear(h, 1))
+def gnll(out, y):                                         # mean Gaussian NLL with per-point variance
+    mu, lv = out[:, :1], out[:, 1:]
+    return 0.5 * (np.log(2 * np.pi) + lv + (y - mu) ** 2 / lv.exp()).mean()
+bce = lambda out, y: F.binary_cross_entropy_with_logits(out, y)
+def train(make, X, Y, loss, steps, seed=0, lr=1e-2, wd=1e-3):
+    torch.manual_seed(seed); net = make()
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd)
+    for _ in range(steps):
+        opt.zero_grad(); loss(net(X), Y).backward(); opt.step()
+    return net.eval()
+REG_STEPS, CLS_STEPS = 1500, 600
+
+point = train(reg_net, Xtr, Ytr, gnll, REG_STEPS)
+xs = np.array([-3.5, -2.5, -1.5, -0.75, 0.0, 0.75, 1.5, 2.5, 3.5])
+with torch.no_grad():
+    o = point(T(xs)); mu, sd = o[:, 0].numpy(), (0.5 * o[:, 1]).exp().numpy()
+print(f"{'x':>6} {'f(x)':>6} {'mean':>6} {'|err|':>6} {'true sd':>8} {'pred sd':>8} {'|err|/sd':>9}")
+for x, m, s in zip(xs, mu, sd):
+    print(f"{x:6.2f} {f(x):6.2f} {m:6.2f} {abs(m - f(x)):6.2f} {noise_sd(x):8.2f} {s:8.2f} {abs(m - f(x)) / s:9.1f}")
+```
+
+```output
+```
+
+S2b
+
+## A point network is overconfident off the data
+
+S3
+
+```python
+cpoint = train(cls_net, Xc_tr, Yc_tr, bce, CLS_STEPS)
+with torch.no_grad():
+    p_te, p_ood = torch.sigmoid(cpoint(Xc_te))[:, 0].numpy(), torch.sigmoid(cpoint(Xc_ood))[:, 0].numpy()
+    logit_ood = cpoint(Xc_ood)[:, 0].abs().numpy()
+conf = lambda p: np.maximum(p, 1 - p)
+print(f"in-distribution test: accuracy {np.mean((p_te > 0.5) == yc_te):.3f} | mean confidence {conf(p_te).mean():.3f}")
+print(f"OOD ring:             mean confidence {conf(p_ood).mean():.3f} | share above 0.99 {np.mean(conf(p_ood) > 0.99):.2f}"
+      f" | median |logit| {np.median(logit_ood):.1f}")
+for r in (3, 6, 12, 24):                                  # walk straight out along one direction
+    with torch.no_grad():
+        z = cpoint(T(np.array([[0.5 + r * 0.6, 0.25 + r * 0.8]])))[0, 0].item()
+    print(f"distance {r:2d} from centre: logit {z:+8.1f}, confidence {conf(1 / (1 + np.exp(-z))):.4f}")
+```
+
+```output
+```
+
+S3b
+
+## The law of total variance splits what you see
+
+S4
+
+### Deriving the decomposition
+
+S4d
+
+```python
+RES, REG, CLS = {}, {}, {}                                # metrics, regression samplers, classifier samplers
+def reg_eval(name, sampler):                              # sampler(X) -> (S, N, 2): S draws of (mean, log-var)
+    REG[name] = sampler; row = {}
+    for tag, X, Y in (("test", Xte, Yte), ("gap", Xgap, Ygap)):
+        torch.manual_seed(0)
+        with torch.no_grad(): o = sampler(X)
+        mu, va, y = o[..., 0], o[..., 1].exp(), Y[:, 0]
+        epi = mu.var(0, unbiased=False)                   # Var over draws of the mean
+        ll = torch.logsumexp(-0.5 * (np.log(2 * np.pi) + va.log() + (y - mu) ** 2 / va), 0) - np.log(len(o))
+        row[tag] = dict(nll=-ll.mean().item(), rmse=(mu.mean(0) - y).pow(2).mean().sqrt().item(),
+                        epi=epi.sqrt().mean().item(), alea=va.mean(0).sqrt().mean().item(), score=epi.numpy())
+    t, g = row["test"], row["gap"]
+    auc = roc_auc_score(np.r_[np.zeros(1000), np.ones(1000)], np.r_[t["score"], g["score"]])
+    RES.setdefault(name, {}).update(r_nll=t["nll"], r_rmse=t["rmse"], gap_nll=g["nll"], epi_t=t["epi"],
+                                    epi_g=g["epi"], r_auc=auc)
+    print(f"{name:13} test NLL {t['nll']:5.2f} RMSE {t['rmse']:.3f} | sd alea {t['alea']:.3f} epi {t['epi']:.3f}"
+          f" | gap NLL {g['nll']:6.2f} epi {g['epi']:.3f} ({g['epi'] / max(t['epi'], 1e-9):5.1f}x) | AUROC {auc:.3f}")
+
+H2 = lambda p: -(p * np.log(p) + (1 - p) * np.log(1 - p))
+def ece(p, y, bins=10):                                   # equal-width bins on confidence (Evaluation & Tuning, ch. 4)
+    c = np.maximum(p, 1 - p); hit = (p > 0.5) == y; b = np.minimum(((c - 0.5) * 2 * bins).astype(int), bins - 1)
+    return sum(abs(c[b == k].mean() - hit[b == k].mean()) * np.mean(b == k) for k in range(bins) if np.any(b == k))
+def cls_eval(name, sampler):                              # sampler(X) -> (S, N, 1) logits
+    CLS[name] = sampler; torch.manual_seed(0)
+    with torch.no_grad(): zt, zo = sampler(Xc_te)[..., 0], sampler(Xc_ood)[..., 0]
+    pt, po = torch.sigmoid(zt).mean(0).double().clamp(1e-7, 1 - 1e-7).numpy(), torch.sigmoid(zo).mean(0).double().clamp(1e-7, 1 - 1e-7).numpy()
+    nll = -np.mean(yc_te * np.log(pt) + (1 - yc_te) * np.log(1 - pt))
+    lab = np.r_[np.zeros(1000), np.ones(1000)]
+    auc_h = roc_auc_score(lab, np.r_[H2(pt), H2(po)])
+    auc_v = roc_auc_score(lab, np.r_[zt.var(0, unbiased=False).numpy(), zo.var(0, unbiased=False).numpy()])
+    RES.setdefault(name, {}).update(c_nll=nll, acc=np.mean((pt > 0.5) == yc_te), ece=ece(pt, yc_te),
+                                    auc_h=auc_h, auc_v=auc_v, conf_ood=np.maximum(po, 1 - po).mean())
+    r = RES[name]
+    print(f"{name:13} NLL {nll:.3f} acc {r['acc']:.3f} ECE {r['ece']:.3f} | OOD conf {r['conf_ood']:.3f}"
+          f" | AUROC entropy {auc_h:.3f} logit-var {auc_v:.3f}")
+
+reg_eval("point", lambda X: point(X)[None])
+cls_eval("point", lambda X: cpoint(X)[None])
+```
+
+```output
+```
+
+S4b
+
+## Deep ensembles: train it five times
+
+S5
+
+```python
+ens_r = [point] + [train(reg_net, Xtr, Ytr, gnll, REG_STEPS, seed=s) for s in range(1, 5)]
+ens_c = [cpoint] + [train(cls_net, Xc_tr, Yc_tr, bce, CLS_STEPS, seed=s) for s in range(1, 5)]
+reg_eval("ensemble", lambda X: torch.stack([m(X) for m in ens_r]))
+cls_eval("ensemble", lambda X: torch.stack([m(X) for m in ens_c]))
+with torch.no_grad():
+    mus = torch.stack([m(T(xs))[:, 0] for m in ens_r]).numpy()
+print("member means at x =", " ".join(f"{x:5.2f}" for x in xs))
+for k, row in enumerate(mus):
+    print(f"member {k}:              " + " ".join(f"{v:5.2f}" for v in row))
+print(f"truth f(x):            " + " ".join(f"{v:5.2f}" for v in f(xs)))
+```
+
+```output
+```
+
+S5b
+
+## MC dropout: a free ensemble with a blind spot
+
+S6
+
+### What dropout approximates
+
+S6d
+
+```python
+mcd_r = train(lambda: reg_net(p=0.1), Xtr, Ytr, gnll, 2 * REG_STEPS).train()      # train(): dropout stays on
+mcd_c = train(lambda: cls_net(p=0.1), Xc_tr, Yc_tr, bce, 2 * CLS_STEPS).train()
+reg_eval("MC dropout", lambda X: torch.stack([mcd_r(X) for _ in range(100)]))
+cls_eval("MC dropout", lambda X: torch.stack([mcd_c(X) for _ in range(100)]))
+```
+
+```output
+```
+
+S6b
+
+## Bayes by Backprop: a Gaussian over every weight
+
+S7
+
+### The ELBO for network weights
+
+S7d
+
+```python
+class BayesLinear(nn.Module):                             # q(w) = N(mu, softplus(rho)^2), mean-field
+    def __init__(self, d_in, d_out, prior_sd=1.0):
+        super().__init__()
+        self.mu = nn.Parameter(torch.randn(d_in + 1, d_out) / np.sqrt(d_in))   # last row is the bias
+        self.rho = nn.Parameter(torch.full((d_in + 1, d_out), -5.0))
+        self.prior_sd = prior_sd
+    def forward(self, x):
+        w = self.mu + F.softplus(self.rho) * torch.randn_like(self.mu)          # reparameterisation (ch. 11)
+        return x @ w[:-1] + w[-1]
+    def kl(self):                                         # KL(q || N(0, prior_sd^2)) in closed form
+        s, p = F.softplus(self.rho), self.prior_sd
+        return (torch.log(p / s) + (s ** 2 + self.mu ** 2) / (2 * p ** 2) - 0.5).sum()
+class BBBNet(nn.Module):
+    def __init__(self, sizes, act):
+        super().__init__(); self.layers, self.act = nn.ModuleList(BayesLinear(a, b) for a, b in zip(sizes, sizes[1:])), act
+    def forward(self, x):
+        for l in self.layers[:-1]: x = self.act(l(x))
+        return self.layers[-1](x)
+    def kl(self): return sum(l.kl() for l in self.layers)
+def train_bbb(sizes, act, X, Y, loss, steps=5000, lr=1e-2, kl_weight=1.0):
+    torch.manual_seed(0); net = BBBNet(sizes, act)
+    opt = torch.optim.Adam(net.parameters(), lr=lr); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps, lr / 100)
+    for _ in range(steps):
+        opt.zero_grad(); (loss(net(X), Y) + kl_weight * net.kl() / len(X)).backward(); opt.step(); sch.step()
+    return net
+bbb_r = train_bbb([1, 50, 2], torch.tanh, Xtr, Ytr, gnll)
+bbb_c = train_bbb([2, 64, 64, 1], torch.relu, Xc_tr, Yc_tr, bce)
+reg_eval("BBB", lambda X: torch.stack([bbb_r(X) for _ in range(200)]))
+cls_eval("BBB", lambda X: torch.stack([bbb_c(X) for _ in range(200)]))
+sd_all = torch.cat([F.softplus(l.rho).flatten() for l in bbb_r.layers])
+print(f"regression q: {len(sd_all)} weights, posterior sd median {sd_all.median():.3f}, "
+      f"share with sd > 0.5 (prior-like) {(sd_all > 0.5).float().mean():.2f}, KL {bbb_r.kl().item():.0f} nats")
+```
+
+```output
+```
+
+S7b
+
+## Last-layer Laplace: Gaussian around the trained head
+
+S8
+
+### The GGN and the evidence for the last layer
+
+S8d
+
+```python
+def feats(net, X):                                        # penultimate activations plus a constant 1
+    return torch.cat([net[:-1](X), torch.ones(len(X), 1)], 1)
+def last_layer_laplace(net, X, curv, loglik):             # curv: per-point second derivative of NLL in the output
+    with torch.no_grad():
+        Phi = feats(net, X).double(); w = torch.cat([net[-1].weight[0], net[-1].bias[:1]]).double()
+        G, I = Phi.T @ (Phi * curv[:, None]), torch.eye(len(w), dtype=torch.float64)
+        logZ = lambda lam: (loglik + 0.5 * len(w) * np.log(lam) - 0.5 * lam * (w @ w) - 0.5 * torch.logdet(G + lam * I)).item()
+        grid = np.logspace(-3, 2, 21); lam = max(grid, key=logZ)
+        L = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(G + lam * I)))
+    return w.float(), L.float(), lam
+
+with torch.no_grad():
+    o = point(Xtr); curv_r = (-o[:, 1]).exp().double()                           # 1 / sigma_i^2
+    ll_r = -gnll(o, Ytr).item() * len(Xtr)
+    zc = cpoint(Xc_tr)[:, 0]; pc = torch.sigmoid(zc).double(); curv_c = pc * (1 - pc)   # p (1 - p)
+    ll_c = -bce(cpoint(Xc_tr), Yc_tr).item() * len(Xc_tr)
+w_r, L_r, lam_r = last_layer_laplace(point, Xtr, curv_r, ll_r)
+w_c, L_c, lam_c = last_layer_laplace(cpoint, Xc_tr, curv_c, ll_c)
+print(f"evidence-optimal prior precision: regression {lam_r:.3g}, classification {lam_c:.3g}")
+def lla_reg(X, S=200):
+    W = w_r + torch.randn(S, len(w_r)) @ L_r.T                                   # (S, 51) head draws
+    return torch.stack([W @ feats(point, X).T, point(X)[:, 1].expand(S, -1)], -1)
+def lla_cls(X, S=200):
+    W = w_c + torch.randn(S, len(w_c)) @ L_c.T
+    return (W @ feats(cpoint, X).T)[..., None]
+reg_eval("LL-Laplace", lla_reg)
+cls_eval("LL-Laplace", lla_cls)
+```
+
+```output
+```
+
+S8b
+
+## SWAG: read the posterior off the SGD trajectory
+
+S9
+
+```python
+def swag_diag(net, X, Y, loss, epochs=100, lr=3e-3, bs=32):
+    net = copy.deepcopy(net).train(); opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9)
+    torch.manual_seed(0); m1 = m2 = 0
+    for _ in range(epochs):                               # constant learning rate, minibatches: the noise is the point
+        for idx in torch.randperm(len(X)).split(bs):
+            opt.zero_grad(); loss(net(X[idx]), Y[idx]).backward(); opt.step()
+        v = nn.utils.parameters_to_vector(net.parameters()).detach()
+        m1, m2 = m1 + v / epochs, m2 + v ** 2 / epochs    # running first and second moments, once per epoch
+    return net, m1, (m2 - m1 ** 2).clamp_min(1e-10)
+def swag_sampler(net, mean, var, S=100):
+    def sample(X):
+        outs = []
+        for _ in range(S):
+            nn.utils.vector_to_parameters(mean + var.sqrt() * torch.randn_like(mean), net.parameters())
+            outs.append(net(X))
+        return torch.stack(outs)
+    return sample
+sw_r, sw_c = swag_diag(point, Xtr, Ytr, gnll), swag_diag(cpoint, Xc_tr, Yc_tr, bce)
+reg_eval("SWAG-diag", swag_sampler(*sw_r))
+cls_eval("SWAG-diag", swag_sampler(*sw_c))
+```
+
+```output
+```
+
+S9b
+
+## HMC on the same network: the reference answer
+
+S10
+
+```python
+import jax, jax.numpy as jnp, numpyro, numpyro.distributions as dist
+import arviz as az
+from numpyro.infer import MCMC, NUTS
+shapes = {"w1": (1, 50), "b1": (50,), "w2": (50, 2), "b2": (2,)}                 # same 1-50-2 tanh net, 202 weights
+def fwd(p, x):
+    return jnp.tanh(x[:, None] @ p["w1"] + p["b1"]) @ p["w2"] + p["b2"]
+def bnn(x, y=None):
+    p = {k: numpyro.sample(k, dist.Normal(0, 1).expand(s).to_event(len(s))) for k, s in shapes.items()}
+    o = fwd(p, x)
+    numpyro.sample("y", dist.Normal(o[:, 0], jnp.exp(0.5 * o[:, 1])), obs=y)
+mcmc = MCMC(NUTS(bnn, max_tree_depth=8), num_warmup=400, num_samples=400, num_chains=4,
+            chain_method="sequential", progress_bar=False)
+mcmc.run(jax.random.PRNGKey(0), jnp.array(xtr), jnp.array(ytr))
+post = mcmc.get_samples(group_by_chain=True)
+w_rhat = az.rhat(az.from_numpyro(mcmc)); w_rhat = np.concatenate([w_rhat[k].values.ravel() for k in shapes])
+f_draws = np.asarray(jax.vmap(jax.vmap(lambda p: fwd(p, jnp.array(xs))))(post))[..., 0]   # (chain, draw, x)
+f_rhat = np.array([az.rhat(f_draws[..., j]) for j in range(len(xs))])
+print(f"divergences {int(mcmc.get_extra_fields()['diverging'].sum())} | weight-space R-hat median {np.median(w_rhat):.2f}, "
+      f"max {w_rhat.max():.2f} | function-space R-hat at the 9 probe x's: max {f_rhat.max():.3f}")
+flat = jax.tree_util.tree_map(lambda a: a.reshape(-1, *a.shape[2:]), post)
+reg_eval("HMC (NUTS)", lambda X: torch.tensor(np.asarray(jax.vmap(lambda p: fwd(p, jnp.array(X[:, 0].numpy())))(flat))))
+print(f"{'epistemic sd at x':18}" + "".join(f"{x:7.2f}" for x in xs))
+for name, s in REG.items():
+    torch.manual_seed(0)
+    with torch.no_grad(): e = s(T(xs))[..., 0].std(0, unbiased=False).numpy()
+    print(f"{name:18}" + "".join(f"{v:7.3f}" for v in e))
+```
+
+```output
+```
+
+S10b
+
+## Side by side
+
+S11
+
+```python
+print(f"{'regression':13} {'test NLL':>8} {'RMSE':>6} {'gap NLL':>8} {'epi test':>8} {'epi gap':>8} {'gap AUROC':>9}")
+for k, r in RES.items():
+    if "r_nll" in r:
+        print(f"{k:13} {r['r_nll']:8.2f} {r['r_rmse']:6.3f} {r['gap_nll']:8.2f} {r['epi_t']:8.3f} {r['epi_g']:8.3f} {r['r_auc']:9.3f}")
+print(f"\n{'classification':13} {'NLL':>8} {'acc':>6} {'ECE':>8} {'OOD conf':>8} {'AUROC H':>8} {'AUROC var':>9}")
+for k, r in RES.items():
+    if "c_nll" in r:
+        print(f"{k:13} {r['c_nll']:8.3f} {r['acc']:6.3f} {r['ece']:8.3f} {r['conf_ood']:8.3f} {r['auc_h']:8.3f} {r['auc_v']:9.3f}")
+```
+
+```output
+```
+
+S11b
+
+## Priors in weight space and the cold posterior
+
+S12
+
+```python
+for t in (1.0, 0.3, 0.1):
+    net = train_bbb([1, 50, 2], torch.tanh, Xtr, Ytr, gnll, kl_weight=t)
+    reg_eval(f"BBB KL x{t}", lambda X: torch.stack([net(X) for _ in range(200)]))
+```
+
+```output
+```
+
+S12b
+
+## Try it Yourself
+
+TRY
+
+```python
+import numpy as np, torch, torch.nn as nn
+torch.set_num_threads(1)
+GAP, MEMBERS, WIDTH = 1.5, 5, 50                          # change these: wider gap, fewer members, wider nets
+rng = np.random.default_rng(1)
+x = rng.uniform(GAP, 4.0, 160) * rng.choice([-1, 1], 160)
+y = x * np.sin(x) + 0.2 * rng.standard_normal(160)
+X, Y = torch.tensor(x, dtype=torch.float32)[:, None], torch.tensor(y, dtype=torch.float32)[:, None]
+grid = torch.linspace(-4, 4, 9)[:, None]
+preds = []
+for s in range(MEMBERS):
+    torch.manual_seed(s)
+    net = nn.Sequential(nn.Linear(1, WIDTH), nn.Tanh(), nn.Linear(WIDTH, 1))
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-2, weight_decay=1e-3)
+    for _ in range(1500):
+        opt.zero_grad(); ((net(X) - Y) ** 2).mean().backward(); opt.step()
+    with torch.no_grad(): preds.append(net(grid)[:, 0])
+P = torch.stack(preds)
+for g, m, s in zip(grid[:, 0], P.mean(0), P.std(0, unbiased=False)):
+    tag = "gap" if abs(g) < GAP else "data"
+    print(f"x {g:+.1f} ({tag:4}): truth {g * np.sin(g):+.2f} | ensemble mean {m:+.2f} | epistemic sd {s:.3f}")
+```
+
+```output
+```
+
+TRYb
+
+## Exercise
+
+EX
+
+<details>
+<summary>Solution</summary>
+
+```python
+def probit_lla(X):                                        # closed-form predictive for the last-layer Laplace
+    with torch.no_grad():
+        Phi = feats(cpoint, X); mu = Phi @ w_c
+        Sigma = L_c @ L_c.T; v = ((Phi @ Sigma) * Phi).sum(1)
+        return torch.sigmoid(mu / torch.sqrt(1 + np.pi * v / 8)).double().numpy(), v.numpy()
+pt, vt = probit_lla(Xc_te); po, vo = probit_lla(Xc_ood)
+lab = np.r_[np.zeros(1000), np.ones(1000)]
+print(f"probit LLA: NLL {-np.mean(yc_te * np.log(pt) + (1 - yc_te) * np.log(1 - pt)):.3f} | ECE {ece(pt, yc_te):.3f}"
+      f" | AUROC entropy {roc_auc_score(lab, np.r_[H2(pt), H2(po)]):.3f} | AUROC var {roc_auc_score(lab, np.r_[vt, vo]):.3f}")
+r = RES["LL-Laplace"]
+print(f"MC LLA:     NLL {r['c_nll']:.3f} | ECE {r['ece']:.3f} | AUROC entropy {r['auc_h']:.3f} | AUROC var {r['auc_v']:.3f}")
+for d in (3, 6, 12, 24, 48):
+    xq = T(np.array([[0.5 + d * 0.6, 0.25 + d * 0.8]]))
+    p, _ = probit_lla(xq)
+    with torch.no_grad(): p0 = torch.sigmoid(cpoint(xq))[0, 0].item()
+    print(f"distance {d:2d}: point confidence {max(p0, 1 - p0):.4f} | Laplace-probit confidence {max(p[0], 1 - p[0]):.4f}")
+```
+
+```output
+```
+
+EXb
+</details>
+
+## Under the Trench
+
+UT
