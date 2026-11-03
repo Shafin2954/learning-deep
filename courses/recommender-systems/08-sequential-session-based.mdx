@@ -7,7 +7,14 @@ order: 8
 
 ## Order is information
 
-PROSE
+Someone who just bought a camera is about to want a memory card, not a second camera. Matrix
+factorisation (ch. 4–5) treats each user as a bag of items and asks what they like *overall*;
+sequential recommendation asks what they want *next*, given the order of what they just did.
+
+The generator below makes order carry signal. Every item has three natural successors (an episode
+and the next one, a phone and its case). Each step follows the last item 30% of the time, the item
+*two* back 15% (a dependency no first-order model can see), stays on the session's current genre —
+its *intent* — 45%, and otherwise falls back to popularity.
 
 ```python
 import numpy as np
@@ -25,8 +32,7 @@ appeal = rng.lognormal(0, 1.2, n_items)
 
 succ = np.zeros((n_items, 3), dtype=int)        # each item has 3 natural "next" items
 for i in range(n_items):
-    same = np.flatnonzero(genre == genre[i])
-    same = same[same != i]
+    same = np.flatnonzero((genre == genre[i]) & (np.arange(n_items) != i))
     succ[i] = rng.choice(same, 3, replace=False, p=appeal[same] / appeal[same].sum())
     if rng.random() < 0.3:
         succ[i, 2] = rng.integers(0, n_items)   # some links cross genres
@@ -67,8 +73,7 @@ def entropy_bits(counts):
     return float(-(p * np.log2(p)).sum())
 
 h_next = entropy_bits(np.bincount(pairs[:, 1], minlength=n_items))
-joint = pd.Series(1, index=pd.MultiIndex.from_arrays([pairs[:, 0], pairs[:, 1]])).groupby(level=[0, 1]).sum()
-h_joint = entropy_bits(joint.values)
+h_joint = entropy_bits(np.bincount(pairs[:, 0] * n_items + pairs[:, 1]))
 h_prev = entropy_bits(np.bincount(pairs[:, 0], minlength=n_items))
 print(f"{len(seqs):,} sequences | {lengths.sum():,} events | length median {np.median(lengths):.0f}, max {lengths.max()}")
 print(f"H(next item)              = {h_next:.2f} bits")
@@ -84,11 +89,16 @@ H(next item | last item)  = 5.09 bits  (plug-in estimate, biased low)
 share of steps that go to one of the last item's 3 successors: 0.361
 ```
 
-PROSE
+Knowing the last item cuts the uncertainty about the next one from 7.98 to about 5.09 bits — from
+"one of 250 equally likely items" to "one of 34". The plug-in estimate is biased low (250,000 cells,
+71k pairs), so read the 2.9-bit gap as an upper bound. 36.1% of steps land on a successor of the
+last item: the injected 30% plus intent and popularity draws that happen to.
 
 ## Leave-last-out, and what it does not protect you from
 
-PROSE
+Sequential papers evaluate by **leave-last-out** (ch. 2): each user's last event is the test target,
+the second-to-last validates, everything earlier trains. The model ranks the full catalogue of 500
+items for each test case — no sampled negatives, for reasons the final table makes concrete.
 
 ```python
 train_seqs = [s[:-2] for s in seqs]                  # everything except the last two events
@@ -126,19 +136,33 @@ popularity: recall@10 0.1713 | ndcg@10 0.0858
 test target already in the user's history: 0.314
 ```
 
-PROSE
+Popularity puts the true next item in the top 10 for 17.1% of users: the floor. And 31.4% of targets
+are already in the user's history, so unlike ch. 2–7 we do **not** filter seen items —
+re-consumption (a grocery staple, a favourite song) is part of the sequential task.
+
+Leave-last-out has a blind spot this data cannot show: no global clock. In real logs user A's last
+event may be in March while user B's training runs into June, so trends and new items leak from the
+future (Ji et al., 2023, measure it on the standard datasets). A global time cut (ch. 2) is the
+production-faithful alternative; if you report leave-last-out because papers do, say so.
 
 ## Markov chains: the next item depends on the last one
 
-PROSE
+The simplest sequence model forgets all but the last item: count how often $j$ followed $i$ and
+recommend the most frequent followers. A lookup table — and on real data, embarrassingly hard to beat.
 
 ### The smoothed transition estimate
 
-PROSE
+This shows that "add-$\beta$" smoothing is the Bayesian posterior mean, not a hack. Let $C_{ij}$ be
+the number of times $j$ followed $i$ in training and $\pi_j$ the overall popularity share of $j$. Put a
+Dirichlet prior $\mathrm{Dir}(\beta\boldsymbol{\pi})$ on the row $P(\cdot \mid i)$; the counts are
+multinomial, so the posterior is $\mathrm{Dir}(\beta\boldsymbol{\pi} + C_{i\cdot})$ with mean
 
 $$
 \hat{P}(j \mid i) = \frac{C_{ij} + \beta\,\pi_j}{\sum_{j'} C_{ij'} + \beta}
 $$
+
+A rarely seen last item falls back to popularity; a frequent one trusts its counts; $\beta$ is the
+prior's pseudo-count. The gap-2 variant adds a table of pairs two steps apart.
 
 ```python
 def transition_counts(seqs_, gap=1):
@@ -180,22 +204,33 @@ for name, fn in (("Markov, shuffled training order", markov_shuffled),
             Markov + gap-2 rules: recall@10 0.6307 | ndcg@10 0.3964
 ```
 
-PROSE
+Shuffling each training sequence costs 0.121 recall (0.558 to 0.437); what survives is same-genre
+co-occurrence. The ordered chain is 3.3x popularity.
+The gap-2 table — a crude *sequential rule* (Ludewig and Jannach, 2018) — adds another 0.072 because
+it counts the generator's skip dependency directly. Remember 0.6307; it comes back at the end.
 
 ### FPMC: factorising the transition matrix
 
-PROSE
+A transition matrix has $n^2$ cells — $10^{12}$ for a million items — so it cannot be estimated at
+scale. FPMC (Rendle et al., 2010) factorises it and adds an MF term for long-term taste; for user $u$
+with previous basket $B_\ell$, item $j$ scores
 
 $$
 \hat{x}_{u,\ell,j} = \underbrace{\mathbf{v}^{UI}_u \cdot \mathbf{v}^{IU}_j}_{\text{MF: long-term taste}}
 + \underbrace{\frac{1}{|B_{\ell}|}\sum_{i \in B_{\ell}} \mathbf{v}^{IL}_j \cdot \mathbf{v}^{LI}_i}_{\text{factorised Markov chain}}
 $$
 
-PROSE
+A taste pair ($\mathbf{v}^{UI}, \mathbf{v}^{IU}$) and a transition pair ($\mathbf{v}^{IL}, \mathbf{v}^{LI}$)
+make the transition matrix low-rank, so items followed by similar things share strength; training is
+BPR (ch. 5). The neural models below replace "the last basket" with a learned summary of the whole
+prefix, but keep the dot product with item embeddings at the top.
 
 ## Session-kNN: find sessions that look like this one
 
-PROSE
+Instead of modelling transitions, find training sessions that look like the current one and vote
+with their items: user-kNN (ch. 3) with the session as the "user" and recency weights on its
+items. On public session datasets, tuned session-kNN matched or beat GRU4Rec in most comparisons
+(Ludewig and Jannach, 2018; Ludewig et al., 2021) — a famous case of the neural model not winning.
 
 ```python
 rows = np.concatenate([np.full(len(s), i) for i, s in enumerate(train_seqs)])
@@ -233,47 +268,27 @@ session-kNN, last 10 items (validation): recall@10 0.4490 | ndcg@10 0.2332
 session-kNN, m=2 (test): recall@10 0.5053 | ndcg@10 0.2554
 ```
 
-PROSE
+Validation picks the last $m = 2$ items; longer windows dilute as intent drifts. On test, session-kNN
+trails first-order Markov (recall 0.505 against 0.558, NDCG 0.255 against 0.355). That is this
+generator's bias: it is transition-heavy, and session-kNN scores what a neighbour *contained*, not
+what came *right after* the match. Real click logs are often more intent-driven, and sequence-aware
+variants (V-SKNN, STAN) weight neighbour items by position relative to the match.
 
 ## GRU4Rec: a running summary of the session
 
-PROSE
+GRU4Rec (Hidasi et al., 2016) reads the session one item at a time and keeps a running summary, the
+hidden state $\mathbf{h}_t = \mathrm{GRU}(\mathbf{h}_{t-1}, \mathbf{e}_{x_t})$ ($\mathbf{e}_{x_t}$ is the
+embedding of the item at step $t$), and predicts the next item at every step with a softmax,
+$P(x_{t+1} = j) \propto \exp(\mathbf{w}_j \cdot \mathbf{h}_t + b_j)$. The state can remember two steps back.
 
 ### Session-parallel mini-batches
 
-PROSE
-
-```python
-def session_parallel(sessions, width=3):
-    """Yield (inputs, targets, reset_mask) like GRU4Rec's original loader."""
-    queue = list(range(len(sessions)))
-    lanes = [queue.pop(0) for _ in range(width)]
-    pos = [0] * width
-    while True:
-        x, y, reset = [], [], []
-        for b in range(width):
-            s = sessions[lanes[b]]
-            x.append(s[pos[b]]); y.append(s[pos[b] + 1]); reset.append(pos[b] == 0)
-        yield x, y, reset
-        for b in range(width):
-            pos[b] += 1
-            if pos[b] + 1 >= len(sessions[lanes[b]]):
-                if not queue:
-                    return
-                lanes[b], pos[b] = queue.pop(0), 0
-
-toy = [[10, 11, 12, 13], [20, 21], [30, 31, 32], [40, 41, 42], [50, 51]]
-for step, (x, y, reset) in enumerate(session_parallel(toy)):
-    print(f"step {step}: input {x} -> target {y} | reset hidden state {reset}")
-```
-
-```output
-step 0: input [10, 20, 30] -> target [11, 21, 31] | reset hidden state [True, True, True]
-step 1: input [11, 40, 31] -> target [12, 41, 32] | reset hidden state [False, True, False]
-step 2: input [12, 41, 50] -> target [13, 42, 51] | reset hidden state [False, False, True]
-```
-
-PROSE
+Sessions differ wildly in length and padding wastes compute, so GRU4Rec's loader runs $B$ parallel
+*lanes*: each advances one session a step per batch; when a session ends, the next in the queue takes
+over the lane with its hidden state reset to zero. With `[10, 11, 12]`,
+`[20, 21]`, `[30, 31, 32]` in three lanes, step 0 feeds `[10, 20, 30]`; lane 2 is then exhausted, so
+step 1 feeds `[11, 40, 31]` with only lane 2 reset. Our sequences are short, so the code below simply
+left-pads to the last 30 items with a next-item loss at every real position — same objective.
 
 ```python
 MAXLEN, PAD = 30, n_items
@@ -318,9 +333,7 @@ def train_seq_model(model, loss_fn=full_softmax_loss, epochs=16, lr=3e-3, batch=
             y = tgt[b]
             keep = y != PAD                              # only real positions carry a loss
             loss = loss_fn(model, model(inp[b])[keep], y[keep])
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            opt.zero_grad(); loss.backward(); opt.step()
     return model
 
 def scorer(model):
@@ -330,11 +343,14 @@ def scorer(model):
         return model.logits(model(pad_left(prefixes))[:, -1]).numpy()
     return fn
 
+def report(name, model):
+    for split, cases in (("validation", valid), ("test", test)):
+        rk = ranks_of_target(scorer(model), cases)
+        print(f"{name} ({split}): recall@10 {metrics(rk)[0]:.4f} | ndcg@10 {metrics(rk)[1]:.4f}")
+    return rk
+
 gru = train_seq_model(GRU4Rec())
-for split, cases in (("validation", valid), ("test", test)):
-    r, n = metrics(ranks_of_target(scorer(gru), cases))
-    print(f"GRU4Rec, full softmax ({split}): recall@10 {r:.4f} | ndcg@10 {n:.4f}")
-results["GRU4Rec"] = ranks_of_target(scorer(gru), test)
+results["GRU4Rec"] = report("GRU4Rec, full softmax", gru)
 ```
 
 ```output
@@ -342,17 +358,24 @@ GRU4Rec, full softmax (validation): recall@10 0.5920 | ndcg@10 0.3636
 GRU4Rec, full softmax (test): recall@10 0.5867 | ndcg@10 0.3632
 ```
 
-PROSE
+GRU4Rec reaches 0.587 recall and 0.363 NDCG: above first-order Markov (0.558 / 0.355), but **below
+the gap-2 count table (0.631 / 0.396)**. The GRU can learn the skip dependency in principle; on 68k
+events it learned part of it. Validation and test agree, so this is not a lucky split.
 
 ## Which loss: full softmax, BPR, TOP1, sampled softmax
 
-PROSE
+Scoring all 500 items at every position is cheap; ten million is not, so the original GRU4Rec scored
+a *sample* $S$ of negatives with ranking losses. With $r_+$ the true next item's score and $r_j$ a
+sampled negative's:
 
 $$
 \mathcal{L}_{\text{CE}} = -\log\frac{e^{r_{+}}}{\sum_{j=1}^{N} e^{r_j}}, \qquad
 \mathcal{L}_{\text{BPR}} = -\frac{1}{N_S}\sum_{j \in S}\log\sigma(r_{+} - r_j), \qquad
 \mathcal{L}_{\text{TOP1}} = \frac{1}{N_S}\sum_{j \in S}\left[\sigma(r_j - r_{+}) + \sigma(r_j^2)\right]
 $$
+
+BPR pushes the positive above each negative; TOP1 adds $\sigma(r_j^2)$ to pull negative scores toward
+zero. Sampled softmax keeps cross-entropy over the positive plus $S$, with ch. 7's logQ correction.
 
 ```python
 log_q = torch.as_tensor(np.log(prior), dtype=torch.float32)
@@ -372,9 +395,8 @@ def sampled_losses(kind, n_neg=64):
         return F.cross_entropy(logits, torch.zeros(len(y), dtype=torch.long))
     return loss_fn
 
-print(f"{'loss':>34} {'recall@10':>10} {'ndcg@10':>9}")
-r, n = metrics(results["GRU4Rec"])
-print(f"{'full softmax over 500 items':>34} {r:>10.4f} {n:>9.4f}")
+print(f"{'loss':>34} {'recall@10':>10} {'ndcg@10':>9}\n{'full softmax over 500 items':>34} "
+      f"{metrics(results['GRU4Rec'])[0]:>10.4f} {metrics(results['GRU4Rec'])[1]:>9.4f}")
 for kind, label in (("bpr", "BPR, 64 sampled negatives"), ("top1", "TOP1, 64 sampled negatives"),
                     ("softmax", "sampled softmax + logQ, 64 neg")):
     m_ = train_seq_model(GRU4Rec(), loss_fn=sampled_losses(kind), epochs=12)
@@ -390,15 +412,24 @@ for kind, label in (("bpr", "BPR, 64 sampled negatives"), ("top1", "TOP1, 64 sam
     sampled softmax + logQ, 64 neg     0.5367    0.3183
 ```
 
-PROSE
+With 64 popularity-sampled negatives, BPR keeps only 54% of the full-softmax recall and TOP1 39%:
+once the positive beats the typical easy negative, the sigmoid saturates and the gradient vanishes.
+Sampled softmax with logQ recovers most of the gap (0.537 against 0.587). Hence later GRU4Rec
+versions (Hidasi and Karatzoglou, 2018) moved to cross-entropy and BPR-max with thousands of
+negatives — and Hidasi and Czapp (2023) found popular third-party GRU4Rec ports getting exactly
+these details wrong. When a sequential baseline looks weak, check its loss and negatives first.
 
 ## SASRec: attention over the whole history
 
-PROSE
+A GRU squeezes the whole prefix through one vector, step by step. SASRec (Kang and McAuley, 2018)
+lets position $t$ look back at *every* earlier item directly and learn which ones matter — the item
+two back is one attention weight away instead of surviving two recurrent updates.
 
 ### Causal self-attention
 
-PROSE
+This shows what "causal" means and why one pass trains every position. Position $t$'s input
+$\mathbf{e}_{x_t} + \mathbf{p}_t$ (item plus learned position embedding) maps linearly to a query
+$\mathbf{q}_t$, key $\mathbf{k}_t$ and value $\mathbf{v}_t$; the output averages values at $s \le t$ only:
 
 $$
 \mathrm{Attn}(H)_t = \sum_{s \le t} \alpha_{ts}\, \mathbf{v}_s, \qquad
@@ -428,8 +459,7 @@ class SASRec(nn.Module):
         super().__init__()
         self.emb = nn.Embedding(n_items + 1, d, padding_idx=PAD)
         self.pos = nn.Embedding(MAXLEN, d)                 # learned absolute positions
-        nn.init.normal_(self.emb.weight, std=0.05)
-        nn.init.normal_(self.pos.weight, std=0.05)
+        nn.init.normal_(self.emb.weight, std=0.05); nn.init.normal_(self.pos.weight, std=0.05)
         self.blocks = nn.ModuleList([CausalBlock(d, heads, drop) for _ in range(n_layers)])
         self.norm, self.drop = nn.LayerNorm(d), nn.Dropout(drop)
         self.register_buffer("causal", torch.tril(torch.ones(MAXLEN, MAXLEN, dtype=torch.bool)))
@@ -438,11 +468,10 @@ class SASRec(nn.Module):
     def forward(self, x):
         allowed = (self.causal[None] & (x != PAD)[:, None, :]) | self.diag[None]
         h = self.drop(self.emb(x) + self.pos.weight[None])
-        for blk in self.blocks:
-            h = blk(h, allowed)
+        for blk in self.blocks: h = blk(h, allowed)
         return self.norm(h)
 
-    def logits(self, h):                                   # output layer tied to input embeddings
+    def logits(self, h):                       # output layer tied to the input embeddings
         return h @ self.emb.weight[:n_items].T
 
 x_demo = pad_left([np.array([7, 3, 9])])
@@ -456,10 +485,7 @@ print(f"max logit change at the last 3 positions after editing the final item: "
       f"{[round(float(v), 6) for v in diff]}")
 
 sas = train_seq_model(SASRec())
-for split, cases in (("validation", valid), ("test", test)):
-    r, n = metrics(ranks_of_target(scorer(sas), cases))
-    print(f"SASRec ({split}): recall@10 {r:.4f} | ndcg@10 {n:.4f}")
-results["SASRec"] = ranks_of_target(scorer(sas), test)
+results["SASRec"] = report("SASRec", sas)
 ```
 
 ```output
@@ -468,45 +494,33 @@ SASRec (validation): recall@10 0.5857 | ndcg@10 0.3600
 SASRec (test): recall@10 0.5713 | ndcg@10 0.3500
 ```
 
-PROSE
+The first line is the causality test: editing the final item moves the logits only at the final
+position, so no position sees its own future and all 30 per-position losses are legitimate. (The
+diagonal is always allowed, so fully padded rows never divide by zero.) SASRec lands at 0.571 recall
+/ 0.350 NDCG — level with GRU4Rec and first-order Markov, below the gap-2 table. One layer and one
+head was the best of the few small configurations tried; the output layer is tied to the input
+embeddings, as in the paper.
 
 ## BERT4Rec: predict hidden items instead of the next one
 
-PROSE
+SASRec reads left to right. BERT4Rec (Sun et al., 2019) hides a random subset $\mathcal{M}$ of
+positions behind a `[MASK]` token and predicts them from *both* sides with a bidirectional
+transformer — the Cloze task:
 
 $$
 \mathcal{L}_{\text{Cloze}} = -\frac{1}{|\mathcal{M}|}\sum_{t \in \mathcal{M}} \log P\big(x_t \mid x_{\setminus \mathcal{M}}\big)
 $$
 
-```python
-def cloze_batch(seq, mask_prob=0.3, seed=0):
-    r_ = np.random.default_rng(seed)
-    x = np.array(seq)
-    masked = r_.random(len(x)) < mask_prob
-    inputs = np.where(masked, -1, x)                    # -1 stands for the [MASK] token
-    labels = np.where(masked, x, -100)                  # -100: no loss at this position
-    return inputs, labels
-
-seq = test[0][0][-10:]
-inputs, labels = cloze_batch(seq)
-print("sequence:", seq.tolist())
-print("inputs  :", inputs.tolist())
-print("labels  :", labels.tolist())
-print("at inference: append [MASK] after the last real item and read its prediction")
-```
-
-```output
-sequence: [327, 158, 185, 393, 42, 106, 387, 106, 188, 393]
-inputs  : [327, -1, -1, -1, 42, 106, 387, 106, 188, 393]
-labels  : [-100, 158, 185, 393, -100, -100, -100, -100, -100, -100]
-at inference: append [MASK] after the last real item and read its prediction
-```
-
-PROSE
+Each epoch draws fresh masks, and at inference a `[MASK]` is appended after the last item. The
+reported win over SASRec has not held up: Petrov and Macdonald (2022) found BERT4Rec hard to
+reproduce and slow to converge, and Klenitskiy and Vasilev (2023) showed SASRec with full
+cross-entropy instead of its original one-negative loss matches or beats it. Much of "BERT4Rec beats
+SASRec" was the loss, not the bidirectionality — the Exercise measures that gap here.
 
 ## The honest comparison
 
-PROSE
+Every model on the same 3,000 test cases, full-catalogue ranking, a bootstrap NDCG interval, and —
+last column — what most pre-2020 sequential papers reported: the target ranked among 100 random items.
 
 ```python
 def sampled_ranks(score_fn, cases, n_neg=100, seed=0):
@@ -520,8 +534,7 @@ def sampled_ranks(score_fn, cases, n_neg=100, seed=0):
             out.append(int((S[row, neg] > S[row, t]).sum()) + 1)
     return np.array(out)
 
-fns = {"popularity": popularity, "Markov (first order)": markov,
-       "Markov + gap-2 rules": markov_two_back,
+fns = {"popularity": popularity, "Markov (first order)": markov, "Markov + gap-2 rules": markov_two_back,
        "session-kNN": lambda P, o: session_knn(P, o, m=2),
        "GRU4Rec": scorer(gru), "SASRec": scorer(sas)}
 boot = np.random.default_rng(1).integers(0, len(test), (300, len(test)))
@@ -547,11 +560,22 @@ Markov + gap-2 rules     0.6307   0.3964 [0.383, 0.409]                  0.7913
               SASRec     0.5713   0.3500 [0.337, 0.363]                  0.8093
 ```
 
-PROSE
+Full ranking first. The gap-2 count table wins outright: NDCG 0.396, interval [0.383, 0.409] clear
+of every other model. GRU4Rec (0.363), first-order Markov (0.355) and SASRec (0.350) overlap — one
+tier. Session-kNN is a tier below, popularity far below. **The neural models did not automatically win**; a count table matched to the generator's
+structure did. On real data nobody hands you the structure — that is the honest case for neural
+models — but it must be won on a full-ranking leaderboard against tuned baselines, not assumed.
+
+Now the last column. Sampled HR@10 says session-kNN (0.784) beats first-order Markov (0.737) — **the
+reverse of full ranking** — and both neural models (0.809) beat the gap-2 table (0.791), reversed
+again. This is Krichene and Rendle (2020) in one table: random negatives are mostly easy, unpopular
+items, so the test rewards broad plausibility (session-kNN's neighbour votes) over pinning the exact
+next item. Sampled metrics are not a compressed version of the real ones; they reorder models.
 
 ## Try it Yourself
 
-PROSE
+One knob: `p_follow` is the chance the next item is one of the last item's two successors (otherwise
+popularity draws it). Watch where the Markov chain overtakes popularity.
 
 ```python
 import numpy as np
@@ -575,14 +599,10 @@ def experiment(p_follow, n_items=300, n_seq=2_000, seed=0):
     for s in train:
         np.add.at(T, (s[:-1], s[1:]), 1.0)
     prior = count / count.sum()
-    def rank(S, t):
-        return int((S > S[t]).sum()) + 1
-    hits = {"popularity": [], "Markov": []}
-    for s in seqs:
-        last, target = s[-2], s[-1]
-        hits["popularity"].append(rank(count, target) <= 10)
-        hits["Markov"].append(rank((T[last] + prior) / (T[last].sum() + 1), target) <= 10)
-    return {k: round(float(np.mean(v)), 4) for k, v in hits.items()}
+    top10 = lambda S, t: (S > S[t]).sum() < 10           # target ranks in the top 10
+    pop_hit = np.mean([top10(count, s[-1]) for s in seqs])
+    mc_hit = np.mean([top10((T[s[-2]] + prior) / (T[s[-2]].sum() + 1), s[-1]) for s in seqs])
+    return {"popularity": round(float(pop_hit), 4), "Markov": round(float(mc_hit), 4)}
 
 for p in (0.0, 0.2, 0.5, 0.8):
     print(f"p_follow={p:.1f}: recall@10 {experiment(p)}")
@@ -595,11 +615,16 @@ p_follow=0.5: recall@10 {'popularity': 0.1665, 'Markov': 0.6195}
 p_follow=0.8: recall@10 {'popularity': 0.125, 'Markov': 0.8435}
 ```
 
-PROSE
+At `p_follow=0` there is no structure, and the chain loses to popularity (0.233 against 0.256):
+90,000 cells estimating noise. At 0.2 it is already 1.6x popularity; at 0.8 it is near the ceiling.
+Add a skip-one rule or shorten the sequences to watch the transition table starve for data — the
+same starvation that makes cold-start items (ch. 9) hard.
 
 ## Exercise
 
-PROSE
+The SASRec paper trained with binary cross-entropy: per position, the true next item against one
+uniform random negative. Train `SASRec()` that way and compare with the full-softmax model on
+full-ranking recall/NDCG and sampled HR@10. How much is the loss — and would sampling have told you?
 
 <details>
 <summary>Solution</summary>
@@ -608,9 +633,7 @@ PROSE
 def bce_one_negative(model, h, y):
     neg = torch.randint(0, n_items, y.shape)              # SASRec's original: 1 uniform negative
     E = model.emb.weight
-    pos = (h * E[y]).sum(-1)
-    negs = (h * E[neg]).sum(-1)
-    return -(F.logsigmoid(pos) + F.logsigmoid(-negs)).mean()
+    return -(F.logsigmoid((h * E[y]).sum(-1)) + F.logsigmoid(-(h * E[neg]).sum(-1))).mean()
 
 sas_bce = train_seq_model(SASRec(), loss_fn=bce_one_negative)
 rk_bce = ranks_of_target(scorer(sas_bce), test)
@@ -628,5 +651,10 @@ for label, model_, rk in (("full softmax (CE)", sas, results["SASRec"]),
        BCE, 1 negative     0.4960    0.2769              0.7943
 ```
 
-PROSE
+One-negative BCE costs 0.075 recall and 0.073 NDCG under full ranking — a 21% relative NDCG loss —
+but only 0.015 sampled HR@10. One uniform negative is almost always easy, so the model learns to
+beat random items: what the sampled metric checks, not what full ranking checks. That is Klenitskiy
+and Vasilev (2023) in miniature: the loss moves SASRec by more than the gap between architectures,
+and sampled evaluation hides it. Use the full softmax while the catalogue allows; past that, many
+popularity-sampled negatives with logQ (ch. 7).
 </details>
