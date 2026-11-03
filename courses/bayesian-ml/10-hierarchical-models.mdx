@@ -1,0 +1,577 @@
+---
+course: bayesian-ml
+chapter: 10-hierarchical-models
+title: "Hierarchical and Multilevel Models"
+order: 10
+---
+
+## Three ways to estimate many related means
+
+You run 30 stores. One opened two days ago and sold 40 units a day; another has 300 days of history
+at 50. Is the new store really a weak performer? You have three options. **No pooling** takes each
+store's own average at face value. **Complete pooling** ignores the store and uses the chain-wide
+average for everyone. **Partial pooling** lets each store keep its own estimate but pulls it toward
+the chain average, *more strongly the less data the store has*. A hierarchical model is the machine
+that decides how hard to pull.
+
+Concretely: group $j$ has a true mean $\theta_j$ (what the store would average over a very long
+time) and an observed mean $\bar y_j$ with standard error $\sigma_j$ (the within-store noise
+divided by $\sqrt{n_j}$). The groups' true means are themselves drawn from a population with mean
+$\mu$ and spread $\tau$:
+
+$$
+\bar y_j \mid \theta_j \sim \mathcal{N}(\theta_j, \sigma_j^2), \qquad \theta_j \sim \mathcal{N}(\mu, \tau^2).
+$$
+
+### Deriving the shrinkage formula
+
+This shows that the partially pooled estimate is a precision-weighted average of the group's data
+and the population mean. Multiply the two Gaussians in $\theta_j$ and complete the square:
+
+$$
+-\tfrac{1}{2}\Big[\tfrac{(\bar y_j - \theta_j)^2}{\sigma_j^2} + \tfrac{(\theta_j - \mu)^2}{\tau^2}\Big]
+= -\tfrac{1}{2}\Big(\tfrac{1}{\sigma_j^2} + \tfrac{1}{\tau^2}\Big)\big(\theta_j - \hat\theta_j\big)^2 + \text{const},
+$$
+
+$$
+\hat\theta_j = \frac{\bar y_j/\sigma_j^2 + \mu/\tau^2}{1/\sigma_j^2 + 1/\tau^2}
+= \underbrace{B_j}_{\text{shrinkage}}\,\mu + (1 - B_j)\,\bar y_j,
+\qquad B_j = \frac{\sigma_j^2}{\sigma_j^2 + \tau^2},
+\qquad V_j = \frac{1}{1/\sigma_j^2 + 1/\tau^2}.
+$$
+
+Each source of information is weighted by its precision (one over its variance). $B_j$ is the
+fraction of the way you move toward $\mu$. It goes to 1 when the group is noisy ($\sigma_j \gg \tau$)
+and to 0 when the group is precise. No pooling is $\tau \to \infty$; complete pooling is $\tau = 0$.
+Below, the hyperparameters $\mu, \tau$ are known (an oracle), so you see the formula alone.
+
+```python
+import logging, warnings
+import numpy as np
+import pymc as pm
+import arviz as az
+from scipy import stats, optimize
+logging.getLogger("pymc").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
+
+rng = np.random.default_rng(0)
+J = 30
+mu_true, tau_true, sd_within = 50.0, 5.0, 20.0
+n_j = rng.choice([2, 4, 10, 30, 100, 300], J)            # days of history per store
+theta = rng.normal(mu_true, tau_true, J)                  # true long-run daily sales
+sig_j = sd_within / np.sqrt(n_j)                          # standard error of each store's mean
+ybar = rng.normal(theta, sig_j)
+
+no_pool = ybar
+complete = np.full(J, np.average(ybar, weights=1 / sig_j ** 2))
+B = sig_j ** 2 / (sig_j ** 2 + tau_true ** 2)
+partial = B * mu_true + (1 - B) * ybar
+
+print(f"{'days':>5} {'truth':>7} {'raw mean':>9} {'B_j':>5} {'partial':>8}")
+for j in np.argsort(n_j)[::5]:
+    print(f"{n_j[j]:>5} {theta[j]:>7.1f} {ybar[j]:>9.1f} {B[j]:>5.2f} {partial[j]:>8.1f}")
+rmse = lambda est, tru=theta: np.sqrt(np.mean((est - tru) ** 2))
+print(f"\nRMSE  no pooling {rmse(no_pool):.2f} | complete pooling {rmse(complete):.2f} | "
+      f"partial pooling {rmse(partial):.2f}")
+```
+
+```output
+```
+
+TODO1
+
+## Stein's paradox: shrinkage wins even when it should not
+
+Here is the surprise that made shrinkage famous. Take $k$ unrelated quantities — the batting
+average of a player, the price of tea, the rainfall in Dhaka — each measured once with unit noise,
+$y_i \sim \mathcal{N}(\theta_i, 1)$. The obvious estimate is $\hat\theta_i = y_i$. Stein (1956)
+showed that for $k \ge 3$ this is *inadmissible*: another estimator has lower total squared error
+for **every** possible $\theta$, not just on average over a prior. James and Stein (1961) wrote
+it down. Shrinking toward the grand mean $\bar y$ (which costs one more degree of freedom):
+
+$$
+\hat\theta^{\mathrm{JS}}_i = \bar y + \Big(1 - \frac{k - 3}{S}\Big)_{+}(y_i - \bar y),
+\qquad S = \sum_{i=1}^{k} (y_i - \bar y)^2 ,
+$$
+
+where $(\cdot)_+$ clips at zero (the "positive-part" version, which is strictly better).
+
+### James–Stein is empirical Bayes
+
+This shows that the mysterious factor $(k-3)/S$ is just an estimate of the shrinkage $B$ from the
+previous section. If $\theta_i \sim \mathcal{N}(\mu, \tau^2)$, then marginally
+$y_i \sim \mathcal{N}(\mu, 1 + \tau^2)$, so $S/(1+\tau^2) \sim \chi^2_{k-1}$. Using
+$\mathbb{E}[1/\chi^2_{\nu}] = 1/(\nu - 2)$:
+
+$$
+\mathbb{E}\Big[\frac{k-3}{S}\Big] = \frac{k-3}{(1+\tau^2)(k-3)} = \frac{1}{1 + \tau^2} = B .
+$$
+
+So James–Stein plugs an unbiased estimate of $B$ into the oracle formula: the data from all the
+other groups tell you how much to trust each one. That is empirical Bayes, the same move as the
+Gamma-Poisson store exercise (ch. 2). The simulation runs four very different truths, including
+ones that are nothing like a normal population.
+
+```python
+def james_stein(y):
+    k, yb = len(y), y.mean()
+    S = np.sum((y - yb) ** 2)
+    return yb + max(0.0, 1 - (k - 3) / S) * (y - yb)
+
+k, R = 20, 5000
+truths = {"normal, tau=1": rng.normal(0, 1, k),
+          "normal, tau=4": rng.normal(0, 4, k),
+          "uniform [-3, 3]": np.linspace(-3, 3, k),
+          "19 zeros + one 10": np.r_[np.zeros(k - 1), 10.0]}
+print(f"{'fixed truth (k=20)':>20} {'no pool':>8} {'complete':>9} {'James-Stein':>12}")
+for name, th in truths.items():
+    err = np.zeros(3)
+    for _ in range(R):
+        y = th + rng.standard_normal(k)
+        err += [np.sum((y - th) ** 2), np.sum((y.mean() - th) ** 2), np.sum((james_stein(y) - th) ** 2)]
+    print(f"{name:>20} {err[0] / R:>8.2f} {err[1] / R:>9.2f} {err[2] / R:>12.2f}")
+```
+
+```output
+```
+
+TODO2
+
+### The same comparison with unequal sample sizes
+
+With unequal $\sigma_j$, James–Stein's single factor no longer applies, but its empirical-Bayes
+logic does. You estimate $(\mu, \tau)$ by maximising the marginal likelihood
+$\bar y_j \sim \mathcal{N}(\mu, \sigma_j^2 + \tau^2)$, then plug them into $B_j$. Repeat the store
+design of the first section on 500 fresh datasets:
+
+```python
+def eb_partial(yb, s):
+    def nll(p):
+        m, lt = p
+        return -stats.norm.logpdf(yb, m, np.sqrt(s ** 2 + np.exp(2 * lt))).sum()
+    m, lt = optimize.minimize(nll, [yb.mean(), np.log(yb.std() + 1e-3)], method="Nelder-Mead").x
+    Bj = s ** 2 / (s ** 2 + np.exp(2 * lt))
+    return Bj * m + (1 - Bj) * yb, np.exp(lt)
+
+res, tau_hats = [], []
+for rep in range(500):
+    r_ = np.random.default_rng(1000 + rep)
+    nj = r_.choice([2, 4, 10, 30, 100, 300], J)
+    sj = sd_within / np.sqrt(nj)
+    th = r_.normal(mu_true, tau_true, J)
+    yb = r_.normal(th, sj)
+    pp, th_hat = eb_partial(yb, sj)
+    tau_hats.append(th_hat)
+    res.append([rmse(yb, th), rmse(np.full(J, np.average(yb, weights=1 / sj ** 2)), th), rmse(pp, th)])
+res = np.array(res)
+print(f"mean RMSE over 500 datasets: no pool {res[:, 0].mean():.2f} | complete {res[:, 1].mean():.2f} "
+      f"| EB partial {res[:, 2].mean():.2f}")
+print(f"partial pooling beats no pooling in {np.mean(res[:, 2] < res[:, 0]):.1%} of datasets, "
+      f"complete pooling in {np.mean(res[:, 2] < res[:, 1]):.1%}")
+print(f"estimated tau: median {np.median(tau_hats):.2f} | share estimated as < 0.5: "
+      f"{np.mean(np.array(tau_hats) < 0.5):.1%}  (truth 5.0)")
+```
+
+```output
+```
+
+TODO3
+
+## Eight Schools: the exact posterior of the group-level spread
+
+Empirical Bayes picks one value of $\tau$ and pretends it is known. When there are only a handful
+of groups, $\tau$ is very uncertain, and that uncertainty should flow into every group's estimate.
+The standard test case is **Eight Schools** (Rubin, 1981): an SAT coaching programme was run in
+eight high schools, and each school reports an estimated effect $y_j$ (in SAT points) with a
+standard error $\sigma_j$. Some effects look large (28 points) but every one is noisy (standard
+errors of 9 to 18).
+
+With only two hyperparameters you do not need MCMC at all. Because everything is Gaussian, you can
+integrate the $\theta_j$ and $\mu$ out in closed form and put $\tau$ on a one-dimensional grid
+(BDA3 §5.4). That exact answer is what you will hold the samplers to.
+
+### The marginal posterior of tau
+
+This shows that $p(\tau \mid y)$ is a product of one-dimensional Gaussian terms. Integrate out
+$\theta_j$: $y_j \mid \mu, \tau \sim \mathcal{N}(\mu, v_j)$ with $v_j = \sigma_j^2 + \tau^2$. With
+prior $\mu \sim \mathcal{N}(m_0, s_0^2)$, treat the prior as a pseudo-school $j = 0$ with $y_0 = m_0$
+and $v_0 = s_0^2$. The $\mu$ integral is then a Gaussian integral over a precision-weighted mean:
+
+$$
+\hat\mu = \frac{\sum_{j=0}^{J} y_j / v_j}{\sum_{j=0}^{J} 1/v_j}, \qquad V_\mu = \Big(\sum_{j=0}^{J} 1/v_j\Big)^{-1},
+$$
+
+$$
+p(\tau \mid y) \propto p(\tau)\, V_\mu^{1/2} \prod_{j=0}^{J} v_j^{-1/2}
+\exp\!\Big(-\frac{(y_j - \hat\mu)^2}{2 v_j}\Big).
+$$
+
+Then $\mu \mid \tau, y \sim \mathcal{N}(\hat\mu, V_\mu)$ and $\theta_j \mid \mu, \tau, y$ is the
+shrinkage formula from the first section. Sampling $\tau$ from the grid, then $\mu$, then $\theta$,
+gives exact independent posterior draws.
+
+```python
+y8 = np.array([28., 8, -3, 7, -1, 1, 18, 12])
+s8 = np.array([15., 10, 16, 11, 9, 11, 10, 18])
+m0, s0 = 0.0, 5.0                                          # mu ~ N(0, 5), tau ~ HalfCauchy(5)
+
+def log_marg_tau(tau, y, s, m0=m0, s0=s0):
+    yy = np.r_[m0, y]
+    v = np.vstack([np.full_like(tau, s0 ** 2), (s ** 2)[:, None] + tau ** 2])   # (J+1, grid)
+    prec = 1 / v
+    V_mu = 1 / prec.sum(0)
+    mu_hat = (yy[:, None] * prec).sum(0) * V_mu
+    return 0.5 * np.log(V_mu) - 0.5 * np.log(v).sum(0) - 0.5 * ((yy[:, None] - mu_hat) ** 2 * prec).sum(0), mu_hat, V_mu
+
+def grid_posterior(log_prior, y=y8, s=s8, tau_grid=np.linspace(1e-4, 60, 60_000)):
+    lm, mu_hat, V_mu = log_marg_tau(tau_grid, y, s)
+    lp = lm + log_prior(tau_grid)
+    p = np.exp(lp - lp.max())
+    return tau_grid, p / p.sum(), mu_hat, V_mu
+
+def exact_draws(tg, p, mu_hat, V_mu, y, s, n=100_000, seed=0):
+    r_ = np.random.default_rng(seed)
+    i = r_.choice(len(tg), n, p=p)
+    tau_d = tg[i]
+    mu_d = r_.normal(mu_hat[i], np.sqrt(V_mu[i]))
+    prec = 1 / s ** 2 + 1 / tau_d[:, None] ** 2
+    th_d = r_.normal((y / s ** 2 + mu_d[:, None] / tau_d[:, None] ** 2) / prec, 1 / np.sqrt(prec))
+    return tau_d, mu_d, th_d
+
+tg, p_tau, mu_hat, V_mu = grid_posterior(lambda t: stats.halfcauchy.logpdf(t, scale=5))
+tau_x, mu_x, th_x = exact_draws(tg, p_tau, mu_hat, V_mu, y8, s8)
+cdf = np.cumsum(p_tau)
+print(f"exact p(tau | y): mean {np.sum(tg * p_tau):.2f} | median {tg[np.searchsorted(cdf, .5)]:.2f} | "
+      f"95% quantile {tg[np.searchsorted(cdf, .95)]:.2f} | P(tau < 1) {cdf[np.searchsorted(tg, 1)]:.3f}")
+print(f"exact mu: mean {mu_x.mean():.2f}, sd {mu_x.std():.2f}")
+print(f"{'school':>7} {'y_j':>5} {'sigma_j':>8} {'E[theta_j|y]':>13} {'sd':>5}")
+for j in range(8):
+    print(f"{'ABCDEFGH'[j]:>7} {y8[j]:>5.0f} {s8[j]:>8.0f} {th_x[:, j].mean():>13.2f} {th_x[:, j].std():>5.2f}")
+```
+
+```output
+```
+
+TODO4
+
+## Priors on the group-level scale
+
+The grid makes prior sensitivity cheap to check, which matters because with few groups the prior
+on $\tau$ does real work. Gelman (2006) catalogued the pitfalls. The once-standard
+$\tau^2 \sim \mathrm{InvGamma}(\epsilon, \epsilon)$ "vague" prior is not vague at all near zero:
+its density in $\tau$ behaves like $\tau^{-2\epsilon - 1} e^{-\epsilon/\tau^2}$, a spike whose
+location depends on the arbitrary $\epsilon$. Exactly where the data cannot rule out $\tau \approx 0$,
+the answer then depends on that arbitrary choice. A **uniform** prior on $\tau$ is fine with many groups
+but leaves a heavy right tail with three. The **half-Cauchy** (Gelman's recommendation) and the
+**half-normal** (Stan's current default advice) are flat near zero and decay in the tail.
+
+```python
+def ig_on_tau(eps):                                        # tau^2 ~ InvGamma(eps, eps), as a density on tau
+    return lambda t: stats.invgamma.logpdf(t ** 2, eps, scale=eps) + np.log(2 * t)
+
+priors = {"uniform(0, inf)": lambda t: np.zeros_like(t),
+          "half-Cauchy(5)": lambda t: stats.halfcauchy.logpdf(t, scale=5),
+          "half-normal(5)": lambda t: stats.halfnorm.logpdf(t, scale=5),
+          "half-normal(1)": lambda t: stats.halfnorm.logpdf(t, scale=1),
+          "IG(1, 1) on tau^2": ig_on_tau(1.0),
+          "IG(.01, .01) on tau^2": ig_on_tau(0.01),
+          "IG(.001,.001) on tau^2": ig_on_tau(0.001)}
+tg_wide = np.linspace(1e-4, 300, 150_000)
+print(f"{'prior on tau':>23} | {'8 schools: median':>17} {'95%':>6} {'E[theta_A]':>10} | "
+      f"{'3 schools: median':>17} {'95%':>6}")
+for name, lpr in priors.items():
+    row = []
+    for yy, ss in ((y8, s8), (y8[:3], s8[:3])):
+        t_, p_, mh, vm = grid_posterior(lpr, yy, ss, tg_wide)
+        c_ = np.cumsum(p_)
+        row += [t_[np.searchsorted(c_, .5)], t_[np.searchsorted(c_, .95)]]
+        if len(yy) == 8:
+            row.append(exact_draws(t_, p_, mh, vm, yy, ss, n=40_000)[2][:, 0].mean())
+    print(f"{name:>23} | {row[0]:>17.2f} {row[1]:>6.1f} {row[2]:>10.2f} | {row[3]:>17.2f} {row[4]:>6.1f}")
+```
+
+```output
+```
+
+TODO5
+
+## Centered parameterization: the funnel returns
+
+Now fit the same model with NUTS. The natural way to write it, the **centered** parameterization,
+says $\theta_j \sim \mathcal{N}(\mu, \tau)$ directly. Its posterior has the shape of Neal's funnel
+from ch. 6: when $\tau$ is small, all $\theta_j$ must crowd into a narrow neck around $\mu$, and when
+$\tau$ is large they spread out. A single step size cannot serve both the wide mouth and the
+narrow neck. The **non-centered** version samples standardised offsets
+$z_j \sim \mathcal{N}(0, 1)$ and *computes* $\theta_j = \mu + \tau z_j$. In $(\mu, \tau, z)$ space the
+prior is a round blob, and with weak data the posterior is close to it.
+
+```python
+def eight_schools(y, s, centered, seed=1, target_accept=0.9):
+    with pm.Model():
+        mu = pm.Normal("mu", m0, s0)
+        tau = pm.HalfCauchy("tau", 5)
+        if centered:
+            th = pm.Normal("theta", mu, tau, shape=len(y))
+        else:
+            z = pm.Normal("z", 0, 1, shape=len(y))
+            th = pm.Deterministic("theta", mu + tau * z)
+        pm.Normal("y", th, s, observed=y)
+        return pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=seed, progressbar=False,
+                         quiet=True, target_accept=target_accept)
+
+def report(name, idata, tau_ref=None):
+    tau = idata.posterior["tau"].values.ravel()
+    ess = az.ess(idata, var_names=["mu", "tau"])
+    print(f"{name:>14} divergences {int(idata.sample_stats['diverging'].values.sum()):>4} | "
+          f"ESS mu {float(ess['mu'].values):>5.0f} tau {float(ess['tau'].values):>5.0f} | "
+          f"E[tau] {tau.mean():5.2f} | P(tau<1) {np.mean(tau < 1):.3f} | E[log tau] {np.log(tau).mean():+.2f}")
+
+print(f"{'exact (grid)':>14} {'':>16} | {'':>21} | E[tau] {tau_x.mean():5.2f} | "
+      f"P(tau<1) {np.mean(tau_x < 1):.3f} | E[log tau] {np.log(tau_x).mean():+.2f}")
+idc = eight_schools(y8, s8, centered=True)
+report("centered", idc)
+idn = eight_schools(y8, s8, centered=False)
+report("non-centered", idn)
+```
+
+```output
+```
+
+TODO6
+
+## When the centered form is better
+
+Non-centering is not free. It helps when the data are *weak* relative to the population spread,
+so each $\theta_j$ is mostly determined by $\mu$ and $\tau$. When each group has lots of data, the
+likelihood pins every $\theta_j$ tightly, and in the non-centered form that turns into a tight
+constraint $\mu + \tau z_j \approx \bar y_j$: now $z_j$ and $(\mu, \tau)$ are strongly coupled, and
+the funnel appears in the other direction. Rule of thumb (Betancourt and Girolami, 2015): center the
+groups whose $\sigma_j$ is small compared to $\tau$, non-center the rest. Below, every school's
+standard error is divided by 10 (100 times more students per school).
+
+```python
+rng_s = np.random.default_rng(3)
+s_strong = s8 / 10
+y_strong = rng_s.normal(rng_s.normal(5, 8, 8), s_strong)
+report("centered", eight_schools(y_strong, s_strong, centered=True))
+report("non-centered", eight_schools(y_strong, s_strong, centered=False))
+```
+
+```output
+```
+
+TODO7
+
+## Varying intercepts and varying slopes
+
+Groups usually differ in more than their average. Think of 25 schools where you regress a test
+score on hours of study: schools differ in their baseline (intercept) *and* in how much an extra
+hour helps (slope), and the two are often correlated — schools with high baselines may gain less
+per hour, because their students are near the ceiling. A multilevel regression gives each school a
+pair $(a_j, b_j)$ drawn from a common bivariate normal, so the schools share information about both
+coefficients and about how they co-vary:
+
+$$
+\text{score}_{i} \sim \mathcal{N}\big(a_{j[i]} + b_{j[i]}\,x_i,\ \sigma\big),\qquad
+\begin{pmatrix} a_j \\ b_j \end{pmatrix} \sim \mathcal{N}\!\left(\begin{pmatrix} \mu_a \\ \mu_b \end{pmatrix},
+\ \mathrm{diag}(\tau)\,\Omega\,\mathrm{diag}(\tau)\right).
+$$
+
+Here $x_i$ is centered hours of study, $\tau = (\tau_a, \tau_b)$ are the two group-level standard
+deviations and $\Omega$ is their $2 \times 2$ correlation matrix. The prior on $\Omega$ is the
+**LKJ** distribution, $p(\Omega) \propto \det(\Omega)^{\eta - 1}$: $\eta = 1$ is uniform over
+correlation matrices and $\eta > 1$ gently favours weak correlations. Non-centered again:
+$(a_j, b_j) = \mu + L z_j$, where $L$ is the Cholesky factor of the covariance and $z_j$ standard
+normal.
+
+```python
+rng_v = np.random.default_rng(10)
+Jv = 25
+n_stu = rng_v.choice([3, 5, 8, 15, 30, 60], Jv)
+mu_ab, tau_ab, rho_true = np.array([60.0, 4.0]), np.array([8.0, 2.0]), -0.6
+Sig_true = np.diag(tau_ab) @ np.array([[1, rho_true], [rho_true, 1]]) @ np.diag(tau_ab)
+ab_true = rng_v.multivariate_normal(mu_ab, Sig_true, Jv)
+school = np.repeat(np.arange(Jv), n_stu)
+hours = rng_v.uniform(-3, 3, len(school))                 # centered hours of study
+score = ab_true[school, 0] + ab_true[school, 1] * hours + rng_v.normal(0, 6, len(school))
+
+with pm.Model() as varying:
+    mu = pm.Normal("mu", [60, 0], [20, 5])
+    chol, corr, sds = pm.LKJCholeskyCov("chol", n=2, eta=2, sd_dist=pm.HalfNormal.dist(10, shape=2),
+                                        compute_corr=True)
+    z = pm.Normal("z", 0, 1, shape=(Jv, 2))
+    ab = pm.Deterministic("ab", mu + z @ chol.T)
+    pm.Deterministic("tau_ab", sds)
+    pm.Deterministic("rho", corr[0, 1])
+    sigma = pm.HalfNormal("sigma", 10)
+    pm.Normal("score", ab[school, 0] + ab[school, 1] * hours, sigma, observed=score)
+    idv = pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=4, progressbar=False,
+                    quiet=True, target_accept=0.9, nuts_sampler="numpyro")   # JAX backend: same NUTS, faster here
+
+summ = az.summary(idv, var_names=["mu", "tau_ab", "rho", "sigma"])
+print(f"{len(score)} students in {Jv} schools | divergences {int(idv.sample_stats['diverging'].values.sum())}")
+truth = dict(zip(summ.index, [*mu_ab, *tau_ab, rho_true, 6.0]))
+for name, row in summ.iterrows():
+    print(f"{name:>10}: mean {row['mean']:>6.2f} | sd {row['sd']:>5.2f} | ESS {row['ess_bulk']:>5.0f} "
+          f"| r_hat {row['r_hat']:.2f} | truth {truth[name]:>5.1f}")
+
+ab_post = idv.posterior["ab"].values.reshape(-1, Jv, 2).mean(0)
+ab_raw = np.array([np.polyfit(hours[school == j], score[school == j], 1)[::-1] for j in range(Jv)])
+print(f"\nslope RMSE vs truth: per-school OLS {rmse(ab_raw[:, 1], ab_true[:, 1]):.2f} | "
+      f"hierarchical {rmse(ab_post[:, 1], ab_true[:, 1]):.2f}")
+print(f"intercept RMSE vs truth: per-school OLS {rmse(ab_raw[:, 0], ab_true[:, 0]):.2f} | "
+      f"hierarchical {rmse(ab_post[:, 0], ab_true[:, 0]):.2f}")
+```
+
+```output
+```
+
+TODO8
+
+## Predicting for an existing group versus a new one
+
+The two kinds of prediction answer different questions. For a school already in the data you use
+its own posterior $(a_j, b_j)$, which is as sharp as that school's data allow. For a school you have
+never seen, you only know it comes from the population, so for each posterior draw you sample a
+fresh $(a_\text{new}, b_\text{new}) \sim \mathcal{N}(\mu, \Sigma)$. That adds the between-school
+spread $\tau$ to the uncertainty. Below: the predicted score of a student who studies 2 hours more
+than average.
+
+```python
+post = idv.posterior
+mu_d = post["mu"].values.reshape(-1, 2)
+tau_d = post["tau_ab"].values.reshape(-1, 2)
+rho_d = post["rho"].values.ravel()
+sig_d = post["sigma"].values.ravel()
+ab_d = post["ab"].values.reshape(-1, Jv, 2)
+rp = np.random.default_rng(7)
+x_new = 2.0
+
+def pred_interval(a, b):
+    yy = a + b * x_new + rp.normal(0, sig_d)
+    lo, hi = np.quantile(yy, [0.05, 0.95])
+    return yy.mean(), lo, hi
+
+cov_d = np.stack([np.stack([tau_d[:, 0] ** 2, rho_d * tau_d[:, 0] * tau_d[:, 1]], -1),
+                  np.stack([rho_d * tau_d[:, 0] * tau_d[:, 1], tau_d[:, 1] ** 2], -1)], 1)
+ab_new = mu_d + np.einsum("nij,nj->ni", np.linalg.cholesky(cov_d), rp.standard_normal((len(mu_d), 2)))
+big, small = np.argmax(n_stu), np.argmin(n_stu)
+print(f"{'school':>22} {'students':>8} {'mean':>6} {'90% interval':>17} {'width':>6} {'true mean':>10}")
+for label, j in (("existing, largest", big), ("existing, smallest", small)):
+    m, lo, hi = pred_interval(ab_d[:, j, 0], ab_d[:, j, 1])
+    print(f"{label:>22} {n_stu[j]:>8} {m:>6.1f} [{lo:6.1f}, {hi:6.1f}] {hi - lo:>6.1f} "
+          f"{ab_true[j, 0] + ab_true[j, 1] * x_new:>10.1f}")
+m, lo, hi = pred_interval(ab_new[:, 0], ab_new[:, 1])
+print(f"{'new school':>22} {0:>8} {m:>6.1f} [{lo:6.1f}, {hi:6.1f}] {hi - lo:>6.1f} "
+      f"{mu_ab[0] + mu_ab[1] * x_new:>10.1f}")
+```
+
+```output
+```
+
+TODO9
+
+## Hierarchical logistic regression: conversion rates per group
+
+Nothing in the idea requires Gaussian data. For 40 marketing campaigns with very different traffic,
+each campaign's conversion rate gets a logit $\alpha + s\,z_g$ with $z_g \sim \mathcal{N}(0, 1)$:
+the campaigns share a typical log-odds $\alpha$ and a spread $s$. A campaign with 20 visitors and 0
+conversions no longer gets an estimated rate of exactly zero; it gets something near the typical
+campaign, with honest uncertainty.
+
+```python
+from scipy.special import expit
+rng_l = np.random.default_rng(5)
+G = 40
+visits = rng_l.choice([20, 50, 200, 1000, 5000], G)
+p_true = expit(rng_l.normal(-3.0, 0.5, G))
+conv = rng_l.binomial(visits, p_true)
+
+with pm.Model():
+    a = pm.Normal("a", -2, 1.5)
+    s_ = pm.HalfNormal("s", 1)
+    z = pm.Normal("z", 0, 1, shape=G)
+    p = pm.Deterministic("p", pm.math.invlogit(a + s_ * z))
+    pm.Binomial("k", visits, p, observed=conv)
+    idl = pm.sample(1000, tune=1000, chains=4, cores=1, random_seed=6, progressbar=False, quiet=True)
+
+p_hat = idl.posterior["p"].values.reshape(-1, G)
+raw = conv / visits
+pooled = np.full(G, conv.sum() / visits.sum())
+print(f"divergences {int(idl.sample_stats['diverging'].values.sum())} | "
+      f"a {idl.posterior['a'].values.mean():.2f} (truth -3.0) | s {idl.posterior['s'].values.mean():.2f} (truth 0.5)")
+print(f"{'visits':>7} {'conv':>5} {'raw':>7} {'partial':>8} {'90% interval':>17} {'truth':>7}")
+for g in np.argsort(visits)[[0, 1, 2, 20, 39]]:
+    lo, hi = np.quantile(p_hat[:, g], [0.05, 0.95])
+    print(f"{visits[g]:>7} {conv[g]:>5} {raw[g]:>7.4f} {p_hat[:, g].mean():>8.4f} [{lo:.4f}, {hi:.4f}] {p_true[g]:>7.4f}")
+for label, mask in (("all", visits > 0), ("visits <= 50", visits <= 50)):
+    print(f"RMSE {label:>13}: raw {rmse(raw[mask], p_true[mask]):.4f} | pooled {rmse(pooled[mask], p_true[mask]):.4f}"
+          f" | partial {rmse(p_hat.mean(0)[mask], p_true[mask]):.4f}")
+```
+
+```output
+```
+
+TODO10
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+k, tau, R = 10, 1.0, 4000           # try k = 4 or 50, tau = 0.2 or 5
+theta = rng.normal(0, tau, k)       # or replace with any fixed vector you like
+loss = {"no pooling": 0.0, "complete pooling": 0.0, "James-Stein": 0.0, "oracle Bayes": 0.0}
+B_oracle = 1 / (1 + tau ** 2)
+for _ in range(R):
+    y = theta + rng.standard_normal(k)
+    yb, S = y.mean(), np.sum((y - y.mean()) ** 2)
+    est = {"no pooling": y,
+           "complete pooling": np.full(k, yb),
+           "James-Stein": yb + max(0.0, 1 - (k - 3) / S) * (y - yb),
+           "oracle Bayes": B_oracle * 0 + (1 - B_oracle) * y}
+    for name, e in est.items():
+        loss[name] += np.sum((e - theta) ** 2) / R
+for name, v in loss.items():
+    print(f"{name:>17}: expected total squared error {v:6.2f}")
+```
+
+```output
+```
+
+TODO11
+
+## Exercise
+
+Empirical Bayes plugs in the $\tau$ that maximises the marginal likelihood $p(y \mid \tau)$. For
+Eight Schools with a flat prior on $\mu$, (1) find that $\hat\tau$ on a grid; (2) compute each
+school's 90% interval for $\theta_j$ under the plug-in posterior and under the full posterior
+(uniform prior on $\tau$, flat on $\mu$, integrated exactly as in this chapter); (3) explain the
+difference. Hint: a flat prior on $\mu$ is the limit $s_0 \to \infty$; $s_0 = 10^4$ is close enough.
+
+<details>
+<summary>Solution</summary>
+
+```python
+tg_e = np.linspace(1e-4, 60, 60_000)
+lm, mh, vm = log_marg_tau(tg_e, y8, s8, m0=0.0, s0=1e4)
+tau_eb = tg_e[np.argmax(lm)]
+print(f"marginal-likelihood maximiser tau_hat = {tau_eb:.4f}")
+
+p_full = np.exp(lm - lm.max()); p_full /= p_full.sum()            # uniform prior on tau
+_, _, th_full = exact_draws(tg_e, p_full, mh, vm, y8, s8, seed=3)
+i_eb = np.argmax(lm)
+one = np.zeros_like(tg_e); one[max(i_eb, 1)] = 1.0                 # point mass at tau_hat (tau > 0 for safety)
+_, _, th_eb = exact_draws(tg_e, one, mh, vm, y8, s8, seed=3)
+print(f"{'school':>7} {'EB 90% interval':>18} {'full-Bayes 90% interval':>25}")
+for j in range(8):
+    a_, b_ = np.quantile(th_eb[:, j], [.05, .95]); c_, d_ = np.quantile(th_full[:, j], [.05, .95])
+    print(f"{'ABCDEFGH'[j]:>7} [{a_:6.1f}, {b_:6.1f}]     [{c_:6.1f}, {d_:6.1f}]")
+```
+
+```output
+```
+
+TODO12
+</details>

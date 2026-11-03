@@ -7,20 +7,20 @@ order: 9
 
 ## Two different questions
 
-Model checking asks whether this model is *adequate*: can it generate data that look like yours,
-in the ways you care about? Model comparison asks which of several models will *predict new data*
-best. A model can pass every check you think of and still lose on prediction. A model can also win
-the comparison and still fail a check, because a comparison only ranks the candidates you gave it.
-The workflow (ch. 8) runs both. Checking tells you what to fix, and comparison tells you whether the
-fix was worth it.
+Think of a weather forecaster. *Checking* asks whether her forecasts look like real weather at all: does
+it ever rain as hard as it really does? *Comparison* asks which of two forecasters you should listen to
+tomorrow. The two questions are different. A model can pass every check you think of and still predict
+worse, and the winner of a comparison can still fail a check, because a comparison only ranks the
+candidates you supplied. The workflow (ch. 8) needs both: checking tells you what to fix, and comparison
+tells you whether the fix paid off.
 
-The running data are 80 days of failed-job counts from a batch cluster. The obvious model is
-Poisson with a Gamma prior. It is conjugate (ch. 2), so the posterior is
-$\mathrm{Gamma}(a_0 + \sum y_i,\; b_0 + n)$ and posterior draws cost nothing.
+The running data are 80 days of failed-job counts $y_i$ from a batch cluster. The obvious model is
+Poisson with rate $\lambda$ and a $\mathrm{Gamma}(a_0, b_0)$ prior (shape, rate). It is conjugate (ch.
+2), so the posterior is $\mathrm{Gamma}(a_0 + \sum y_i,\; b_0 + n)$ and posterior draws cost nothing.
 
 ```python
 import numpy as np
-from scipy import stats, optimize
+from scipy import stats
 from scipy.special import logsumexp, gammaln
 
 rng = np.random.default_rng(9)
@@ -38,22 +38,29 @@ n=80 | mean 3.73 | var 18.00 | zeros 0.200 | max 22
 posterior lambda: mean 3.728, 95% [3.321, 4.180]
 ```
 
+The variance is almost five times the mean, which a Poisson cannot produce (its variance *equals* its
+mean). The posterior for $\lambda$ does not show any of that. It is a tight interval around 3.7, and the
+fit looks perfectly healthy from the parameters alone.
+
 ## Posterior predictive checks done properly
 
-A posterior predictive check (ch. 1) simulates replicated data $y^{\text{rep}} \sim p(y^{\text{rep}}\mid y)$
-and compares a test statistic $T(y^{\text{rep}})$ with $T(y)$. The posterior predictive p-value is
+The idea: if the model were right, fake data simulated from it should look like the real data. So you
+simulate many fake datasets and look for a feature where the real data stand out. Formally, a posterior
+predictive check (ch. 1) simulates replicated data $y^{\text{rep}} \sim p(y^{\text{rep}}\mid y)$ and
+compares a test statistic $T(y^{\text{rep}})$ with $T(y)$. The posterior predictive p-value is
 
 $$
 p_B = P\big(T(y^{\text{rep}}) \ge T(y) \,\big|\, y\big) = \iint \mathbb{1}\big[T(y^{\text{rep}}) \ge T(y)\big]\,
 p(y^{\text{rep}}\mid\theta)\,p(\theta\mid y)\,dy^{\text{rep}}\,d\theta .
 $$
 
+In words: $p_B$ is the fraction of fake datasets whose statistic is at least as large as the real one.
 The choice of $T$ is everything. For the Poisson, $\sum y_i$ is sufficient for $\lambda$, so the
-posterior is built to reproduce the sample mean. Checking the mean is checking the fit against
-itself. Useful statistics are roughly **orthogonal to the fitted parameters**: features the model
-pins down *as a consequence* of its assumptions rather than by fitting them. For a Poisson, that means
-the dispersion ratio $s^2/\bar y$ (fixed at 1 by assumption), the fraction of zeros (fixed at
-$e^{-\lambda}$), and the maximum.
+posterior is built to reproduce the sample mean. Checking the mean is checking the fit against itself.
+Useful statistics are roughly **orthogonal to the fitted parameters**: features the model pins down *as a
+consequence* of its assumptions rather than by fitting them. For a Poisson, that means the dispersion
+ratio $s^2/\bar y$ (fixed at 1 by assumption), the fraction of zeros (fixed at $e^{-\lambda}$), and the
+maximum.
 
 ```python
 y_rep_p = rng.poisson(lam[:, None], (S, n_c))
@@ -79,15 +86,20 @@ Poisson:
   max        observed  22.00 | replicated 90% [  7.00,  11.00] | p_B 0.000
 ```
 
-FILL_PPC
+The mean passes with $p_B = 0.497$, which proves nothing, because the model was fitted to reproduce it.
+The three assumption-driven statistics all fail at $p_B = 0.000$. The observed dispersion ratio of 4.83
+is far outside the replicated range of 0.75 to 1.27. One day in five has zero failures, where the Poisson
+expects at most 6%, and a maximum of 22 sits above anything the model replicates (90% band 7 to 11). Each
+failure also points at the fix: the data need a variance larger than the mean.
 
 ### Posterior predictive p-values are conservative
 
-The data are used twice: once to fit $\theta$, once to judge it. Unlike a classical p-value, $p_B$
-is therefore not uniform when the model is true. It is pulled toward 0.5, and the pull is
+This subsection shows that $p_B$ cannot be read like a classical p-value, because it rarely gets extreme
+even when it should. The data are used twice: once to fit $\theta$, once to judge it. Unlike a classical
+p-value, $p_B$ is therefore not uniform when the model is true. It is pulled toward 0.5, and the pull is
 strongest for statistics close to what was fitted. The simulation below draws 400 datasets *from the
-Poisson model itself* and records $p_B$ for three statistics. A calibrated p-value would put 10% of
-its mass outside $[0.05, 0.95]$ and have sd $1/\sqrt{12} = 0.289$.
+Poisson model itself* and records $p_B$ for three statistics. A calibrated p-value would put 10% of its
+mass outside $[0.05, 0.95]$ and have sd $1/\sqrt{12} = 0.289$.
 
 ```python
 R, S_small = 400, 500
@@ -111,15 +123,22 @@ T = var/mean  sd(p_B) 0.277 (uniform 0.289) | P(p_B < 0.05 or > 0.95) 0.095 (uni
 T = max       sd(p_B) 0.263 (uniform 0.289) | P(p_B < 0.05 or > 0.95) 0.068 (uniform 0.100)
 ```
 
-FILL_CONSERV
+When the model is true, $p_B$ for the mean has sd 0.022 and never leaves $[0.05, 0.95]$, so it cannot
+reject anything. The dispersion ratio is nearly calibrated (sd 0.277, 9.5% extreme), because the Poisson
+fit does not tune it. The maximum is in between (6.8% extreme), slightly conservative and lumpy because
+it is discrete. The practical rule: a $p_B$ near 0 or 1 is strong evidence of misfit, while a $p_B$ near
+0.5 is weak evidence of fit unless $T$ is roughly ancillary. Treat PPCs as a search for *how* the model
+is wrong, not as a test with a size.
 
 ## Fixing the likelihood: negative binomial
 
-The negative binomial is a Gamma mixture of Poissons: $y \mid \mu, \phi \sim \mathrm{NB}(\mu, \phi)$
-with $\mathbb{E}y = \mu$ and $\mathrm{Var}\,y = \mu + \mu^2/\phi$. Small $\phi$ means strong
-overdispersion, and $\phi \to \infty$ recovers the Poisson. Two parameters fit comfortably on a grid
-(ch. 1), with priors $\log\mu \sim \mathcal{N}(\log 3, 1)$ and $\log\phi \sim \mathcal{N}(0, 1.5)$. You
-also keep the grid's log-likelihood matrix, because exact leave-one-out on a grid is just a reweighting.
+The fix is to let each day have its own hidden rate. If busy and quiet days have different $\lambda$,
+then counts pooled over days vary more than any single Poisson would allow. The negative binomial is a
+Gamma mixture of Poissons: $y \mid \mu, \phi \sim \mathrm{NB}(\mu, \phi)$ with $\mathbb{E}y = \mu$ and
+$\mathrm{Var}\,y = \mu + \mu^2/\phi$. Small $\phi$ means strong overdispersion, and $\phi \to \infty$
+recovers the Poisson. Two parameters fit comfortably on a grid (ch. 1), with priors
+$\log\mu \sim \mathcal{N}(\log 3, 1)$ and $\log\phi \sim \mathcal{N}(0, 1.5)$. You also keep the grid's
+log-likelihood matrix, because exact leave-one-out on a grid is just a reweighting.
 
 ```python
 def nb_logpmf(y, mu, phi):
@@ -151,19 +170,26 @@ NegBin:
   max        observed  22.00 | replicated 90% [ 13.00,  33.00] | p_B 0.377
 ```
 
-FILL_NB
+The dispersion $\phi$ has posterior mean 1.03, far from the Poisson limit $\phi \to \infty$, and it is
+confidently identified (95% interval 0.66 to 1.53). Every statistic now lands mid-distribution, with
+$p_B$ between 0.38 and 0.60. The mean's posterior interval also widened from $[3.32, 4.18]$ to
+$[2.93, 4.80]$. The Poisson was not only wrong about the tails. It was also overconfident about the
+quantity it fitted.
 
 ## LOO-PIT: a calibration check that does not double-dip
 
-The probability integral transform fixes the double use of data by predicting each point from the
-others. If $F_{-i}$ is the leave-one-out predictive CDF, $u_i = F_{-i}(y_i)$ is uniform when the
-model is calibrated. Counts need the randomised version, $u_i = F_{-i}(y_i - 1) + v_i\,p_{-i}(y_i)$
-with $v_i \sim \mathcal{U}(0,1)$. A U-shape means predictive intervals that are too narrow
-(underdispersion), and a hump means intervals that are too wide.
+Ask, for each day: before seeing it, where did the model expect today's count to fall? If the model is
+honest, the real counts should land at random percentiles of its forecasts: as often in the bottom 20% as
+in the top 20%. The probability integral transform (PIT) turns that into a check, and it fixes the double
+use of data by predicting each point from the others. If $F_{-i}$ is the leave-one-out predictive CDF,
+$u_i = F_{-i}(y_i)$ is uniform when the model is calibrated. Counts need the randomised version,
+$u_i = F_{-i}(y_i - 1) + v_i\,p_{-i}(y_i)$ with $v_i \sim \mathcal{U}(0,1)$ a random tie-breaker. A
+U-shape means predictive intervals that are too narrow (underdispersion), and a hump means intervals that
+are too wide.
 
 Both models allow exact LOO here. For the Poisson, $\lambda \mid y_{-i}$ is again Gamma, so
-$p(\tilde y \mid y_{-i})$ is negative binomial in closed form. On the NB grid, dividing the
-posterior weights by $p(y_i\mid\theta)$ and renormalising *is* the posterior given $y_{-i}$.
+$p(\tilde y \mid y_{-i})$ is negative binomial in closed form. On the NB grid, dividing the posterior
+weights by $p(y_i\mid\theta)$ and renormalising *is* the posterior given $y_{-i}$.
 
 ```python
 a_i, b_i = a0 + y_c.sum() - y_c, b0 + n_c - 1                           # Gamma posterior without y_i
@@ -185,44 +211,50 @@ Poisson  LOO-PIT counts per fifth [35 11  9  7 18] (expect 16 each) | outside [0
 NegBin   LOO-PIT counts per fifth [15 17 16 15 17] (expect 16 each) | outside [0.05, 0.95]: 0.113 (expect 0.10) | KS p 0.999
 ```
 
-FILL_PIT
+The Poisson's LOO-PIT is U-shaped. 35 of 80 days fall in the bottom fifth and 18 in the top, and 41% land
+outside the central 90% band, where 10% is expected. Its predictive intervals are far too narrow at both
+ends. The negative binomial is flat (15 to 17 per bin, 11.3% outside, KS $p$ 0.999). LOO-PIT checks the
+whole predictive distribution at once, and the leave-one-out step avoids the conservativeness of $p_B$.
 
 ## Predictive accuracy as the target
 
-To compare models you need a score, and the Bayesian default is the **expected log pointwise
-predictive density** for new data $\tilde y_i$ from the true process $p_t$:
+Grade a forecaster by the probability she gave to what actually happened. If she said 30% and it rained,
+she scores $\log 0.3$. Add those log scores up over many days and you have the yardstick used for the
+rest of the chapter. To compare models you need a score like this, and the Bayesian default is the
+**expected log pointwise predictive density** for new data $\tilde y_i$ from the true process $p_t$:
 
 $$
 \mathrm{elpd} = \sum_{i=1}^{n} \int p_t(\tilde y_i)\,\log p(\tilde y_i \mid y)\,d\tilde y_i,
 \qquad p(\tilde y_i \mid y) = \int p(\tilde y_i\mid\theta)\,p(\theta\mid y)\,d\theta .
 $$
 
-The log score is the only proper local scoring rule, and it rewards the whole predictive
-distribution, not just a point forecast. You do not know $p_t$. The naive plug-in reuses the
-observed data, giving the **log pointwise predictive density**, computed from $S$ draws as
+The log score is the only proper local scoring rule, and it rewards the whole predictive distribution,
+not just a point forecast. You do not know $p_t$. The naive plug-in reuses the observed data, giving the
+**log pointwise predictive density**, computed from $S$ draws as
 
 $$
 \mathrm{lppd} = \sum_{i=1}^{n} \log \frac{1}{S}\sum_{s=1}^{S} p(y_i\mid\theta^{(s)}) .
 $$
 
-The lppd is optimistic, because each $y_i$ helped choose the $\theta$ that is now scoring it.
-The bias grows with the effective number of parameters. Every criterion below is an
-estimate of this optimism.
+The lppd is optimistic, because each $y_i$ helped choose the $\theta$ that is now scoring it. The bias
+grows with the effective number of parameters. Every criterion below is an estimate of this optimism.
 
 ### The classical corrections, briefly
 
-AIC subtracts the parameter count $k$ from the maximised log-likelihood: $\widehat{\mathrm{elpd}}_{\mathrm{AIC}} = \log p(y\mid\hat\theta_{\mathrm{MLE}}) - k$.
-It conditions on a point estimate and assumes flat priors and a regular model. DIC replaces the MLE by
-the posterior mean and $k$ by $p_{\mathrm{DIC}} = 2\big(\log p(y\mid\bar\theta) - \mathbb{E}_{\text{post}}\log p(y\mid\theta)\big)$,
-which shrinks when the prior regularises. Both still plug in a point, and DIC can go negative or
-behave badly when the posterior mean is a poor summary (multimodality, constraints).
+This shows the two older penalties, each a "fit minus complexity" estimate. AIC uses
+$\log p(y\mid\hat\theta_{\mathrm{MLE}}) - k$, with $k$ the parameter count. DIC uses
+$\log p(y\mid\bar\theta) - p_{\mathrm{DIC}}$, with posterior mean $\bar\theta$ and
+$p_{\mathrm{DIC}} = 2\big(\log p(y\mid\bar\theta) - \mathbb{E}_{\text{post}}\log p(y\mid\theta)\big)$,
+which shrinks when the prior regularises. Both plug in a single point, which fails when that point is a
+poor summary (multimodality, constraints).
 
 ### WAIC derived from a cumulant expansion
 
-Write $L_i = \log p(y_i\mid\theta)$ as a random variable under the posterior, with mean $\mu_i$ and
-variance $\sigma_i^2$. The cumulant generating function gives
-$\log\mathbb{E}[e^{tL_i}] = t\mu_i + \tfrac{t^2}{2}\sigma_i^2 + O(t^3)$. At $t = 1$ this is the
-lppd term. At $t = -1$ it is the *leave-one-out* term, because by Bayes' rule
+This derivation shows that a point's optimism is, to second order, the posterior variance of its
+log-likelihood. Write $L_i = \log p(y_i\mid\theta)$ as a random variable under the posterior, with mean
+$\mu_i$ and variance $\sigma_i^2$. The cumulant generating function gives
+$\log\mathbb{E}[e^{tL_i}] = t\mu_i + \tfrac{t^2}{2}\sigma_i^2 + O(t^3)$. At $t = 1$ this is the lppd
+term. At $t = -1$ it is the *leave-one-out* term, because by Bayes' rule
 
 $$
 p(y_i\mid y_{-i}) = \frac{1}{\mathbb{E}_{\theta\mid y}\big[1/p(y_i\mid\theta)\big]}
@@ -237,16 +269,17 @@ $$
 \qquad p_{\mathrm{WAIC}} = \sum_{i=1}^{n} \mathrm{Var}_{\theta\mid y}\big[\log p(y_i\mid\theta)\big]\;}
 $$
 
-Watanabe proved the asymptotic equivalence with LOO for singular models too. It is fully Bayesian
-(it averages over the posterior and uses no point estimate) and pointwise. It fails when a single
+Watanabe proved the asymptotic equivalence with LOO for singular models too. It is fully Bayesian (it
+averages over the posterior and uses no point estimate) and pointwise. It fails when a single
 $\sigma_i^2$ is large, which is exactly when the expansion is invalid.
 
 ## All the criteria against the truth
 
-A conjugate Normal-inverse-Gamma regression gives closed forms for everything: posterior draws,
-the evidence, and the predictive distribution, which is Student-t. So you can refit $n$ times for
-exact LOO and compute the true elpd on a large test set from the known generator. The models use
-the first $k$ of 10 covariates, and only the first four have nonzero effects.
+The fair test of a penalty is to generate data where you know the true out-of-sample score, then see
+which estimate lands on it. A conjugate Normal-inverse-Gamma regression gives closed forms for
+everything: posterior draws, the evidence, and the predictive distribution, which is Student-t. So you
+can refit $n$ times for exact LOO and compute the true elpd on a large test set from the known generator.
+The models use the first $k$ of 10 covariates, and only the first four have nonzero effects.
 
 ```python
 def nig_fit(X, y, tau=1.0, a=2.0, b=2.0):
@@ -313,26 +346,36 @@ averages over 40 training sets (elpd scale, higher is better)
 LOO picks the true-elpd-best k in 0.35 of datasets
 ```
 
-FILL_TABLE
+Read across a row. The lppd is always too high, and the gap to the truth grows with $k$: 1.75 nats at
+$k=1$ and 9.88 at $k=10$, roughly one nat per parameter plus one for the noise variance. AIC, DIC, WAIC
+and exact LOO all remove most of that gap, and all of them pick $k=4$ on average, as does the truth. At
+$k=10$ AIC and DIC are close to the truth on average, while WAIC and LOO are slightly pessimistic, by 0.8
+and 1.8 nats. But look at the last column. On any *single* dataset the LOO estimate misses the true elpd
+by 3.5 to 6 nats, which is more than the gaps between models. So LOO picks the truly best $k$ in only 35%
+of datasets. Every estimate of elpd is noisy, and the noise has to go into the comparison (below). The
+later sections reuse the last training set, `X_r, y_r`.
 
 ## Importance-sampling LOO and Pareto smoothing
 
-Refitting $n$ times is cheap only for conjugate models. The identity in the WAIC derivation gives
-LOO from one fit: the posterior is the proposal and $p(\theta\mid y_{-i})$ the target, so the
-importance ratios are $r_i^{(s)} \propto 1/p(y_i\mid\theta^{(s)})$ (ch. 3) and
+Exact LOO means refitting $n$ times. The shortcut is to reuse the one posterior you have and reweight its
+draws so that point $i$ counts as if it had never been seen. Draws that fit $y_i$ badly get *more*
+weight, because without $y_i$ they would have been more plausible. Refitting $n$ times is cheap only for
+conjugate models. The identity in the WAIC derivation gives LOO from one fit: the posterior is the
+proposal and $p(\theta\mid y_{-i})$ the target, so the importance ratios are
+$r_i^{(s)} \propto 1/p(y_i\mid\theta^{(s)})$ (ch. 3) and
 
 $$
 p(y_i\mid y_{-i}) \approx \frac{\sum_s r_i^{(s)}\,p(y_i\mid\theta^{(s)})}{\sum_s r_i^{(s)}}
 = \frac{1}{\frac{1}{S}\sum_s 1/p(y_i\mid\theta^{(s)})} .
 $$
 
-That is a harmonic mean, and its variance can be infinite. When $y_i$ is influential the full
-posterior is much narrower than the leave-$i$-out one, so the proposal has lighter tails than the
-target, which is the failure mode you met in ch. 3. **PSIS** (Vehtari, Gelman and Gabry 2017; Vehtari et al. 2024)
-fits a generalised Pareto distribution to the largest $M = \min(S/5,\, 3\sqrt{S})$ ratios.
-It replaces them with the fitted distribution's expected order statistics, truncates at the raw maximum, and reports
-the shape $\hat k$. Below is the reference algorithm written out: the Zhang–Stephens profile
-estimator with a weak prior shrinking $\hat k$ toward 0.5.
+That is a harmonic mean, and its variance can be infinite. When $y_i$ is influential the full posterior
+is much narrower than the leave-$i$-out one, so the proposal has lighter tails than the target, which is
+the failure mode you met in ch. 3. **PSIS** (Vehtari, Gelman and Gabry 2017; Vehtari et al. 2024) fits a
+generalised Pareto distribution to the largest $M = \min(S/5,\, 3\sqrt{S})$ ratios. It replaces them with
+quantiles of the fit, truncates at the raw maximum, and reports the shape $\hat k$ (the same diagnostic
+as ch. 3). Here is the reference algorithm: the Zhang–Stephens profile estimator, with a weak prior that
+shrinks $\hat k$ toward 0.5. It is checked on ch. 3's Gaussian test, where $k = 1 - \sigma_q^2$.
 
 ```python
 def gpd_fit(x):
@@ -384,11 +427,17 @@ sigma_q 0.7: khat 0.30 (theory 0.51) | E[x^2] raw IS 0.901, PSIS 0.899 (truth 1)
 sigma_q 0.5: khat 0.69 (theory 0.75) | E[x^2] raw IS 0.843, PSIS 0.801 (truth 1)
 ```
 
+When the true $k$ is 0.36 or 0.51, the fit reads low (0.25, 0.30). That is the prior pulling toward 0.5
+together with a tail that 4000 draws barely sample. The 0.75 case is caught near the alarm line (0.69).
+Notice also that smoothing did not rescue the estimate there: $E[x^2]$ is 0.84 raw and 0.80 smoothed,
+against a truth of 1. Smoothing reduces variance. The number to act on is $\hat k$. Above 0.7 (more
+precisely $\min(1 - 1/\log_{10}S,\, 0.7)$), no reweighting of these draws can be trusted.
+
 ### One influential point
 
-Now append one corrupted record to the regression: a high-leverage row ($x_1 = 4.5$) whose
-response is 8 units below the line. Fit the $k = 4$ model and compare the three LOO estimates
-point by point.
+This example shows $\hat k$ singling out the one observation whose removal really changes the posterior.
+Append one corrupted record to the regression: a high-leverage row ($x_1 = 4.5$) whose response is 8
+units below the line. Fit the $k = 4$ model and compare the three LOO estimates point by point.
 
 ```python
 X_o = np.vstack([X_r[:, :4], [4.5, 0, 0, 0]])
@@ -417,12 +466,19 @@ sum: lppd -70.70 | raw IS -79.34 | PSIS -79.12 | exact -80.08 | p_loo = lppd - e
 observations with khat > 0.7: [40]
 ```
 
-FILL_OUTLIER
+Observation 40, the corrupted row, has $\hat k = 1.10$. That is far past 0.7, and every other point is
+below 0.4. Its in-sample lppd of $-4.61$ is badly optimistic, because the fit bent toward the bad point.
+Exact LOO says $-10.78$, and both importance-sampling estimates stop short at about $-10$. That is the
+signature of a proposal whose tails are too light: the draws that would explain the point without it are
+never sampled. The other rows agree to 0.01. The diagnosis is also visible in the total:
+$p_{\mathrm{loo}} = 8.42$ for a model with five parameters. When $p_{\mathrm{loo}}$ exceeds the parameter
+count, the model is misspecified or has influential points. The remedies, in order: refit exactly for the
+flagged points (ArviZ's `reloo`), moment matching, or a robust likelihood (Student-t, ch. 8).
 
 ### Checking against ArviZ
 
-ArviZ 1.x takes a `DataTree` with `posterior` and `log_likelihood` groups. Here are the same
-draws, reshaped to (chain, draw, obs).
+This check confirms the from-scratch code against the library. ArviZ 1.x reads a `DataTree` with
+`posterior` and `log_likelihood` groups, shaped (chain, draw, obs).
 
 ```python
 import arviz as az
@@ -442,22 +498,26 @@ ours : elpd_loo -79.12 (se 8.71) | p_loo 8.42 | max khat 1.10 at obs 40
 max |khat ours - ArviZ| over all points 0.018
 ```
 
-FILL_AZ
+The totals agree to 0.01 nats, $p_{\mathrm{loo}}$ to 0.01, and each point's $\hat k$ to within 0.02. The
+small differences come from ArviZ's relative-efficiency correction for MCMC draws, which matters little
+here because these draws are independent. ArviZ also issues the $\hat k > 0.7$ warning for observation
+40.
 
 ## Differences, standard errors, and ties
 
-The elpd of a single model has a standard error, but what matters for comparison is the *paired*
-difference. Both models score the same $y_i$, so you take pointwise differences
+Two students sit the same exam. Do not compare their total scores with each one's own uncertainty.
+Compare them question by question, because a hard question is hard for both. The elpd of a single model
+has a standard error, but what matters for comparison is the *paired* difference. Both models score the
+same $y_i$, so you take pointwise differences
 $d_i = \widehat{\mathrm{elpd}}_{A,i} - \widehat{\mathrm{elpd}}_{B,i}$ and
 
 $$
 \widehat{\Delta} = \sum_i d_i, \qquad \mathrm{SE}(\widehat\Delta) = \sqrt{n\,\mathrm{Var}(d_i)} .
 $$
 
-This SE is usually far smaller than either model's own SE, because the hard and easy points are
-shared. Rules of thumb: $|\Delta| < 4$ is a tie whatever the SE, and the SE itself is only
-trustworthy when $n$ is not tiny and the models are not badly misspecified. Treat a difference
-within about two SEs as noise.
+This SE is usually far smaller than either model's own SE, because the hard and easy points are shared.
+Rules of thumb: $|\Delta| < 4$ is a tie whatever the SE, and the SE itself is only trustworthy when $n$
+is not tiny and the models are not badly misspecified. Treat a difference within about two SEs as noise.
 
 ```python
 def compare(name, a, b):
@@ -470,7 +530,6 @@ loo_pois = stats.nbinom.logpmf(y_c, a_i, b_i / (b_i + 1))                    # e
 loo_nb = logsumexp(np.log(w_loo + 1e-300) + ll_grid_nb, 1)                   # exact, grid
 compare("counts: NegBin - Poisson", loo_nb, loo_pois)
 compare("regression: k=4 - k=3", exact_loo(X_r[:, :4], y_r), exact_loo(X_r[:, :3], y_r))
-compare("regression: k=4 - k=2", exact_loo(X_r[:, :4], y_r), exact_loo(X_r[:, :2], y_r))
 ```
 
 ```output
@@ -479,17 +538,26 @@ regression: k=4 - k=3            diff   -1.22 | SE  0.48 | diff/SE  -2.5 | SE(A)
 regression: k=4 - k=2            diff   -2.13 | SE  0.88 | diff/SE  -2.4 | SE(A) alone  4.48
 ```
 
-FILL_DIFF
+The negative binomial wins by 72.6 nats, 3.3 SEs. That is decisive, and it confirms what the PPC and
+LOO-PIT showed. Here the paired SE (21.7) is larger than the NB's own SE (9.2), because the Poisson's
+pointwise scores on the extreme days are catastrophic and very spread out. The regression row is the more
+common situation. The SE of the difference is 0.48, a tenth of either model's own SE, and $k=3$ leads by
+1.22 nats. That is 2.5 SEs, but $|\Delta| < 4$, so the rule of thumb calls it a tie, and correctly. The
+truth includes the fourth coefficient (0.15), but 40 observations cannot reliably see an effect that
+small. The table above showed the true elpd favouring $k=4$ over $k=2$ by under one nat on average.
 
 ## Bayes factors versus LOO: prior sensitivity
 
-The Bayes factor compares **prior** predictive performance: the evidence
+Suppose you give a model a ridiculously vague prior on one coefficient, $\pm 1000$. Before seeing data,
+it spreads its bets so thin that it predicted the actual data poorly. The Bayes factor punishes exactly
+that. After seeing even a few points, the vague prior no longer matters, and LOO does not care. The Bayes
+factor compares **prior** predictive performance: the evidence
 $p(y\mid M) = \int p(y\mid\theta)p(\theta\mid M)\,d\theta$ scores how well the model predicted the data
-before seeing any of it. LOO compares **posterior** predictive performance. The difference is
-practical. For one extra coefficient with prior sd $\tau$, the evidence carries an Occam factor
-of roughly $\sigma_{\text{post}}/\tau$, so every tenfold widening of a vague prior costs
-$\log 10 \approx 2.3$ nats. That is Lindley's paradox (ch. 3). The LOO predictive
-conditions on $n-1$ points, and the prior washes out.
+before seeing any of it. LOO compares **posterior** predictive performance. The difference is practical.
+For one extra coefficient with prior sd $\tau$, the evidence carries an Occam factor of roughly
+$\sigma_{\text{post}}/\tau$, so every tenfold widening of a vague prior costs $\log 10 \approx 2.3$ nats.
+That is Lindley's paradox (ch. 3). The LOO predictive conditions on $n-1$ points, and the prior washes
+out.
 
 ```python
 print(f"{'tau':>6} {'log BF(k=4 vs 3)':>17} {'LOO diff':>9}")
@@ -508,28 +576,35 @@ for tau in (0.5, 1, 10, 100, 1000):
   1000             -8.85     -1.27
 ```
 
-FILL_BF
+From $\tau = 10$ on, the log Bayes factor falls by $\log 10 = 2.30$ per decade: $-4.24$, $-6.54$,
+$-8.85$. With a vague enough prior you can make the evidence reject the $k = 4$ model as strongly as you
+like, without touching the data. The LOO difference moves from $-1.09$ to $-1.27$ and then freezes. Bayes
+factors are the right tool when the priors are genuine scientific statements about effect sizes. With
+default "weakly informative" priors they measure the prior as much as the model. LOO measures predictive
+performance and stays put.
 
 ## Stacking predictive distributions
 
-When you cannot pick a winner, you can average. **Bayesian model averaging** weights model $k$
-by its posterior probability $p(M_k\mid y) \propto p(y\mid M_k)\,p(M_k)$. That is the right
-answer only in the $\mathcal{M}$-closed case, where one candidate is true. Then BMA weights
-converge to 1 on that model. When no candidate is true ($\mathcal{M}$-open), BMA still converges to a
-single model, the one closest in KL divergence, even when a mixture would predict better.
-*Pseudo-BMA* swaps the evidence for LOO, $w_k \propto \exp(\widehat{\mathrm{elpd}}_{\mathrm{loo},k})$,
-and inherits the same winner-take-all behaviour.
+If three forecasters each watch a different part of the sky, the best forecast mixes them, even if one of
+them is individually best. Picking that one throws information away. When you cannot pick a winner, you
+can average. **Bayesian model averaging** weights model $k$ by its posterior probability
+$p(M_k\mid y) \propto p(y\mid M_k)\,p(M_k)$. That is the right answer only in the $\mathcal{M}$-closed
+case, where one candidate is true. Then BMA weights converge to 1 on that model. When no candidate is
+true ($\mathcal{M}$-open), BMA still converges to a single model, the one closest in KL divergence, even
+when a mixture would predict better. *Pseudo-BMA* swaps the evidence for LOO,
+$w_k \propto \exp(\widehat{\mathrm{elpd}}_{\mathrm{loo},k})$, and inherits the same winner-take-all
+behaviour.
 
-**Stacking** (Yao, Vehtari, Simpson and Gelman 2018) optimises the weights for prediction directly. It maximises the LOO
-log score of the mixture over the simplex:
+**Stacking** (Yao, Vehtari, Simpson and Gelman 2018) optimises the weights for prediction directly. It
+maximises the LOO log score of the mixture over the simplex:
 
 $$
 \hat w = \arg\max_{w \in \Delta_K} \sum_{i=1}^{n} \log \sum_{k=1}^{K} w_k\, p(y_i\mid y_{-i}, M_k).
 $$
 
-The objective is concave in $w$. It is the log-likelihood of a mixture with *fixed* components, so
-the EM update $w_k \leftarrow \frac1n\sum_i w_k p_{ik} / \sum_j w_j p_{ij}$ climbs to the global optimum.
-The test below uses three covariates of equal strength, and each candidate model sees only one of them.
+The objective is concave in $w$. It is the log-likelihood of a mixture with *fixed* components, so the EM
+update $w_k \leftarrow \frac1n\sum_i w_k p_{ik} / \sum_j w_j p_{ij}$ climbs to the global optimum. The
+test below uses three covariates of equal strength, and each candidate model sees only one of them.
 
 ```python
 n_s, rng_s = 300, np.random.default_rng(18)
@@ -561,7 +636,13 @@ stacking          weights [0.623 0.281 0.096] | test log score per obs -1.6957
 best single       weights [1. 0. 0.] | test log score per obs -1.7202
 ```
 
-FILL_STACK
+Model 1 wins the elpd comparison by 15 nats, so BMA and pseudo-BMA both give it weight 1.000 and score
+exactly like the best single model: $-1.7202$ per test point. Stacking keeps all three, with weights
+0.623, 0.281 and 0.096, and scores $-1.6957$. That is 0.025 nats per observation better, or about 7 nats
+over 300 points, and the gap grows with $n$ because BMA only concentrates harder. A mixture of three
+one-covariate predictives is wider than any one of them, which suits data that none of them explains
+alone. Stacking is not model selection. Its weights say which combination predicts best, not which model
+is true.
 
 ## Try it Yourself
 
@@ -602,19 +683,21 @@ obs 48: y=16 x=+1.80 | Var(log-lik)   0.94 | IS   -6.13 | exact   -6.12
 obs 47: y= 2 x=+1.96 | Var(log-lik)   0.69 | IS   -5.29 | exact   -5.30
 ```
 
-Push the outlier up and watch the pointwise variance of its log-likelihood explode, WAIC drift
-away from exact LOO, and raw IS start to wobble. Paste the `psis` function from above to see its
-$\hat k$ cross 0.7 at the same time. The next chapter's hierarchical models are where PSIS-LOO earns
-its keep, because "leave one group out" and "leave one observation out" answer different questions.
+The outlier at $y = 40$ has a log-likelihood variance of 5.67, six times the next point, and in-sample it
+contributes 5.67 of the model's total $p_{\mathrm{WAIC}}$ of 8.42. Here IS-LOO, WAIC and exact LOO still
+agree to within 0.2 nats. Try a smaller or larger outlier, or move it to a high-leverage $x$, and watch
+where WAIC and raw IS start to drift from the exact answer. Paste the `psis` function from above to see
+whether $\hat k$ crosses 0.7 first. The next chapter's hierarchical models are where PSIS-LOO earns its
+keep, because "leave one group out" and "leave one observation out" answer different questions.
 
 ## Exercise
 
 Take the overdispersed counts `y_c` and add a third candidate: a zero-inflated Poisson with
 $P(y=0) = \pi + (1-\pi)e^{-\lambda}$, priors $\pi \sim \mathrm{Beta}(1,1)$ and
-$\log\lambda \sim \mathcal{N}(\log 3, 1)$. Fit it on a grid, compute its exact LOO (grid reweighting)
-and its PSIS-LOO from 4000 grid draws with the `psis` function, and report max $\hat k$. Then compare it with
-the negative binomial (difference and SE), and compute stacking weights over all three models. Does
-the zero-inflated model fix the PPC on the fraction of zeros, and does it fix the maximum?
+$\log\lambda \sim \mathcal{N}(\log 3, 1)$. Fit it on a grid, compute its exact LOO (grid reweighting) and
+its PSIS-LOO from 4000 grid draws with the `psis` function, and report max $\hat k$. Then compare it with
+the negative binomial (difference and SE), and compute stacking weights over all three models. Does the
+zero-inflated model fix the PPC on the fraction of zeros, and does it fix the maximum?
 
 <details>
 <summary>Solution</summary>
@@ -652,5 +735,10 @@ ZIP:
   max        observed  22.00 | replicated 90% [  8.00,  13.00] | p_B 0.000
 ```
 
-FILL_SOL
+The zero-inflated model fixes the zeros ($p_B$ 0.566) and nothing else: dispersion ratio and maximum
+still fail at 0.000. It treats the excess zeros as a separate "quiet day" process, but the non-zero days
+are still Poisson, so it cannot produce a 22. PSIS-LOO matches exact LOO to 0.01 nats with max $\hat k$
+0.25. The negative binomial beats it by 46 nats (2.9 SE, and $|\Delta| \gg 4$), and stacking gives the NB
+all the weight. Checking told you *which* feature the ZIP misses. Comparison told you it was not worth
+keeping.
 </details>

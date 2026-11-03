@@ -108,7 +108,7 @@ def implicit_als(X, d=16, alpha=5.0, lam=50.0, n_iter=8, seed=0):
 
 def item_stats(hist, now, half_life=14.0):
     pop = np.bincount(hist["item"], minlength=n_items).astype(float)
-    w = 0.5 ** ((now - hist["ts"].values) / half_life)
+    w = 0.5 ** (np.abs(now - hist["ts"].values) / half_life)
     trend = np.bincount(hist["item"], weights=w, minlength=n_items)
     last = np.full(n_items, -1_000.0)
     np.maximum.at(last, hist["item"].values, hist["ts"].values.astype(float))
@@ -123,7 +123,17 @@ def build_sources(hist, now):
     S = C / norm[:, None] / norm[None, :]
     np.fill_diagonal(S, 0.0)
     U, V = implicit_als(X)
-    src = {"seen": X.toarray() > 0, "icf": np.asarray(X @ S), "als": U @ V.T, "V": V, "X": X}
+    w = 0.5 ** ((now - hist["ts"].values) / 30.0)          # recency weights, 30-day half-life
+    Xw = sparse.csr_matrix((w, (hist["user"], hist["item"])), shape=(n_users, n_items))
+    U_rec = np.zeros_like(U)                                # fold users in on recent history only
+    for u in range(n_users):
+        idx, wu = Xw.indices[Xw.indptr[u]:Xw.indptr[u + 1]], Xw.data[Xw.indptr[u]:Xw.indptr[u + 1]]
+        if len(idx):
+            Vi = V[idx]
+            U_rec[u] = np.linalg.solve(V.T @ V + 50.0 * np.eye(V.shape[1])
+                                       + 5.0 * (Vi * wu[:, None]).T @ Vi, Vi.T @ (1 + 5.0 * wu))
+    src = {"seen": X.toarray() > 0, "icf": np.asarray(X @ S), "als": U @ V.T, "V": V, "X": X,
+           "icf_recent": np.asarray(Xw @ S), "als_recent": U_rec @ V.T}
     src.update(item_stats(hist, now))
     return src
 
@@ -275,7 +285,7 @@ for n_probe in (1, 2, 4, 8, 16, 32):
 ## The ranker's training table, built across a time gap
 
 ```python
-FEATS = ["als", "icf", "als_rank", "icf_rank", "log_pop", "log_trend", "trend_ratio",
+FEATS = ["als", "icf", "als_recent", "icf_recent", "als_rank", "icf_rank", "log_pop", "log_trend", "trend_ratio",
          "log_item_age", "user_log_n", "genre_aff", "genre_aff_recent", "n_sources"]
 
 def rank_matrix(S, seen):
@@ -284,22 +294,24 @@ def rank_matrix(S, seen):
     np.put_along_axis(rk, order, np.arange(S.shape[1])[None, :].repeat(len(S), 0), axis=1)
     return rk
 
-def feature_table(src, hist, now, users, truth, n_per=50, items_from=None):
-    """One row per (user, candidate). items_from lets you (wrongly) swap in item statistics."""
-    it = items_from or src
+def feature_table(src, hist, now, users, truth, n_per=50, agg_hist=None):
+    """One row per (user, candidate). agg_hist lets you (wrongly) compute aggregates on another log."""
+    agg = hist if agg_hist is None else agg_hist
+    it = src if agg_hist is None else item_stats(agg, now)
     _, votes = generate(src, users, n_per)
     r_idx, i_idx = np.nonzero(votes)
     u_idx = users[r_idx]
     seen = src["seen"][users]
     G = np.zeros((n_users, 6))
-    np.add.at(G, (hist["user"].values, genre[hist["item"].values]), 1.0)
+    np.add.at(G, (agg["user"].values, genre[agg["item"].values]), 1.0)
     Gr = np.zeros((n_users, 6))
-    np.add.at(Gr, (hist["user"].values, genre[hist["item"].values]),
-              0.5 ** ((now - hist["ts"].values) / 14.0))
+    np.add.at(Gr, (agg["user"].values, genre[agg["item"].values]),
+              0.5 ** (np.abs(now - agg["ts"].values) / 14.0))
     n_u = G.sum(1)
     df = pd.DataFrame({
         "user": u_idx, "item": i_idx,
         "als": src["als"][u_idx, i_idx], "icf": src["icf"][u_idx, i_idx],
+        "als_recent": src["als_recent"][u_idx, i_idx], "icf_recent": src["icf_recent"][u_idx, i_idx],
         "als_rank": np.log1p(rank_matrix(src["als"][users], seen)[r_idx, i_idx]),
         "icf_rank": np.log1p(rank_matrix(src["icf"][users], seen)[r_idx, i_idx]),
         "log_pop": np.log1p(it["pop"][i_idx]), "log_trend": np.log1p(it["trend"][i_idx]),
@@ -422,7 +434,7 @@ def ltr_loss(s, y, m, kind):
             w = w / idcg[:, :, None]
     return (nn.functional.softplus(-diff) * w)[pair].sum() / pair.sum().clamp(min=1)
 
-def train_ltr(kind, Xl, Yl, Ml, epochs=12, batch=64, lr=3e-3, seed=0):
+def train_ltr(kind, Xl, Yl, Ml, epochs=8, batch=64, lr=3e-3, seed=0):
     torch.manual_seed(seed)
     model = nn.Sequential(nn.Linear(len(FEATS), 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU(),
                           nn.Linear(32, 1))
@@ -469,8 +481,8 @@ for n in (10, 25, 50, 100):
     d["s_lambdarank"] = score_df(ltr["lambdarank"], d)
     d["oracle"] = d["label"] + 1e-6 * d["als"]
     rows.append({"n per source": n, "mean |C|": round(d.groupby("user").size().mean(), 1),
-                 "cand. recall": round(d.groupby("user")["label"].sum().sum()
-                                       / sum(len(truth_C[u]) for u in users_te), 4),
+                 "cand. recall": round(float(np.mean([g.sum() / len(truth_C[u]) for u, g
+                                                    in d.groupby("user")["label"]])), 4),
                  "iALS only": round(ndcg_table(d, "als", truth_C), 4),
                  "+ GBDT": round(ndcg_table(d, "s_gb", truth_C), 4),
                  "+ LambdaRank MLP": round(ndcg_table(d, "s_lambdarank", truth_C), 4),
@@ -489,8 +501,8 @@ print(pd.DataFrame(rows).to_string(index=False))
 ## Leakage: the bug that makes a ranker look brilliant
 
 ```python
-leaky_items = item_stats(hist_AB, t1)          # item statistics computed through t2, served "as of" t1
-tr_leak = feature_table(src_A, hist_A, t1, users_tr, truth_B, items_from={**src_A, **leaky_items})
+# the bug: user and item aggregates come from a snapshot of the whole log (through t2)
+tr_leak = feature_table(src_A, hist_A, t1, users_tr, truth_B, agg_hist=hist_AB)
 val_users = set(users_tr[np.random.default_rng(0).random(len(users_tr)) < 0.2])
 results = []
 for name, table in (("clean", tr), ("leaky", tr_leak)):
