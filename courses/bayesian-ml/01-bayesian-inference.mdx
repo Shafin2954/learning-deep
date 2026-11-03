@@ -1,0 +1,726 @@
+---
+course: bayesian-ml
+chapter: 01-bayesian-inference
+title: "Bayesian Inference: Priors, Likelihoods, Posteriors"
+order: 1
+---
+
+## What the posterior is a distribution over
+
+A frequentist probability is a long-run frequency of a repeatable event. A Bayesian probability is a
+**degree of belief** about anything you are uncertain of, repeatable or not. That includes the
+parameter itself. The activation rate of your new onboarding flow is one fixed number, but you do not know it,
+so you describe what you know about it with a distribution, $p(\theta)$, and you condition that
+distribution on what you saw:
+
+$$
+p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{\int p(y \mid \theta')\,p(\theta')\,d\theta'}
+$$
+
+The posterior describes your uncertainty about $\theta$, not the randomness of $\theta$. The
+data are fixed once observed, so you condition on them. Nothing gets "repeated". You met the formula and
+Beta-Binomial conjugacy in (Probability & Statistics, ch. 16). This chapter is about what you *do*
+with a posterior once you have one. To keep conjugacy out of the way, you compute every posterior
+here by brute force on a grid.
+
+```python
+import numpy as np
+from scipy import stats
+
+n, k = 120, 23                                   # trial users, activated within 7 days
+grid = np.linspace(0, 1, 2001)                   # candidate values of theta
+prior = np.ones_like(grid)                       # flat prior
+like = stats.binom.pmf(k, n, grid)               # p(y | theta) evaluated at every candidate
+unnorm = like * prior
+post = unnorm / unnorm.sum()                     # normalise over the grid
+exact = stats.beta(1 + k, 1 + n - k)             # the conjugate answer, for checking only
+
+pm = np.sum(grid * post)
+print(f"posterior mean  grid {pm:.5f} | exact {exact.mean():.5f}")
+print(f"posterior sd    grid {np.sqrt(np.sum((grid - pm) ** 2 * post)):.5f} | exact {exact.std():.5f}")
+print(f"P(theta > 0.25) grid {post[grid > 0.25].sum():.5f} | exact {exact.sf(0.25):.5f}")
+print(f"evidence p(y)   {np.trapezoid(unnorm, grid):.6f}  (theory under a flat prior: 1/(n+1) = {1/(n+1):.6f})")
+```
+
+```output
+posterior mean  grid 0.19672 | exact 0.19672
+posterior sd    grid 0.03584 | exact 0.03584
+P(theta > 0.25) grid 0.07437 | exact 0.07524
+evidence p(y)   0.008264  (theory under a flat prior: 1/(n+1) = 0.008264)
+```
+
+Four lines of numpy do the same job as the conjugate formula. The tail probability is off in the
+third decimal only because the grid's cell at exactly 0.25 is excluded, which is grid resolution
+and not a bug. The denominator, the **evidence**
+$p(y)$, is a number you will need again for model comparison (ch. 9). Under a flat prior it equals
+$1/(n+1)$ whatever $k$ is, because before seeing data every count from 0 to $n$ is equally likely.
+
+## The likelihood principle
+
+The data enter the posterior only through the likelihood *as a function of* $\theta$. Constant
+factors cancel when you normalise. So two experiments that give proportional likelihoods give the same
+posterior, however they were designed. Here is the classic case. You see 9 successes and 3 failures.
+Design A fixed $n = 12$ in advance (binomial). Design B kept going until the 3rd failure
+(negative binomial):
+
+$$
+p_A(y \mid \theta) = \binom{12}{9}\theta^{9}(1-\theta)^{3}, \qquad
+p_B(y \mid \theta) = \binom{11}{9}\theta^{9}(1-\theta)^{3}
+$$
+
+```python
+g_in = grid[1:-1]                                # interior: scipy's nbinom is undefined at p = 0
+like_A = stats.binom.pmf(9, 12, g_in)
+like_B = stats.nbinom.pmf(9, 3, 1 - g_in)        # 9 successes before the 3rd failure
+post_A, post_B = like_A / like_A.sum(), like_B / like_B.sum()
+ratio = like_A / like_B
+print(f"likelihood ratio A/B over the grid: min {ratio.min():.4f} max {ratio.max():.4f}")
+print(f"max |posterior_A - posterior_B| = {np.abs(post_A - post_B).max():.1e}")
+print(f"one-sided p-value for theta = 0.5: design A {stats.binom.sf(8, 12, 0.5):.4f} | "
+      f"design B {stats.nbinom.sf(8, 3, 0.5):.4f}")
+```
+
+```output
+likelihood ratio A/B over the grid: min 4.0000 max 4.0000
+max |posterior_A - posterior_B| = 4.3e-18
+one-sided p-value for theta = 0.5: design A 0.0730 | design B 0.0327
+```
+
+The two posteriors are the same to machine precision. The p-values land on opposite sides of 0.05.
+A p-value depends on data you *could* have seen but did not, and that set changes with the stopping
+rule. A posterior depends only on what you saw. Two practical consequences follow. Bayesian analysis
+is not invalidated by optional stopping (peeking at an A/B test does not change the posterior). It
+*is* still sensitive to how the data were selected, because selection changes the likelihood itself.
+
+## Grid approximation in two dimensions
+
+Most real models have more than one parameter. Say you have twenty latency measurements (ms) of a
+new service, modelled as $y_i \sim \mathcal{N}(\mu, \sigma)$. You use weakly informative priors
+$\mu \sim \mathcal{N}(200, 50)$ and $\sigma \sim \mathrm{HalfNormal}(50)$. The grid is now a
+surface, and a single parameter's posterior is obtained by **marginalising**: you sum the other
+axis out.
+
+```python
+rng = np.random.default_rng(1)
+y_lat = np.round(205 + 14 * rng.standard_t(3, 20), 1)    # heavy-ish tails: the truth is not Normal
+mu_g = np.linspace(150, 260, 441)
+sg_g = np.linspace(1, 80, 400)
+MU, SG = np.meshgrid(mu_g, sg_g, indexing="ij")
+log_post = (stats.norm.logpdf(y_lat[:, None, None], MU, SG).sum(axis=0)
+            + stats.norm.logpdf(MU, 200, 50) + stats.halfnorm.logpdf(SG, scale=50))
+P2 = np.exp(log_post - log_post.max())            # subtract the max before exp: avoids underflow
+P2 /= P2.sum()
+p_mu, p_sg = P2.sum(axis=1), P2.sum(axis=0)       # marginals
+
+def grid_summary(g, p):
+    cdf = np.cumsum(p)
+    m = np.sum(g * p)
+    return m, np.sqrt(np.sum((g - m) ** 2 * p)), g[np.searchsorted(cdf, 0.025)], g[np.searchsorted(cdf, 0.975)]
+
+print(f"data: n={len(y_lat)}, mean {y_lat.mean():.1f}, sd {y_lat.std(ddof=1):.1f}, "
+      f"min {y_lat.min():.1f}, max {y_lat.max():.1f}")
+for name, g, p in (("mu", mu_g, p_mu), ("sigma", sg_g, p_sg)):
+    m, s, lo, hi = grid_summary(g, p)
+    print(f"{name:>6}: mean {m:7.2f} | sd {s:5.2f} | 95% interval [{lo:.2f}, {hi:.2f}]")
+corr = np.sum((MU - np.sum(MU * P2)) * (SG - np.sum(SG * P2)) * P2) / (
+    grid_summary(mu_g, p_mu)[1] * grid_summary(sg_g, p_sg)[1])
+print(f"posterior corr(mu, sigma) = {corr:+.3f}")
+print("\ngrid cells needed at 100 points per axis:")
+for d in (1, 2, 3, 5, 10):
+    print(f"  {d:>2} parameters -> {100 ** d:.0e} likelihood evaluations")
+```
+
+```output
+data: n=20, mean 191.1, sd 36.4, min 45.2, max 219.9
+    mu: mean  191.34 | sd  8.52 | 95% interval [174.50, 208.25]
+ sigma: mean   38.21 | sd  6.49 | 95% interval [27.93, 53.27]
+posterior corr(mu, sigma) = +0.011
+
+grid cells needed at 100 points per axis:
+   1 parameters -> 1e+02 likelihood evaluations
+   2 parameters -> 1e+04 likelihood evaluations
+   3 parameters -> 1e+06 likelihood evaluations
+   5 parameters -> 1e+10 likelihood evaluations
+  10 parameters -> 1e+20 likelihood evaluations
+```
+
+One measurement (45.2 ms, perhaps a cache hit) sits far below the rest and inflates the sample sd
+to 36.4. The posterior for sigma inherits that inflation and is right-skewed: its mean is 38.2, but
+the 95% interval runs from 27.9 to 53.3, asymmetric around it. The 95% interval for mu has
+half-width about 16.9. The known-sigma answer, $1.96 \times 36.4/\sqrt{20}$, gives 16.0. The extra
+width is the uncertainty about sigma propagating into mu. The posterior correlation is $+0.011$, as
+theory predicts for a Normal model, but the joint is still not a product of Gaussians. The last table explains why this course does not stop at grids. The cost is
+$G^{d}$, and at ten parameters it is already hopeless. Chapter 3 picks up exactly here.
+
+## Posterior summaries: point estimates and intervals
+
+A posterior is a whole distribution. Any single number summarising it is a *decision* (derived
+below). The three standard ones are the mean, the median and the mode (MAP). They agree on
+symmetric posteriors and separate on skewed ones. Take a rare event: 2 chargebacks in 60
+transactions, flat prior.
+
+For intervals there are two conventions. The **equal-tailed interval** (ETI) cuts
+$\alpha/2$ from each tail. The **highest posterior density interval** (HPDI) is the *shortest*
+interval with mass $1-\alpha$, so every point inside has higher density than every point outside.
+
+```python
+post_cb = stats.binom.pmf(2, 60, grid); post_cb /= post_cb.sum()
+cdf_cb = np.cumsum(post_cb)
+draws = rng.choice(grid, size=100_000, p=post_cb)       # sampling from the grid posterior
+
+def hpdi_samples(x, mass=0.95):
+    x = np.sort(x)
+    w = int(np.ceil(mass * len(x)))
+    widths = x[w - 1:] - x[:len(x) - w + 1]
+    i = np.argmin(widths)
+    return x[i], x[i + w - 1]
+
+def hpdi_grid(g, p, mass=0.95):
+    order = np.argsort(p)[::-1]                          # densest cells first
+    keep = order[:np.searchsorted(np.cumsum(p[order]), mass) + 1]
+    return g[keep].min(), g[keep].max()
+
+print(f"mean {np.sum(grid * post_cb):.4f} | median {grid[np.searchsorted(cdf_cb, 0.5)]:.4f} "
+      f"| MAP {grid[np.argmax(post_cb)]:.4f}  (MLE k/n = {2/60:.4f})")
+eti_g = (grid[np.searchsorted(cdf_cb, 0.025)], grid[np.searchsorted(cdf_cb, 0.975)])
+rows = [("ETI  from grid", eti_g), ("ETI  from samples", tuple(np.quantile(draws, [0.025, 0.975]))),
+        ("HPDI from grid", hpdi_grid(grid, post_cb)), ("HPDI from samples", hpdi_samples(draws))]
+for name, (lo, hi) in rows:
+    print(f"{name:18} [{lo:.4f}, {hi:.4f}]  width {hi - lo:.4f}")
+```
+
+```output
+mean 0.0484 | median 0.0435 | MAP 0.0335  (MLE k/n = 0.0333)
+ETI  from grid     [0.0105, 0.1135]  width 0.1030
+ETI  from samples  [0.0105, 0.1130]  width 0.1025
+HPDI from grid     [0.0055, 0.1015]  width 0.0960
+HPDI from samples  [0.0050, 0.1005]  width 0.0955
+```
+
+The MAP equals the MLE under a flat prior. The mean is pulled right by the tail. The HPDI is
+narrower than the ETI and shifted toward zero, where the density actually lives. Grid and samples
+agree to about three decimals. Use the HPDI to describe *where the mass is*. Use the ETI when you
+need invariance: the ETI of $\log\theta$ is the log of the ETI of $\theta$, but HPDIs do not
+transform this way. Sample-based HPDIs are also noisier in the tails, so you need plenty of draws.
+
+## Credible intervals are not confidence intervals
+
+A 95% **credible interval** says: given this data and this prior, $\theta$ is in here with
+probability 0.95. A 95% **confidence interval** says: the *procedure* covers the fixed true
+$\theta$ in 95% of repeated datasets. Neither guarantees the other. The simulation below checks both
+properties. First $\theta$ is fixed and the data are repeated (the frequentist question). Then
+$\theta$ itself is drawn from the prior each time (the Bayesian question).
+
+```python
+R, n_cov = 40_000, 30
+def intervals(kk, nn, a0, b0):
+    phat = kk / nn
+    half = 1.96 * np.sqrt(phat * (1 - phat) / nn)
+    return {"Wald CI": (phat - half, phat + half),
+            "flat-prior CrI": (stats.beta.ppf(0.025, 1 + kk, 1 + nn - kk), stats.beta.ppf(0.975, 1 + kk, 1 + nn - kk)),
+            "Jeffreys CrI": (stats.beta.ppf(0.025, .5 + kk, .5 + nn - kk), stats.beta.ppf(0.975, .5 + kk, .5 + nn - kk)),
+            "Beta(2,8) CrI": (stats.beta.ppf(0.025, a0 + kk, b0 + nn - kk), stats.beta.ppf(0.975, a0 + kk, b0 + nn - kk))}
+
+print(f"{'theta':>14}" + "".join(f"{m:>16}" for m in intervals(np.array([1]), 30, 2, 8)))
+for th in (0.02, 0.1, 0.3, 0.5):
+    kk = rng.binomial(n_cov, th, R)
+    cov = {m: np.mean((lo <= th) & (th <= hi)) for m, (lo, hi) in intervals(kk, n_cov, 2, 8).items()}
+    print(f"{'fixed ' + str(th):>14}" + "".join(f"{v:>16.3f}" for v in cov.values()))
+th = rng.beta(2, 8, R)                                    # theta drawn from the Beta(2,8) prior
+kk = rng.binomial(n_cov, th)
+cov = {m: np.mean((lo <= th) & (th <= hi)) for m, (lo, hi) in intervals(kk, n_cov, 2, 8).items()}
+print(f"{'~ Beta(2,8)':>14}" + "".join(f"{v:>16.3f}" for v in cov.values()))
+```
+
+```output
+         theta         Wald CI  flat-prior CrI    Jeffreys CrI   Beta(2,8) CrI
+    fixed 0.02           0.454           0.881           0.979           0.881
+     fixed 0.1           0.809           0.974           0.932           0.974
+     fixed 0.3           0.952           0.929           0.952           0.963
+     fixed 0.5           0.957           0.957           0.957           0.898
+   ~ Beta(2,8)           0.886           0.952           0.948           0.950
+```
+
+Read the rows. At $\theta = 0.02$ the Wald interval covers 45% of the time instead of 95%. When
+$k=0$ it collapses to a single point, and at $\theta=0.1$ it still only reaches 0.809. The credible
+intervals are not exact either, because binomial discreteness makes coverage oscillate (0.881 to
+0.974 for the flat prior). The Jeffreys interval stays closest to 0.95 at three of the four values,
+which is why it is recommended as a frequentist binomial interval too. The informative Beta(2,8)
+interval drops to 0.898 at $\theta = 0.5$, where its prior is wrong. The last row is the Bayesian guarantee: **when $\theta$ really is drawn
+from the prior, the posterior interval under that prior has exactly its nominal coverage**, averaged
+over $\theta$. Credible intervals are calibrated *with respect to the prior*. Confidence intervals are
+calibrated for every fixed $\theta$, at least when they work.
+
+## Sampling from the posterior to answer questions
+
+Once you have draws, any question about any function of the parameters becomes an average over
+draws. You never need a new integral. Here is the business question for two onboarding variants:
+A converted 23 of 120 users and B converted 35 of 130. Is B better, by how much, and what does it
+cost you to ship B if you are wrong?
+
+```python
+S = 200_000
+theta_A = rng.beta(1 + 23, 1 + 120 - 23, S)
+theta_B = rng.beta(1 + 35, 1 + 130 - 35, S)
+lift = theta_B / theta_A - 1
+print(f"P(B > A)                       = {np.mean(theta_B > theta_A):.4f}")
+print(f"relative lift: median {np.median(lift):+.1%}, 90% ETI [{np.quantile(lift, .05):+.1%}, {np.quantile(lift, .95):+.1%}]")
+print(f"P(lift > 10%)                  = {np.mean(lift > 0.10):.4f}")
+print(f"expected loss if you ship B    = {np.mean(np.maximum(theta_A - theta_B, 0)):.5f} (absolute rate)")
+print(f"expected loss if you ship A    = {np.mean(np.maximum(theta_B - theta_A, 0)):.5f}")
+```
+
+```output
+P(B > A)                       = 0.9248
+relative lift: median +38.9%, 90% ETI [-4.6%, +106.1%]
+P(lift > 10%)                  = 0.8462
+expected loss if you ship B    = 0.00179 (absolute rate)
+expected loss if you ship A    = 0.07759
+```
+
+$P(B > A) = 0.92$ sounds decisive, but the 90% interval on the lift runs from $-4.6\%$ to
+$+106\%$. The lift distribution is wide and skewed (a ratio of two uncertain rates), and
+"P(B > A)" alone hides that. The expected-loss numbers are the honest decision quantities. Shipping
+B costs you 0.18 percentage points of conversion in expectation (the small chance it is worse,
+times how much worse). Shipping A costs 7.8 points, more than forty times as much.
+A common stopping rule is "stop when the expected loss of the leader falls below a threshold you
+can tolerate", and the likelihood principle (above) says peeking does not invalidate it.
+
+## Prior predictive and posterior predictive
+
+A model is a joint distribution $p(y, \theta) = p(y \mid \theta)\,p(\theta)$, so you can simulate
+data from it *before* seeing any data. That is the **prior predictive** $p(y) = \int p(y\mid\theta)p(\theta)d\theta$.
+It is the cleanest way to see what a prior actually says, because a prior on parameters is hard to
+judge directly and a prior on observable data is not.
+
+```python
+def prior_predictive(mu_draw, sg_draw):
+    sim = rng.normal(mu_draw, sg_draw)
+    return np.mean(sim < 0), np.mean(sim > 1000), np.quantile(sim, [0.05, 0.5, 0.95])
+
+M = 100_000
+for name, mu_d, sg_d in (
+        ("'vague': N(0,1000), U(0,1000)", rng.normal(0, 1000, M), rng.uniform(0, 1000, M)),
+        ("weakly informative (ours)", rng.normal(200, 50, M), np.abs(rng.normal(0, 50, M)))):
+    neg, huge, q = prior_predictive(mu_d, sg_d)
+    print(f"{name:30} P(latency<0) {neg:.3f} | P(>1s) {huge:.3f} | 5/50/95% {np.round(q).astype(int)}")
+```
+
+```output
+'vague': N(0,1000), U(0,1000)  P(latency<0) 0.498 | P(>1s) 0.189 | 5/50/95% [-1888     5  1891]
+weakly informative (ours)      P(latency<0) 0.006 | P(>1s) 0.000 | 5/50/95% [ 87 200 314]
+```
+
+The "vague" prior believes half of all latencies are negative and nearly a fifth take over a
+second. It is
+not neutral. It is confidently absurd. The weakly informative prior still allows a wide range but
+stays on the right planet.
+
+The **posterior predictive** $p(\tilde{y}\mid y) = \int p(\tilde{y}\mid\theta)\,p(\theta\mid y)\,d\theta$
+is simulated the same way, with posterior draws in place of prior draws. Its main job is the
+**posterior predictive check**. You pick a statistic $T$, simulate replicated datasets, and ask
+whether $T(y_{\text{obs}})$ looks typical among them. The fraction of replications at least as
+extreme as the observed value is the posterior predictive p-value. A value near 0 or 1 means the
+model cannot reproduce that feature of the data.
+
+```python
+idx = rng.choice(P2.size, size=4000, p=P2.ravel())          # joint draws from the 2-D grid
+mu_s, sg_s = MU.ravel()[idx], SG.ravel()[idx]
+y_rep = rng.normal(mu_s[:, None], sg_s[:, None], (4000, len(y_lat)))
+checks = {"mean": np.mean, "sd": lambda a, axis=None: np.std(a, axis=axis, ddof=1),
+          "max": np.max, "min": np.min,
+          "kurtosis": lambda a, axis=None: stats.kurtosis(a, axis=axis)}
+for name, T in checks.items():
+    t_obs, t_rep = T(y_lat), T(y_rep, axis=1)
+    print(f"T = {name:9} observed {t_obs:8.2f} | replicated 90% [{np.quantile(t_rep, .05):7.2f}, "
+          f"{np.quantile(t_rep, .95):7.2f}] | ppp = P(T_rep >= T_obs) = {np.mean(t_rep >= t_obs):.3f}")
+```
+
+```output
+T = mean      observed   191.08 | replicated 90% [ 171.21,  211.74] | ppp = P(T_rep >= T_obs) = 0.503
+T = sd        observed    36.35 | replicated 90% [  25.13,   53.71] | ppp = P(T_rep >= T_obs) = 0.520
+T = max       observed   219.90 | replicated 90% [ 227.49,  307.89] | ppp = P(T_rep >= T_obs) = 0.980
+T = min       observed    45.20 | replicated 90% [  75.41,  154.83] | ppp = P(T_rep >= T_obs) = 0.992
+T = kurtosis  observed    11.43 | replicated 90% [  -1.18,    1.21] | ppp = P(T_rep >= T_obs) = 0.000
+```
+
+The checks on mean and sd pass trivially (ppp near 0.5), because the model fitted those
+parameters directly. **Never check a model with statistics it was fitted to reproduce.** The tail
+statistics tell the story, and they fail in both directions. The single low outlier inflated sigma,
+so the fitted Normal expects a maximum of at least 227 ms in 95% of replications, while the
+observed maximum is 219.9 (ppp 0.980). It also cannot produce a minimum as low as 45.2 (ppp 0.992).
+Kurtosis is 11.4 against a replicated range of about $\pm 1.2$ (ppp 0.000). The Normal likelihood
+is wrong in the tails, which is correct, since the data came from a $t_3$. Chapter 9 builds this into a full workflow. Chapter 8 replaces the Normal with a Student-t in
+one line of PyMC.
+
+## Choosing priors
+
+The four families you will actually use:
+
+- **Flat**: $p(\theta) \propto 1$. Convenient, and often improper (it does not integrate to one). It is also not invariant (below).
+- **Weakly informative**: rules out absurd values but stays wide over plausible ones, like $\mu \sim \mathcal{N}(200, 50)$ above. This is the default in modern practice.
+- **Informative**: encodes real knowledge, such as last quarter's conversion rate or a physical constraint.
+- **Jeffreys**: $p(\theta) \propto \sqrt{I(\theta)}$, built to be invariant under reparameterisation.
+
+### Deriving the Jeffreys prior for a Bernoulli
+
+For one observation $y \in \{0,1\}$, $\log p(y\mid\theta) = y\log\theta + (1-y)\log(1-\theta)$. The
+Fisher information is minus the expected second derivative:
+
+$$
+I(\theta) = -\mathbb{E}\left[\frac{\partial^2}{\partial\theta^2}\log p(y\mid\theta)\right]
+= \mathbb{E}\left[\frac{y}{\theta^2} + \frac{1-y}{(1-\theta)^2}\right]
+= \frac{1}{\theta} + \frac{1}{1-\theta} = \frac{1}{\theta(1-\theta)}
+$$
+
+$$
+p_J(\theta) \propto \theta^{-1/2}(1-\theta)^{-1/2} = \mathrm{Beta}\left(\tfrac{1}{2}, \tfrac{1}{2}\right)
+$$
+
+Invariance comes from the chain rule. For $\phi = g(\theta)$ you have
+$I(\phi) = I(\theta)\,(d\theta/d\phi)^2$, so $\sqrt{I(\phi)} = \sqrt{I(\theta)}\,|d\theta/d\phi|$.
+That is exactly the change-of-variables formula for a density. Computing Jeffreys in $\phi$ and
+transforming Jeffreys from $\theta$ give the same answer.
+
+### Why "uninformative" is a myth
+
+A flat prior on $\theta$ is *not* flat on the log-odds $\phi = \log\frac{\theta}{1-\theta}$, and the
+reverse is also true. Which one is "ignorance"? The check below transforms both and verifies that
+Jeffreys has no such ambiguity.
+
+```python
+u = rng.uniform(0, 1, 1_000_000)
+phi_from_flat_theta = np.log(u / (1 - u))
+print(f"flat on theta   -> P(|log-odds| < 1) = {np.mean(np.abs(phi_from_flat_theta) < 1):.3f} "
+      f"(a flat prior on [-10, 10] would give {2/20:.3f})")
+theta_from_flat_phi = 1 / (1 + np.exp(-rng.uniform(-10, 10, 1_000_000)))
+print(f"flat on log-odds -> P(theta < 0.01 or theta > 0.99) = "
+      f"{np.mean((theta_from_flat_phi < .01) | (theta_from_flat_phi > .99)):.3f}  (flat on theta: 0.020)")
+
+th_g = grid[1:-1]
+phi_g = np.log(th_g / (1 - th_g))
+jeff_transformed = th_g ** -0.5 * (1 - th_g) ** -0.5 * th_g * (1 - th_g)   # p_J(theta) |dtheta/dphi|
+I_phi = th_g * (1 - th_g)                                                   # Fisher info computed in phi
+jeff_direct = np.sqrt(I_phi)
+print(f"Jeffreys: transformed vs computed-in-phi, max abs diff = {np.abs(jeff_transformed - jeff_direct).max():.1e}")
+
+print("\n0 conversions in 10 trials, posterior under four 'neutral' priors:")
+for name, logprior in (("flat on theta", np.zeros_like(th_g)),
+                       ("flat on log-odds [-10,10]", -np.log(th_g * (1 - th_g))),
+                       ("Jeffreys Beta(.5,.5)", -0.5 * np.log(th_g * (1 - th_g))),
+                       ("weakly inf. Beta(2,8)", stats.beta.logpdf(th_g, 2, 8))):
+    w = np.exp(stats.binom.logpmf(0, 10, th_g) + logprior); w /= w.sum()
+    c = np.cumsum(w)
+    print(f"  {name:26} mean {np.sum(th_g * w):.4f} | 95% upper bound {th_g[np.searchsorted(c, .95)]:.4f}")
+```
+
+```output
+flat on theta   -> P(|log-odds| < 1) = 0.461 (a flat prior on [-10, 10] would give 0.100)
+flat on log-odds -> P(theta < 0.01 or theta > 0.99) = 0.541  (flat on theta: 0.020)
+Jeffreys: transformed vs computed-in-phi, max abs diff = 1.7e-16
+
+0 conversions in 10 trials, posterior under four 'neutral' priors:
+  flat on theta              mean 0.0836 | 95% upper bound 0.2385
+  flat on log-odds [-10,10]  mean 0.0186 | 95% upper bound 0.0890
+  Jeffreys Beta(.5,.5)       mean 0.0483 | 95% upper bound 0.1750
+  weakly inf. Beta(2,8)      mean 0.1000 | 95% upper bound 0.2265
+```
+
+The "flat on log-odds" prior puts most of its mass in the outer slivers $\theta<0.01$ or
+$\theta>0.99$. With zero successes it drags the posterior mean toward zero, far below what the
+other priors give. Every prior is informative about *something*. With 10 observations the choice moves the 95% upper bound from 0.089 to 0.239, almost a factor
+of three. The defensible move is to pick a prior on
+purpose, check its prior predictive, and report a sensitivity analysis. Jeffreys answers the
+invariance problem, but it is a formal device: in multiple dimensions it misbehaves, and it ignores
+real knowledge you have.
+
+## Sequential updating equals batch updating
+
+Today's posterior is tomorrow's prior. If observations are conditionally independent given
+$\theta$, then $p(\theta\mid y_{1:n}) \propto p(y_n\mid\theta)\,p(\theta\mid y_{1:n-1})$. Unrolling
+this recovers the batch likelihood $\prod_i p(y_i\mid\theta)$, so order and chunking cannot matter.
+The check below uses a non-conjugate mixture prior, so no conjugate algebra does the work.
+
+```python
+prior_mix = 0.7 * stats.beta.pdf(th_g, 2, 18) + 0.3 * stats.beta.pdf(th_g, 5, 5)
+stream = (rng.random(120) < 0.19).astype(int)
+
+def update(p, obs):
+    p = p * np.where(obs == 1, th_g, 1 - th_g)
+    return p / p.sum()
+
+seq = prior_mix / prior_mix.sum()
+for obs in stream:
+    seq = update(seq, obs)
+shuffled = prior_mix / prior_mix.sum()
+for obs in rng.permutation(stream):
+    shuffled = update(shuffled, obs)
+batch = prior_mix * th_g ** stream.sum() * (1 - th_g) ** (len(stream) - stream.sum())
+batch /= batch.sum()
+print(f"{stream.sum()} / {len(stream)} successes; posterior mean {np.sum(th_g * batch):.5f}")
+print(f"max |sequential - batch|          = {np.abs(seq - batch).max():.1e}")
+print(f"max |shuffled sequential - batch| = {np.abs(shuffled - batch).max():.1e}")
+```
+
+```output
+19 / 120 successes; posterior mean 0.15125
+max |sequential - batch|          = 1.6e-17
+max |shuffled sequential - batch| = 1.2e-17
+```
+
+The differences are pure floating-point noise. That is why Bayesian methods handle streaming data
+naturally: the posterior *is* the sufficient memory of everything seen so far. Chapter 11 (online
+variational inference) and the bandit chapters elsewhere in the curriculum exploit this. When a
+posterior has no closed form you have to approximate it at each step, and the equality then holds
+only approximately.
+
+## Bayesian decision theory: why mean, median, MAP
+
+A point estimate is an action $a$ chosen to minimise **posterior expected loss**
+$\rho(a) = \int L(a, \theta)\,p(\theta\mid y)\,d\theta$. Each common summary is optimal for one
+specific loss.
+
+### Squared loss gives the posterior mean
+
+$$
+\frac{d}{da}\int (a-\theta)^2 p(\theta\mid y)\,d\theta = 2\left(a - \mathbb{E}[\theta\mid y]\right) = 0
+\;\Rightarrow\; \boxed{a^{*} = \mathbb{E}[\theta\mid y]}
+$$
+
+### Absolute loss gives the posterior median
+
+Split the integral at $a$:
+$\rho(a) = \int_{-\infty}^{a}(a-\theta)p\,d\theta + \int_{a}^{\infty}(\theta-a)p\,d\theta$.
+Differentiating (Leibniz rule; the boundary terms vanish) gives
+$\rho'(a) = F(a) - (1 - F(a))$. Setting it to zero gives $F(a^{*}) = 1/2$, which is the median. With
+asymmetric costs, $c_u$ per unit of under-estimation and $c_o$ per unit of over-estimation, the
+same steps give
+
+$$
+\rho'(a) = c_o F(a) - c_u\,(1-F(a)) = 0 \;\Rightarrow\; \boxed{a^{*} = F^{-1}\!\left(\frac{c_u}{c_u + c_o}\right)}
+$$
+
+### Zero-one loss gives the MAP
+
+With $L = \mathbb{1}[|a-\theta| > \varepsilon]$, $\rho(a) = 1 - P(|\theta - a| \le \varepsilon \mid y)
+\approx 1 - 2\varepsilon\,p(a\mid y)$. Minimising it means maximising the density, and as
+$\varepsilon \to 0$ the solution is the mode. The MAP is the least principled of the three: it is
+a limit of a strange loss, and unlike the median it is **not invariant under reparameterisation**
+(the Jacobian moves the mode).
+
+```python
+actions = grid
+F = np.cumsum(post_cb)
+losses = {
+    "squared":           ((actions[:, None] - grid[None, :]) ** 2) @ post_cb,
+    "absolute":          np.abs(actions[:, None] - grid[None, :]) @ post_cb,
+    "0-1 (eps=0.002)":   1 - (np.abs(actions[:, None] - grid[None, :]) <= 0.002 + 1e-9) @ post_cb,
+    "linear 4:1 under":  np.where(actions[:, None] < grid[None, :], 4.0, 1.0)
+                         * np.abs(actions[:, None] - grid[None, :]) @ post_cb,
+}
+theory = {"squared": np.sum(grid * post_cb), "absolute": grid[np.searchsorted(F, 0.5)],
+          "0-1 (eps=0.002)": grid[np.argmax(post_cb)], "linear 4:1 under": grid[np.searchsorted(F, 0.8)]}
+for name, rho in losses.items():
+    print(f"{name:17} argmin expected loss {actions[np.argmin(rho)]:.4f} | theory {theory[name]:.4f}")
+phi_post = post_cb[1:-1] * th_g * (1 - th_g)          # same posterior, expressed over log-odds
+print(f"MAP on theta scale {grid[np.argmax(post_cb)]:.4f} vs MAP on log-odds mapped back "
+      f"{th_g[np.argmax(phi_post)]:.4f}  (median: identical on both scales)")
+```
+
+```output
+squared           argmin expected loss 0.0485 | theory 0.0484
+absolute          argmin expected loss 0.0435 | theory 0.0435
+0-1 (eps=0.002)   argmin expected loss 0.0335 | theory 0.0335
+linear 4:1 under  argmin expected loss 0.0690 | theory 0.0690
+MAP on theta scale 0.0335 vs MAP on log-odds mapped back 0.0485  (median: identical on both scales)
+```
+
+Brute-force minimisation lands on the derived answers, up to grid resolution. On a grid, the
+0-1 window needs a tiny tolerance in the comparison: otherwise floating-point rounding changes how
+many cells each window contains, and that noise swamps the 3% density differences near the mode. The asymmetric row
+is the one you will use most in practice: if under-forecasting fraud cost is four times worse than
+over-forecasting, you report the 80th percentile, not the mean. The last line shows the MAP moving
+from 0.0335 to 0.0485 when nothing but the parameterisation changed.
+
+## MAP as regularised MLE
+
+Take the log of the posterior and you get a log-likelihood plus a log-prior. MAP estimation is
+therefore penalised maximum likelihood. For linear regression $y = Xw + \varepsilon$,
+$\varepsilon \sim \mathcal{N}(0, \sigma^2)$:
+
+$$
+-\log p(w\mid y) = \frac{1}{2\sigma^2}\lVert y - Xw\rVert^2 \;-\; \log p(w) + \text{const}
+$$
+
+### Gaussian prior gives ridge, Laplace prior gives lasso
+
+With $w_j \sim \mathcal{N}(0, \tau^2)$ the penalty is $\frac{1}{2\tau^2}\lVert w\rVert_2^2$.
+Multiplying by $2\sigma^2$ gives $\lVert y - Xw\rVert^2 + \frac{\sigma^2}{\tau^2}\lVert w\rVert_2^2$,
+which is ridge with $\lambda = \sigma^2/\tau^2$. With $w_j \sim \mathrm{Laplace}(0, b)$ the penalty
+is $\frac{1}{b}\lVert w\rVert_1$. In scikit-learn's scaling, $\frac{1}{2n}\lVert y-Xw\rVert^2 + \alpha\lVert w\rVert_1$,
+this is lasso with $\alpha = \sigma^2/(n b)$.
+
+```python
+from sklearn.linear_model import Ridge, Lasso
+n_r, p_r, sigma, tau, b = 50, 10, 1.0, 0.5, 0.2
+X = rng.normal(0, 1, (n_r, p_r))
+w_true = np.array([1.5, -1.0, 0.5] + [0.0] * 7)
+y_r = X @ w_true + rng.normal(0, sigma, n_r)
+
+w_map_gauss = np.linalg.solve(X.T @ X / sigma**2 + np.eye(p_r) / tau**2, X.T @ y_r / sigma**2)
+w_ridge = Ridge(alpha=sigma**2 / tau**2, fit_intercept=False).fit(X, y_r).coef_
+print(f"Gaussian-prior MAP vs Ridge(alpha={sigma**2/tau**2:g}): max diff {np.abs(w_map_gauss - w_ridge).max():.1e}")
+
+w_lasso = Lasso(alpha=sigma**2 / (n_r * b), fit_intercept=False, tol=1e-12, max_iter=100_000).fit(X, y_r).coef_
+grad = X.T @ (y_r - X @ w_lasso) / sigma**2                # gradient of the log-likelihood
+nz = w_lasso != 0                                          # KKT for the Laplace-prior MAP:
+kkt_nz = np.abs(grad[nz] - np.sign(w_lasso[nz]) / b).max() # grad = sign(w)/b where w != 0
+kkt_z = (np.abs(grad[~nz]) - 1 / b).max() if (~nz).any() else -np.inf   # |grad| <= 1/b where w == 0
+print(f"Lasso(alpha={sigma**2/(n_r*b):g}) as Laplace-prior MAP: {nz.sum()} nonzero of {p_r}, "
+      f"KKT residual {kkt_nz:.1e}, max zero-coef slack {kkt_z:+.2f} (must be <= 0)")
+print("coefficients (true | ridge MAP | lasso MAP):")
+for j in range(5):
+    print(f"  w{j}: {w_true[j]:+.2f} | {w_ridge[j]:+.3f} | {w_lasso[j]:+.3f}")
+```
+
+```output
+Gaussian-prior MAP vs Ridge(alpha=4): max diff 1.7e-16
+Lasso(alpha=0.1) as Laplace-prior MAP: 8 nonzero of 10, KKT residual 1.5e-11, max zero-coef slack -1.46 (must be <= 0)
+coefficients (true | ridge MAP | lasso MAP):
+  w0: +1.50 | +1.077 | +1.107
+  w1: -1.00 | -1.034 | -0.960
+  w2: +0.50 | +0.369 | +0.401
+  w3: +0.00 | -0.232 | -0.081
+  w4: +0.00 | +0.349 | +0.209
+```
+
+Both identities hold to numerical precision. The Bayesian reading explains the hyperparameter.
+$\lambda$ is a noise-to-prior variance ratio, which is why the right amount of regularisation grows
+with noise and shrinks as you become confident about effect sizes. Hierarchical models (ch. 10)
+then *learn* $\tau$ from data instead of grid-searching it.
+
+### The posterior under a Laplace prior is not sparse
+
+Lasso sparsity is a property of the **mode**, not of the Bayesian posterior. Here is one weak
+coefficient whose MAP is exactly zero:
+
+```python
+x1 = rng.normal(0, 1, 20)
+y1 = 0.05 * x1 + rng.normal(0, 1, 20)
+w_g = np.linspace(-1.5, 1.5, 30_001)
+lp = stats.norm.logpdf(y1[:, None], w_g[None, :] * x1[:, None], 1).sum(axis=0) + stats.laplace.logpdf(w_g, 0, 0.1)
+pw = np.exp(lp - lp.max()); pw /= pw.sum()
+print(f"MAP {w_g[np.argmax(pw)]:+.4f} | posterior mean {np.sum(w_g * pw):+.4f} | "
+      f"P(|w| < 0.01) {pw[np.abs(w_g) < 0.01].sum():.3f} | P(w > 0) {pw[w_g > 0].sum():.3f}")
+```
+
+```output
+MAP +0.0000 | posterior mean +0.0426 | P(|w| < 0.01) 0.099 | P(w > 0) 0.632
+```
+
+The mode sits on zero. The posterior mean is $+0.043$, only about 10% of the posterior mass lies
+within 0.01 of zero, and $P(w>0) = 0.63$. A Bayesian under this prior is not saying "zero". They
+are saying "small, probably positive, very uncertain". If you want a posterior that actually says "this coefficient is probably zero", you need a
+prior with a spike there (spike-and-slab, or the horseshoe from ch. 10). Shrinkage and selection
+are different things.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(7)
+grid = np.linspace(0, 1, 4001)
+
+prior = stats.beta.pdf(grid, 2, 10)             # try: np.ones_like(grid), Beta(0.5,0.5), Beta(20,80)
+data = {"A": (23, 120), "B": (35, 130)}         # (conversions, users)
+
+draws = {}
+for arm, (k, n) in data.items():
+    p = stats.binom.pmf(k, n, grid) * prior
+    p /= p.sum()
+    draws[arm] = rng.choice(grid, size=100_000, p=p)
+    c = np.cumsum(p)
+    print(f"{arm}: mean {np.sum(grid * p):.4f} | median {grid[np.searchsorted(c, .5)]:.4f} | "
+          f"MAP {grid[np.argmax(p)]:.4f} | 95% ETI [{grid[np.searchsorted(c, .025)]:.4f}, {grid[np.searchsorted(c, .975)]:.4f}]")
+
+dA, dB = draws["A"], draws["B"]
+print(f"P(B > A) {np.mean(dB > dA):.4f} | expected loss shipping B {np.mean(np.maximum(dA - dB, 0)):.5f}")
+future = rng.binomial(1000, dB)                  # posterior predictive: next 1000 users on B
+print(f"next 1000 users on B: 90% predictive interval [{np.quantile(future, .05):.0f}, {np.quantile(future, .95):.0f}] conversions")
+```
+
+```output
+A: mean 0.1894 | median 0.1878 | MAP 0.1845 | 95% ETI [0.1275, 0.2602]
+B: mean 0.2606 | median 0.2595 | MAP 0.2572 | 95% ETI [0.1920, 0.3355]
+P(B > A) 0.9224 | expected loss shipping B 0.00174
+next 1000 users on B: 90% predictive interval [199, 327] conversions
+```
+
+Swap in the priors listed in the comment and watch which numbers move. With 120 users per arm a
+Beta(2,10) prior barely matters, but Beta(20,80) is worth 100 pseudo-users and visibly pulls both
+arms together. Then cut the data to `(2, 12)` and `(4, 13)` and see the prior take over. Chapter 2
+replaces this grid with closed forms for every conjugate pair.
+
+## Exercise
+
+A team logs production incidents per week. The last 12 weeks: `[3, 1, 4, 2, 0, 5, 3, 2, 6, 1, 3, 4]`.
+Model them as $y_i \sim \mathrm{Poisson}(\lambda)$.
+
+1. Derive the Jeffreys prior for the Poisson rate. Then compute the posterior on a grid under that prior.
+2. Report the posterior mean, median, MAP, and the 90% ETI and HPDI.
+3. Compute the posterior predictive probability of 6 or more incidents next week. Compare it with the plug-in $\mathrm{Poisson}(\hat\lambda_{\text{MLE}})$ answer and explain the difference.
+4. You set the on-call capacity $c$ (incidents the rota can absorb). An incident beyond capacity costs 5 units. Each unused slot costs 1 unit. Choose $c$ by minimising posterior predictive expected loss, and check it against the quantile formula derived above.
+
+<details>
+<summary>Solution</summary>
+
+```python
+y_inc = np.array([3, 1, 4, 2, 0, 5, 3, 2, 6, 1, 3, 4])
+lam = np.linspace(1e-4, 12, 24_000)
+# Jeffreys: log p = y log(lam) - lam - log y!;  d2/dlam2 = -y/lam^2;  I = E[y]/lam^2 = 1/lam
+log_post = stats.poisson.logpmf(y_inc[:, None], lam[None, :]).sum(axis=0) - 0.5 * np.log(lam)
+pl = np.exp(log_post - log_post.max()); pl /= pl.sum()
+cl = np.cumsum(pl)
+print(f"(1) posterior is Gamma({y_inc.sum()}+1/2, rate {len(y_inc)}); grid mean {np.sum(lam*pl):.4f}, "
+      f"exact {(y_inc.sum()+.5)/len(y_inc):.4f}")
+print(f"(2) mean {np.sum(lam*pl):.3f} | median {lam[np.searchsorted(cl,.5)]:.3f} | MAP {lam[np.argmax(pl)]:.3f}")
+print(f"    90% ETI  [{lam[np.searchsorted(cl,.05)]:.3f}, {lam[np.searchsorted(cl,.95)]:.3f}]")
+lo, hi = hpdi_grid(lam, pl, 0.90)
+print(f"    90% HPDI [{lo:.3f}, {hi:.3f}]")
+
+lam_draws = rng.choice(lam, size=400_000, p=pl)
+y_next = rng.poisson(lam_draws)
+mle = y_inc.mean()
+print(f"(3) P(y_next >= 6): posterior predictive {np.mean(y_next >= 6):.4f} | plug-in Poisson({mle:.2f}) "
+      f"{stats.poisson.sf(5, mle):.4f}")
+
+caps = np.arange(0, 16)
+exp_loss = [np.mean(5 * np.maximum(y_next - c, 0) + 1 * np.maximum(c - y_next, 0)) for c in caps]
+best = caps[int(np.argmin(exp_loss))]
+q = np.quantile(y_next, 5 / 6)
+print(f"(4) expected loss by capacity: " + ", ".join(f"{c}:{l:.2f}" for c, l in zip(caps[2:9], exp_loss[2:9])))
+print(f"    best capacity {best} | predictive quantile at 5/(5+1) = {q:.0f}")
+```
+
+```output
+(1) posterior is Gamma(34+1/2, rate 12); grid mean 2.8750, exact 2.8750
+(2) mean 2.875 | median 2.847 | MAP 2.792
+    90% ETI  [2.120, 3.725]
+    90% HPDI [2.070, 3.664]
+(3) P(y_next >= 6): posterior predictive 0.0799 | plug-in Poisson(2.83) 0.0681
+(4) expected loss by capacity: 2:6.13, 3:3.90, 4:2.95, 5:2.92, 6:3.44, 7:4.24, 8:5.17
+    best capacity 5 | predictive quantile at 5/(5+1) = 5
+```
+
+The Fisher information for a Poisson is $I(\lambda) = \mathbb{E}[y]/\lambda^2 = 1/\lambda$, so the
+Jeffreys prior is $\lambda^{-1/2}$. It is improper, but the posterior $\mathrm{Gamma}(\sum y_i + \tfrac12, n)$
+is proper. The posterior predictive puts more mass on 6 or more incidents than the plug-in Poisson
+does, because it averages over uncertainty in $\lambda$. The result is a negative binomial, which is
+overdispersed relative to any single Poisson. The plug-in answer pretends you know $\lambda$
+exactly and so understates tail risk, which is the quantity on-call planning cares about. For the
+capacity decision, the loss is the asymmetric linear loss from the decision-theory section, with
+$c_u = 5$ and $c_o = 1$. The optimum is the $5/6$ quantile of the *predictive* distribution of next
+week's count, not of $\lambda$. Brute-force minimisation and the formula agree.
+</details>
