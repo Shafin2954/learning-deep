@@ -85,7 +85,7 @@ Layer 4 variance: 0.1281
 Layer 5 variance: 0.1006
 ```
 
-The variance stabilizes — no explosion or collapse. The slight drop from 1.0 is the tanh saturation effect at the tails.
+The variance neither explodes nor collapses to zero: it falls from about 1.0 to 0.10 over five layers, and the drop flattens out (0.39, 0.24, 0.16, 0.13, 0.10). Part of the shrinkage is tanh compressing large values; the first step is also a plain $n_{in}\,\text{Var}(w) = 128 \cdot \tfrac{1}{128} = 1$ followed by tanh squashing.
 
 ## He / Kaiming initialization
 
@@ -122,7 +122,7 @@ Xavier:  mean=0.0363  std=0.0533  alive=51.16%
 He    :  mean=0.6658  std=0.9276  alive=53.75%
 ```
 
-Xavier under ReLU causes progressive signal collapse — only 21% of neurons remain active after 8 layers. He initialization keeps half alive and the signal magnitude grows stably.
+Xavier under ReLU causes progressive signal collapse: after 8 layers the activation std is 0.05, versus 0.93 for He. The alive fraction is about 50% for both, because it only measures the sign of the pre-activation, not its size. The signal *magnitude* is what separates the schemes: He keeps it at order 1.
 
 ### LeCun initialization
 
@@ -165,6 +165,8 @@ He init outputs (diverse):    [[0.    0.834 1.973 1.356]]
 import torch
 import torch.nn as nn
 
+torch.manual_seed(0)
+torch.set_num_threads(1)
 layer = nn.Linear(256, 128)
 
 # Default (Kaiming uniform for Linear layers in PyTorch)
@@ -184,9 +186,9 @@ print(f"Bias all zero: {layer.bias.data.sum().item():.1f}")
 ```
 
 ```output
-Default std: 0.0363
-He normal std: 0.0882
-Xavier uniform std: 0.0721
+Default std: 0.0360
+He normal std: 0.0880
+Xavier uniform std: 0.0723
 Bias all zero: 0.0
 ```
 
@@ -232,7 +234,7 @@ Swap `relu` for `np.tanh` and rerun — notice how Xavier (std=`sqrt(2/(256+256)
 
 ## Exercise
 
-Simulate a 12-layer network with width 512 under three initialization schemes: (a) constant `std=0.01`, (b) Xavier normal, (c) He normal — all using ReLU. Track the fraction of alive neurons at each layer. Which scheme produces stable signal?
+Simulate a 12-layer network with width 512 under three initialization schemes: (a) constant `std=0.01`, (b) Xavier normal, (c) He normal — all using ReLU. Track the fraction of alive neurons and the activation standard deviation at each layer. Which scheme produces stable signal?
 
 <details>
 <summary>Solution</summary>
@@ -252,19 +254,20 @@ configs = {
 x0 = np.random.randn(128, 512)
 for name, std in configs.items():
     x = x0.copy()
-    alive_per_layer = []
+    alive_per_layer, std_per_layer = [], []
     for _ in range(12):
         W = np.random.randn(512, 512) * std
         x = relu(x @ W)
         alive_per_layer.append((x > 0).mean())
-    print(f"{name:12s}: layer-1={alive_per_layer[0]:.2%}  layer-12={alive_per_layer[-1]:.2%}")
+        std_per_layer.append(x.std())
+    print(f"{name:12s}: alive L1={alive_per_layer[0]:.2%} L12={alive_per_layer[-1]:.2%}  std L1={std_per_layer[0]:.2e} L12={std_per_layer[-1]:.2e}")
 ```
 
 ```output
-const-0.01  : layer-1=49.91%  layer-12=49.74%
-Xavier      : layer-1=49.99%  layer-12=48.28%
-He          : layer-1=49.98%  layer-12=51.10%
+const-0.01  : alive L1=49.91% L12=49.74%  std L1=1.31e-01 L12=2.14e-10
+Xavier      : alive L1=49.99% L12=48.28%  std L1=5.78e-01 L12=1.35e-02
+He          : alive L1=49.98% L12=51.10%  std L1=8.24e-01 L12=9.66e-01
 ```
 
-He initialization keeps ~50% neurons alive through all 12 layers. Xavier drops significantly by layer 12. `std=0.01` kills almost all neurons immediately — dead ReLU problem.
+The alive fraction stays near 50% for all three because ReLU zeroes about half of any symmetric pre-activation regardless of scale; it cannot detect a vanishing signal. The activation std can: it decays to $10^{-10}$ with `std=0.01`, to $10^{-2}$ with Xavier, and stays near 1 only with He. Practically, the signal is dead long before units are literally zero.
 </details>

@@ -32,7 +32,7 @@ Epoch | Train  | Val (overfit)
   100 | 0.0134 | 0.2824
 ```
 
-Training loss keeps falling while validation loss rises after epoch 30 — classic overfitting.
+These curves are simulated, not trained. Training loss keeps falling while validation loss bottoms out around epoch 50 (0.1163) and then rises to 0.2824 by epoch 100 — classic overfitting.
 
 ## Weight decay (L2 regularization)
 
@@ -75,7 +75,7 @@ L2 (100 steps): [ 2.997   0.01    1.4985 -0.005   1.998 ]
 L1 (100 steps): [ 2.999  0.009  1.499 -0.004  1.999]
 ```
 
-L2 shrinks all weights proportionally. L1 zeros out the two near-zero weights while barely touching the large ones.
+L2 shrinks every weight by the same *fraction* (about 0.1% here: $3.0 \to 2.997$, while $0.01$ barely moves). L1 subtracts the same *absolute* amount ($\eta\lambda = 10^{-5}$ per step, $0.001$ in total) from every weight: negligible for $3.0$, but 10% of $0.01$ and 20% of $-0.005$. Run it for more steps and the small weights reach exactly zero first (after about 1000 and 500 steps).
 
 ## Dropout
 
@@ -97,13 +97,13 @@ out_infer = dropout_forward(x, p=0.5, training=False)
 
 print(f"Training output  (some zeros, rest ×2): {out_train[0]}")
 print(f"Inference output (no change):           {out_infer[0]}")
-print(f"Training mean: {out_train.mean():.4f} (≈1.0 by scaling)")
+print(f"Training mean: {out_train.mean():.4f} (expectation 1.0; only 32 entries, so noisy)")
 ```
 
 ```output
 Training output  (some zeros, rest ×2): [0. 2. 0. 0. 0. 0. 0. 0.]
 Inference output (no change):           [1. 1. 1. 1. 1. 1. 1. 1.]
-Training mean: 0.7500 (≈1.0 by scaling)
+Training mean: 0.7500 (expectation 1.0; only 32 entries, so noisy)
 ```
 
 The inverted scaling ensures `E[output] = E[input]` during training, so inference behavior is identical to the expected training behavior.
@@ -165,13 +165,13 @@ def train_with_early_stopping(patience=10):
                 return best_epoch
     return 200
 
-stopped_at = train_with_early_stopping(patience=15)
-print(f"Would have trained to epoch 200, stopped at {stopped_at}")
+best = train_with_early_stopping(patience=15)
+print(f"Restore weights from epoch {best} (instead of training all 200 epochs)")
 ```
 
 ```output
 Early stop at epoch 75. Best epoch: 60, val_loss=0.1026
-Would have trained to epoch 200, stopped at 60
+Restore weights from epoch 60 (instead of training all 200 epochs)
 ```
 
 The key detail: restore the model weights from `best_epoch`, not the weights at the stopping epoch.
@@ -212,11 +212,11 @@ Dropout 0.5: mean=0.0046, std=2.8320
 Active units: 50.5%
 ```
 
-Try changing `p` to 0.8 — you'll see the std remains close to the original due to inverted scaling.
+The mean stays near zero thanks to inverted scaling, but the std grows by $1/\sqrt{1-p}$: $1.99 \to 2.38$ at $p=0.3$ and $2.83$ at $p=0.5$. Try $p=0.8$ and the std should be about 4.4.
 
 ## Exercise
 
-Implement a simple 2-layer MLP in numpy with both dropout (p=0.3) and L2 regularization (λ=1e-3). Train it on 200 random binary classification samples. Track train and val accuracy every 20 epochs. Show the regularization effect on weight magnitudes.
+Implement a simple 2-layer MLP in numpy with both dropout (p=0.3) and L2 regularization ($\lambda = 10^{-3}$). Train it on 200 random binary classification samples and track validation accuracy every 50 epochs. Compare the mean weight magnitude against the same network trained with no regularization.
 
 <details>
 <summary>Solution</summary>
@@ -231,46 +231,49 @@ X_val = np.random.randn(50, 4); y_val = (X_val[:,0] + X_val[:,1] > 0).astype(flo
 def relu(x): return np.maximum(0, x)
 def sigmoid(x): return 1/(1+np.exp(-x))
 
-np.random.seed(1)
-W1 = np.random.randn(4, 16) * np.sqrt(2/4)
-W2 = np.random.randn(16, 1) * np.sqrt(2/16)
-b1, b2 = np.zeros(16), np.zeros(1)
-lr, lam = 0.05, 1e-3
+def train(regularize, epochs=200, lr=0.05, lam=1e-3, p=0.3):
+    rng = np.random.default_rng(1)
+    W1 = rng.standard_normal((4, 16)) * np.sqrt(2/4)
+    W2 = rng.standard_normal((16, 1)) * np.sqrt(2/16)
+    b1, b2 = np.zeros(16), np.zeros(1)
+    lam = lam if regularize else 0.0
+    keep = (1 - p) if regularize else 1.0
+    yt = y_tr.reshape(-1, 1)
+    for epoch in range(1, epochs + 1):
+        h = relu(X_tr @ W1 + b1)
+        mask = (rng.random(h.shape) < keep).astype(float) / keep
+        h_drop = h * mask
+        out = sigmoid(h_drop @ W2 + b2)
 
-for epoch in range(1, 201):
-    # Forward with dropout
-    h = relu(X_tr @ W1 + b1)
-    mask = (np.random.rand(*h.shape) > 0.3).astype(float) / 0.7
-    h_drop = h * mask
-    out = sigmoid(h_drop @ W2 + b2)
+        dout = (out - yt) / len(X_tr)
+        dW2 = h_drop.T @ dout + lam*W2; db2 = dout.sum(axis=0)
+        dh_relu = (dout @ W2.T) * mask * (h > 0)
+        dW1 = X_tr.T @ dh_relu + lam*W1; db1 = dh_relu.sum(axis=0)
+        W1 -= lr*dW1; b1 -= lr*db1; W2 -= lr*dW2; b2 -= lr*db2
 
-    # Loss + L2
-    loss = -np.mean(y_tr.reshape(-1,1)*np.log(out+1e-8)+(1-y_tr.reshape(-1,1))*np.log(1-out+1e-8))
-    loss += lam/2*(np.sum(W1**2)+np.sum(W2**2))
+        if epoch % 50 == 0:
+            pred_val = sigmoid(relu(X_val @ W1 + b1) @ W2 + b2) > 0.5
+            val_acc = (pred_val.flatten() == y_val).mean()
+            print(f"  epoch {epoch}: val_acc={val_acc:.2%}, mean|W1|={np.abs(W1).mean():.4f}, mean|W2|={np.abs(W2).mean():.4f}")
 
-    # Backward
-    dout = (out - y_tr.reshape(-1,1))/len(X_tr)
-    dW2 = h_drop.T @ dout + lam*W2; db2 = dout.sum(axis=0)
-    dh_drop = dout @ W2.T
-    dh = dh_drop * mask
-    dh_relu = dh * (h > 0)
-    dW1 = X_tr.T @ dh_relu + lam*W1; db1 = dh_relu.sum(axis=0)
-
-    W1 -= lr*dW1; b1 -= lr*db1; W2 -= lr*dW2; b2 -= lr*db2
-
-    if epoch % 50 == 0:
-        h_val = relu(X_val @ W1 + b1)
-        pred_val = sigmoid(h_val @ W2 + b2) > 0.5
-        val_acc = (pred_val.flatten() == y_val).mean()
-        print(f"Epoch {epoch}: val_acc={val_acc:.2%}, |W1|={np.abs(W1).mean():.4f}")
+print("Dropout + L2:")
+train(True)
+print("No regularization:")
+train(False)
 ```
 
 ```output
-Epoch 50: val_acc=90.00%, |W1|=0.5209
-Epoch 100: val_acc=94.00%, |W1|=0.5206
-Epoch 150: val_acc=96.00%, |W1|=0.5239
-Epoch 200: val_acc=98.00%, |W1|=0.5273
+Dropout + L2:
+  epoch 50: val_acc=78.00%, mean|W1|=0.4562, mean|W2|=0.2086
+  epoch 100: val_acc=86.00%, mean|W1|=0.4556, mean|W2|=0.2562
+  epoch 150: val_acc=88.00%, mean|W1|=0.4582, mean|W2|=0.3042
+  epoch 200: val_acc=94.00%, mean|W1|=0.4655, mean|W2|=0.3446
+No regularization:
+  epoch 50: val_acc=78.00%, mean|W1|=0.4598, mean|W2|=0.2330
+  epoch 100: val_acc=88.00%, mean|W1|=0.4623, mean|W2|=0.3000
+  epoch 150: val_acc=94.00%, mean|W1|=0.4709, mean|W2|=0.3608
+  epoch 200: val_acc=96.00%, mean|W1|=0.4800, mean|W2|=0.4108
 ```
 
-Dropout + L2 together prevent large weights and reduce co-adaptation. Compare `|W1|` magnitude against training without regularization — regularized weights stay smaller throughout.
+With dropout and L2 the weights are smaller at every checkpoint (mean $|W_2|$ 0.34 vs 0.41 at epoch 200, mean $|W_1|$ 0.466 vs 0.480). The effect is modest here: this task is easy and the network small, so there is little overfitting to prevent; validation accuracy is similar (and the noisy dropout run lags slightly) on 50 validation points.
 </details>
