@@ -51,12 +51,12 @@ B, D = 32, 128
 z = torch.randn(2 * B, D)
 loss = simclr_loss(z)
 print(f"SimCLR loss (random): {loss.item():.3f}")
-print(f"Min theoretical (perfect): {-torch.tensor(1/(2*B-1)).log().item():.3f}")
+print(f"Chance level, log(2B-1):  {torch.tensor(2*B-1.).log().item():.3f}")
 ```
 
 ```output
-SimCLR loss (random): 4.155
-SimCLR loss (perfect): 0.020
+SimCLR loss (random): 4.163
+Chance level, log(2B-1):  4.143
 ```
 
 The loss is cross-entropy where the positive pair is the "correct class" among 2B-1 negatives. Lower = more agreement.
@@ -135,7 +135,7 @@ print(f"BYOL loss (perfect): {byol_loss(online, online.detach()).item():.3f}")
 ```
 
 ```output
-BYOL loss (random):  2.001
+BYOL loss (random):  1.994
 BYOL loss (perfect): 0.000
 ```
 
@@ -190,14 +190,14 @@ import numpy as np
 import torchvision.models as models
 import torch
 
-# Use a pretrained ResNet as a stand-in for a self-supervised model
-backbone = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+# Randomly initialised ResNet-18 as a stand-in encoder (offline; a real probe would use SSL weights)
+backbone = models.resnet18(weights=None)
 backbone.fc = nn.Identity()   # remove classification head
 backbone.eval()
 
 # Random data as proxy for downstream task
-X_raw = torch.randn(200, 3, 224, 224)
-y_raw = np.random.randint(0, 5, 200)
+X_raw = torch.randn(200, 3, 64, 64)
+y_raw = np.random.RandomState(0).randint(0, 5, 200)
 
 with torch.no_grad():
     feats = backbone(X_raw).numpy()
@@ -209,9 +209,11 @@ print(f"Feature dim: {feats.shape[1]}")
 ```
 
 ```output
-Linear probe accuracy: 37.00%
-Feature dim: 2048
+Linear probe accuracy: 100.00%
+Feature dim: 512
 ```
+
+The accuracy printed above is on the same 200 randomly labelled samples the probe was fit on, so it only measures memorisation (512 features, 200 points), not representation quality; always score a probe on held-out data.
 
 Good SSL representations achieve linear probe accuracy within 5–10% of full fine-tuning on ImageNet (e.g., DINO ViT-B/8: 79.5% linear probe vs 84% fine-tuned).
 
@@ -238,15 +240,16 @@ def simclr_loss(z, temperature=0.5):
 
 # Simulate embeddings from similar vs random views
 B, D = 16, 64
-z_good = torch.cat([torch.randn(B, D), torch.randn(B, D) * 0.1 + torch.randn(B, D)])
+base   = torch.randn(B, D)
+z_good = torch.cat([base, base + 0.1 * torch.randn(B, D)])   # second view = first view + small noise
 z_rand = torch.randn(2 * B, D)
 print(f"SimCLR loss (similar views): {simclr_loss(z_good):.3f}")
 print(f"SimCLR loss (random):        {simclr_loss(z_rand):.3f}")
 ```
 
 ```output
-SimCLR loss (similar views): 3.651
-SimCLR loss (random):        4.135
+SimCLR loss (similar views): 1.655
+SimCLR loss (random):        3.538
 ```
 
 Try decreasing temperature from 0.5 to 0.1 and observe how sharply the loss distinguishes the two cases.
@@ -279,7 +282,13 @@ loss = mae_loss(pred, target)
 print(f"MAE reconstruction loss: {loss.item():.4f}")
 
 # Perfect reconstruction
-print(f"Perfect recon loss:       {mae_loss(target, target).item():.4f}")
+tgt_norm = (target - target.mean(-1, keepdim=True)) / (target.var(-1, keepdim=True) + 1e-6).sqrt()
+print(f"Perfect recon loss:       {mae_loss(tgt_norm, target).item():.4f}")   # pred = normalised target
+```
+
+```output
+MAE reconstruction loss: 1.9997
+Perfect recon loss:       0.0000
 ```
 
 Normalizing per patch removes absolute pixel intensity, making the model focus on relative texture and shape within each patch rather than global brightness — a key reason MAE representations generalize well.
