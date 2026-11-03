@@ -7,11 +7,11 @@ order: 8
 
 ## Why Tabular Methods Don't Scale
 
-A tabular Q-table stores one value per $(s,a)$ pair. This works for a 4×4 gridworld with
+A tabular Q-table stores one value per $(s,a)$ pair. This works for a $4\times 4$ gridworld with
 16 states. It fails for:
 
 - **Mountain Car**: continuous position × velocity → infinitely many states.
-- **Atari**: 84×84 pixel frames → $256^{84 \times 84}$ possible states.
+- **Atari**: $84\times 84$ pixel frames → $256^{84 \times 84}$ possible states.
 - **Robotic control**: joint angles, velocities → high-dimensional continuous spaces.
 
 The solution: approximate $V(s)$ or $Q(s,a)$ with a parameterized function $\hat{v}(s,w)$
@@ -38,6 +38,7 @@ harder; semi-gradient is the standard.
 
 ```python
 import numpy as np
+np.random.seed(0)
 
 # Mountain Car: position in [-1.2, 0.6], velocity in [-0.07, 0.07]
 # Feature: discretize into 10x10 bins → 100-dim one-hot
@@ -94,18 +95,22 @@ for pos in np.linspace(-1.2, 0.4, 9):
 
 ```output
 Approx value at vel=0 (lower = worse, mountain car aims for pos=0.5):
-  pos=-1.20: V ≈ -186.3
-  pos=-1.00: V ≈ -193.7
-  pos=-0.75: V ≈ -199.2
-  pos=-0.50: V ≈ -201.4
-  pos=-0.25: V ≈ -198.8
-  pos=+0.00: V ≈ -187.5
-  pos=+0.25: V ≈ -152.3
-  pos=+0.40: V ≈ -89.6
+  pos=-1.20: V ≈ -20.8
+  pos=-1.00: V ≈ -59.7
+  pos=-0.80: V ≈ -74.6
+  pos=-0.60: V ≈ -80.7
+  pos=-0.40: V ≈ -78.3
+  pos=-0.20: V ≈ -68.9
+  pos=+0.00: V ≈ -34.5
+  pos=+0.20: V ≈ -3.2
+  pos=+0.40: V ≈ -0.6
 ```
 
-Values near the goal (pos ≈ 0.5) are higher (less negative) under the random policy — the
-agent expects to reach the goal sooner from positions close to it.
+Values near the goal ($\text{pos}\approx 0.5$) are higher (less negative) under the random policy — the
+agent expects to reach the goal sooner from positions close to it. The value at the far-left
+end ($-22$) looks too good: that cell is almost never visited with velocity 0, so its weight is
+still close to its initial value of 0. A one-hot table has no way to generalise to cells it has
+not seen — exactly the weakness that overlapping tilings (below) address.
 
 ## The Deadly Triad
 
@@ -121,58 +126,49 @@ diverges on carefully constructed off-policy examples. The classic is Baird's co
 ```python
 import numpy as np
 
-# Baird's counterexample (simplified): 7 states, dashed policy (behavior)
-# targets solid policy (greedy), linear FA. Semi-gradient TD diverges.
-# We show weight norms growing over iterations.
-
-np.random.seed(42)
-n_states, n_features = 7, 8
+# Baird's counterexample: 7 states, 8 weights, linear features, all rewards 0.
+# Target policy: always jump to state 6 (the "solid" action).
+# Off-policy data: every state is updated equally often (uniform distribution), even though
+# the target policy only ever moves to, and so only "lives" in, state 6.
 gamma = 0.99
-
-# Feature vectors phi(s) from Baird's example
-phi = np.zeros((n_states, n_features))
+phi = np.zeros((7, 8))
 for i in range(6):
     phi[i, i] = 2.0
-    phi[i, 6] = 1.0
+    phi[i, 7] = 1.0
 phi[6, 6] = 1.0
 phi[6, 7] = 2.0
 
-# Target policy: always go to state 6
-# Behavior policy: uniform over all states
-# Reward: always 0
-
-w = np.ones(n_features) * 0.1
+w = np.array([1, 1, 1, 1, 1, 1, 10, 1], dtype=float)  # Sutton & Barto's initial weights
 alpha = 0.01
 norms = []
 for step in range(1000):
-    # Off-policy: uniform behavior, target always → state 6
-    s = np.random.randint(n_states)
-    ns = 6  # target policy
-    td_error = 0 + gamma * (w @ phi[ns]) - (w @ phi[s])
-    # Importance sampling ratio for off-policy (simplified: IS ≈ target/behavior)
-    # For demo: just run semi-gradient off-policy without IS
-    w += alpha * td_error * phi[s]
+    # Expected semi-gradient TD(0) update: average over the uniform state distribution.
+    # The target-policy successor of every state is state 6, with reward 0.
+    update = np.zeros(8)
+    for s in range(7):
+        td_error = 0 + gamma * (w @ phi[6]) - (w @ phi[s])
+        update += td_error * phi[s]
+    w += alpha * update
     norms.append(np.linalg.norm(w))
 
 print("Weight norm over training (Baird's counterexample):")
 for step in [0, 100, 250, 500, 750, 999]:
     print(f"  step {step:4d}: ||w|| = {norms[step]:.2f}")
-print("→ Weights diverge: the deadly triad in action.")
 ```
 
 ```output
 Weight norm over training (Baird's counterexample):
-  step    0: ||w|| = 0.28
-  step  100: ||w|| = 1.47
-  step  250: ||w|| = 5.93
-  step  500: ||w|| = 28.14
-  step  750: ||w|| = 104.72
-  step  999: ||w|| = 311.88
-→ Weights diverge: the deadly triad in action.
+  step    0: ||w|| = 10.52
+  step  100: ||w|| = 190.77
+  step  250: ||w|| = 2840.15
+  step  500: ||w|| = 184470.00
+  step  750: ||w|| = 11733319.76
+  step  999: ||w|| = 733659421.64
 ```
 
-The weights grow without bound. This is not a bug — it's the inevitable consequence of the
-deadly triad.
+The weights grow without bound even though the true value function is exactly representable
+(all zeros, with $w=0$). This is not a bug — it's the inevitable consequence of the deadly triad:
+function approximation, bootstrapping, and an off-policy state distribution.
 
 ### Why DQN Works
 
@@ -236,14 +232,14 @@ for ep in range(200):
 
 ```output
 Episode   0: 1000 steps
-Episode  50: 847 steps
-Episode 100: 412 steps
-Episode 150: 203 steps
+Episode  50: 476 steps
+Episode 100: 161 steps
+Episode 150: 157 steps
 ```
 
 ## Exercise
 
-Implement **true online TD(λ)** for the linear FA case — an efficient algorithm that
+Implement **true online TD($\lambda$)** for the linear FA case — an efficient algorithm that
 maintains the eligibility trace and corrects for the semi-gradient approximation. The key
 update for the trace:
 
@@ -251,20 +247,14 @@ $$
 e_t = \gamma \lambda e_{t-1} + (1 - \alpha \gamma \lambda \phi_t^T e_{t-1}) \phi_t
 $$
 
-Apply it to the Mountain Car random walk prediction problem (100 features, λ=0.9, α=0.01,
-200 episodes) and compare the final weight norm vs standard TD(λ).
+Apply it to the Mountain Car random walk prediction problem (100 features, $\lambda=0.9$, $\alpha=0.01$,
+200 episodes) and compare the final weight norm vs standard TD($\lambda$).
 
 <details>
 <summary>Solution</summary>
 
 ```python
 import numpy as np
-
-n_features = 100
-w = np.zeros(n_features)
-e = np.zeros(n_features)
-alpha, gamma, lam = 0.01, 0.99, 0.9
-v_old = 0.0
 
 def tile_features(pos, vel, n_bins=10):
     pb = np.clip(int((pos+1.2)/1.8*n_bins), 0, n_bins-1)
@@ -279,30 +269,47 @@ def mc_step(pos, vel, action):
     if np_ <= -1.2: nv = 0.0
     return np_, nv, -1.0, np_ >= 0.5
 
-for ep in range(200):
-    pos, vel = -0.5, 0.0
-    e[:] = 0
-    phi = tile_features(pos, vel)
-    v_old = w @ phi
-    for _ in range(1000):
-        a = np.random.randint(3)
-        np_, nv, r, done = mc_step(pos, vel, a)
-        phi_ns = tile_features(np_, nv) if not done else np.zeros(n_features)
-        v = w @ phi
-        v_ns = w @ phi_ns
-        delta = r + gamma * v_ns - v
-        # True online TD(λ) trace update
-        e = gamma * lam * e + (1 - alpha * gamma * lam * (e @ phi)) * phi
-        w += alpha * (delta + v - v_old) * e - alpha * (v - v_old) * phi
-        v_old = v_ns
-        phi = phi_ns
-        pos, vel = np_, nv
-        if done: break
+def run(true_online, n_episodes=200, lam=0.9, alpha=0.01, gamma=0.99, seed=0):
+    rng = np.random.default_rng(seed)
+    w = np.zeros(100)
+    for ep in range(n_episodes):
+        pos, vel = -0.5, 0.0
+        e = np.zeros(100)
+        v_old = 0.0
+        phi = tile_features(pos, vel)
+        for _ in range(1000):
+            np_, nv, r, done = mc_step(pos, vel, rng.integers(3))
+            phi_ns = np.zeros(100) if done else tile_features(np_, nv)
+            v, v_ns = w @ phi, w @ phi_ns
+            delta = r + gamma * v_ns - v
+            if true_online:
+                e = gamma * lam * e + (1 - alpha * gamma * lam * (e @ phi)) * phi
+                w += alpha * (delta + v - v_old) * e - alpha * (v - v_old) * phi
+                v_old = v_ns
+            else:
+                e = gamma * lam * e + phi          # accumulating trace
+                w += alpha * delta * e
+            phi, pos, vel = phi_ns, np_, nv
+            if done: break
+    return w
 
-print(f"True online TD(λ) final ||w|| = {np.linalg.norm(w):.3f}")
+w_std = run(true_online=False)
+w_tol = run(true_online=True)
+print(f"standard TD(lambda)    ||w|| = {np.linalg.norm(w_std):.3f}")
+print(f"true online TD(lambda) ||w|| = {np.linalg.norm(w_tol):.3f}")
+print(f"max |w_std - w_tol| = {np.abs(w_std - w_tol).max():.3f}")
 ```
 
-True online TD(λ) satisfies the forward view exactly (unlike standard TD(λ) which only
-approximates it). Weight norms are typically smaller and more stable because the correction
-term $\alpha(v - v_{old})\phi$ removes the double-counting that accumulates in standard traces.
+```output
+standard TD(lambda)    ||w|| = 462.168
+true online TD(lambda) ||w|| = 462.488
+max |w_std - w_tol| = 0.211
+```
+
+
+The two algorithms end up with nearly the same weights (norms 462.2 vs 462.5): with a small step
+size and one-hot features, true online TD($\lambda$) and the standard accumulating-trace version
+agree closely, because the correction term only matters when $\alpha\,\phi^\top e$ is not small.
+The benefit of the true online update is exact equivalence to the forward $\lambda$-return for
+larger step sizes and denser features.
 </details>

@@ -32,10 +32,46 @@ Using $\alpha = 1/N(s)$ gives the sample mean. Using a fixed small $\alpha$ trac
 non-stationary problems.
 
 ```python
+import random
 import numpy as np
-import gymnasium as gym
 
-env = gym.make("Blackjack-v1", sab=True)
+class Blackjack:
+    """Blackjack with Sutton & Barto rules (infinite deck), same interface as gymnasium's Blackjack-v1(sab=True).
+    Observation: (player_sum, dealer_showing_card, usable_ace). Actions: 0=stick, 1=hit."""
+    def __init__(self, seed=0):
+        self.rnd = random.Random(seed)
+    def _draw(self):
+        return min(self.rnd.randint(1, 13), 10)
+    @staticmethod
+    def _total(hand):
+        t = sum(hand)
+        return t + 10 if 1 in hand and t + 10 <= 21 else t
+    def _obs(self):
+        return (self._total(self.player), self.dealer[0], 1 in self.player and sum(self.player) + 10 <= 21)
+    def sample_action(self):
+        return self.rnd.randint(0, 1)
+    def reset(self):
+        self.player = [self._draw(), self._draw()]
+        self.dealer = [self._draw(), self._draw()]
+        return self._obs(), {}
+    def step(self, action):
+        if action == 1:  # hit
+            self.player.append(self._draw())
+            if self._total(self.player) > 21:
+                return self._obs(), -1.0, True, False, {}
+            return self._obs(), 0.0, False, False, {}
+        while self._total(self.dealer) < 17:  # dealer plays out
+            self.dealer.append(self._draw())
+        p, d = self._total(self.player), self._total(self.dealer)
+        if d > 21:
+            d = 0  # dealer busts: any standing player wins
+        reward = float(p > d) - float(p < d)
+        natural = lambda h: sorted(h) == [1, 10]
+        if natural(self.player):
+            reward = 0.0 if natural(self.dealer) else 1.0
+        return self._obs(), reward, True, False, {}
+
+env = Blackjack(seed=0)
 
 def generate_episode(env, policy):
     """Returns list of (state, action, reward)."""
@@ -84,25 +120,28 @@ for ps in range(12, 22):
 
 ```output
 V(player_sum, dealer=2, usable_ace=True):
-  player=12: 0.141
-  player=13: 0.196
-  player=14: 0.248
-  player=15: 0.300
-  player=16: 0.358
-  player=17: 0.441
-  player=18: 0.587
-  player=19: 0.751
-  player=20: 0.928
-  player=21: 0.979
+  player=12: -0.132
+  player=13: -0.258
+  player=14: -0.173
+  player=15: -0.200
+  player=16: -0.306
+  player=17: -0.333
+  player=18: -0.330
+  player=19: -0.300
+  player=20: 0.608
+  player=21: 0.983
 ```
 
-Values increase with player sum — exactly what you'd expect. With a usable ace, 20 wins
-about 93% of the time against a dealer showing 2.
+This policy hits on everything below 20, so states 12–19 have negative values (hitting a
+soft hand often turns it into a worse hard hand or a bust), while the states where it sticks
+are strongly positive: $V(20)\approx 0.61$ and $V(21)\approx 0.98$ against a dealer showing 2. The
+sharp jump at 20 is the signature of the stick rule, not of a smooth value function. Estimates
+for rarely visited states (such as the soft 14) are noisy.
 
-## MC Control: ε-Soft Policy
+## MC Control: $\varepsilon$-Soft Policy
 
-To find the optimal policy without a model, you need to explore. The **ε-soft** approach
-makes every action available with at least probability ε/|A|, but assigns most probability to
+To find the optimal policy without a model, you need to explore. The **$\varepsilon$-soft** approach
+makes every action available with at least probability $\varepsilon/|A|$, but assigns most probability to
 the current best action:
 
 $$
@@ -115,18 +154,18 @@ $$
 ```python
 from collections import defaultdict
 
-env = gym.make("Blackjack-v1", sab=True)
+env = Blackjack(seed=1)
 
 Q = defaultdict(lambda: np.zeros(2))  # 2 actions: stick=0, hit=1
 N = defaultdict(lambda: np.zeros(2))
 epsilon = 0.1
 
 def epsilon_greedy(state, eps=epsilon):
-    if np.random.random() < eps:
-        return env.action_space.sample()
+    if env.rnd.random() < eps:
+        return env.sample_action()
     return int(np.argmax(Q[state]))
 
-n_episodes = 500_000
+n_episodes = 300_000
 for ep in range(n_episodes):
     episode = []
     state, _ = env.reset()
@@ -159,7 +198,7 @@ for ps in range(12, 22):
 
 ```output
 Optimal action (0=stick, 1=hit) — no usable ace, dealer=6:
-  player=12: hit
+  player=12: stick
   player=13: stick
   player=14: stick
   player=15: stick
@@ -172,14 +211,14 @@ Optimal action (0=stick, 1=hit) — no usable ace, dealer=6:
 ```
 
 With dealer showing 6 (a "bust card"), the learnt policy matches basic strategy: stick from
-13 upward, because the dealer is likely to bust.
+12 upward, because the dealer is likely to bust.
 
-### Exploring Starts vs ε-Soft
+### Exploring Starts vs $\varepsilon$-Soft
 
-An alternative to ε-soft is **exploring starts**: guarantee every (state, action) pair has
+An alternative to $\varepsilon$-soft is **exploring starts**: guarantee every (state, action) pair has
 nonzero probability of being the start of an episode. This allows a fully greedy policy but
 requires control over the environment's start distribution — impossible in real settings.
-ε-soft is the practical default.
+$\varepsilon$-soft is the practical default.
 
 ## Importance Sampling for Off-Policy MC
 
@@ -198,14 +237,13 @@ in practice, and the bias vanishes asymptotically.
 ## Try it Yourself
 
 ```python
-import numpy as np
-import gymnasium as gym
 from collections import defaultdict
 
 # Train MC control on Blackjack for 200,000 episodes with epsilon=0.1
 # Then evaluate the greedy policy for 10,000 episodes and report win rate
+# (uses the Blackjack class defined earlier on this page)
 
-env = gym.make("Blackjack-v1", sab=True)
+env = Blackjack(seed=2)
 Q = defaultdict(lambda: np.zeros(2))
 N = defaultdict(lambda: np.zeros(2))
 epsilon = 0.1
@@ -215,7 +253,7 @@ for ep in range(200_000):
     state, _ = env.reset()
     done = False
     while not done:
-        action = int(np.argmax(Q[state])) if np.random.random() > epsilon else env.action_space.sample()
+        action = int(np.argmax(Q[state])) if env.rnd.random() > epsilon else env.sample_action()
         next_state, reward, terminated, truncated, _ = env.step(action)
         episode.append((state, action, reward))
         state = next_state
@@ -250,7 +288,7 @@ print(f"Win rate: {wins/100:.1f}%  Draw: {draws/100:.1f}%  Loss: {losses/100:.1f
 ```
 
 ```output
-Win rate: 43.2%  Draw: 9.4%  Loss: 47.4%
+Win rate: 42.6%  Draw: 8.8%  Loss: 48.7%
 ```
 
 ## Exercise
@@ -263,17 +301,16 @@ between first-visit and every-visit MC. Are they different? Why or why not in th
 <summary>Solution</summary>
 
 ```python
-import numpy as np
-import gymnasium as gym
-
-env = gym.make("Blackjack-v1", sab=True)
+env = Blackjack(seed=3)
 
 def simple_policy(state):
     return 0 if state[0] >= 20 else 1
 
-# Every-visit MC
+# Every-visit and first-visit MC from the same episodes
 returns_sum_ev = {}
 returns_count_ev = {}
+returns_sum_fv = {}
+returns_count_fv = {}
 
 for ep in range(100_000):
     episode = []
@@ -286,20 +323,32 @@ for ep in range(100_000):
         state = ns
         done = terminated or truncated
     G = 0
+    first_return = {}
     for t in reversed(range(len(episode))):
         s, a, r = episode[t]
         G = r + G
         # Every visit: update even if s was seen before
         returns_sum_ev[s] = returns_sum_ev.get(s, 0) + G
         returns_count_ev[s] = returns_count_ev.get(s, 0) + 1
+        first_return[s] = G  # going backwards, the last write is the first visit
+    for s, G0 in first_return.items():
+        returns_sum_fv[s] = returns_sum_fv.get(s, 0) + G0
+        returns_count_fv[s] = returns_count_fv.get(s, 0) + 1
 
 for key in [(18, 6, False), (20, 10, False)]:
     ev = returns_sum_ev.get(key, 0) / max(returns_count_ev.get(key, 1), 1)
-    print(f"Every-visit V{key} = {ev:.4f}")
+    fv = returns_sum_fv.get(key, 0) / max(returns_count_fv.get(key, 1), 1)
+    print(f"V{key}: every-visit = {ev:.4f}, first-visit = {fv:.4f}")
+```
+
+```output
+V(18, 6, False): every-visit = -0.6593, first-visit = -0.6593
+V(20, 10, False): every-visit = 0.4296, first-visit = 0.4296
 ```
 
 In the limit, first-visit and every-visit MC both converge to the true $v_\pi(s)$ — the
-difference is variance, not bias. Every-visit uses more updates per episode (less variance
-per episode but correlated within episodes). For Blackjack, each state appears at most once
-per episode anyway, so the two methods give nearly identical results.
+difference is small-sample behaviour (every-visit is slightly biased but consistent). Every-visit
+uses more updates per episode, but they are correlated within an episode. For Blackjack, a state
+never repeats within an episode here (the player's sum only grows), so the two methods agree to
+the digits shown above.
 </details>

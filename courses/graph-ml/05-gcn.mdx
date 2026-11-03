@@ -63,33 +63,57 @@ class GCNConvScratch(nn.Module):
         out.index_add_(0, row, norm.unsqueeze(-1) * x[col])
         return out
 
-print("GCNConvScratch defined — 2-layer GCN for Cora.")
+print("GCNConvScratch defined: one GCN layer in plain torch.")
 ```
 
 ```output
-GCNConvScratch defined — 2-layer GCN for Cora.
+GCNConvScratch defined: one GCN layer in plain torch.
 ```
 
-## Node classification on Cora
+## Node classification on a synthetic citation graph
 
-Cora has 2708 papers (nodes), 5429 citation edges, 1433 bag-of-words features, 7 classes.
+`torch_geometric` is not available here, and Cora needs a download, so you build a small Cora-like graph yourself: a stochastic block model with 5 research areas (classes) of 60 papers each. Papers in the same area cite each other far more often (probability 0.06) than papers in different areas (0.015). Each paper has 100 bag-of-words features, where each class favors its own 20 words, so the features are informative but noisy. Only 10 labeled papers per class are used for training, as in the semi-supervised Cora setup.
 
 ```python
-from torch_geometric.datasets import Planetoid
-from torch_geometric.transforms import NormalizeFeatures
+import numpy as np
+torch.set_num_threads(1)
 
-dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=NormalizeFeatures())
-data = dataset[0]
+def make_graph(n_per=60, k=5, p_in=0.06, p_out=0.015, d=100, seed=2):
+    rng = np.random.default_rng(seed)
+    y = np.repeat(np.arange(k), n_per)
+    n = len(y)
+    P = np.where(y[:, None] == y[None, :], p_in, p_out)
+    U = np.triu(rng.random((n, n)) < P, 1)
+    A = U | U.T
+    base = np.full((k, d), 0.03)
+    for c in range(k):
+        base[c, c * 20:(c + 1) * 20] = 0.15        # class-favored words
+    X = (rng.random((n, d)) < base[y]).astype(np.float32)
+    X = X / np.maximum(X.sum(1, keepdims=True), 1)  # row-normalize like NormalizeFeatures
+    train = np.zeros(n, bool)
+    for c in range(k):
+        train[np.nonzero(y == c)[0][:10]] = True
+    rest = np.nonzero(~train)[0]
+    rng.shuffle(rest)
+    val = np.zeros(n, bool); val[rest[:100]] = True
+    test = ~train & ~val
+    return (torch.tensor(X), torch.tensor(np.stack(np.nonzero(A))), torch.tensor(y),
+            torch.tensor(train), torch.tensor(val), torch.tensor(test))
 
-print(f"Nodes: {data.num_nodes}, Edges: {data.num_edges}")
-print(f"Node features: {data.x.shape}, Classes: {dataset.num_classes}")
-print(f"Train/Val/Test: {data.train_mask.sum()}/{data.val_mask.sum()}/{data.test_mask.sum()}")
+x, edge_index, y, train_mask, val_mask, test_mask = make_graph()
+num_nodes, num_classes = x.shape[0], 5
+print(f"Nodes: {num_nodes}, Edges (directed): {edge_index.shape[1]}")
+print(f"Node features: {tuple(x.shape)}, Classes: {num_classes}")
+print(f"Train/Val/Test: {int(train_mask.sum())}/{int(val_mask.sum())}/{int(test_mask.sum())}")
+same = (y[edge_index[0]] == y[edge_index[1]]).float().mean().item()
+print(f"Fraction of edges joining same-class nodes (homophily): {same:.3f}")
 ```
 
 ```output
-Nodes: 2708, Edges: 10556
-Node features: torch.Size([2708, 1433]), Classes: 7
-Train/Val/Test: 140/500/1000
+Nodes: 300, Edges (directed): 2174
+Node features: (300, 100), Classes: 5
+Train/Val/Test: 50/100/150
+Fraction of edges joining same-class nodes (homophily): 0.479
 ```
 
 ```python
@@ -104,200 +128,147 @@ class GCN(nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         return self.conv2(x, edge_index_tilde, norm)
 
-edge_index_tilde, norm = gcn_norm(data.edge_index, data.num_nodes)
+edge_index_tilde, norm = gcn_norm(edge_index, num_nodes)
 
-model = GCN(dataset.num_features, 64, dataset.num_classes)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
-
-def train():
-    model.train()
-    optimizer.zero_grad()
-    out = model(data.x, edge_index_tilde, norm)
-    loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
-    loss.backward()
-    optimizer.step()
-    return loss.item()
-
-@torch.no_grad()
-def test():
+def accuracies(model, *args):
     model.eval()
-    out = model(data.x, edge_index_tilde, norm)
-    pred = out.argmax(dim=1)
-    accs = []
-    for mask in [data.train_mask, data.val_mask, data.test_mask]:
-        accs.append((pred[mask] == data.y[mask]).float().mean().item())
-    return accs
+    with torch.no_grad():
+        pred = model(x, *args).argmax(dim=1)
+    return [(pred[m] == y[m]).float().mean().item() for m in (train_mask, val_mask, test_mask)]
 
-for epoch in range(1, 201):
-    loss = train()
+def fit(model, *args, epochs=200, lr=0.01):
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+    for _ in range(epochs):
+        model.train(); opt.zero_grad()
+        out = model(x, *args)
+        F.cross_entropy(out[train_mask], y[train_mask]).backward()
+        opt.step()
+    return accuracies(model, *args)
 
-train_acc, val_acc, test_acc = test()
+torch.manual_seed(0)
+model = GCN(x.shape[1], 32, num_classes)
+train_acc, val_acc, test_acc = fit(model, edge_index_tilde, norm)
 print(f"Train: {train_acc:.3f}  Val: {val_acc:.3f}  Test: {test_acc:.3f}")
 ```
 
 ```output
-Train: 0.971  Val: 0.784  Test: 0.801
+Train: 1.000  Val: 0.720  Test: 0.720
 ```
 
-## PyG shorthand
+## Checking against the dense formula
 
-Using `torch_geometric.nn.GCNConv` gives the same result in fewer lines:
+The edge-list implementation should equal the matrix formula $\tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2} X W$ exactly. Build the dense matrix and compare, then do the same for a graph-free baseline (an MLP on the same features) to see what the graph contributes.
 
 ```python
-from torch_geometric.nn import GCNConv
+A_t = torch.zeros(num_nodes, num_nodes)
+A_t[edge_index[0], edge_index[1]] = 1.0
+A_t = A_t + torch.eye(num_nodes)
+d_inv_sqrt = A_t.sum(1).pow(-0.5)
+A_hat = d_inv_sqrt[:, None] * A_t * d_inv_sqrt[None, :]
 
-class GCNPyG(nn.Module):
+layer = GCNConvScratch(x.shape[1], 8)
+dense_out = A_hat @ layer.W(x)
+print("Edge-list matches dense formula:", torch.allclose(layer(x, edge_index_tilde, norm), dense_out, atol=1e-6))
+
+class MLP(nn.Module):
     def __init__(self, in_ch, hidden, out_ch):
         super().__init__()
-        self.conv1 = GCNConv(in_ch, hidden)
-        self.conv2 = GCNConv(hidden, out_ch)
+        self.l1, self.l2 = nn.Linear(in_ch, hidden), nn.Linear(hidden, out_ch)
+    def forward(self, x):
+        return self.l2(F.dropout(F.relu(self.l1(x)), 0.5, self.training))
 
-    def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.dropout(x, p=0.5, training=self.training)
-        return self.conv2(x, edge_index)
-
-model_pyg = GCNPyG(dataset.num_features, 64, dataset.num_classes)
-opt_pyg = torch.optim.Adam(model_pyg.parameters(), lr=0.01, weight_decay=5e-4)
-
-for epoch in range(200):
-    model_pyg.train()
-    opt_pyg.zero_grad()
-    out = model_pyg(data.x, data.edge_index)
-    F.cross_entropy(out[data.train_mask], data.y[data.train_mask]).backward()
-    opt_pyg.step()
-
-model_pyg.eval()
-pred = model_pyg(data.x, data.edge_index).argmax(1)
-test_acc = (pred[data.test_mask] == data.y[data.test_mask]).float().mean()
-print(f"PyG GCN test accuracy: {test_acc:.3f}")
+torch.manual_seed(0)
+mlp_acc = fit(MLP(x.shape[1], 32, num_classes))
+print(f"MLP (no graph) test accuracy: {mlp_acc[2]:.3f}   GCN test accuracy: {test_acc:.3f}")
 ```
 
 ```output
-PyG GCN test accuracy: 0.812
+Edge-list matches dense formula: True
+MLP (no graph) test accuracy: 0.613   GCN test accuracy: 0.720
 ```
 
 ## Over-smoothing
 
-Stack too many GCN layers and all node embeddings converge to the same value — the graph's
-eigenvector. At depth $K$, every node aggregates its entire $K$-hop neighborhood, and with
-symmetric normalization the representations average out.
+Stack too many GCN layers and all node embeddings converge to the same value, the dominant eigenvector of the normalized adjacency. At depth $K$, every node aggregates its entire $K$-hop neighborhood, and the representations average out.
 
 ```python
-@torch.no_grad()
-def test_depth(depth):
-    layers = [GCNConv(dataset.num_features if i == 0 else 64, 64)
-              for i in range(depth)]
-    out_layer = GCNConv(64, dataset.num_classes)
+class DeepGCN(nn.Module):
+    def __init__(self, in_ch, hidden, out_ch, depth):
+        super().__init__()
+        dims = [in_ch] + [hidden] * (depth - 1) + [out_ch]
+        self.convs = nn.ModuleList(GCNConvScratch(dims[i], dims[i + 1]) for i in range(depth))
+    def forward(self, x, edge_index_tilde, norm):
+        for conv in self.convs[:-1]:
+            x = F.dropout(F.relu(conv(x, edge_index_tilde, norm)), 0.5, self.training)
+        return self.convs[-1](x, edge_index_tilde, norm)
 
-    model_d = nn.ModuleList(layers + [out_layer])
-    opt = torch.optim.Adam(model_d.parameters(), lr=0.01, weight_decay=5e-4)
-
-    for _ in range(200):
-        model_d.train(); opt.zero_grad()
-        x = data.x
-        for i, layer in enumerate(model_d[:-1]):
-            x = F.relu(layer(x, data.edge_index))
-            x = F.dropout(x, 0.5, training=True)
-        out = model_d[-1](x, data.edge_index)
-        F.cross_entropy(out[data.train_mask], data.y[data.train_mask]).backward()
-        opt.step()
-
-    model_d.eval()
-    x = data.x
-    for layer in model_d[:-1]:
-        x = F.relu(layer(x, data.edge_index))
-    out = model_d[-1](x, data.edge_index)
-    pred = out.argmax(1)
-    return (pred[data.test_mask] == data.y[data.test_mask]).float().mean().item()
-
-for d in [1, 2, 4, 8]:
-    acc = test_depth(d)
-    print(f"Depth {d}: test acc = {acc:.3f}")
+for d in [1, 2, 4, 8, 16]:
+    torch.manual_seed(0)
+    acc = fit(DeepGCN(x.shape[1], 32, num_classes, d), edge_index_tilde, norm)[2]
+    print(f"Depth {d:2d}: test acc = {acc:.3f}")
 ```
 
 ```output
-Depth 1: test acc = 0.742
-Depth 2: test acc = 0.812
-Depth 4: test acc = 0.653
-Depth 8: test acc = 0.421
+Depth  1: test acc = 0.653
+Depth  2: test acc = 0.720
+Depth  4: test acc = 0.240
+Depth  8: test acc = 0.173
+Depth 16: test acc = 0.193
 ```
 
-Depth 2 is the sweet spot for Cora. Beyond depth 4, over-smoothing dominates.
+Depth 2 is the sweet spot on this graph. From depth 4 on, accuracy collapses to roughly chance (0.2 for 5 classes): over-smoothing blurs the classes together, and with dropout on every layer and only 50 labels the deep stacks are also hard to optimize.
 
 ## Try it Yourself
 
 ```python
-from torch_geometric.datasets import Planetoid
-from torch_geometric.nn import GCNConv
-import torch, torch.nn.functional as F, torch.nn as nn
-
-dataset = Planetoid(root='/tmp/Cora', name='Cora')
-data = dataset[0]
-
-class GCN(nn.Module):
-    def __init__(self, hidden=64):
-        super().__init__()
-        self.c1 = GCNConv(dataset.num_features, hidden)
-        self.c2 = GCNConv(hidden, dataset.num_classes)
-    def forward(self, x, ei):
-        return self.c2(F.dropout(F.relu(self.c1(x, ei)), 0.5, self.training), ei)
-
-model = GCN(); opt = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
-for _ in range(200):
-    model.train(); opt.zero_grad()
-    out = model(data.x, data.edge_index)
-    F.cross_entropy(out[data.train_mask], data.y[data.train_mask]).backward(); opt.step()
-model.eval()
-pred = model(data.x, data.edge_index).argmax(1)
-print("Test acc:", (pred[data.test_mask]==data.y[data.test_mask]).float().mean().item())
-# Try: change hidden to 128 or 256. Does accuracy improve?
+# Reuses GCN, fit, gcn_norm, make_graph from earlier on this page (same kernel session).
+for hidden in [8, 32, 128]:
+    torch.manual_seed(0)
+    m = GCN(x.shape[1], hidden, num_classes)
+    print(f"hidden={hidden:3d}  test acc = {fit(m, edge_index_tilde, norm)[2]:.3f}")
+# Try: change p_out in make_graph to 0.04 (noisier graph) and re-run the cells above.
 ```
 
 ```output
-Test acc: 0.808
+hidden=  8  test acc = 0.693
+hidden= 32  test acc = 0.720
+hidden=128  test acc = 0.733
 ```
 
 ## Exercise
 
 Add a **residual connection** to the 2-layer GCN: after the first conv, add a linear
 projection of the raw input features $x$ to the hidden dimension, then add it to the
-first conv's output before the second conv. Does this help or hurt accuracy on Cora?
+first conv's output before the second conv. Does this help or hurt accuracy on this graph?
 
 <details>
 <summary>Solution</summary>
 
 ```python
-from torch_geometric.datasets import Planetoid
-from torch_geometric.nn import GCNConv
-import torch, torch.nn as nn, torch.nn.functional as F
-
-dataset = Planetoid(root='/tmp/Cora', name='Cora')
-data = dataset[0]
-
 class ResGCN(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden=32):
         super().__init__()
-        self.c1 = GCNConv(dataset.num_features, 64)
-        self.c2 = GCNConv(64, dataset.num_classes)
-        self.proj = nn.Linear(dataset.num_features, 64, bias=False)
+        self.c1 = GCNConvScratch(x.shape[1], hidden)
+        self.c2 = GCNConvScratch(hidden, num_classes)
+        self.proj = nn.Linear(x.shape[1], hidden, bias=False)
 
-    def forward(self, x, ei):
-        h = F.relu(self.c1(x, ei)) + self.proj(x)   # residual
+    def forward(self, x, eit, norm):
+        h = F.relu(self.c1(x, eit, norm)) + self.proj(x)   # residual
         h = F.dropout(h, 0.5, self.training)
-        return self.c2(h, ei)
+        return self.c2(h, eit, norm)
 
-model = ResGCN()
-opt = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
-for _ in range(200):
-    model.train(); opt.zero_grad()
-    F.cross_entropy(model(data.x, data.edge_index)[data.train_mask],
-                    data.y[data.train_mask]).backward(); opt.step()
-model.eval()
-pred = model(data.x, data.edge_index).argmax(1)
-print("ResGCN test acc:", (pred[data.test_mask]==data.y[data.test_mask]).float().mean().item())
+for name, cls in [("GCN", lambda: GCN(x.shape[1], 32, num_classes)), ("ResGCN", ResGCN)]:
+    accs = []
+    for seed in range(5):
+        torch.manual_seed(seed)
+        accs.append(fit(cls(), edge_index_tilde, norm)[2])
+    print(f"{name:7s} mean test acc over 5 seeds: {np.mean(accs):.3f}")
 ```
 
-The residual connection typically gives a small improvement (0.80 → 0.82) because it
-provides a gradient highway for the input features, similar to ResNet (ch. 4 in CNNs).
+```output
+GCN     mean test acc over 5 seeds: 0.721
+ResGCN  mean test acc over 5 seeds: 0.660
+```
+
+On this graph the residual hurts (about 0.66 vs 0.72). The projection of the raw features gives the model a path that skips the graph, and with only 50 training labels it overfits the noisy features instead of leaning on neighbor averaging. Residuals help when depth is the problem; at depth 2 with a strong graph signal they mostly dilute smoothing.
 </details>

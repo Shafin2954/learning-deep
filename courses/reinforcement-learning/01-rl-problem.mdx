@@ -43,22 +43,45 @@ If the state fully captures the relevant history, the process is **Markov**. Thi
 
 ## The gymnasium API
 
-`gymnasium` (the maintained fork of OpenAI gym) provides a standard interface for RL environments.
+`gymnasium` (the maintained fork of OpenAI gym) defines the standard interface for RL environments: `env.reset()` returns `(obs, info)` and `env.step(a)` returns `(obs, reward, terminated, truncated, info)`. To keep every example here self-contained, we re-implement CartPole's physics (about 20 lines of numpy) behind exactly that interface. Code you write against this class ports to `gym.make("CartPole-v1")` unchanged.
 
 ```python
-import gymnasium as gym
+import numpy as np
 
-env = gym.make("CartPole-v1")
+class CartPole:
+    """CartPole-v1 dynamics (Euler integration, tau=0.02) in plain numpy."""
+    n_actions = 2
+    def __init__(self, seed=0):
+        self.rng = np.random.default_rng(seed)
+    def reset(self, seed=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        self.s = self.rng.uniform(-0.05, 0.05, 4)
+        self.t = 0
+        return self.s.copy(), {}
+    def step(self, a):
+        x, xd, th, thd = self.s
+        f = 10.0 if a == 1 else -10.0
+        c, sn = np.cos(th), np.sin(th)
+        tmp = (f + 0.05 * thd**2 * sn) / 1.1
+        thacc = (9.8 * sn - c * tmp) / (0.5 * (4 / 3 - 0.1 * c**2 / 1.1))
+        xacc = tmp - 0.05 * thacc * c / 1.1
+        self.s = np.array([x + 0.02 * xd, xd + 0.02 * xacc, th + 0.02 * thd, thd + 0.02 * thacc])
+        self.t += 1
+        terminated = bool(abs(self.s[0]) > 2.4 or abs(self.s[2]) > 0.2095)
+        return self.s.copy(), 1.0, terminated, self.t >= 500, {}
+
+env = CartPole()
 obs, info = env.reset(seed=42)
-print("Observation space:", env.observation_space)
-print("Action space:     ", env.action_space)
-print("Initial obs shape:", obs.shape)
+print("Actions:           ", env.n_actions)
+print("Initial obs shape: ", obs.shape)
+print("Initial obs:       ", np.round(obs, 4))
 ```
 
 ```output
-Observation space: Box([-4.8       -inf -0.41887903       -inf], [4.8       inf 0.41887903       inf], (4,), float64)
-Action space:      Discrete(2)
-Initial obs shape: (4,)
+Actions:            2
+Initial obs shape:  (4,)
+Initial obs:        [ 0.0274 -0.0061  0.0359  0.0197]
 ```
 
 CartPole's observation is `[cart_pos, cart_vel, pole_angle, pole_angular_vel]`. Actions are 0 (push left) or 1 (push right).
@@ -66,10 +89,8 @@ CartPole's observation is `[cart_pos, cart_vel, pole_angle, pole_angular_vel]`. 
 ### Running a random policy
 
 ```python
-import gymnasium as gym
-import numpy as np
-
-env = gym.make("CartPole-v1")
+rng = np.random.default_rng(0)
+env = CartPole()
 total_rewards = []
 
 for episode in range(10):
@@ -77,7 +98,7 @@ for episode in range(10):
     total_reward = 0
     done = False
     while not done:
-        action = env.action_space.sample()  # random action
+        action = int(rng.integers(2))  # random action
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         done = terminated or truncated
@@ -88,7 +109,7 @@ print(f"Max possible:         500")
 ```
 
 ```output
-Mean reward (random): 22.3 ± 9.7
+Mean reward (random): 21.5 ± 13.1
 Max possible:         500
 ```
 
@@ -97,13 +118,11 @@ A random policy averages about 22 steps before the pole falls. A trained agent a
 ### The step loop in detail
 
 ```python
-import gymnasium as gym
-
-env = gym.make("CartPole-v1")
+env = CartPole(seed=1)
 obs, _ = env.reset()
 
 for t in range(5):
-    action = env.action_space.sample()
+    action = int(rng.integers(2))
     next_obs, reward, terminated, truncated, info = env.step(action)
     print(f"t={t}  action={action}  reward={reward:.0f}  terminated={terminated}")
     obs = next_obs
@@ -113,10 +132,10 @@ for t in range(5):
 
 ```output
 t=0  action=1  reward=1  terminated=False
-t=1  action=0  reward=1  terminated=False
+t=1  action=1  reward=1  terminated=False
 t=2  action=0  reward=1  terminated=False
 t=3  action=1  reward=1  terminated=False
-t=4  action=0  reward=1  terminated=True
+t=4  action=1  reward=1  terminated=False
 ```
 
 Each step gives reward +1 for staying upright. `terminated=True` means the pole fell or the cart left bounds.
@@ -130,11 +149,8 @@ Classic pitfall: reward a cleaning robot for *seeing* dirt as clean, and it lear
 ## Try it Yourself
 
 ```python
-import gymnasium as gym
-import numpy as np
-
 # Try a right-biased policy and compare to random
-env = gym.make("CartPole-v1")
+env = CartPole(seed=2)
 
 def right_biased_policy(obs):
     # Always push right — terrible, but instructive
@@ -155,7 +171,7 @@ print(f"Right-only policy: mean={np.mean(rewards):.1f}, std={np.std(rewards):.1f
 ```
 
 ```output
-Right-only policy: mean=10.2, std=3.8
+Right-only policy: mean=9.3, std=0.7
 ```
 
 ## Exercise
@@ -166,10 +182,7 @@ Implement an **angle-based heuristic**: if the pole angle (index 2 of observatio
 <summary>Solution</summary>
 
 ```python
-import gymnasium as gym
-import numpy as np
-
-env = gym.make("CartPole-v1")
+env = CartPole(seed=3)
 
 def angle_policy(obs):
     return 1 if obs[2] > 0 else 0  # push in direction pole is falling
@@ -188,5 +201,9 @@ for _ in range(20):
 print(f"Angle policy: mean={np.mean(rewards):.1f}, std={np.std(rewards):.1f}")
 ```
 
-This heuristic achieves ~40–80 mean reward — better than random (≈22) but far below a trained agent (500). The pole angle alone doesn't capture cart position drift, which eventually causes failure.
+```output
+Angle policy: mean=46.8, std=7.2
+```
+
+This heuristic achieves a mean reward of roughly 45 — better than random ($\approx 22$) but far below a trained agent (500). The pole angle alone doesn't capture cart position drift, which eventually causes failure.
 </details>
