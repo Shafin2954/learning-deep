@@ -15,6 +15,19 @@ ESL/ISLR, Bishop, Murphy PML 1–2, Sutton & Barto, BDA3, Kleppmann, original pa
 - `tools/fill_outputs.py <chapter.mdx>` — runs all python blocks in one namespace (like the page's
   kernel session) and writes real stdout into the output blocks. `--check` verifies without writing.
 
+## Plan (agreed 2026-11-03)
+
+1. Finish recommender-systems and bayesian-ml.
+2. **Repair pass** over the 14 June courses: fix crashing code and regenerate real outputs with
+   `tools/fill_outputs.py`, adjusting prose only where it contradicts the real numbers.
+3. **Deep rewrite** of core courses in this order: math-optimization, probability-statistics,
+   classical-ml, deep-learning-foundations, sequence-transformers, nlp-llms; then the rest.
+
+Audit (2026-11-03): 181 June teaching chapters checked — 0 pass `--check`, 63 crash.
+
+Style rule added for all new/rewritten chapters: intuition first — each section opens in plain
+language (problem + core idea + concrete example) before symbols; every symbol defined in words.
+
 ## Status by course
 
 | # | Course | Status |
