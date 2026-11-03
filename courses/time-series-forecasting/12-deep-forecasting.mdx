@@ -15,7 +15,7 @@ Three situations where deep models consistently win:
 - **Rich covariates** — promotions, holidays, weather, categorical metadata that ARIMA can't easily absorb.
 - **Complex, long-range seasonality** — multiple overlapping periods that seasonal ARIMA struggles to parameterize.
 
-The tradeoff: they require substantially more data, are harder to debug, and need GPU training. For a single short series with no covariates, classical methods usually win.
+The tradeoff: they require substantially more data, are harder to debug, and benefit from GPU training (the small models here run on CPU). For a single short series with no covariates, classical methods usually win.
 
 ## DeepAR: probabilistic autoregressive LSTM
 
@@ -51,6 +51,13 @@ print(f"\nSeries: {df['unique_id'].nunique()}, rows per series: {df.groupby('uni
 ```
 
 ```output
+  unique_id         ds         y
+0  series_0 2020-01-31  0.125730
+1  series_0 2020-02-29  1.452402
+2  series_0 2020-03-31  3.407513
+3  series_0 2020-04-30  3.358421
+
+Series: 5, rows per series: 72
 ```
 
 Now a global panel for the models: pivot to a `(series, time)` array, scale each series with statistics from the training part only, and hold out the last 12 months.
@@ -73,6 +80,7 @@ print("panel:", tuple(Ys.shape), " train:", train, " holdout:", Ys.shape[1] - tr
 ```
 
 ```output
+panel: (5, 72)  train: 60  holdout: 12
 ```
 
 Below, a minimal DeepAR: an LSTM that sees the previous value, the calendar covariates, and a learned series embedding, and outputs the mean and scale of a Gaussian for the next value. Training minimizes the Gaussian negative log-likelihood; forecasting samples 200 paths autoregressively.
@@ -133,6 +141,14 @@ print(f"80% interval coverage: {np.mean(cov):.2f}")
 ```
 
 ```output
+step   0  NLL 1.529
+step 100  NLL 0.031
+step 200  NLL -0.426
+step 300  NLL -0.099
+final NLL -0.704
+DeepAR mean-path MAE (scaled units): 0.606
+Seasonal-naive MAE:                  0.640
+80% interval coverage: 0.13
 ```
 
 DeepAR forecasts a *distribution* per step, letting you sample many trajectories and derive any quantile. The coverage printed above is far below the nominal 80%: with 5 short series the model is overconfident, which is exactly why calibration must always be checked rather than assumed. Its point forecast barely beats seasonal naive here.
@@ -195,6 +211,9 @@ print(f"holdout MAE: {(pred - Ys[:, train:]).abs().mean().item():.3f}")
 ```
 
 ```output
+parameters: 24300
+train MAE:   0.032
+holdout MAE: 0.575
 ```
 
 The gap between training and holdout error is the signature of a deep model fed too little data: 24k parameters against only 125 training windows. With thousands of series the gap closes; with five it overfits.
@@ -262,6 +281,11 @@ print("attention-weight matrix shape:", tuple(w.shape))
 ```
 
 ```output
+parameters: 14148
+train pinball:   0.053
+holdout pinball: 0.196
+[q10, q90] coverage: 0.30  (nominal 0.80)
+attention-weight matrix shape: (5, 24, 24)
 ```
 
 The attention matrix `w` (one 24-by-24 map per series) is what TFT exposes for interpretation: which historical timestamps the model attends to when forecasting. The same small-data caveat applies: the quantile band undercovers on the holdout.
@@ -284,13 +308,13 @@ print(df.to_string())
 ```
 
 ```output
-                    Global? Probabilistic      Covariates Interpretable     Data needed
+                     Global?      Probabilistic         Covariates Interpretable  Data needed
 Model
-ARIMA/SARIMA           No    Yes (parametric) Limited (SARIMAX)     Yes        < 100 pts
-LightGBM + lag feats  No*    Via quantile loss    Yes (any)    Via SHAP        ~500+ pts
-DeepAR                Yes    Yes (parametric)     Yes              No       Many series
-N-BEATS               Yes    No / quantile        No           Partial       Many series
-TFT                   Yes    Yes (quantile)       Yes (rich)   Partial       Many series
+ARIMA/SARIMA              No   Yes (parametric)  Limited (SARIMAX)           Yes    < 100 pts
+LightGBM + lag feats     No*  Via quantile loss          Yes (any)      Via SHAP    ~500+ pts
+DeepAR                   Yes   Yes (parametric)                Yes            No  Many series
+N-BEATS                  Yes      No / quantile                 No       Partial  Many series
+TFT                      Yes     Yes (quantile)         Yes (rich)       Partial  Many series
 ```
 
 *LightGBM can be made global by including a series-ID categorical feature.
@@ -345,6 +369,13 @@ print(out)
 ```
 
 ```output
+               s0     s1     s2
+2024-01-31  10.20  14.16  14.48
+2024-02-29  12.50  14.63  12.60
+2024-03-31  14.55  14.37  10.35
+2024-04-30  15.15  12.31   7.65
+2024-05-31  14.54   9.97   5.48
+2024-06-30  12.59   7.37   4.99
 ```
 
 Try changing the number of hidden units or the lookback `L` and see how the forecasts change.

@@ -93,8 +93,8 @@ Naive MAE: 5.057
 MASE:      0.743
 ```
 
-Early stopping halted training at iteration 187 — no overfitting past that point. MASE 0.38
-means LightGBM makes errors less than 40% as large as the naive baseline.
+Early stopping halted training at iteration 70, when validation MAE stopped improving. MASE 0.74
+means LightGBM makes errors about three quarters as large as the naive baseline.
 
 ## Feature importance
 
@@ -142,8 +142,7 @@ for name, score in imp[:6]:
   lag_3              527
 ```
 
-`lag_7` dominates — the strong weekly cycle means last week's same-weekday value is the
-best single predictor. The rolling mean and day-of-week signals follow.
+Split-count importances are fairly flat here: `roll_std_7`, `lag_1` and `lag_7` lead, with the other lags close behind. Split counts reward features that are easy to split on repeatedly, not necessarily the ones that matter most; prefer gain or permutation importance before drawing conclusions.
 
 ## Try it Yourself
 
@@ -226,20 +225,21 @@ print("Direct strategy MAE by horizon:", [f"{v:.3f}" for v in direct_maes])
 # Recursive: one 1-step model, feed predictions back in as lags
 m1 = lgb.LGBMRegressor(n_estimators=150, verbose=-1)
 m1.fit(X[:split], y_arr[:split])
-lag_ix = {l: feat_cols.index(f'lag_{l}') for l in [1, 2, 3, 7]}
-rec_err = {h: [] for h in range(1, 5)}
-for i in range(split, len(y_arr) - 4):
-    hist = list(y_arr[:i])          # observed up to (not including) row i's target
-    for h in range(1, 5):
-        feats = [hist[-l] for l in [1, 2, 3, 7]]
-        p = m1.predict(np.array([feats]))[0]
-        rec_err[h].append(abs(y_arr[i + h - 1] - p))
-        hist.append(p)
-print("Recursive strategy MAE by horizon:", [f"{np.mean(rec_err[h]):.3f}" for h in range(1, 5)])
+rows = np.arange(split, len(y_arr) - 3)
+buf  = np.array([y_arr[i-7:i] for i in rows])        # last 7 observed values per origin (oldest .. newest)
+rec_maes = []
+for h in range(1, 5):
+    feats = buf[:, [-1, -2, -3, -7]]                  # lag_1, lag_2, lag_3, lag_7
+    p = m1.predict(feats)
+    rec_maes.append(np.mean(np.abs(y_arr[rows + h - 1] - p)))
+    buf = np.hstack([buf[:, 1:], p[:, None]])         # feed the prediction back in as the newest lag
+print("Recursive strategy MAE by horizon:", [f"{v:.3f}" for v in rec_maes])
 ```
 
 ```output
-Direct strategy MAE by horizon: ['5.823', '7.219', '5.805', '2.831']
-Recursive strategy MAE by horizon: ['3.206', '3.084', '3.095', '3.121']
+Direct strategy MAE by horizon: ['3.251', '5.823', '7.219', '5.805']
+Recursive strategy MAE by horizon: ['3.177', '3.116', '3.104', '3.188']
 ```
+
+The recursive strategy stays near 3.1 at every horizon because the weekly pattern is carried by `lag_7`, which the model can read directly. The direct models for $h=2,3,4$ are much worse (5.8 to 7.2): this feature set has no calendar columns, so each direct model must infer the day-of-week shift from lags alone. Direct is not automatically better; it needs features that match its target horizon.
 </details>
