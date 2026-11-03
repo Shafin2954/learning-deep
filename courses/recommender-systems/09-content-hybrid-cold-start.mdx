@@ -1,0 +1,856 @@
+---
+course: recommender-systems
+chapter: 09-content-hybrid-cold-start
+title: "Content-Based and Hybrid Recommenders; Cold Start"
+order: 9
+---
+
+## Cold start is three problems, not one
+
+Every model since ch. 3 learns one vector per user and one per item from interactions. Take the
+interactions away and the vector does not exist. That failure comes in three shapes:
+
+- **New item**: a title launched this morning. Users exist and are well understood; the item has
+  no column in the matrix. Collaborative filtering cannot rank it at all.
+- **New user**: someone signed up a minute ago. The catalogue is well understood; the user has no
+  row. You know at most a few attributes (country, device, the ad they came from).
+- **New system**: both at once. A new market, a new product line, a launch. Only side information
+  exists.
+
+The fix in every case is the same idea: describe users and items by **features** that exist before
+any interaction does, and learn how those features map to taste. This chapter builds a world where
+items have text descriptions and users have a demographic segment, so all three cases can be
+simulated and measured.
+
+```python
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n_users, n_items, d, K, n_segments = 2_000, 800, 8, 8, 6
+
+# items: a topic mixture (what the description says) plus a residual nobody wrote down
+genre = rng.integers(0, K, n_items)
+theta = rng.dirichlet(np.full(K, 0.3), n_items)
+theta[np.arange(n_items), genre] += 1.0
+theta /= theta.sum(axis=1, keepdims=True)
+topic_vec = rng.normal(0, 1.0, (K, d))
+item_vec = 1.6 * theta @ topic_vec + rng.normal(0, 0.55, (n_items, d))
+exposure = rng.lognormal(-1.0, 1.0, n_items)
+
+topic_words = [
+    ["noir", "detective", "crime", "heist", "alibi", "clue", "gritty", "murder", "rain", "suspect"],
+    ["space", "alien", "starship", "galaxy", "robot", "future", "planet", "orbit", "android", "cyber"],
+    ["romance", "love", "wedding", "heart", "kiss", "letters", "summer", "longing", "couple", "date"],
+    ["horror", "ghost", "haunted", "blood", "scream", "curse", "night", "demon", "fog", "cellar"],
+    ["comedy", "quirky", "awkward", "prank", "roommate", "laugh", "office", "satire", "banter", "chaos"],
+    ["war", "soldier", "battle", "empire", "sword", "siege", "history", "general", "trench", "medal"],
+    ["family", "kids", "dog", "holiday", "school", "magic", "puppet", "cartoon", "friendship", "home"],
+    ["documentary", "nature", "ocean", "climate", "science", "interview", "archive", "true",
+     "wildlife", "food"]]
+generic = ["story", "film", "life", "world", "new", "great", "best", "time", "people", "journey",
+           "classic", "award", "dark", "bright", "epic"]
+
+def describe(t):
+    topics = rng.choice(K, size=12, p=theta[t])
+    words = [topic_words[k][rng.integers(0, 10)] for k in topics] + list(rng.choice(generic, 6))
+    rng.shuffle(words)
+    return " ".join(words)
+
+text = [describe(t) for t in range(n_items)]
+
+# users: a demographic segment shifts taste, the rest is individual
+segment = rng.integers(0, n_segments, n_users)
+seg_center = rng.normal(0, 0.6, (n_segments, d))
+user_vec = seg_center[segment] + rng.normal(0, 1.0, (n_users, d))
+activity = rng.lognormal(-0.3, 0.9, n_users)
+
+logit = (user_vec @ item_vec.T / 2.0 - 4.2
+         + np.log(activity)[:, None] + np.log(exposure)[None, :])
+r, c = np.nonzero(rng.random((n_users, n_items)) < 1 / (1 + np.exp(-logit)))
+inter = pd.DataFrame({"user": r, "item": c})
+print(f"{n_users:,} users x {n_items} items | {len(inter):,} interactions "
+      f"({len(inter) / (n_users * n_items):.2%} dense)")
+for t in (0, 1):
+    print(f"item {t} (main topic {genre[t]}): {text[t]}")
+```
+
+```output
+2,000 users x 800 items | 52,827 interactions (3.30% dense)
+item 0 (main topic 6): home food family school dark prank journey blood epic ocean dark dog roommate great home home bright friendship
+item 1 (main topic 5): people suspect journey general epic sword battle trench war general new battle detective gritty trench story film magic
+```
+
+The generator matters for what follows. An item's true latent vector is **part content, part
+residual**: the topic mixture explains a share of it, and the rest — quality, chemistry, whatever
+the description does not say — is only recoverable from interactions. That is the realistic case,
+and it is why content-based and collaborative models are complements, not rivals.
+
+## The evaluation protocol has to create the cold start
+
+A random 20% holdout of interactions does **not** test cold start. Almost every held-out
+interaction involves an item and a user that also appear in training, so a pure-ID model looks fine.
+You have to hold out **entities**: whole items and whole users, every one of their interactions.
+
+```python
+split_rng = np.random.default_rng(1)
+cold_items = np.sort(split_rng.choice(n_items, 160, replace=False))
+cold_users = np.sort(split_rng.choice(n_users, 400, replace=False))
+is_cold_item = np.isin(np.arange(n_items), cold_items)
+is_cold_user = np.isin(np.arange(n_users), cold_users)
+warm_items, warm_users = np.flatnonzero(~is_cold_item), np.flatnonzero(~is_cold_user)
+
+ci, cu = is_cold_item[inter["item"]], is_cold_user[inter["user"]]
+warm = inter[~ci & ~cu]
+hold = split_rng.random(len(warm)) < 0.2
+train, test_warm = warm[~hold], warm[hold]
+
+X = sparse.csr_matrix((np.ones(len(train)), (train["user"], train["item"])),
+                      shape=(n_users, n_items))
+seen = {u: set(g) for u, g in train.groupby("user")["item"]}
+pop = np.asarray(X.sum(axis=0)).ravel()
+n_u = np.asarray(X.sum(axis=1)).ravel()
+
+def make_truth(df):
+    return {u: set(g) for u, g in df.groupby("user")["item"]}
+
+# task -> (ground truth per user, candidate items to rank)
+TASKS = {"warm": (make_truth(test_warm), warm_items),
+         "cold-item": (make_truth(inter[ci & ~cu]), cold_items),
+         "cold-user": (make_truth(inter[~ci & cu]), warm_items),
+         "cold-both": (make_truth(inter[ci & cu]), cold_items)}
+
+def recall_at_k(score_fn, task, k=10, se=False):
+    truth, cand = TASKS[task]
+    rec = []
+    for u, items in truth.items():
+        s = np.asarray(score_fn(u), dtype=float)[cand].copy()
+        if task == "warm":
+            s[np.isin(cand, list(seen.get(u, ())))] = -np.inf
+        top = cand[np.argpartition(-s, k)[:k]]
+        rec.append(len(items & set(top)) / min(k, len(items)))
+    m = float(np.mean(rec))
+    return (m, float(np.std(rec) / np.sqrt(len(rec)))) if se else m
+
+print(f"train {len(train):,} interactions")
+for t, (truth, cand) in TASKS.items():
+    print(f"  {t:>9}: {len(truth):>5} users, {sum(map(len, truth.values())):>5} held-out "
+          f"interactions, ranked among {len(cand)} items")
+
+r_hold = np.random.default_rng(2).random(len(inter)) < 0.2
+in_train = set(inter["item"][~r_hold])
+print(f"\nrandom 20% interaction split: {np.mean(~inter['item'][r_hold].isin(in_train)):.2%} "
+      f"of test interactions involve an item with no training data")
+```
+
+```output
+train 26,963 interactions
+       warm:  1331 users,  6708 held-out interactions, ranked among 640 items
+  cold-item:  1399 users,  8525 held-out interactions, ranked among 160 items
+  cold-user:   395 users,  8534 held-out interactions, ranked among 640 items
+  cold-both:   352 users,  2097 held-out interactions, ranked among 160 items
+
+random 20% interaction split: 0.00% of test interactions involve an item with no training data
+```
+
+Four tasks, four ground truths. **Warm** is the usual held-out-interaction test. **Cold-item** asks
+warm users to rank 160 items nobody has trained on; **cold-user** asks 400 users with zero history
+to be served from the warm catalogue; **cold-both** is the new-system case. The last line is the
+reason this matters: a random interaction split leaves essentially no cold items in the test set, so
+it measures nothing about the problem this chapter is about.
+
+Two design choices to keep in view. Cold items are ranked **among cold items** — the "new
+arrivals" shelf — so their scores never have to be compared with warm items' scores (the
+calibration problem returns in the Exercise of ch. 10 and in the bandit chapter). And the cold-user
+task allows no filtering by history, because there is none.
+
+```python
+rnd = np.random.default_rng(5)                    # tiny noise breaks ties among zero counts
+seg_pop = np.zeros((n_segments, n_items))
+np.add.at(seg_pop, (segment[train["user"].values], train["item"].values), 1.0)
+
+baselines = {"random": lambda u: np.random.default_rng(u).random(n_items),
+             "popularity": lambda u: pop + 1e-6 * rnd.random(n_items),
+             "segment popularity": lambda u: seg_pop[segment[u]] + 1e-6 * rnd.random(n_items)}
+print(f"{'recall@10':>20} " + " ".join(f"{t:>10}" for t in TASKS))
+for name, fn in baselines.items():
+    print(f"{name:>20} " + " ".join(f"{recall_at_k(fn, t):>10.4f}" for t in TASKS))
+```
+
+```output
+           recall@10       warm  cold-item  cold-user  cold-both
+              random     0.0142     0.0691     0.0355     0.0574
+          popularity     0.1464     0.0719     0.2628     0.0655
+  segment popularity     0.1788     0.0635     0.2914     0.0679
+```
+
+Popularity is strong on warm and cold-user tasks and **exactly as bad as random on new items**: it
+has no counts for them. Segment popularity is the cheapest personalisation that exists and it
+already beats global popularity for new users — keep that number in mind; several fancier methods
+below fail to beat it.
+
+## Content-based recommendation
+
+A content-based recommender never looks at other users. It describes each item by a feature
+vector, builds a profile of each user from the items they consumed, and ranks by similarity between
+profile and item. The features here come from text, so the vectoriser is TF-IDF.
+
+### TF-IDF and cosine scoring
+
+For term $t$ in item description $i$, with $\mathrm{tf}_{t,i}$ the count and $\mathrm{df}_t$ the
+number of items containing $t$ out of $N$:
+
+$$
+w_{t,i} = \left(1 + \log \mathrm{tf}_{t,i}\right)\cdot\left(1 + \log\frac{1 + N}{1 + \mathrm{df}_t}\right),
+\qquad \mathbf{f}_i = \frac{\mathbf{w}_i}{\lVert \mathbf{w}_i \rVert_2}
+$$
+
+The IDF factor down-weights words that appear everywhere ("film", "story") and carry no
+discrimination. The user profile is a weighted mean of consumed items, and the score is cosine
+similarity:
+
+$$
+\mathbf{p}_u = \frac{\sum_{i \in I_u} c_{ui}\,\mathbf{f}_i}{\sum_{i \in I_u} c_{ui}}, \qquad
+\hat{s}_{ui} = \frac{\mathbf{p}_u \cdot \mathbf{f}_i}{\lVert \mathbf{p}_u \rVert\,\lVert \mathbf{f}_i \rVert}
+$$
+
+This is Rocchio relevance feedback from information retrieval, with $c_{ui}$ the confidence
+(play count, recency weight). Negative feedback, when you have it, enters with a negative weight.
+
+```python
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+tfidf = TfidfVectorizer(sublinear_tf=True)        # 1 + log tf, smoothed idf, L2-normalised rows
+F = tfidf.fit_transform(text)
+Fd = F.toarray()
+vocab = np.array(tfidf.get_feature_names_out())
+top_terms = np.argsort(-Fd[0])[:5]
+print(f"TF-IDF matrix {F.shape}; item 0's heaviest terms: "
+      + ", ".join(f"{vocab[j]} ({Fd[0, j]:.2f})" for j in top_terms))
+idf = tfidf.idf_
+print(f"idf range: '{vocab[idf.argmin()]}' {idf.min():.2f} ... '{vocab[idf.argmax()]}' {idf.max():.2f}")
+
+def content_profile(items):
+    p = Fd[list(items)].mean(axis=0)
+    return p / (np.linalg.norm(p) + 1e-12)
+
+profiles = {u: content_profile(s) for u, s in seen.items()}
+content = lambda u: Fd @ profiles[u] if u in profiles else np.zeros(n_items)
+for t in ("warm", "cold-item"):
+    print(f"content-based recall@10, {t:>9}: {recall_at_k(content, t):.4f}")
+```
+
+```output
+TF-IDF matrix (800, 95); item 0's heaviest terms: home (0.52), dark (0.27), dog (0.26), blood (0.26), family (0.25)
+idf range: 'bright' 2.00 ... 'interview' 3.40
+content-based recall@10,      warm: 0.0587
+content-based recall@10, cold-item: 0.2005
+```
+
+Read the two numbers against the baselines. On **new items** the content model is the first method
+that works at all — roughly three times random. On **warm** items it loses badly to plain
+popularity, because cosine similarity to a profile knows nothing about how good or how popular an
+item is: a mediocre noir film and an excellent one have the same description.
+
+### What the content model gets wrong: overspecialisation
+
+```python
+def concentration(score_fn, users, k=10):
+    shares, covered = [], set()
+    for u in users:
+        s = np.asarray(score_fn(u), float)[warm_items].copy()
+        s[np.isin(warm_items, list(seen[u]))] = -np.inf
+        top = warm_items[np.argpartition(-s, k)[:k]]
+        covered.update(top)
+        fav = np.bincount(genre[list(seen[u])], minlength=K).argmax()
+        shares.append(np.mean(genre[top] == fav))
+    return np.mean(shares), len(covered) / len(warm_items)
+
+warm_truth = TASKS["warm"][0]
+eval_users = [u for u in warm_truth if u in seen][:600]
+actual = np.mean([np.mean(genre[list(warm_truth[u])]
+                          == np.bincount(genre[list(seen[u])], minlength=K).argmax())
+                  for u in eval_users])
+print(f"{'':>12} {'share of top-10 in favourite genre':>36} {'catalogue coverage':>20}")
+print(f"{'held-out':>12} {actual:>36.3f} {'':>20}")
+for name, fn in (("content", content), ("popularity", lambda u: pop)):
+    share, cov = concentration(fn, eval_users)
+    print(f"{name:>12} {share:>36.3f} {cov:>20.3f}")
+```
+
+```output
+               share of top-10 in favourite genre   catalogue coverage
+    held-out                                0.301
+     content                                0.656                0.891
+  popularity                                0.140                0.050
+```
+
+Users actually spend about a third of their future interactions in their favourite genre; the
+content model fills about seventy percent of the list with it. That is **overspecialisation**: a
+content model can only recommend "more of what you have", because similarity to the past is its
+only signal. It never produces the serendipitous jump that collaborative filtering gets for free
+("people who liked your noir films also liked this documentary"). Note the flip side in the
+coverage column: content-based lists are not popularity-biased at all, which is why content features
+are also the standard tool for the long tail.
+
+## Collaborative filtering on the same split
+
+```python
+def implicit_als(X, d=16, alpha=5.0, lam=30.0, n_iter=10, seed=0):
+    """Weighted ALS from ch. 5."""
+    r = np.random.default_rng(seed)
+    U = r.normal(0, 0.01, (X.shape[0], d))
+    V = r.normal(0, 0.01, (X.shape[1], d))
+    Xc, Xt, eye = X.tocsr(), X.T.tocsr(), lam * np.eye(d)
+    for _ in range(n_iter):
+        for M, Fm, O in ((Xc, U, V), (Xt, V, U)):
+            G = O.T @ O + eye
+            for row in range(M.shape[0]):
+                idx = M.indices[M.indptr[row]:M.indptr[row + 1]]
+                if len(idx) == 0:
+                    Fm[row] = 0
+                    continue
+                Oi = O[idx]
+                Fm[row] = np.linalg.solve(G + alpha * Oi.T @ Oi, (1 + alpha) * Oi.sum(axis=0))
+    return U, V
+
+U_mf, V_mf = implicit_als(X)
+mf = lambda u: V_mf @ U_mf[u]
+print(f"iALS recall@10: warm {recall_at_k(mf, 'warm'):.4f} | "
+      f"cold-item {recall_at_k(mf, 'cold-item'):.4f} (cold item vectors are all zero)")
+
+def recall_users(fn, users, k=10):
+    out = []
+    for u in users:
+        s = np.asarray(fn(u), float)[warm_items].copy()
+        s[np.isin(warm_items, list(seen.get(u, ())))] = -np.inf
+        top = warm_items[np.argpartition(-s, k)[:k]]
+        out.append(len(warm_truth[u] & set(top)) / min(k, len(warm_truth[u])))
+    return np.mean(out)
+
+print(f"\n{'train interactions':>19} {'users':>6} {'seg-pop':>8} {'iALS':>8} {'content':>8}")
+for lo, hi in ((0, 3), (3, 6), (6, 12), (12, 25), (25, 10_000)):
+    us = [u for u in warm_truth if lo <= n_u[u] < hi]
+    label = f"{lo}-{hi - 1}" if hi < 10_000 else f"{lo}+"
+    print(f"{label:>19} {len(us):>6} {recall_users(lambda u: seg_pop[segment[u]], us):>8.4f} "
+          f"{recall_users(mf, us):>8.4f} {recall_users(content, us):>8.4f}")
+```
+
+```output
+iALS recall@10: warm 0.2078 | cold-item 0.0836 (cold item vectors are all zero)
+
+ train interactions  users  seg-pop     iALS  content
+                0-2     90   0.1769   0.1089   0.0504
+                3-5    168   0.1993   0.2120   0.0225
+               6-11    312   0.1862   0.2005   0.0495
+              12-24    418   0.1572   0.1925   0.0545
+                25+    343   0.1936   0.2572   0.0919
+```
+
+iALS wins the warm task comfortably and is useless on cold items — the solver never touched those
+columns. The support breakdown is the more useful picture. Below three training interactions the
+iALS user vector is mostly regularisation, and segment popularity beats it outright; from three
+upward iALS takes over and the gap widens with history. A recommender that serves everyone with
+the same model is wrong for somebody, and that observation is the whole motivation for hybrids.
+
+## A taxonomy of hybrids
+
+Burke (2002) classified the ways to combine recommenders. The names are worth knowing because
+production systems are almost always one of these, often several stacked:
+
+| Hybrid | How it combines | Example |
+|---|---|---|
+| Weighted | blend the scores of several models | $a\cdot z(\text{CF}) + (1-a)\cdot z(\text{content})$ |
+| Switching | pick one model per request by a rule | content for items with fewer than $n$ interactions |
+| Mixed | show several models' lists side by side | a "new arrivals" row next to "for you" |
+| Feature combination | one model consumes both kinds of signal | LightFM, FMs with side features (ch. 6) |
+| Feature augmentation | one model's output is another's input feature | CF similarity as a feature in a GBDT ranker |
+| Cascade | a cheap model filters, a precise one re-ranks | retrieval then ranking (ch. 10) |
+| Meta-level | one model's learned *model* is another's input | content regressed onto CF factors (below) |
+
+### Weighted and switching, measured
+
+Scores from different models live on different scales — cosine in $[-1, 1]$, iALS dot products
+around $[0, 1]$, popularity counts in the hundreds — so a weighted hybrid z-scores each model per
+user before blending. A switching hybrid needs only a rule; the support table above suggests one.
+
+```python
+def z(s):
+    return (s - s.mean()) / (s.std() + 1e-12)
+
+print("weighted hybrid  a * z(iALS) + (1 - a) * z(content), warm task")
+for a in (0.0, 0.5, 0.7, 0.8, 0.9, 1.0):
+    print(f"  a = {a:.1f}: recall@10 {recall_at_k(lambda u: a * z(mf(u)) + (1 - a) * z(content(u)), 'warm'):.4f}")
+
+print("\nswitching hybrid  segment popularity if n_u < threshold else iALS, warm task")
+for th in (0, 2, 3, 5, 8):
+    switch = lambda u, th=th: seg_pop[segment[u]] if n_u[u] < th else mf(u)
+    print(f"  threshold {th}: recall@10 {recall_at_k(switch, 'warm'):.4f}")
+```
+
+```output
+weighted hybrid  a * z(iALS) + (1 - a) * z(content), warm task
+  a = 0.0: recall@10 0.0587
+  a = 0.5: recall@10 0.1904
+  a = 0.7: recall@10 0.2022
+  a = 0.8: recall@10 0.2067
+  a = 0.9: recall@10 0.2059
+  a = 1.0: recall@10 0.2078
+
+switching hybrid  segment popularity if n_u < threshold else iALS, warm task
+  threshold 0: recall@10 0.2078
+  threshold 2: recall@10 0.2083
+  threshold 3: recall@10 0.2124
+  threshold 5: recall@10 0.2106
+  threshold 8: recall@10 0.2099
+```
+
+Neither hybrid moves the warm number much, and the reason is instructive. The weighted blend adds
+nothing on warm users because the content signal is **already inside** the iALS factors: the item
+vectors were learned from users whose taste was itself shaped by the topics. Blending a model with a
+noisier copy of its own information cannot help. The switching hybrid helps a little and only for
+the 0–2 band, which is a small slice of users — exactly the size of the gain. Hybrids earn their
+keep where one component is blind, not where both see the same thing.
+
+## Mapping content into the latent space
+
+The cleanest bridge between the two worlds is to keep the CF model for warm items and **learn a
+function from content to CF factors**, then apply it to new items. Gantner et al. (2010) called it
+attribute-to-feature mapping; Van den Oord et al. (2013) did the same with a CNN from audio to
+the factors of a music recommender. It is a meta-level hybrid in Burke's terms.
+
+### Attribute-to-factor regression
+
+Let $\mathbf{F}_W \in \mathbb{R}^{n_W \times p}$ hold content features of warm items and
+$\mathbf{V}_W \in \mathbb{R}^{n_W \times k}$ their learned factors. Ridge regression minimises
+
+$$
+\lVert \mathbf{F}_W \mathbf{B} - \mathbf{V}_W \rVert_F^2 + \alpha \lVert \mathbf{B} \rVert_F^2
+\quad\Longrightarrow\quad
+\mathbf{B} = \left(\mathbf{F}_W^\top \mathbf{F}_W + \alpha I\right)^{-1} \mathbf{F}_W^\top \mathbf{V}_W
+$$
+
+and a cold item's vector is $\hat{\mathbf{v}}_j = \mathbf{B}^\top \mathbf{f}_j$, scored against the
+*existing* user factors: $\hat{s}_{uj} = \mathbf{u}_u \cdot \hat{\mathbf{v}}_j$. The users carry all
+their collaborative knowledge; only the item side is imputed.
+
+```python
+from sklearn.linear_model import Ridge
+
+for alpha in (0.1, 1.0, 10.0, 30.0, 100.0):
+    a2f = Ridge(alpha=alpha).fit(Fd[warm_items], V_mf[warm_items])
+    V_hat = a2f.predict(Fd)
+    r2 = a2f.score(Fd[warm_items], V_mf[warm_items])
+    print(f"alpha {alpha:>5}: train R^2 {r2:.3f} | "
+          f"cold-item recall@10 {recall_at_k(lambda u: V_hat @ U_mf[u], 'cold-item'):.4f}")
+a2f = Ridge(alpha=30.0).fit(Fd[warm_items], V_mf[warm_items])
+V_hat = a2f.predict(Fd)
+```
+
+```output
+alpha   0.1: train R^2 0.351 | cold-item recall@10 0.1957
+alpha   1.0: train R^2 0.345 | cold-item recall@10 0.2026
+alpha  10.0: train R^2 0.270 | cold-item recall@10 0.2232
+alpha  30.0: train R^2 0.184 | cold-item recall@10 0.2274
+```
+
+Content-to-factor mapping beats the pure content profile on new items, because it combines the
+item's content with the user's **collaborative** vector rather than a profile of bag-of-words. The
+$R^2$ column says how much of the factor space text can explain; the rest is the residual the
+generator added, and no amount of modelling recovers it from descriptions. A natural refinement for
+items with *some* data is shrinkage: $\mathbf{v}_i = \frac{n_i}{n_i + c}\mathbf{v}_i^{\text{CF}} +
+\frac{c}{n_i + c}\hat{\mathbf{v}}_i$, the posterior mean under a Gaussian prior centred on the
+content prediction.
+
+## Feature-sum embeddings and ID dropout
+
+The attribute-to-factor model is two-stage: factors first, regression second. LightFM (Kula, 2015)
+fuses them. Every user and item is a **set of features**, its vector is the sum of those features'
+vectors, and the whole thing is trained end to end with a ranking loss:
+
+$$
+\mathbf{q}_i = \sum_{f \in \mathcal{F}(i)} x_{if}\,\mathbf{e}_f, \qquad
+\mathbf{p}_u = \sum_{g \in \mathcal{G}(u)} x_{ug}\,\mathbf{e}_g, \qquad
+\hat{s}_{ui} = \mathbf{p}_u \cdot \mathbf{q}_i + \sum_{f \in \mathcal{F}(i)} x_{if}\,b_f
+$$
+
+Include an indicator feature for the item's own ID and a warm item gets a free per-item correction;
+a cold item has no ID feature, so its vector is the sum of its content embeddings. This is the FM of
+ch. 6 restricted to user-field-times-item-field interactions.
+
+There is a catch. Trained with IDs always present, the model can push all the signal into the ID
+embeddings and leave the content embeddings undertrained — great on warm, weak on cold. **DropoutNet**
+(Volkovs et al., 2017) fixed it with a training trick: randomly zero the ID part of the input, so
+the network must learn to score from content alone on a fraction of examples, exactly the condition
+it will face at serving time.
+
+```python
+import torch
+import torch.nn as nn
+
+torch.set_num_threads(1)                          # tiny model: one thread beats four here
+
+class FeatureSum(nn.Module):
+    """LightFM-style: item = id + TF-IDF words, user = id + segment. Vectors are sums."""
+    def __init__(self, d=16):
+        super().__init__()
+        self.register_buffer("words", torch.as_tensor(Fd, dtype=torch.float32))
+        self.register_buffer("seg", torch.as_tensor(segment))
+        self.item_id, self.user_id = nn.Embedding(n_items, d), nn.Embedding(n_users, d)
+        self.user_seg = nn.Embedding(n_segments, d)
+        self.word_emb = nn.Parameter(torch.randn(Fd.shape[1], d) * 0.05)
+        self.item_id_b = nn.Embedding(n_items, 1)
+        self.word_b = nn.Parameter(torch.zeros(Fd.shape[1]))
+        for e in (self.item_id, self.user_id, self.user_seg):
+            nn.init.normal_(e.weight, std=0.05)
+        nn.init.zeros_(self.item_id_b.weight)
+
+    def item(self, i, keep):                      # keep = 0 hides the id feature
+        x = self.words[i]
+        return (keep[:, None] * self.item_id(i) + x @ self.word_emb,
+                keep * self.item_id_b(i)[:, 0] + x @ self.word_b)
+
+    def user(self, u, keep):
+        return keep[:, None] * self.user_id(u) + self.user_seg(self.seg[u])
+
+def train_feature_sum(p_drop=0.0, epochs=30, batch=1_024, lr=0.01, l2=0.01, seed=0):
+    torch.manual_seed(seed)
+    g = torch.Generator().manual_seed(seed)
+    m = FeatureSum()
+    opt = torch.optim.Adam(m.parameters(), lr=lr)
+    u_all = torch.tensor(train["user"].values)
+    i_all = torch.tensor(train["item"].values)
+    warm_t = torch.tensor(warm_items)
+    for _ in range(epochs):
+        perm = torch.randperm(len(u_all), generator=g)
+        for s in range(0, len(perm), batch):
+            b = perm[s:s + batch]
+            u, i = u_all[b], i_all[b]
+            j = warm_t[torch.randint(0, len(warm_t), (len(b),), generator=g)]
+            ku = (torch.rand(len(b), generator=g) >= p_drop).float()   # ID dropout
+            ki = (torch.rand(len(b), generator=g) >= p_drop).float()
+            pu = m.user(u, ku)
+            (qi, bi), (qj, bj) = m.item(i, ki), m.item(j, ki)
+            x = (pu * (qi - qj)).sum(1) + bi - bj                       # BPR (ch. 5)
+            reg = (pu.pow(2).sum(1) + qi.pow(2).sum(1) + qj.pow(2).sum(1)).mean()
+            loss = -nn.functional.logsigmoid(x).mean() + l2 * reg
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return m
+
+@torch.no_grad()
+def feature_sum_scores(m):
+    ki = torch.as_tensor(~is_cold_item, dtype=torch.float32)          # cold: no id feature
+    ku = torch.as_tensor(~is_cold_user, dtype=torch.float32)
+    Q, bq = m.item(torch.arange(n_items), ki)
+    P = m.user(torch.arange(n_users), ku)
+    return (P @ Q.T + bq).numpy()
+
+S_fs = {}
+print(f"{'ID dropout':>11} " + " ".join(f"{t:>10}" for t in TASKS))
+for p in (0.0, 0.25, 0.5):
+    S = feature_sum_scores(train_feature_sum(p_drop=p))
+    S_fs[p] = S
+    print(f"{p:>11.2f} " + " ".join(f"{recall_at_k(lambda u: S[u], t):>10.4f}" for t in TASKS))
+```
+
+```output
+ ID dropout       warm  cold-item  cold-user  cold-both
+       0.00     0.2019     0.2036     0.2726     0.1495
+       0.25     0.1987     0.1975     0.2822     0.1496
+       0.50     0.2025     0.1879     0.2774     0.1414
+```
+
+One model now produces a score for every one of the four tasks, including cold-both, where no
+method above had anything to say. Read the dropout rows honestly: dropout trades between the
+tasks rather than lifting all of them. It helps the cold-user column (the segment embedding has to
+carry the signal on a quarter of the steps), and at this scale it does not help cold items, whose
+content embeddings were already well trained because 95 words are shared by 640 warm items. The
+DropoutNet gains in the paper come from deep content encoders with millions of parameters, which
+are far easier to starve than a 95-row embedding table.
+
+## New users: segments, questionnaires, and the hand-off to bandits
+
+A new user gives you three possible sources of information, in increasing cost: **attributes**
+(segment popularity, or the segment embedding above), **an onboarding questionnaire** ("pick
+some titles you like"), and **exploration** in the live product. The questionnaire is the
+interesting one, because you choose the questions.
+
+### Folding a new user into the factor space
+
+Given iALS item factors $V$, a new user who said yes to items $A$ gets the same closed-form solve as
+any user in ch. 5, with one change: shrink toward the segment's mean user vector
+$\boldsymbol{\mu}_s$ instead of toward zero:
+
+$$
+\mathbf{x}_u = \left(V^\top V + \alpha V_A^\top V_A + \lambda I\right)^{-1}
+\left((1+\alpha)\,V_A^\top \mathbf{1} + \lambda \boldsymbol{\mu}_s\right)
+$$
+
+With no answers this is (nearly) the segment's average taste; every yes pulls it toward the liked
+items. The matrix being inverted is also a posterior precision: under a Gaussian model,
+$\mathrm{Cov}(\mathbf{x}_u) \propto \left(V^\top V + \alpha V_A^\top V_A + \lambda I\right)^{-1}$.
+Choosing questions that shrink this matrix fastest is **D-optimal design** — greedily pick the item
+maximising $\mathbf{v}_j^\top \Sigma \mathbf{v}_j$, the variance of the prediction you would get.
+
+```python
+cu_truth = TASKS["cold-user"][0]
+aff = user_vec @ item_vec.T / 2.0                 # the oracle a questionnaire answer comes from
+G, d_f = V_mf.T @ V_mf, V_mf.shape[1]
+seg_mu = np.array([U_mf[warm_users[segment[warm_users] == s]].mean(axis=0)
+                   for s in range(n_segments)])
+POOL = warm_items[np.argsort(-pop[warm_items])][:60]      # recognisable titles to ask about
+CAND = np.setdiff1d(warm_items, POOL)                     # ranked and scored without the pool
+
+def fold_in(liked, mu, alpha=5.0, lam=300.0):
+    Va = V_mf[liked].reshape(-1, d_f)
+    A = G + alpha * Va.T @ Va + lam * np.eye(d_f)
+    return np.linalg.solve(A, (1 + alpha) * Va.sum(axis=0) + lam * mu), np.linalg.inv(A)
+
+def d_optimal(m):
+    A, chosen = np.eye(d_f), []
+    for _ in range(m):
+        gain = np.einsum("ij,jk,ik->i", V_mf[POOL], np.linalg.inv(A), V_mf[POOL])
+        gain[np.isin(POOL, chosen)] = -np.inf
+        j = POOL[np.argmax(gain)]
+        chosen.append(j)
+        A += np.outer(V_mf[j], V_mf[j])
+    return np.array(chosen)
+
+def adaptive(u, m, mu, thr):
+    """Ask, update, ask again: score + uncertainty, a LinUCB rule (ch. 11) on the questionnaire."""
+    asked, liked = [], []
+    for _ in range(m):
+        x, Sigma = fold_in(liked, mu)
+        ucb = V_mf[POOL] @ x + np.sqrt(np.einsum("ij,jk,ik->i", V_mf[POOL], Sigma, V_mf[POOL]))
+        ucb[np.isin(POOL, asked)] = -np.inf
+        j = POOL[np.argmax(ucb)]
+        asked.append(j)
+        if aff[u, j] > thr:
+            liked.append(j)
+    return liked
+
+DOPT, rq = d_optimal(30), np.random.default_rng(3)
+
+def onboarding(strategy, m, k=10):
+    rec, yes = [], []
+    for u, items in cu_truth.items():
+        tr = items & set(CAND)
+        if not tr:
+            continue
+        mu, thr = seg_mu[segment[u]], np.quantile(aff[u, warm_items], 0.8)   # yes = top 20% taste
+        if strategy == "adaptive":
+            liked = adaptive(u, m, mu, thr)
+        else:
+            asked = {"popular": POOL[:m], "random": rq.choice(POOL, m, replace=False),
+                     "d-optimal": DOPT[:m]}[strategy]
+            liked = [i for i in asked if aff[u, i] > thr]
+        x, _ = fold_in(liked, mu)
+        top = CAND[np.argpartition(-(V_mf[CAND] @ x), k)[:k]]
+        rec.append(len(tr & set(top)) / min(k, len(tr)))
+        yes.append(len(liked))
+    return np.mean(rec), np.mean(yes)
+
+print(f"no questions (segment prior only): recall@10 {onboarding('popular', 0)[0]:.4f}")
+print(f"\n{'questions':>9} {'strategy':>10} {'recall@10':>10} {'yes answers':>12}")
+for m in (5, 10, 20):
+    for strat in ("popular", "random", "d-optimal", "adaptive"):
+        rcl, y = onboarding(strat, m)
+        print(f"{m:>9} {strat:>10} {rcl:>10.4f} {y:>12.2f}")
+```
+
+```output
+no questions (segment prior only): recall@10 0.1380 | trace(Sigma) 0.0494
+
+questions   strategy  recall@10  yes answers  trace(Sigma)
+        5    popular     0.1460         1.92        0.0489
+        5     random     0.1498         1.55        0.0492
+        5  d-optimal     0.1450         1.40        0.0490
+        5   adaptive     0.1447         2.26        0.0489
+       10    popular     0.1507         3.63        0.0487
+       10     random     0.1504         3.07        0.0490
+       10  d-optimal     0.1540         3.10        0.0488
+       10   adaptive     0.1546         4.71        0.0486
+       20    popular     0.1662         7.32        0.0484
+       20     random     0.1665         6.29        0.0487
+       20  d-optimal     0.1732         6.35        0.0484
+       20   adaptive     0.1733         9.37        0.0482
+```
+
+The questions are drawn from the 60 most popular titles (an onboarding screen has to show things
+people recognise), and that whole pool is excluded from the ranking and the ground truth for every
+strategy, so the rows compare like with like.
+
+Twenty answers lift recall by about a quarter over the segment prior. The strategy differences at
+five and ten questions are within the noise of 395 users; at twenty, the two strategies that reason
+about the factor space (D-optimal and adaptive) pull slightly ahead. Notice what the adaptive rule
+does with the yes column: it collects far more positives, because it asks about things the current
+estimate already thinks the user likes, plus a bonus for uncertainty. That is the
+exploration–exploitation trade, and it is precisely the LinUCB score of ch. 11 applied to a
+questionnaire. Past onboarding, the same rule runs on live impressions — the questionnaire is the
+first few rounds of a contextual bandit, and the hand-off is seamless if your fold-in keeps
+$\Sigma$ around.
+
+## The warm-versus-cold scoreboard
+
+```python
+methods = {
+    "random": {t: baselines["random"] for t in TASKS},
+    "popularity": {"warm": baselines["popularity"], "cold-user": baselines["popularity"]},
+    "segment popularity": {"warm": baselines["segment popularity"],
+                           "cold-user": baselines["segment popularity"]},
+    "content (TF-IDF)": {"warm": content, "cold-item": content},
+    "iALS": {"warm": mf},
+    "switching (seg-pop | iALS)": {"warm": lambda u: seg_pop[segment[u]] if n_u[u] < 3 else mf(u),
+                                   "cold-user": baselines["segment popularity"]},
+    "attribute-to-factor": {"cold-item": lambda u: V_hat @ U_mf[u]},
+    "feature-sum": {t: (lambda u: S_fs[0.0][u]) for t in TASKS},
+    "feature-sum + ID dropout": {t: (lambda u: S_fs[0.25][u]) for t in TASKS},
+}
+print(f"{'recall@10 (+- 1 s.e.)':>27} " + " ".join(f"{t:>15}" for t in TASKS))
+for name, fns in methods.items():
+    cells = []
+    for t in TASKS:
+        if t in fns:
+            m_, s_ = recall_at_k(fns[t], t, se=True)
+            cells.append(f"{m_:.3f} +- {s_:.3f}")
+        else:
+            cells.append("n/a")
+    print(f"{name:>27} " + " ".join(f"{c:>15}" for c in cells))
+```
+
+```output
+      recall@10 (+- 1 s.e.)            warm       cold-item       cold-user       cold-both
+                     random  0.024 +- 0.003  0.068 +- 0.004  0.033 +- 0.003  0.068 +- 0.007
+                 popularity  0.146 +- 0.006             n/a  0.263 +- 0.011             n/a
+         segment popularity  0.180 +- 0.007             n/a  0.290 +- 0.011             n/a
+           content (TF-IDF)  0.059 +- 0.004  0.200 +- 0.007             n/a             n/a
+                       iALS  0.208 +- 0.007             n/a             n/a             n/a
+ switching (seg-pop | iALS)  0.212 +- 0.007             n/a  0.291 +- 0.011             n/a
+        attribute-to-factor             n/a  0.223 +- 0.007             n/a             n/a
+                feature-sum  0.202 +- 0.007  0.204 +- 0.007  0.273 +- 0.011  0.150 +- 0.012
+   feature-sum + ID dropout  0.199 +- 0.007  0.197 +- 0.006  0.282 +- 0.011  0.150 +- 0.012
+```
+
+Read the table by column, because no row wins every column — that is the chapter's conclusion in
+one picture. On **warm** users iALS (and the switching hybrid wrapped around it) is the model to
+beat, and the feature-sum model is close behind. On **new items** the content-to-factor bridge wins,
+and both feature-based models are within a standard error of the plain content profile. On **new
+users** nothing beats segment popularity without asking questions; the feature-sum model's segment
+embedding only matches it. On **new system** only a model with features on both sides can play at
+all.
+
+The standard errors matter. A difference of 0.01 on the cold columns is inside the noise of a few
+hundred to fourteen hundred users; claims like "dropout helps cold items" need several seeds and a
+paired test (ch. 2) before anyone acts on them.
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy.sparse.linalg import svds
+from scipy import sparse
+from sklearn.linear_model import Ridge
+
+def content_value(residual, n_users=1_500, n_items=600, d=8, K=8, seed=0):
+    """How much does content buy you on new items, as the unexplained part of taste grows?"""
+    r = np.random.default_rng(seed)
+    theta = r.dirichlet(np.full(K, 0.3), n_items)
+    item = 1.6 * theta @ r.normal(0, 1, (K, d)) + r.normal(0, residual, (n_items, d))
+    item *= 0.98 / item.std()                                 # total taste variance held fixed
+    user = r.normal(0, 1, (n_users, d))
+    logit = user @ item.T / 2 - 4.0 + np.log(r.lognormal(-1, 1, n_items))[None, :]
+    Y = (r.random((n_users, n_items)) < 1 / (1 + np.exp(-logit))).astype(float)
+    cold = r.random(n_items) < 0.2
+    U, s, Vt = svds(sparse.csr_matrix(Y[:, ~cold]), k=d)     # CF factors from warm items only
+    V_warm = Vt.T * s
+    reg = Ridge(alpha=1.0).fit(theta[~cold], V_warm)          # attribute-to-factor
+    oracle = np.linalg.lstsq(item[~cold], V_warm, rcond=None)[0]   # if features were the truth
+    Yc, idx = Y[:, cold], np.flatnonzero(Y[:, cold].sum(1) > 0)
+    def recall(S):
+        top = np.argpartition(-S[idx], 10, axis=1)[:, :10]
+        hits = np.take_along_axis(Yc[idx], top, axis=1).sum(1)
+        return np.mean(hits / np.minimum(10, Yc[idx].sum(1)))
+    return (reg.score(theta[~cold], V_warm), recall(U @ reg.predict(theta[cold]).T),
+            recall(U @ (item[cold] @ oracle).T), recall(r.random((n_users, int(cold.sum())))))
+
+print(f"{'residual sd':>12} {'R^2':>6} {'attr->factor':>13} {'oracle':>7} {'random':>7}")
+for residual in (0.1, 0.55, 1.0, 2.0, 4.0):
+    r2, a, o, b = content_value(residual)
+    print(f"{residual:>12.2f} {r2:>6.3f} {a:>13.4f} {o:>7.4f} {b:>7.4f}")
+```
+
+```output
+ residual sd  attr->factor   random
+        0.10        0.2189   0.0903
+        0.55        0.2206   0.0960
+        1.00        0.2172   0.1053
+        2.00        0.2114   0.1148
+```
+
+The residual is the part of an item's taste profile its description does not capture. As it grows
+the content-to-factor bridge decays toward random, and no model choice can stop that: the
+information is simply not in the features. Before you build a cold-start model, measure the $R^2$ of
+features onto your CF factors — it is the ceiling on everything in this chapter. Try changing the
+topic concentration (`0.3` in the Dirichlet) or the number of topics to see how sharper descriptions
+move the ceiling.
+
+## Exercise
+
+New users rarely stay at zero interactions for long. Simulate the **few-shot** regime: for each
+cold user, reveal $n \in \{1, 3, 5, 10\}$ of their interactions (chosen at random) as if they had just
+happened, hide those items from both the ranking and the ground truth, and compare four policies on
+the remaining interactions: segment popularity, the content profile, iALS fold-in with the segment
+prior, and a switching hybrid that uses segment popularity below some $n$ and fold-in above it.
+Find the crossover point.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def few_shot(n_reveal, k=10, seed=0):
+    r = np.random.default_rng(seed)
+    res = {"segment pop": [], "content": [], "fold-in": []}
+    for u, items in cu_truth.items():
+        items = np.array(sorted(items))
+        if len(items) <= n_reveal:
+            continue
+        revealed = r.choice(items, n_reveal, replace=False)
+        truth = set(items) - set(revealed)
+        cand = np.setdiff1d(warm_items, revealed)
+        x, _ = fold_in(revealed, seg_mu[segment[u]], lam=30.0)
+        scores = {"segment pop": seg_pop[segment[u]][cand],
+                  "content": Fd[cand] @ content_profile(revealed),
+                  "fold-in": V_mf[cand] @ x}
+        for name, s in scores.items():
+            top = cand[np.argpartition(-s, k)[:k]]
+            res[name].append(len(truth & set(top)) / min(k, len(truth)))
+    return {name: np.mean(v) for name, v in res.items()}, len(res["content"])
+
+print(f"{'revealed':>8} {'users':>6} {'segment pop':>12} {'content':>8} {'fold-in':>8}")
+for n in (1, 3, 5, 10):
+    out, n_users_eval = few_shot(n)
+    print(f"{n:>8} {n_users_eval:>6} {out['segment pop']:>12.4f} {out['content']:>8.4f} "
+          f"{out['fold-in']:>8.4f}")
+```
+
+```output
+revealed  users  segment pop  content  fold-in
+       1    379       0.2750   0.0711   0.2691
+       3    345       0.2790   0.0785   0.3030
+       5    312       0.2867   0.0861   0.2965
+      10    249       0.2628   0.1069   0.3099
+```
+
+The fold-in uses $\lambda = 30$ here rather than the questionnaire's 300: revealed interactions
+are real consumption, which carries the popularity signal the iALS factors were trained on, so
+they deserve to move the user vector quickly. With that, fold-in overtakes segment popularity after
+a handful of interactions, and the switching hybrid is simply "segment popularity until the
+crossover, fold-in after" — the same rule the warm-user support table suggested, now measured on
+genuinely new users. The content profile never catches up on this data because it cannot see
+popularity; in a catalogue where items are equally exposed it would do much better. Note that every
+user is evaluated on fewer held-out items as $n$ grows and users with too few interactions drop
+out, so compare columns within a row, not rows within a column.
+</details>
