@@ -18,6 +18,7 @@ BPE starts with individual characters (or bytes) and repeatedly merges the most 
 ### The merge algorithm
 
 ```python
+import re
 from collections import Counter
 
 def get_vocab(corpus: list[str]) -> dict:
@@ -36,13 +37,10 @@ def get_pair_counts(vocab: dict) -> Counter:
     return counts
 
 def merge_vocab(pair: tuple, vocab: dict) -> dict:
-    new_vocab = {}
-    bigram = ' '.join(pair)
+    # lookarounds make sure we only merge whole symbols, never fragments of one
+    pattern = re.compile(r'(?<!\S)' + re.escape(' '.join(pair)) + r'(?!\S)')
     replacement = ''.join(pair)
-    for seq, freq in vocab.items():
-        new_seq = seq.replace(bigram, replacement)
-        new_vocab[new_seq] = freq
-    return new_vocab
+    return {pattern.sub(replacement, seq): freq for seq, freq in vocab.items()}
 
 corpus = ['low', 'lower', 'lowest', 'new', 'newer', 'wide']
 vocab = get_vocab(corpus)
@@ -54,7 +52,7 @@ for i in range(4):
     pairs = get_pair_counts(vocab)
     best = pairs.most_common(1)[0][0]
     vocab = merge_vocab(best, vocab)
-    print(f"Merge {i+1}: {best[0]!r} + {best[1]!r} → {''.join(best)!r}")
+    print(f"Merge {i+1}: {best[0]!r} + {best[1]!r} -> {''.join(best)!r}")
 ```
 
 ```output
@@ -62,46 +60,99 @@ Initial vocab (top 3):
   'l o w </w>': 1
   'l o w e r </w>': 1
   'l o w e s t </w>': 1
-Merge 1: 'l' + 'o' → 'lo'
-Merge 2: 'lo' + 'w' → 'low'
-Merge 3: 'e' + 'r' → 'er'
-Merge 4: 'low' + 'e' → 'lowe'
+Merge 1: 'l' + 'o' -> 'lo'
+Merge 2: 'lo' + 'w' -> 'low'
+Merge 3: 'low' + 'e' -> 'lowe'
+Merge 4: 'r' + '</w>' -> 'r</w>'
 ```
 
-After 10–50K merges on a large corpus you have a vocabulary. At inference, apply the same merge rules in order to tokenize new text.
+Ties are broken by first occurrence, so the very first merge is the earliest of the most frequent pairs. After 10-50K merges on a large corpus you have a vocabulary. At inference, apply the same merge rules in the order they were learned to tokenize new text.
 
 ### Byte-level BPE
 
-GPT-2 and its successors use **byte-level BPE**: treat every byte (0–255) as a base character. This guarantees zero OOV for any Unicode text — a Bengali glyph that's rare in training becomes a sequence of byte tokens.
+GPT-2 and its successors use **byte-level BPE**: treat every byte (0-255) as a base character. This guarantees zero OOV for any Unicode text — a Bengali glyph that's rare in training becomes a sequence of byte tokens. The price is visible immediately: each Bengali code point takes 3 bytes in UTF-8.
+
+```python
+for w in ["language", "ভাষা"]:
+    b = w.encode("utf-8")
+    print(f"{w!r}: {len(w)} characters -> {len(b)} bytes: {list(b)}")
+```
+
+```output
+'language': 8 characters -> 8 bytes: [108, 97, 110, 103, 117, 97, 103, 101]
+'ভাষা': 4 characters -> 12 bytes: [224, 166, 173, 224, 166, 190, 224, 166, 183, 224, 166, 190]
+```
 
 ## WordPiece: likelihood-based merging
 
-WordPiece (BERT, RoBERTa) also builds from characters but merges the pair that **maximizes the likelihood** of the corpus under the resulting language model — not just the most frequent pair.
+WordPiece (BERT) also builds from characters but merges the pair that **maximizes the likelihood** of the corpus under the resulting language model — not just the most frequent pair.
 
 The score for merging symbols $(a, b)$:
 
 $$
-\text{score}(a, b) = \frac{P(ab)}{P(a) \cdot P(b)}
+\text{score}(a, b) = \frac{\text{count}(ab)}{\text{count}(a) \cdot \text{count}(b)}
 $$
 
-This prefers merges where the bigram is much more probable than the product of unigrams — i.e., pairs that co-occur more than chance. WordPiece marks continuation pieces with `##`:
+This prefers merges where the bigram is much more frequent than the product of unigram frequencies would predict — i.e., pairs that co-occur more than chance. WordPiece marks continuation pieces with `##`. Below is a miniature trainer plus the greedy longest-match-first encoder BERT uses at inference. The vocabulary is learned from a toy corpus (no pretrained tokenizer is downloaded in this course).
 
 ```python
-from transformers import BertTokenizer
+def train_wordpiece(words, n_merges):
+    seqs = Counter()
+    for w in words:
+        seqs[tuple([w[0]] + ['##' + c for c in w[1:]])] += 1
+    vocab = {s for q in seqs for s in q}
+    for _ in range(n_merges):
+        uni, bi = Counter(), Counter()
+        for q, f in seqs.items():
+            for x in q: uni[x] += f
+            for x, y in zip(q, q[1:]): bi[(x, y)] += f
+        if not bi: break
+        best = max(bi, key=lambda p: (bi[p] / (uni[p[0]] * uni[p[1]]), bi[p], p))
+        new = best[0] + best[1].replace('##', '', 1)
+        vocab.add(new)
+        out = Counter()
+        for q, f in seqs.items():
+            q2, i = [], 0
+            while i < len(q):
+                if i + 1 < len(q) and (q[i], q[i + 1]) == best:
+                    q2.append(new); i += 2
+                else:
+                    q2.append(q[i]); i += 1
+            out[tuple(q2)] += f
+        seqs = out
+    return vocab
 
-tok = BertTokenizer.from_pretrained('bert-base-uncased')
-tokens = tok.tokenize("ChatGPT tokenizes surprisingly well")
-print(tokens)
-ids = tok.convert_tokens_to_ids(tokens)
-print(ids)
+def wp_tokenize(word, vocab):
+    toks, start = [], 0
+    while start < len(word):
+        end = len(word)
+        while end > start:
+            piece = word[start:end] if start == 0 else '##' + word[start:end]
+            if piece in vocab:
+                toks.append(piece); break
+            end -= 1
+        else:
+            return ['[UNK]']
+        start = end
+    return toks
+
+wp_corpus = ("token tokens tokenize tokenizes tokenizer tokenizers tokenized "
+             "chat chats chatting chatted talk talks talking talked "
+             "surprise surprising surprisingly well wellness good goodness").split() * 3
+wp_vocab = train_wordpiece(wp_corpus, 60)
+for w in ["tokenizes", "chatting", "surprisingly", "chatgpt", "tokenizing"]:
+    print(f"{w:13s} -> {wp_tokenize(w, wp_vocab)}")
 ```
 
 ```output
-['chat', '##gp', '##t', 'token', '##izes', 'surprisingly', 'well']
-[13102, 14798, 1102, 19204, 5004, 10075, 2092]
+tokenizes     -> ['tokenizes']
+chatting      -> ['chatting']
+surprisingly  -> ['surprisingly']
+chatgpt       -> ['chat', '##g', '##p', '##t']
+tokenizing    -> ['tokeniz', '##i', '##ng']
 ```
 
-"ChatGPT" → `['chat', '##gp', '##t']`: unknown compound word handled by falling back to pieces.
+Frequent words become single tokens, inflected forms share a stem ("tokeniz" + "##i" + "##ng"), and an unseen compound like "chatgpt" falls back to a known piece plus single characters: `chat`, `##g`, `##p`, `##t`. A word containing a character absent from the vocabulary entirely would return `[UNK]`; real BERT vocabularies include all single characters of common scripts to make this rare.
 
 ## Unigram LM: prune from the top
 
@@ -113,79 +164,148 @@ $$
 P(\text{tokens}) = \prod_{i} P(t_i)
 $$
 
-This is used in T5, LLaMA, Mistral, and Gemma.
+This is used in T5, LLaMA, Mistral, and Gemma. A toy Viterbi segmenter over a hand-set unigram table shows how the best split is chosen:
+
+```python
+import math
+
+probs = {"un": 0.05, "believ": 0.02, "able": 0.04, "unbeliev": 0.0005,
+         "u": 0.01, "n": 0.01, "b": 0.01, "e": 0.02, "l": 0.01, "i": 0.01,
+         "v": 0.01, "a": 0.02}
+logp = {t: math.log(p) for t, p in probs.items()}
+
+def viterbi(word):
+    best = [(-math.inf, None)] * (len(word) + 1)
+    best[0] = (0.0, None)
+    for end in range(1, len(word) + 1):
+        for start in range(end):
+            piece = word[start:end]
+            if piece in logp and best[start][0] > -math.inf:
+                score = best[start][0] + logp[piece]
+                if score > best[end][0]:
+                    best[end] = (score, start)
+    toks, end = [], len(word)
+    while end > 0:
+        start = best[end][1]
+        toks.append(word[start:end]); end = start
+    return toks[::-1], best[-1][0]
+
+toks, lp = viterbi("unbelievable")
+print(toks, round(lp, 2))
+```
+
+```output
+['un', 'believ', 'able'] -10.13
+```
+
+The three-piece split wins because its summed log-probability beats both the character-level split and the rare `unbeliev` + `able` split.
 
 ## Comparing tokenizers on Bengali text
 
+Tokenizer quality depends on the training data. We train a small character-level BPE on (a) English only and (b) English plus Bengali, with a byte fallback for characters outside the vocabulary (as in byte-level BPE and LLaMA). The corpora are tiny, so absolute numbers are illustrative; the pattern is what matters.
+
 ```python
-from transformers import AutoTokenizer
+def train_bpe(words, n_merges):
+    vocab = get_vocab(words)
+    merges = []
+    for _ in range(n_merges):
+        pairs = get_pair_counts(vocab)
+        if not pairs: break
+        best = pairs.most_common(1)[0][0]
+        merges.append(best)
+        vocab = merge_vocab(best, vocab)
+    return merges
 
-texts = [
-    "Natural language processing is amazing.",
-    "প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ।",
-]
+def bpe_encode(word, merges, chars):
+    syms = []
+    for c in word:
+        syms += [c] if c in chars else [f"<0x{b:02X}>" for b in c.encode("utf-8")]
+    syms.append("</w>")
+    for a, b in merges:
+        i = 0
+        while i < len(syms) - 1:
+            if syms[i] == a and syms[i + 1] == b:
+                syms[i:i + 2] = [a + b]
+            else:
+                i += 1
+    return syms
 
-for model_name in ['bert-base-uncased', 'xlm-roberta-base']:
-    tok = AutoTokenizer.from_pretrained(model_name)
+en = ("natural language processing is amazing and language models process natural text "
+      "processing text is natural").split() * 2
+bn = ("প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ ভাষা মডেল প্রাকৃতিক ভাষা প্রক্রিয়াকরণ").split() * 2
+
+merges_en = train_bpe(en, 30)
+chars_en = set("".join(en))
+merges_mix = train_bpe(en + bn, 60)
+chars_mix = set("".join(en + bn))
+
+texts = ["natural language processing is amazing",
+         "প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ"]
+for name, merges, chars in [("english-only BPE", merges_en, chars_en),
+                            ("english+bengali BPE", merges_mix, chars_mix)]:
     for t in texts:
-        n = len(tok.tokenize(t))
-        print(f"{model_name:30s} | {n:3d} tokens | {t[:40]}")
+        words = t.split()
+        n = sum(len(bpe_encode(w, merges, chars)) for w in words)
+        print(f"{name:20s} | {n:3d} tokens | {len(words)} words | fertility {n/len(words):.2f}")
     print()
 ```
 
 ```output
-bert-base-uncased              |   6 tokens | Natural language processing is amazing.
-bert-base-uncased              |  43 tokens | প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ।
-xlm-roberta-base               |   6 tokens | Natural language processing is amazing.
-xlm-roberta-base               |  11 tokens | প্রাকৃতিক ভাষা প্রক্রিয়াকরণ অসাধারণ।
+english-only BPE     |   9 tokens | 5 words | fertility 1.80
+english-only BPE     | 103 tokens | 4 words | fertility 25.75
+
+english+bengali BPE  |   5 tokens | 5 words | fertility 1.00
+english+bengali BPE  |   9 tokens | 4 words | fertility 2.25
 ```
 
-BERT's English-centric vocabulary fragments Bengali into individual bytes (43 tokens for 5 words). XLM-RoBERTa, trained on 100 languages including Bengali, uses 11 tokens for the same text — 4× more efficient.
+The English-only tokenizer falls back to raw bytes for Bengali, so every code point costs three tokens; the tokenizer that saw Bengali merges them into longer pieces. This is the same effect that makes English-centric vocabularies expensive and slow for Bengali, and why multilingual models (XLM-R, mT5) train their tokenizers on 100 languages.
 
 ### Fertility: tokens per word
 
-**Fertility** measures how many tokens a tokenizer produces per source word. English baseline is ~1.2–1.5 with a good subword model. Bengali on an English-only tokenizer can reach 8–12 tokens/word.
+**Fertility** measures how many tokens a tokenizer produces per source word. English baseline is ~1.2-1.5 with a good subword model. Bengali on an English-only tokenizer can be many times worse (8-12 tokens/word for real vocabularies); the toy printout above is even more extreme because it has no Bengali merges at all.
 
 ## SentencePiece vs Hugging Face tokenizers
 
+SentencePiece works on the raw string. It replaces spaces with the visible symbol `▁` (U+2581) and treats the result as one long sequence, so it needs no language-specific pre-tokenization and the original text is exactly recoverable:
+
 ```python
-import sentencepiece as spm
+def sp_normalize(text):
+    return "▁" + text.replace(" ", "▁")
 
-# In practice you'd train on your corpus:
-# spm.SentencePieceTrainer.train('--input=corpus.txt --model_prefix=mymodel --vocab_size=8000')
-
-# Using a pretrained SentencePiece model (T5/LLaMA use these):
-tok = AutoTokenizer.from_pretrained('t5-small')
-tokens = tok.tokenize("The tokenizer handles Bengali: বাংলা")
-print(tokens)
+text = "The tokenizer handles Bengali: বাংলা"
+norm = sp_normalize(text)
+print(norm)
+pieces = ["▁The", "▁token", "izer", "▁handles", "▁Bengali", ":", "▁বাং", "লা"]   # a plausible segmentation
+print("".join(pieces) == norm)
+print("".join(pieces).replace("▁", " ").lstrip() == text)
 ```
 
 ```output
-['▁The', '▁tokenizer', '▁handles', '▁Bengali', ':', '▁বাং', 'লা']
+▁The▁tokenizer▁handles▁Bengali:▁বাংলা
+True
+True
 ```
 
-SentencePiece uses `▁` (U+2581) to mark word-initial position instead of `##` continuation. No pre-tokenization on spaces is needed — it works on raw Unicode, including scripts without explicit word boundaries.
+`▁` marks word-initial position instead of `##` marking continuation. No pre-tokenization on spaces is needed — it works on raw Unicode, including scripts without explicit word boundaries. In practice you would train it with `spm.SentencePieceTrainer.train(input='corpus.txt', model_prefix='m', vocab_size=8000)`; the segmentation above is hand-written for illustration.
 
 ## Try it Yourself
 
 ```python
-from transformers import AutoTokenizer
-
-sentence = "Transformers handle morphology better than word tokenizers."
-for model in ['bert-base-uncased', 'gpt2', 't5-small', 'xlm-roberta-base']:
-    tok = AutoTokenizer.from_pretrained(model)
-    toks = tok.tokenize(sentence)
-    print(f"{model:30s} → {len(toks):2d} tokens: {toks[:5]}")
+sentence = "natural language is amazing"
+for name, merges, chars in [("english-only", merges_en, chars_en),
+                            ("english+bengali", merges_mix, chars_mix)]:
+    toks = [t for w in sentence.split() for t in bpe_encode(w, merges, chars)]
+    print(f"{name:16s} -> {len(toks):2d} tokens: {toks[:8]}")
+print("character level  ->", len(sentence.replace(' ', '')) + len(sentence.split()), "tokens")
 ```
 
 ```output
-bert-base-uncased              →  9 tokens: ['transformers', 'handle', 'mor', '##ph', '##ology']
-gpt2                           →  9 tokens: ['Transform', 'ers', 'Ġhandle', 'Ġmorphology', 'Ġbetter']
-t5-small                       →  9 tokens: ['▁Transform', 'ers', '▁handle', '▁morphology', '▁better']
-xlm-roberta-base               →  9 tokens: ['▁Transform', 'ers', '▁handle', '▁morphology', '▁better']
+english-only     ->  8 tokens: ['natural</w>', 'language</w>', 'is</w>', 'a', 'm', 'a', 'z', 'ing</w>']
+english+bengali  ->  4 tokens: ['natural</w>', 'language</w>', 'is</w>', 'amazing</w>']
+character level  -> 28 tokens
 ```
 
-Try the same sentence with Bengali or Turkish text and see the fertility difference.
+Try the same sentence with Bengali text, or train with more merges and watch the token count fall.
 
 ## Exercise
 
@@ -217,8 +337,17 @@ vocab = {'l o w </w>': 1, 'l o w e r </w>': 1,
          'n e w </w>': 1, 'w i d e r </w>': 1}
 for i in range(6):
     vocab, pair = bpe_step(vocab)
-    print(f"Step {i+1}: merged {pair} → vocab size {len(set(' '.join(vocab).split()))}")
+    print(f"Step {i+1}: merged {pair} -> {list(vocab)}")
 ```
 
-The key insight: BPE greedily merges based on count, not linguistic knowledge — yet it learns meaningful pieces like "low", "er", "new" because those pairs co-occur frequently.
+```output
+Step 1: merged ('l', 'o') -> ['lo w </w>', 'lo w e r </w>', 'n e w </w>', 'w i d e r </w>']
+Step 2: merged ('lo', 'w') -> ['low </w>', 'low e r </w>', 'n e w </w>', 'w i d e r </w>']
+Step 3: merged ('e', 'r') -> ['low </w>', 'low er </w>', 'n e w </w>', 'w i d er </w>']
+Step 4: merged ('er', '</w>') -> ['low </w>', 'low er</w>', 'n e w </w>', 'w i d er</w>']
+Step 5: merged ('low', '</w>') -> ['low</w>', 'low er</w>', 'n e w </w>', 'w i d er</w>']
+Step 6: merged ('low', 'er</w>') -> ['low</w>', 'lower</w>', 'n e w </w>', 'w i d er</w>']
+```
+
+The key insight: BPE greedily merges based on count, not linguistic knowledge — yet it learns meaningful pieces like "low" and "er" because those pairs co-occur frequently.
 </details>

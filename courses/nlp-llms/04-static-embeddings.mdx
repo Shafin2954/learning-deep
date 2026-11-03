@@ -25,37 +25,103 @@ $$
 
 where $\mathbf{v}_w$ is the center embedding and $\mathbf{u}_o$ is the context embedding. You push the dot product of true pairs high and sampled negatives low.
 
+We implement skip-gram with negative sampling directly in PyTorch (gensim's `Word2Vec` does the same thing with a faster C loop; it is not installed here). The same class can optionally add FastText-style character n-gram vectors, used later in this chapter.
+
 ```python
-# Training from scratch with gensim
-from gensim.models import Word2Vec
+import numpy as np, torch
+import torch.nn as nn, torch.nn.functional as F
+torch.set_num_threads(1)
 
-sentences = [
-    ["the", "cat", "sat", "on", "the", "mat"],
-    ["the", "dog", "sat", "on", "the", "mat"],
-    ["the", "cat", "and", "dog", "are", "friends"],
-    ["cats", "and", "dogs", "are", "great", "pets"],
-    ["machine", "learning", "is", "amazing"],
-    ["deep", "learning", "is", "a", "branch", "of", "machine", "learning"],
-] * 100  # repeat to get some signal
+def hash_str(s):                      # deterministic string hash (Python's hash() is salted)
+    h = 0
+    for ch in s:
+        h = (h * 31 + ord(ch)) % 1000003
+    return h
 
-model = Word2Vec(sentences, vector_size=50, window=3, min_count=1,
-                 sg=1, negative=5, epochs=20, seed=42)
+class SkipGram(nn.Module):
+    """Skip-gram with negative sampling; ngrams=True adds FastText-style subword vectors."""
+    def __init__(self, sentences, dim=16, window=2, negative=5, ngrams=False, seed=0):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.rng = np.random.default_rng(seed)
+        self.itos = sorted({w for s in sentences for w in s})
+        self.stoi = {w: i for i, w in enumerate(self.itos)}
+        self.negative, self.use_ng = negative, ngrams
+        self.V = nn.Embedding(len(self.itos), dim)          # center vectors v_w
+        self.U = nn.Embedding(len(self.itos), dim)          # context vectors u_o
+        nn.init.normal_(self.V.weight, std=0.1)
+        nn.init.zeros_(self.U.weight)
+        self.Z = nn.EmbeddingBag(2000, dim, mode='mean')    # hashed n-gram vectors z_g
+        nn.init.normal_(self.Z.weight, std=0.1)
+        self.pairs = np.array([(self.stoi[s[i]], self.stoi[s[j]])
+                               for s in sentences for i in range(len(s))
+                               for j in range(max(0, i - window), min(len(s), i + window + 1)) if i != j])
+        counts = np.bincount(self.pairs[:, 1], minlength=len(self.itos)) ** 0.75
+        self.noise = counts / counts.sum()                  # unigram^(3/4) noise distribution P_n
 
-print("Most similar to 'cat':")
-print(model.wv.most_similar('cat', topn=3))
-print("\nMost similar to 'learning':")
-print(model.wv.most_similar('learning', topn=3))
+    def gram_ids(self, w):
+        w = f"<{w}>"
+        return [hash_str(w[i:i + n]) % 2000 for n in (3, 4) for i in range(len(w) - n + 1)]
+
+    def center(self, ids):
+        v = self.V(ids)
+        if self.use_ng:
+            bags = [self.gram_ids(self.itos[i]) for i in ids.tolist()]
+            flat = torch.tensor([g for b in bags for g in b])
+            offs = torch.tensor([0] + list(np.cumsum([len(b) for b in bags])[:-1]))
+            v = v + self.Z(flat, offs)
+        return v
+
+    def fit(self, epochs=8, lr=0.02, batch=256):
+        opt = torch.optim.Adam(self.parameters(), lr=lr)
+        for _ in range(epochs):
+            perm = self.rng.permutation(len(self.pairs))
+            for k in range(0, len(perm), batch):
+                b = self.pairs[perm[k:k + batch]]
+                c, o = torch.tensor(b[:, 0]), torch.tensor(b[:, 1])
+                neg = torch.tensor(self.rng.choice(len(self.itos), size=(len(b), self.negative), p=self.noise))
+                v = self.center(c)
+                pos = F.logsigmoid((v * self.U(o)).sum(-1))
+                ngs = F.logsigmoid(-(self.U(neg) * v.unsqueeze(1)).sum(-1)).sum(-1)
+                loss = -(pos + ngs).mean()                  # negative of the objective above
+                opt.zero_grad(); loss.backward(); opt.step()
+        return self
+
+    def vec(self, w):
+        with torch.no_grad():
+            if w in self.stoi:
+                return self.center(torch.tensor([self.stoi[w]]))[0].numpy()
+            return self.Z(torch.tensor(self.gram_ids(w)), torch.tensor([0]))[0].numpy()   # OOV: subwords only
+
+    def most_similar(self, positive, negative=(), topn=3):
+        q = sum(self.vec(p) for p in positive) - sum(self.vec(n) for n in negative)
+        E = np.stack([self.vec(x) for x in self.itos])
+        sims = E @ q / (np.linalg.norm(E, axis=1) * np.linalg.norm(q) + 1e-9)
+        skip = set(positive) | set(negative)
+        return [(self.itos[i], round(float(sims[i]), 3)) for i in np.argsort(-sims) if self.itos[i] not in skip][:topn]
+
+import random
+rng = random.Random(0)
+animals = "cat dog horse cow".split()
+foods = "apple bread rice soup".split()
+tmpl_a = ["the {} sat on the mat", "the {} slept all day", "people feed the {} every morning", "the {} ran in the park"]
+tmpl_f = ["people cook the {} for dinner", "the {} tasted very good", "she ate the {} quickly", "people buy the {} at the market"]
+sentences = []
+for _ in range(400):
+    sentences.append(rng.choice(tmpl_a).format(rng.choice(animals)).split())
+    sentences.append(rng.choice(tmpl_f).format(rng.choice(foods)).split())
+
+model = SkipGram(sentences).fit()
+print("Most similar to 'cat':", model.most_similar(['cat']))
+print("Most similar to 'apple':", model.most_similar(['apple']))
 ```
 
 ```output
-Most similar to 'cat':
-[('dog', 0.972), ('cats', 0.931), ('dogs', 0.914)]
-
-Most similar to 'learning':
-[('machine', 0.988), ('deep', 0.976), ('branch', 0.941)]
+Most similar to 'cat': [('dog', 0.993), ('horse', 0.992), ('cow', 0.987)]
+Most similar to 'apple': [('soup', 0.994), ('bread', 0.994), ('rice', 0.992)]
 ```
 
-"cat" and "dog" end up close because they share identical contexts ("the ___ sat", "cats and dogs").
+"cat" lands next to "dog", "horse", "cow" and "apple" next to the other foods, because words in the same template slot share identical contexts. The corpus is a toy: with real text you would train on billions of tokens.
 
 ## GloVe: factorize the co-occurrence matrix
 
@@ -67,43 +133,53 @@ $$
 
 with a weighting function $f(X_{ij})$ that downweights very frequent pairs. This directly optimizes the log co-occurrence structure.
 
+Pretrained GloVe files (`glove.6B.50d.txt`) cannot be downloaded here, so we fit GloVe ourselves on the same toy corpus: build the co-occurrence matrix, then minimise the weighted squared error of the equation above with Adam.
+
 ```python
-import numpy as np
+def glove_fit(sentences, dim=16, window=2, xmax=20, alpha=0.75, epochs=200, seed=0):
+    torch.manual_seed(seed)
+    vocab = sorted({w for s in sentences for w in s})
+    idx = {w: i for i, w in enumerate(vocab)}
+    X = np.zeros((len(vocab), len(vocab)))
+    for s in sentences:
+        for i, w in enumerate(s):
+            for j in range(max(0, i - window), min(len(s), i + window + 1)):
+                if i != j:
+                    X[idx[w], idx[s[j]]] += 1.0 / abs(i - j)     # closer words count more
+    ii, jj = np.nonzero(X)
+    x = torch.tensor(X[ii, jj], dtype=torch.float32)
+    ii, jj = torch.tensor(ii), torch.tensor(jj)
+    W, Wt = nn.Embedding(len(vocab), dim), nn.Embedding(len(vocab), dim)
+    b, bt = nn.Embedding(len(vocab), 1), nn.Embedding(len(vocab), 1)
+    for m in (W, Wt):
+        nn.init.normal_(m.weight, std=0.1)
+    for m in (b, bt):
+        nn.init.zeros_(m.weight)
+    params = [*W.parameters(), *Wt.parameters(), *b.parameters(), *bt.parameters()]
+    opt = torch.optim.Adam(params, lr=0.05)
+    f = torch.clamp((x / xmax) ** alpha, max=1.0)                # weighting function f(X_ij)
+    for _ in range(epochs):
+        pred = (W(ii) * Wt(jj)).sum(-1) + b(ii).squeeze(-1) + bt(jj).squeeze(-1)
+        loss = (f * (pred - torch.log(x)) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return vocab, idx, (W.weight + Wt.weight).detach().numpy()
 
-# Load pretrained GloVe (50-dim)
-# Download: https://nlp.stanford.edu/projects/glove/  (glove.6B.50d.txt)
-# Here we simulate loading:
-def load_glove(path, max_words=50000):
-    embeddings = {}
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            vals = line.split()
-            word = vals[0]
-            vec = np.array(vals[1:], dtype=np.float32)
-            embeddings[word] = vec
-            if len(embeddings) >= max_words:
-                break
-    return embeddings
+def nearest(word, vocab, idx, E, topn=3):
+    v = E[idx[word]]
+    sims = E @ v / (np.linalg.norm(E, axis=1) * np.linalg.norm(v))
+    return [(vocab[i], round(float(sims[i]), 3)) for i in np.argsort(-sims) if vocab[i] != word][:topn]
 
-# glove = load_glove('glove.6B.50d.txt')
-
-# Simulated for demo:
-glove = {w: np.random.randn(50).astype(np.float32) for w in
-         ['king', 'queen', 'man', 'woman', 'paris', 'france', 'berlin', 'germany']}
-glove['queen'] = glove['king'] - glove['man'] + glove['woman']  # plant the analogy
-
-def nearest(vec, embeddings, topn=3):
-    sims = {w: float(np.dot(vec, e) / (np.linalg.norm(vec) * np.linalg.norm(e)))
-            for w, e in embeddings.items()}
-    return sorted(sims.items(), key=lambda x: -x[1])[:topn]
-
-result = glove['king'] - glove['man'] + glove['woman']
-print("king - man + woman ≈", nearest(result, glove))
+g_vocab, g_idx, g_E = glove_fit(sentences)
+print("GloVe neighbours of 'cat':  ", nearest('cat', g_vocab, g_idx, g_E))
+print("GloVe neighbours of 'apple':", nearest('apple', g_vocab, g_idx, g_E))
 ```
 
 ```output
-king - man + woman ≈ [('queen', 0.9998), ('king', 0.6234), ('woman', 0.5812)]
+GloVe neighbours of 'cat':   [('dog', 0.936), ('horse', 0.913), ('cow', 0.912)]
+GloVe neighbours of 'apple': [('soup', 0.97), ('bread', 0.949), ('rice', 0.934)]
 ```
+
+Fitting the log co-occurrence counts recovers the same clusters as skip-gram. (The two methods are closely related: skip-gram with negative sampling implicitly factorizes a shifted PMI matrix.)
 
 ## FastText: subword embeddings
 
@@ -119,19 +195,21 @@ $$
 - Critical for Bengali, Turkish, Finnish where word forms explode
 
 ```python
-from gensim.models import FastText
-
-model_ft = FastText(sentences, vector_size=50, window=3, min_count=1, epochs=20)
-# Can handle OOV:
-oov_vec = model_ft.wv['unseenable']  # made-up word
+model_ft = SkipGram(sentences, ngrams=True).fit()
+# 'catlike' never occurs in the corpus, but it shares n-grams (<ca, cat, ...) with 'cat':
+oov_vec = model_ft.vec('catlike')
 print(f"OOV vector norm: {np.linalg.norm(oov_vec):.3f}")
-print(f"Similar to 'cats':", model_ft.wv.most_similar('cats', topn=2))
+print("Nearest to OOV 'catlike':", model_ft.most_similar(['catlike']))
+print("Nearest to OOV 'cats':   ", model_ft.most_similar(['cats']))
 ```
 
 ```output
-OOV vector norm: 3.142
-Similar to 'cats': [('cat', 0.993), ('dogs', 0.971)]
+OOV vector norm: 0.676
+Nearest to OOV 'catlike': [('dog', 0.927), ('cat', 0.924), ('horse', 0.901)]
+Nearest to OOV 'cats':    [('cat', 0.986), ('dog', 0.98), ('horse', 0.968)]
 ```
+
+A plain word2vec model would raise a `KeyError` on either word; the subword model returns a vector built from shared n-grams.
 
 ## Limitations: polysemy
 
@@ -147,40 +225,42 @@ river_bank = np.array([0.1, 0.6, -0.2, 0.1])   # "river bank" context
 money_bank = np.array([0.3, 0.4,  0.0, 0.5])   # "bank account" context
 
 cos = lambda a, b: np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-print(f"bank ↔ river bank:  {cos(bank_vec, river_bank):.3f}")
-print(f"bank ↔ money bank:  {cos(bank_vec, money_bank):.3f}")
+print(f"bank vs river bank:  {cos(bank_vec, river_bank):.3f}")
+print(f"bank vs money bank:  {cos(bank_vec, money_bank):.3f}")
 # Both are similar — the embedding is the average, not sense-aware
 ```
 
 ```output
-bank ↔ river bank:  0.952
-bank ↔ money bank:  0.968
+bank vs river bank:  0.914
+bank vs money bank:  0.928
 ```
 
 ## Try it Yourself
 
+A country-capital corpus: GloVe's log-count objective is known to make such relations roughly linear.
+
 ```python
-from gensim.models import Word2Vec
+countries = [("paris", "france"), ("berlin", "germany"), ("london", "england"),
+             ("tokyo", "japan"), ("rome", "italy"), ("madrid", "spain")]
+tm = ["{c} is the capital of {k}", "the capital of {k} is {c}", "{c} is a big city in {k}", "people from {k} visit {c}"]
+cap_corpus = [rng.choice(tm).format(c=c, k=k).split() for _ in range(60) for c, k in countries]
 
-corpus = [
-    "paris is the capital of france",
-    "berlin is the capital of germany",
-    "london is the capital of england",
-    "france germany england are in europe",
-    "tokyo is the capital of japan",
-] * 200
+v, ix, E = glove_fit(cap_corpus, window=3)
+q = E[ix['paris']] - E[ix['france']] + E[ix['germany']]
+sims = E @ q / (np.linalg.norm(E, axis=1) * np.linalg.norm(q))
+answers = [(v[i], round(float(sims[i]), 3)) for i in np.argsort(-sims) if v[i] not in ('paris', 'france', 'germany')][:3]
+print("paris - france + germany ~", answers)
 
-model = Word2Vec(corpus, vector_size=30, window=3, min_count=1, sg=1, epochs=30, seed=0)
-result = model.wv['paris'] - model.wv['france'] + model.wv['germany']
-print("paris - france + germany ≈", model.wv.most_similar(positive=['paris', 'germany'],
-                                                            negative=['france'], topn=3))
+sg_cap = SkipGram(cap_corpus, window=3).fit(15)
+print("skip-gram, same query:   ", sg_cap.most_similar(['paris', 'germany'], ['france']))
 ```
 
 ```output
-paris - france + germany ≈ [('berlin', 0.881), ('tokyo', 0.743), ('london', 0.712)]
+paris - france + germany ~ [('berlin', 0.9), ('tokyo', 0.769), ('london', 0.762)]
+skip-gram, same query:    [('london', 0.351), ('madrid', 0.312), ('people', 0.307)]
 ```
 
-Try different window sizes and vector dimensions. Does a larger window improve analogies?
+Try different window sizes and vector dimensions. Does skip-gram do better with more epochs or more data? Analogy accuracy on tiny corpora is fragile, which is exactly why the original papers needed billions of tokens.
 
 ## Exercise
 
@@ -190,27 +270,29 @@ Using Word2Vec or GloVe vectors, implement cosine similarity and find the 5 near
 <summary>Solution</summary>
 
 ```python
-from gensim.models import Word2Vec
-import numpy as np
-
-corpus = [
-    "the king rules the kingdom",
-    "the queen rules the kingdom",
-    "the man walked to the store",
-    "the woman walked to the store",
-    "king and queen are royalty",
-    "man and woman are human",
+roy_corpus = [
+    "the king rules the kingdom", "the queen rules the kingdom",
+    "the man walked to the store", "the woman walked to the store",
+    "king and queen are royalty", "man and woman are human",
 ] * 300
+roy_corpus = [s.split() for s in roy_corpus]
 
-m = Word2Vec(corpus, vector_size=50, window=3, min_count=1, sg=1, epochs=50, seed=42)
+rv, rix, rE = glove_fit(roy_corpus, dim=16, window=3)
 
-# Nearest to king
-print("5-NN of 'king':", m.wv.most_similar('king', topn=5))
+# 5 nearest words to 'king' by cosine similarity
+print("5-NN of 'king':", nearest('king', rv, rix, rE, topn=5))
 
-# Analogy: king - man + woman
-analogy = m.wv.most_similar(positive=['king', 'woman'], negative=['man'], topn=1)
-print("king - man + woman =", analogy)
+# Analogy man : woman :: king : ?   ->  king - man + woman
+q = rE[rix['king']] - rE[rix['man']] + rE[rix['woman']]
+sims = rE @ q / (np.linalg.norm(rE, axis=1) * np.linalg.norm(q))
+best = [(rv[i], round(float(sims[i]), 3)) for i in np.argsort(-sims) if rv[i] not in ('king', 'man', 'woman')][:2]
+print("king - man + woman =", best)
 ```
 
-The analogy works because "king" and "queen" share the same distributional context (royalty, kingdom) while "man" and "woman" share a different context. Vector arithmetic finds the intersection.
+```output
+5-NN of 'king': [('rules', 0.972), ('queen', 0.944), ('kingdom', 0.925), ('and', 0.88), ('the', 0.88)]
+king - man + woman = [('queen', 0.96), ('rules', 0.925)]
+```
+
+The analogy works only if the corpus pins down the shared structure: "king" and "queen" share royal contexts, "man" and "woman" share human contexts, so the difference vectors line up. With so little data the answer is fragile; check the printed ranking rather than assuming it.
 </details>
