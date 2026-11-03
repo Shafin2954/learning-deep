@@ -32,25 +32,27 @@ language (problem + core idea + concrete example) before symbols; every symbol d
 
 | # | Course | Status |
 |---|---|---|
-| 1 | python-for-data-work | June v2 — needs upgrade to bar |
-| 2 | math-optimization | June v2 — needs upgrade |
+| 1 | python-for-data-work | repaired (real outputs) — deep rewrite pending |
+| 2 | math-optimization | repaired — deep rewrite pending (priority 1) |
 | 3 | probability-statistics | June v2 — needs upgrade |
-| 4 | data-wrangling-eda | June v2 — needs upgrade |
+| 4 | data-wrangling-eda | repaired — deep rewrite pending |
 | 5 | classical-ml | June v2 — needs upgrade |
-| 6 | time-series-forecasting | June v2 — needs upgrade |
+| 6 | time-series-forecasting | repaired — deep rewrite pending |
 | 7 | deep-learning-foundations | June v2 — needs upgrade |
-| 8 | cnns-computer-vision | June v2 — needs upgrade |
+| 8 | cnns-computer-vision | repaired — deep rewrite pending |
 | 9 | sequence-transformers | June v2 — needs upgrade |
-| 10 | generative-models | June v2 — needs upgrade |
-| 11 | modern-architectures | June v2 — needs upgrade |
+| 10 | generative-models | repaired — deep rewrite pending |
+| 11 | modern-architectures | repaired — deep rewrite pending |
 | 12 | nlp-llms | June v2 — needs upgrade |
 | 13 | reinforcement-learning | June v2 — needs upgrade |
 | 14 | graph-ml | June v2 — needs upgrade |
-| 15 | recommender-systems | ch. 1–7 at bar; ch. 8–11, capstone, INDEX, registration in progress |
-| 16 | bayesian-ml | in progress (13 teaching chapters + capstone; adds a model-checking chapter beyond PLAN) |
+| 15 | recommender-systems | DONE at bar, registered |
+| 16 | bayesian-ml | DONE at bar, registered (ch. 1–6 predate the intuition-first rule; ch. 4–6 exceed 1000 lines — candidates to split) |
 | 17 | eval-tuning | at bar (Aug) |
 | 18 | competition-ml | at bar (Aug) |
 | 19 | system-design | at bar (Aug) |
 | 20 | mlops | at bar (Aug) |
+
+Repairs in progress (Nov 3): probability-statistics, classical-ml, deep-learning-foundations, graph-ml, reinforcement-learning. Remaining: sequence-transformers, nlp-llms.
 
 Fast-track courses (`foundations-for-llm`, `bengali-llm`, `tabular-kaggle`) are frozen.
