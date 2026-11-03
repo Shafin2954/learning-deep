@@ -53,13 +53,40 @@ print(pd.DataFrame(rows).to_string(index=False, float_format="%.4f"))
 ```
 
 ```output
+catalogue mean CTR 0.0360 | oracle top-5 CTR 0.1157
+of the 10 truly best items, the old system showed 0
+                policy  day  true CTR shown  items shown  best-10 ever shown  best-10 in top-5
+            popularity    1          0.0669            5                   0                 0
+            popularity    3          0.0669            5                   0                 0
+            popularity   10          0.0669            5                   0                 0
+            popularity   30          0.0669            5                   0                 0
+            greedy CTR    1          0.0699            5                   0                 0
+            greedy CTR    3          0.0699            5                   0                 0
+            greedy CTR   10          0.0699            5                   0                 0
+            greedy CTR   30          0.0699            5                   0                 0
+greedy CTR + 5% random    1          0.0683          182                   9                 0
+greedy CTR + 5% random    3          0.0633          184                  10                 1
+greedy CTR + 5% random   10          0.0982          187                  10                 4
+greedy CTR + 5% random   30          0.0984          181                  10                 4
 ```
 
-PROSE_LOOP
+None of the 10 truly best items is in the inherited log, and neither deterministic policy ever
+finds one. Popularity freezes on five items at 0.0669; ranking by smoothed CTR is no better
+(0.0699), because an unseen item scores the prior $1/30$, below every proven item. Both collapse the
+40 exposed items to 5, and 10,000 impressions a day carry no information about the other 195.
+
+Replacing 5% of slots with random items costs a little on day 3 (0.0633), then lifts CTR to 0.0982,
+40% above the greedy ranker, once four of the best ten reach the top five. That 5% is paid every
+day, forever. The rest of this chapter is about paying less for the same information, and about
+measuring a policy from logs without deploying it.
 
 ## A quick recap of the non-contextual bandit
 
-PROSE_RECAP
+The basics are in (Reinforcement Learning, ch. 2): $\varepsilon$-greedy, UCB1 with bonus
+$\sqrt{2\ln t / N_a}$, and Thompson sampling from a Beta posterior. What changes in a recommender is
+the regime. There are hundreds of arms, rewards are clicks with means of a few percent, and every
+impression spent exploring is a real user shown something worse. Run the three algorithms on the
+200 items above, one slot per request.
 
 ```python
 def bernoulli_bandit(algo, p, T=50_000, seed=0, eps=0.05):
@@ -79,20 +106,40 @@ def bernoulli_bandit(algo, p, T=50_000, seed=0, eps=0.05):
     return np.cumsum(regret)
 
 checks = [1_000, 5_000, 20_000, 50_000]
-table = {algo: [bernoulli_bandit(algo, true_ctr)[c - 1] for c in checks]
+table = {algo: bernoulli_bandit(algo, true_ctr)[np.array(checks) - 1]
          for algo in ("eps-greedy", "UCB1", "Thompson")}
 print("cumulative regret (expected clicks lost vs always showing the best item)")
 print(pd.DataFrame(table, index=[f"T={c:,}" for c in checks]).round(1).to_string())
 ```
 
 ```output
+cumulative regret (expected clicks lost vs always showing the best item)
+          eps-greedy    UCB1  Thompson
+T=1,000         88.3    90.8      90.0
+T=5,000        200.5   446.9     424.2
+T=20,000       292.6  1752.6    1278.8
+T=50,000       445.4  4255.7    1958.3
 ```
 
-PROSE_RECAP2
+Two results go against the textbook ordering. UCB1 is worst by far (4,256 clicks lost): its
+Hoeffding bonus assumes rewards spread over $[0, 1]$, but a 4% click has standard deviation
+$\sqrt{0.04 \cdot 0.96} \approx 0.2$, so it keeps re-checking items it already knows are bad.
+KL-UCB and UCB-V use the variance and fix this; Thompson sampling is calibrated to Bernoulli
+rewards by construction. And $\varepsilon$-greedy wins only because $(s+1)/(n+2)$ scores an
+untried item at 0.5, which is the optimistic initialisation of RL ch. 2. Its fixed 5% still costs
+linear regret (153 clicks between 20k and 50k).
+
+The structural lesson: each algorithm learns every item separately, so exploration cost scales
+with the catalogue, and one non-personalised arm is the best it can converge to.
 
 ## Contextual bandits: let the features share the exploration
 
-PROSE_CTX
+A **contextual bandit** observes a context $x_t$ (user features, time, device), picks an arm
+$a_t$, and sees only that arm's reward. Its regret is measured against the best arm *for that
+context*, not the best arm overall. The environment below has 30 items with item features, users
+with 5 features, and a logistic click model whose interaction term $x^\top B f_a$ makes different
+users prefer different items. LinUCB will model it linearly, so the model is deliberately a little
+misspecified, as real models are.
 
 ```python
 rng = np.random.default_rng(1)
@@ -116,38 +163,70 @@ print(f"best item per user       {P.max(1).mean():.4f}   <- the prize for person
 ```
 
 ```output
+CTR of a random item     0.0515
+best single item for all 0.1046
+best item per user       0.2385   <- the prize for personalising
 ```
 
-PROSE_CTX2
+Personalising is worth more than doubling the CTR: 0.2385 against 0.1046. The non-contextual
+algorithms above can at best converge to the 0.1046 row.
 
 ### Deriving the LinUCB bonus
 
-PROSE_DERIV
+Disjoint LinUCB (Li et al., 2010) fits one ridge regression per arm. After the arm has been
+played on contexts $X_a$ with rewards $y_a$:
 
-```python
-r = np.random.default_rng(2)
-theta, sigma, lam = r.normal(0, 1, d_u), 0.5, 1.0
-cover = []
-for n in (20, 200, 2_000):
-    Xd = draw_users(n, r)
-    y = Xd @ theta + r.normal(0, sigma, n)
-    A = Xd.T @ Xd + lam * np.eye(d_u)
-    th_hat = np.linalg.solve(A, Xd.T @ y)
-    Xq = draw_users(5_000, r)
-    width = sigma * np.sqrt(np.einsum("ni,ij,nj->n", Xq, np.linalg.inv(A), Xq))
-    err = np.abs(Xq @ (th_hat - theta))
-    cover.append({"n": n, "mean width": width.mean(), "coverage of 1.96 x width": (err <= 1.96 * width).mean()})
-print(pd.DataFrame(cover).to_string(index=False, float_format="%.4f"))
-```
+$$
+A_a = \lambda I + X_a^\top X_a, \qquad b_a = X_a^\top y_a, \qquad \hat\theta_a = A_a^{-1} b_a
+$$
 
-```output
-```
+Assume $y = X_a\theta_a + \varepsilon$ with independent noise of variance $\sigma^2$. Substitute and
+separate the error:
 
-PROSE_DERIV2
+$$
+\hat\theta_a - \theta_a = A_a^{-1}X_a^\top\varepsilon - \lambda A_a^{-1}\theta_a
+$$
+
+The second term is the ridge bias. The first has covariance
+$\sigma^2 A_a^{-1}X_a^\top X_a A_a^{-1} \preceq \sigma^2 A_a^{-1}$, because
+$X_a^\top X_a = A_a - \lambda I \preceq A_a$. The prediction error for a new context therefore
+satisfies
+
+$$
+\operatorname{sd}\bigl(x^\top\hat\theta_a - x^\top\theta_a\bigr) \le \sigma\sqrt{x^\top A_a^{-1}x} = \sigma\,\lVert x\rVert_{A_a^{-1}}
+$$
+
+The geometric reading is that $\theta_a$ lies, with high probability, in the ellipsoid
+$\{\theta : (\theta-\hat\theta_a)^\top A_a(\theta-\hat\theta_a) \le \beta\}$. By Cauchy–Schwarz in the
+$A_a$ inner product, the largest value of $x^\top\theta$ over that ellipsoid is
+$x^\top\hat\theta_a + \sqrt{\beta}\,\lVert x\rVert_{A_a^{-1}}$. That is the LinUCB score:
+
+$$
+a_t = \arg\max_a \Bigl[\, x_t^\top\hat\theta_a + \alpha\sqrt{x_t^\top A_a^{-1}x_t} \,\Bigr]
+$$
+
+The bonus is large in directions of feature space the arm has not been tried in, not merely for
+arms tried rarely, so a user who resembles earlier clickers stops costing exploration. The bound
+ignores the ridge bias $\lambda A_a^{-1}\theta_a$; the theoretical radius of Abbasi-Yadkori et al.
+(2011), $\sqrt{\beta_t} = \sigma\sqrt{d\log((1 + t/\lambda)/\delta)} + \sqrt{\lambda}\lVert\theta\rVert$,
+adds a term for it and is too conservative to use in practice, so $\alpha$ is tuned instead.
+
+Updates use Sherman–Morrison, so a click costs $O(d^2)$ instead of a $d \times d$ inversion:
+
+$$
+(A + xx^\top)^{-1} = A^{-1} - \frac{A^{-1}xx^\top A^{-1}}{1 + x^\top A^{-1}x}
+$$
 
 ### Linear Thompson sampling
 
-PROSE_LINTS
+With a Gaussian prior $\theta_a \sim \mathcal{N}(0, \tfrac{v^2}{\lambda}I)$ and Gaussian noise of
+variance $v^2$, the posterior is exactly $\mathcal{N}(\hat\theta_a, v^2A_a^{-1})$, the same quantities
+LinUCB keeps. Linear Thompson sampling (Agrawal and Goyal, 2013) draws $\tilde\theta_a$ from the
+posterior and plays $\arg\max_a x_t^\top\tilde\theta_a$. Each arm's score depends only on the scalar
+$x_t^\top\tilde\theta_a \sim \mathcal{N}\bigl(x_t^\top\hat\theta_a,\; v^2 x_t^\top A_a^{-1}x_t\bigr)$,
+so you can sample that scalar directly: $K$ normal draws per request instead of $K$ Cholesky
+factorisations. The two algorithms then differ only in replacing the constant $\alpha$ with
+$v\,z_a$, where $z_a \sim \mathcal{N}(0,1)$.
 
 ```python
 def run_contextual(algo, T=20_000, alpha=1.0, v=0.5, lam=1.0, seed=0):
@@ -192,13 +271,32 @@ print(pd.DataFrame(res, index=[f"regret@{c:,}" for c in checks] + ["CTR last 5k"
 ```
 
 ```output
+                       regret@1,000  regret@5,000  regret@10,000  regret@20,000  CTR last 5k
+random                        193.7         935.5         1881.5         3759.1       0.0546
+Thompson (no context)         189.2         867.2         1682.2         3129.4       0.1042
+LinUCB alpha=0.0              173.7         782.8         1555.9         3116.8       0.0818
+LinUCB alpha=0.5              105.6         290.6          433.5          649.4       0.2192
+LinUCB alpha=1.0              123.2         330.9          458.9          651.2       0.2208
+LinTS v=0.1                   140.6         357.9          498.3          755.2       0.2168
+LinTS v=0.25                  168.9         458.5          623.3          868.6       0.2148
 ```
 
-PROSE_LINTS2
+The ranking is clear. Both linear bandits reach a CTR of about 0.22 out of a possible 0.2385, more
+than twice the 0.1042 at which context-free Thompson sampling stops. The row to remember is
+**$\alpha = 0$**, the greedy ridge model. Its regret (3,117) is no better than ignoring the context,
+and its CTR of 0.0818 is below the best single item. It locks onto whichever arms happened to pay
+off first. This is the feedback loop of the first section, now in a personalised model.
+
+LinTS trails LinUCB (755 against 649 at its best $v$) and is more sensitive to its scale, which
+matches practice: Thompson sampling usually needs its posterior shrunk well below the "correct"
+variance. This is one seed; gaps of ~100 between tuned variants are noise, gaps of thousands are not.
 
 ## Off-policy evaluation: scoring a policy you never ran
 
-PROSE_OPE
+Each experiment above was run online. In production you have logs from the current policy
+$\mu$ and a candidate $\pi$, and you want $V(\pi) = \mathbb{E}_x\bigl[\bar r(x, \pi(x))\bigr]$, its
+expected CTR, before you expose real users to it. The candidate here is the greedy policy implied by
+what LinUCB learned, and the simulator gives its true value.
 
 ```python
 _, theta_lin, _ = run_contextual("LinUCB", alpha=0.5)
@@ -211,11 +309,16 @@ print(f"true CTR of the target policy (100k simulated users): {V_true:.4f}")
 ```
 
 ```output
+true CTR of the target policy (100k simulated users): 0.2211
 ```
 
 ### The replay method
 
-PROSE_REPLAY
+Li et al. (2011) evaluated news bandits on Yahoo! front-page logs served **uniformly at random**.
+Then $P(a_{\log} = \pi(x)) = 1/K$ for every $x$, so the events where the logged arm agrees with
+the policy are an unbiased sample of $(x, \pi(x), r)$: discard the rest and average. A *learning*
+policy is replayed the same way, updating only on matched events; the retained stream has the
+distribution of an online run of that length.
 
 ```python
 r = np.random.default_rng(5)
@@ -226,41 +329,68 @@ Rl = (r.random(n_log) < click_prob(Xl)[np.arange(n_log), Al]).astype(float)
 match = target_policy(Xl) == Al
 print(f"fixed policy: {match.sum():,} of {n_log:,} events match | replay CTR "
       f"{Rl[match].mean():.4f} +/- {Rl[match].std() / np.sqrt(match.sum()):.4f} (truth {V_true:.4f})")
-
-def replay_linucb(X, A, R, alpha=0.5, lam=1.0):
-    """Li et al. (2011): stream the log, keep only events where the learner agrees, learn from those."""
-    A_inv = np.tile(np.eye(d_u) / lam, (K, 1, 1))
-    b = np.zeros((K, d_u))
-    kept = []
-    for x, a_log, y in zip(X, A, R):
-        mean = np.einsum("kij,kj->ki", A_inv, b) @ x
-        width = np.sqrt(np.einsum("i,kij,j->k", x, A_inv, x))
-        if np.argmax(mean + alpha * width) != a_log:
-            continue                                            # the learner never "saw" this user
-        kept.append(y)
-        Ax = A_inv[a_log] @ x
-        A_inv[a_log] -= np.outer(Ax, Ax) / (1 + x @ Ax)
-        b[a_log] += y * x
-    return np.array(kept)
-
-kept = replay_linucb(Xl, Al, Rl)
-online = np.mean([run_contextual("LinUCB", T=len(kept), alpha=0.5, seed=s)[2].mean() for s in range(5)])
-print(f"learning LinUCB: replay kept {len(kept):,} events | replay CTR {kept.mean():.4f} "
-      f"| online CTR over the same horizon {online:.4f}")
 ```
 
 ```output
+fixed policy: 2,045 of 60,000 events match | replay CTR 0.2166 +/- 0.0091 (truth 0.2211)
 ```
 
-PROSE_REPLAY2
+2,045 events survive, close to $60{,}000/30$, and the estimate is within one standard error of the
+truth. The price: a fraction $(K-1)/K$ of the data is discarded, and you need uniformly random
+logging, which you rarely have. The estimators below accept any logging policy whose propensities
+were recorded.
 
 ### Inverse propensity scoring is unbiased
 
-PROSE_IPS
+Log the propensity $\mu(a_i \mid x_i)$ with every impression. The IPS estimator reweights each
+logged reward by how much more (or less) often $\pi$ would have taken that action:
+
+$$
+\hat V_{\text{IPS}} = \frac{1}{n}\sum_{i=1}^n \frac{\pi(a_i \mid x_i)}{\mu(a_i \mid x_i)}\, r_i
+$$
+
+It is unbiased. Condition on $x$, take the expectation over $a \sim \mu(\cdot \mid x)$ and the
+reward:
+
+$$
+\mathbb{E}\!\left[\frac{\pi(a \mid x)}{\mu(a \mid x)}\, r \,\middle|\, x\right]
+= \sum_a \mu(a \mid x)\,\frac{\pi(a \mid x)}{\mu(a \mid x)}\,\bar r(x, a)
+= \sum_a \pi(a \mid x)\,\bar r(x, a)
+$$
+
+Averaging over $x$ gives $V(\pi)$. The single condition is **support**: wherever
+$\pi(a \mid x) > 0$, $\mu(a \mid x)$ must be positive, so the logging policy has to explore. A
+deterministic production ranker cannot be evaluated off-policy at all. Replay is the special case
+$\mu = 1/K$.
+
+The price is variance. For a deterministic $\pi$ the second moment is
+$\mathbb{E}_x\bigl[\bar r^{(2)}(x, \pi(x)) / \mu(\pi(x) \mid x)\bigr]$, which grows with the
+*inverse* propensity of the action $\pi$ wants. One logged event with $\mu = 10^{-3}$ that happens
+to be a click contributes 1,000 times its fair share. The **effective sample size**
+$\bigl(\sum_i w_i\bigr)^2 / \sum_i w_i^2$ tells you how many unweighted samples your estimate is
+actually worth.
 
 ### Self-normalised and doubly robust estimators
 
-PROSE_DR
+**Self-normalised IPS** divides by the realised total weight instead of $n$:
+$\hat V_{\text{SNIPS}} = \sum_i w_i r_i / \sum_i w_i$. Since $\mathbb{E}[w] = 1$, the denominator
+estimates $n$. It is biased by $O(1/n)$, it is invariant to adding a constant to all rewards, and it
+usually has much lower variance.
+
+The **direct method** fits a reward model $\hat q(x, a)$ and averages $\hat q(x, \pi(x))$. It has
+low variance and is biased by whatever the model gets wrong, including extrapolation to actions the
+logger rarely took. **Doubly robust** (Dudík et al., 2011) uses the model and corrects its residual
+with IPS:
+
+$$
+\hat V_{\text{DR}} = \frac{1}{n}\sum_{i=1}^n \Bigl[\hat q\bigl(x_i, \pi(x_i)\bigr) + w_i\bigl(r_i - \hat q(x_i, a_i)\bigr)\Bigr]
+$$
+
+If the propensities are right, the correction term has expectation
+$\mathbb{E}_x\bigl[\bar r(x, \pi(x)) - \hat q(x, \pi(x))\bigr]$ (by the IPS argument), which cancels
+the model's bias exactly. If instead the model is right, $\mathbb{E}[r - \hat q(x, a) \mid x, a] = 0$
+for any weights. Either one being correct is enough. Now compare all four as the logging
+policy gets more peaked (larger $\beta$, so less exploration):
 
 ```python
 theta_rough = theta_true + np.random.default_rng(7).normal(0, 0.4, theta_true.shape)
@@ -302,51 +432,54 @@ print(pd.DataFrame(rows).to_string(index=False))
 ```
 
 ```output
+200 logs of 3,000 events each; target value 0.2211
+ beta ESS max w     DM bias / sd    IPS bias / sd  SNIPS bias / sd     DR bias / sd
+  0.0  99    30 -0.0472 / 0.0228 -0.0032 / 0.0474 -0.0005 / 0.0447 -0.0066 / 0.0392
+  1.0 183   235 +0.0121 / 0.0127 +0.0003 / 0.0281 +0.0037 / 0.0276 +0.0018 / 0.0239
+  2.0 106  2969 -0.0005 / 0.0136 +0.0097 / 0.0795 +0.0099 / 0.0537 +0.0028 / 0.0420
+  4.0  80 10095 -0.0093 / 0.0164 -0.0012 / 0.1571 +0.0181 / 0.0794 -0.0058 / 0.0997
 ```
 
-PROSE_DR2
+Read down the IPS column. As logging gets greedier the largest weight goes from 30 to 10,095 and
+the standard deviation from 0.028 to 0.157: at $\beta = 4$ one 3,000-event log can miss by more than
+the value itself. IPS stays unbiased (every bias is under 0.01), which is no comfort when you have one
+log. SNIPS roughly halves the spread at $\beta \ge 2$.
+
+The direct method is the mirror image: the largest bias in the table under uniform logging
+($-0.047$, a linear model of a logistic truth underestimates exactly the high-CTR pairs the target
+picks) but a standard deviation never above 0.017, so at $\beta = 4$ the *biased* DM has the lowest
+error. DR beats IPS everywhere and is best for $\beta \le 2$; at $\beta = 4$ it inherits the
+weights through $w_i(r_i - \hat q)$ and loses to SNIPS (0.100 against 0.079), which is why SWITCH,
+clipped DR and MRDR exist. Practical rules: always log propensities, and keep enough randomisation in
+production that the policies you will want to evaluate have support.
 
 ## Slates and position bias
 
-PROSE_SLATE
+A real recommender shows a ranked **slate**, so a click depends on the position as well as the item.
+Under the position-based model
 
-```python
-from scipy.stats import spearmanr
+$$
+P(\text{click} \mid i, k) = \underbrace{P(\text{examined} \mid k)}_{\theta_k}\cdot \underbrace{P(\text{relevant} \mid i)}_{\rho_i}
+$$
 
-r = np.random.default_rng(3)
-n_docs, slots = 40, 8
-relevance = r.beta(2, 8, n_docs)                               # P(click | examined)
-examine = 1 / (1 + np.arange(slots)) ** 0.9                    # P(examined | position)
-prior_score = relevance + r.normal(0, 0.12, n_docs)            # the logging ranker is decent
-clicks, imps, exam_w, pos_sum = (np.zeros(n_docs) for _ in range(4))
-for _ in range(50):                                            # 50 x 1,000 sessions
-    noisy = prior_score[None, :] + r.gumbel(0, 0.04, (1_000, n_docs))
-    rank = np.argsort(-noisy, 1)[:, :slots]
-    c = r.random(rank.shape) < examine[None, :] * relevance[rank]
-    np.add.at(clicks, rank.ravel(), c.ravel())
-    np.add.at(imps, rank.ravel(), 1)
-    np.add.at(exam_w, rank.ravel(), np.tile(examine, 1_000))   # sum of examination propensities
-    np.add.at(pos_sum, rank.ravel(), np.tile(np.arange(1, slots + 1), 1_000))
-ok = imps > 200
-naive, ips = clicks / np.maximum(imps, 1), clicks / np.maximum(exam_w, 1e-9)
-show = pd.DataFrame({"mean position": pos_sum / np.maximum(imps, 1), "relevance": relevance,
-                     "naive CTR": naive, "IPS estimate": ips})[ok].sort_values("mean position")
-print(show.iloc[::4].round(3).to_string())
-print(f"\ndocs with enough impressions: {ok.sum()}")
-print(f"Spearman with relevance: naive {spearmanr(naive[ok], relevance[ok])[0]:.3f} | "
-      f"IPS {spearmanr(ips[ok], relevance[ok])[0]:.3f}")
-print(f"mean abs error:          naive {np.abs(naive - relevance)[ok].mean():.3f} | "
-      f"IPS {np.abs(ips - relevance)[ok].mean():.3f}")
-```
-
-```output
-```
-
-PROSE_SLATE2
+so naive CTR estimates $\theta_k\rho_i$, and an item the old ranker kept at slot 6 looks a quarter
+as good as it is; train on it and the next ranker keeps it there. If the $\theta_k$ are known
+(estimated from small randomised swaps of adjacent results, Joachims et al., 2017), weighting each
+click by $1/\theta_k$ is IPS again with position as the action, and $\sum \text{clicks}_i / \sum_k \theta_{k}$
+over the item's impressions is unbiased for $\rho_i$, with the familiar variance cost at low slots.
+Full slate OPE is harder, because the action space is every ordered list: the **pseudo-inverse
+estimator** (Swaminathan et al., 2017) assumes the slate reward is additive over positions, and
+**cascading bandits** model a user scanning top-down and stopping at the first click. Both reduce a
+combinatorial action space to per-position quantities.
 
 ## Running a bandit in production
 
-PROSE_PROD
+**Exploration budget.** Exploration is spent on real users; cap it as a traffic percentage (the 5%
+above) or as a regret guardrail against the current policy (conservative bandits), and report it.
+**Delayed and batched feedback.** Conversions arrive days later and models refresh hourly; within one
+refresh a deterministic UCB serves the same arm to everyone, while Thompson keeps randomising.
+**Non-stationarity.** Items age and tastes drift. **Discounting** multiplies counts by $\gamma$ each
+step (memory $1/(1-\gamma)$); a **sliding window** keeps only the last $W$ events.
 
 ```python
 from collections import deque
@@ -392,22 +525,21 @@ for name, kw in (("Thompson", {}), ("Thompson, discount 0.999", {"gamma": 0.999}
                  "regret second half": regs[:, 20_000:].sum(1).mean()})
 print("non-stationary: CTRs swap at t = 20,000 (mean of 3 seeds)")
 print(pd.DataFrame(rows).round(1).to_string(index=False))
-
-rows = []
-for batch in (1, 500, 2_000):
-    row = {"update every": batch}
-    for algo in ("UCB1", "TS"):
-        row[algo + " regret"] = np.mean([bandit_run(algo, p0, T=10_000, batch=batch, seed=sd).sum()
-                                         for sd in range(4)])
-    rows.append(row)
-print("\ndelayed / batched feedback, stationary CTRs, T = 10,000 (mean of 4 seeds)")
-print(pd.DataFrame(rows).round(1).to_string(index=False))
 ```
 
 ```output
+non-stationary: CTRs swap at t = 20,000 (mean of 3 seeds)
+                  policy  regret first half  regret second half
+                Thompson              150.0               815.5
+Thompson, discount 0.999              549.5               683.2
+  Thompson, window 2,000              427.0               527.3
 ```
 
-PROSE_PROD2
+After the swap, stationary Thompson loses 815 clicks: its posterior on the old winner holds
+thousands of observations and gives way slowly. Both forgetting schemes recover faster, the window
+best (527). Forgetting costs 3–4x stationary Thompson's 150 in the first half, because at a 5–10% CTR
+a memory of 1,000–2,000 impressions holds only 50–200 clicks. Set the memory from how fast your
+items actually change, not from a default.
 
 ## Try it Yourself
 
@@ -420,14 +552,16 @@ ctr = rng.beta(2, 30, (n_seg, K))
 target = np.argmax(ctr + rng.normal(0, 0.02, ctr.shape), axis=1)   # a decent but imperfect policy
 V = ctr[np.arange(n_seg), target].mean()
 
-def logging_probs(beta):
-    z = beta * np.log(ctr + rng.normal(0, 0.01, ctr.shape).clip(0))
+noise = rng.normal(0, 0.5, ctr.shape)                   # the logging ranker's own errors
+
+def logging_probs(beta):                                # softmax over the ranker's log-CTR
+    z = beta * (np.log(ctr) + noise)
     e = np.exp(z - z.max(1, keepdims=True))
     return e / e.sum(1, keepdims=True)
 
-mu = logging_probs(beta=3.0)                            # try 0.0 (uniform) up to 6.0 (peaked)
+mu = logging_probs(beta=4.0)                            # try 0.0 (uniform) up to 6.0 (peaked)
 
-def estimates(n, r, clips=(np.inf, 100, 20, 5)):
+def estimates(n, r, clips=(np.inf, 200, 50, 10)):
     seg = r.integers(0, n_seg, n)
     a = (mu[seg].cumsum(1) > r.random((n, 1))).argmax(1)
     y = (r.random(n) < ctr[seg, a]).astype(float)
@@ -446,13 +580,32 @@ print(summary.round(4).to_string())
 ```
 
 ```output
+true value 0.1389 | smallest logging propensity on the target's action 0.0008
+                bias      sd    rmse
+IPS clip inf  0.0030  0.0402  0.0403
+IPS clip 200 -0.0020  0.0132  0.0134
+IPS clip 50  -0.0027  0.0118  0.0122
+IPS clip 10  -0.0087  0.0093  0.0127
+SNIPS         0.0023  0.0318  0.0318
 ```
 
-PROSE_TRY
+With $\beta = 4$ the logging policy almost never takes the action the target wants for one
+segment (smallest propensity 0.0008). Unclipped IPS is nearly unbiased but has a standard deviation
+of 0.040 on a value of 0.139. Clipping weights at 50 cuts the RMSE to 0.012 at a cost of a 0.003
+bias. Clipping at 10 cuts the variance further, but the bias (−0.0087) now dominates and the RMSE
+rises again. SNIPS helps only a little (0.032), because the problem is a handful of huge weights, not their
+total. Set `beta=0.0` to see every estimator agree, then raise it to 6.0. Also try making the target
+policy disagree more with the logger: the support condition is what breaks first.
 
 ## Exercise
 
-PROSE_EX
+Disjoint LinUCB learns a separate $\theta_a$ per item, so a newly launched item starts with no
+knowledge and a large bonus. Implement a **shared** LinUCB whose context is the feature cross
+$z(x, a) = \operatorname{vec}(x f_a^\top)$, one ridge model for all items, so a new item inherits
+what was learned about its attributes. Run both on the 30-item catalogue from this chapter and
+launch 10 new items (drawn from the same feature model) at $t = 5{,}000$. Compare regret before the
+launch, in the first 1,000 rounds after it, and over the remainder. Also count how many impressions
+each model spends on the new items.
 
 <details>
 <summary>Solution</summary>
@@ -513,11 +666,40 @@ print(pd.DataFrame(rows).round(1).to_string(index=False))
 ```
 
 ```output
+   model  regret before launch  regret 1k after launch  regret 10k after launch  pulls of new items
+disjoint                 112.8                    73.5                    198.8                3671
+  shared                  77.6                     9.9                     60.8                2797
 ```
 
-PROSE_SOL
+The shared model is better at every stage. After the launch it loses 9.9 clicks in the first 1,000
+rounds against 73.5 for the disjoint model, and 60.8 against 198.8 over the following 10,000. It
+also spends fewer impressions on the new items (2,797 against 3,671), because it does not need to
+explore them blindly: each new item's score comes from its features via the shared
+$d_u \times d_i = 30$-parameter model, and the bonus is already small in directions the model has
+seen. The disjoint model must learn each new item's 6 parameters from scratch. The shared model is also better *before* the launch (77.6 against 112.8), since 30 parameters
+in total learn faster than $30 \times 6 = 180$.
+
+This is the hybrid LinUCB of Li et al. (2010), which combines shared feature-cross terms with
+per-arm residuals, and it is the bandit version of the cold-start argument of ch. 9. The shared
+model is only as good as the features, though. When an item's appeal is not in $f_a$, a per-arm
+residual is what catches it, and that is why the production version keeps both.
 </details>
 
 ## Under the Trench
 
-UTT
+Rare and advanced topics you should at least know the name of. You won't need them daily,
+but you'll stop being surprised when you meet them.
+
+- **Wide & Deep / DeepFM / DLRM** — industrial CTR architectures that combine memorising feature crosses with deep embeddings of sparse ids; DLRM is the reference design for embedding-table-bound ranking at scale.
+- **Graph-based recsys (LightGCN)** — treat the user-item matrix as a bipartite graph and smooth embeddings over neighbours with simplified, nonlinearity-free graph convolutions.
+- **Diversity, novelty, serendipity, fairness** — objectives beyond accuracy, usually enforced at re-ranking with MMR or DPP; fairness covers exposure to item providers as well as treatment of users.
+- **Exposure bias & debiasing** — logged interactions reflect what was shown; inverse-propensity training, randomised buckets and causal embeddings correct the training signal, not only the evaluation.
+- **Approximate nearest neighbours (FAISS/HNSW)** — product quantisation, IVF and navigable small-world graphs serve two-tower retrieval over billions of vectors in milliseconds.
+- **Multi-task & multi-objective ranking** — predict click, dwell, like and purchase jointly (shared-bottom, MMoE, PLE) and combine them with a tuned value formula or a Pareto method.
+- **Reranking & calibration in ranking** — a final stage that applies business rules, diversity and freshness, and calibrates scores so a predicted 3% means 3%.
+- **Counterfactual learning-to-rank** — train (not only evaluate) rankers with position-propensity-weighted losses so the model learns relevance rather than the old ranking.
+- **Slate and combinatorial bandits** — choose whole lists with interacting items (cascading, slate Q-learning, SlateQ) instead of one arm per request.
+- **Off-policy learning (POEM, BanditNet)** — optimise a policy directly on logged bandit feedback using a variance-regularised or self-normalised IPS objective.
+- **Generative retrieval / semantic IDs** — give each item a short discrete token code (e.g. RQ-VAE) and train a sequence model to decode the next item's code instead of searching an index.
+- **LLM-based recommenders** — use language models as feature encoders, zero-shot rankers or conversational recommenders; strong for cold start, expensive and hard to ground in a catalogue.
+- **Reinforcement learning for long-term value** — optimise retention or lifetime engagement rather than the next click, with off-policy corrections such as top-K REINFORCE (Chen et al., 2019).

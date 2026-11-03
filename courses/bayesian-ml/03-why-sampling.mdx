@@ -1,0 +1,770 @@
+---
+course: bayesian-ml
+chapter: 03-why-sampling
+title: "Why Sampling: The Intractable Posterior"
+order: 3
+---
+
+## A posterior you cannot write down
+
+Chapter 2 only worked because the prior and likelihood were conjugate. Change one modelling choice and
+the closed form disappears. The standard example is logistic regression. You have a binary outcome
+(did the trial user convert?) and features, with $y_i \sim \mathrm{Bernoulli}(\sigma(x_i^\top\beta))$
+and a weakly informative prior $\beta_j \sim \mathcal{N}(0, 2.5^2)$. The unnormalised log posterior
+is easy to evaluate:
+
+$$
+\log \tilde p(\beta) = \log p(y, \beta) = \sum_{i=1}^{n}\left[y_i\,\eta_i - \log\left(1 + e^{\eta_i}\right)\right]
+- \frac{\lVert\beta\rVert^2}{2 \cdot 2.5^2} + \text{const}, \qquad \eta_i = x_i^\top\beta
+$$
+
+No Gaussian prior is conjugate to the logistic likelihood. The posterior is
+$p(\beta \mid y) = \tilde p(\beta) / Z$ with $Z = p(y) = \int \tilde p(\beta)\,d\beta$, and that
+integral has no closed form. This chapter uses one small, synthetic dataset as its running example:
+40 users, an intercept and two standardised features, so $d = 3$.
+
+```python
+import numpy as np
+import time
+from scipy import stats, special, optimize
+
+rng = np.random.default_rng(3)
+n, d, prior_sd = 40, 3, 2.5
+X = np.column_stack([np.ones(n), rng.normal(size=(n, 2))])
+beta_true = np.array([-0.5, 1.5, -1.0])
+y = (rng.random(n) < special.expit(X @ beta_true)).astype(float)
+
+def log_joint(B, X=X, y=y, s=prior_sd):
+    """log p(y, beta) for one beta (d,) or a batch (M, d). Vectorised, no normaliser needed."""
+    eta = B @ X.T
+    loglik = (y * eta - np.logaddexp(0, eta)).sum(-1)
+    return loglik - 0.5 * (B ** 2).sum(-1) / s ** 2 - X.shape[1] * np.log(s * np.sqrt(2 * np.pi))
+
+print(f"n = {n}, positives = {int(y.sum())}, d = {d}")
+for b in (np.zeros(3), beta_true, np.array([0.0, 3.0, -3.0])):
+    print(f"log p(y, beta={np.array2string(b, precision=1)}) = {log_joint(b):9.3f}")
+```
+
+```output
+```
+
+Each line is one evaluation of the numerator. Differences between them are meaningful: the
+posterior density at the true $\beta$ is $e^{\Delta}$ times the density at the origin. The absolute
+level is not meaningful until you know $\log Z$.
+
+### Every posterior quantity is a ratio of integrals
+
+Anything you want from the posterior has the same shape:
+
+$$
+\mathbb{E}[f(\beta) \mid y] = \frac{\int f(\beta)\,\tilde p(\beta)\,d\beta}{\int \tilde p(\beta)\,d\beta}
+$$
+
+A mean takes $f(\beta) = \beta$, a tail probability takes $f = \mathbb{1}[\beta_1 > 1]$, and a
+predictive takes $f = p(\tilde y \mid \beta)$. Both the numerator and the denominator are
+$d$-dimensional integrals. The rest of the chapter is about the four ways to attack them: put a grid
+on them, replace the integrand by a Gaussian, average over random points, or (from ch. 4) build a
+Markov chain whose draws do the averaging for you.
+
+## The grid and the $G^d$ wall
+
+The brute-force answer from chapter 1 still works in three dimensions. Put $G$ nodes on each axis of
+a box, evaluate $\tilde p$ at all $G^d$ nodes, and replace each integral by a sum times the cell
+volume $h^d$. Below the box is $[-5, 5]^3$, chosen generously, and $G$ doubles each row. The $G = 160$
+grid becomes the reference for the next few sections.
+
+```python
+def grid_posterior(G, lo=-5.0, hi=5.0, chunk=250_000):
+    axis = np.linspace(lo, hi, G)
+    h = axis[1] - axis[0]
+    pts = np.stack(np.meshgrid(*[axis] * d, indexing="ij"), -1).reshape(-1, d)
+    lj = np.concatenate([log_joint(pts[i:i + chunk]) for i in range(0, len(pts), chunk)])
+    m = lj.max()
+    w = np.exp(lj - m)
+    logZ = m + np.log(w.sum()) + d * np.log(h)
+    w /= w.sum()
+    mean = w @ pts
+    return logZ, mean, np.sqrt(w @ (pts - mean) ** 2), w, pts
+
+print(f"{'G':>4} {'evals':>10} {'seconds':>8} {'log Z':>9} {'posterior mean':>26} {'posterior sd':>22}")
+for G in (10, 20, 40, 80, 160):
+    t0 = time.perf_counter()
+    logZ_g, mean_g, sd_g, w_g, pts_g = grid_posterior(G)
+    sec = time.perf_counter() - t0
+    print(f"{G:>4} {G**d:>10,} {sec:>8.3f} {logZ_g:>9.4f} {np.array2string(mean_g, precision=3):>26} "
+          f"{np.array2string(sd_g, precision=3):>22}")
+ref_grid = dict(logZ=logZ_g, mean=mean_g, sd=sd_g)
+per_eval = sec / 160 ** d
+print(f"\ncost per evaluation ~ {per_eval * 1e9:.0f} ns. With only G = 30 nodes per axis:")
+for dd in (3, 5, 8, 10, 15, 20):
+    secs = 30 ** dd * per_eval
+    print(f"  d = {dd:>2}: {30 ** dd:9.2e} evaluations ~ {secs:9.2e} s = {secs / 3.15e7:9.2e} years")
+```
+
+```output
+```
+
+Three parameters is the comfortable case: by $G = 40$ (64,000 evaluations) the mean and sd are
+already within a few thousandths of the $G = 160$ answer. The trouble is the exponent. Even at a
+coarse 30 nodes per axis the cost passes a year near $d = 10$ and the age of the universe well
+before $d = 20$. A logistic regression with twenty features is not an exotic model. The grid also
+wastes almost all of its work: most of the box carries negligible posterior mass, and the
+fraction of wasted cells grows with $d$ (the typical-set section below makes this precise).
+
+## The Laplace approximation
+
+If you cannot integrate $\tilde p$, replace it with something you can. Near its mode, a smooth log
+posterior looks like a quadratic, and the exponential of a quadratic is a Gaussian whose integral
+you know exactly.
+
+### Derivation
+
+Let $\hat\beta = \arg\max \log\tilde p(\beta)$ and $A = -\nabla^2 \log\tilde p(\hat\beta)$ (the
+negative Hessian, positive definite at a strict maximum). The gradient vanishes at the mode, so a
+second-order Taylor expansion gives
+
+$$
+\log\tilde p(\beta) \approx \log\tilde p(\hat\beta) - \tfrac{1}{2}(\beta - \hat\beta)^\top A\,(\beta - \hat\beta)
+$$
+
+Exponentiating and using $\int e^{-\frac12 u^\top A u}du = (2\pi)^{d/2}\lvert A\rvert^{-1/2}$:
+
+$$
+p(\beta \mid y) \approx \mathcal{N}\left(\hat\beta,\; A^{-1}\right), \qquad
+\boxed{\log Z \approx \log\tilde p(\hat\beta) + \frac{d}{2}\log 2\pi - \frac{1}{2}\log\lvert A\rvert}
+$$
+
+For logistic regression the derivatives are explicit. With $p_i = \sigma(\eta_i)$ and
+$W = \mathrm{diag}(p_i(1 - p_i))$:
+
+$$
+\nabla\log\tilde p = X^\top(y - p) - \beta/s^2, \qquad
+\nabla^2\log\tilde p = -X^\top W X - I/s^2
+$$
+
+The Hessian is negative definite everywhere, so the log posterior is strictly concave and Newton's
+method $\beta \leftarrow \beta - (\nabla^2)^{-1}\nabla$ converges fast. It is the same iteration as
+IRLS in a GLM, plus the prior term.
+
+```python
+def laplace(X=X, y=y, s=prior_sd, iters=12, verbose=False):
+    b = np.zeros(X.shape[1])
+    for it in range(iters):
+        p = special.expit(X @ b)
+        g = X.T @ (y - p) - b / s ** 2
+        H = -(X.T * (p * (1 - p))) @ X - np.eye(X.shape[1]) / s ** 2
+        if verbose:
+            print(f"  iter {it}: log p(y,b) = {log_joint(b, X, y, s):9.5f}  |grad| = {np.linalg.norm(g):.2e}")
+        if np.linalg.norm(g) < 1e-10:
+            break
+        b = b - np.linalg.solve(H, g)
+    cov = np.linalg.inv(-H)
+    logZ = log_joint(b, X, y, s) + 0.5 * X.shape[1] * np.log(2 * np.pi) + 0.5 * np.linalg.slogdet(cov)[1]
+    return b, cov, logZ
+
+b_map, cov_lap, logZ_lap = laplace(verbose=True)
+sd_lap = np.sqrt(np.diag(cov_lap))
+print(f"\n{'':>14} {'mean / mode':>26} {'sd':>22} {'log Z':>9}")
+print(f"{'Laplace':>14} {np.array2string(b_map, precision=3):>26} {np.array2string(sd_lap, precision=3):>22} {logZ_lap:9.4f}")
+print(f"{'grid G=160':>14} {np.array2string(ref_grid['mean'], precision=3):>26} "
+      f"{np.array2string(ref_grid['sd'], precision=3):>22} {ref_grid['logZ']:9.4f}")
+```
+
+```output
+```
+
+Newton reaches machine precision in a handful of steps, each costing one pass over the data. The
+Gaussian approximation is close but not exact. The Laplace mean is the posterior *mode*, and
+logistic posteriors are skewed away from zero (the likelihood flattens as $|\eta|$ grows), so the
+true mean of a large coefficient sits further out than the mode. The sds are too small for the same
+reason. The evidence is off by a few hundredths of a nat, which is small enough for most model
+comparisons. The Bernstein-von Mises theorem says the posterior becomes Gaussian as $n \to \infty$,
+with Laplace errors of relative order $1/n$. With 40 observations and 3 parameters you are in the
+regime where it is good, not perfect.
+
+### Where Laplace breaks
+
+A Gaussian centred on the mode cannot represent three things: heavy skew, a hard boundary, and more
+than one mode. Each case below is one-dimensional, so the exact answer comes from a fine grid.
+
+```python
+def exact_1d(logp, g):
+    w = np.exp(logp - logp.max()); h = g[1] - g[0]
+    logZ = logp.max() + np.log(w.sum() * h); w /= w.sum()
+    m = w @ g
+    return w, m, np.sqrt(w @ (g - m) ** 2), logZ
+
+def laplace_1d(logp_fn, x0):
+    mode = optimize.minimize_scalar(lambda t: -logp_fn(t), bracket=(x0 - 0.1, x0 + 0.1)).x
+    eps = 1e-4
+    a = -(logp_fn(mode + eps) - 2 * logp_fn(mode) + logp_fn(mode - eps)) / eps ** 2
+    return mode, 1 / np.sqrt(a), logp_fn(mode) + 0.5 * np.log(2 * np.pi / a)
+
+# (a) skew: nearly separable logistic data, slope only, weak N(0, 10^2) prior
+xs = np.linspace(-2, 2, 10); ys = np.array([0, 0, 0, 0, 1, 0, 1, 1, 1, 1.0])
+lp_a = lambda t: np.sum(ys * t * xs - np.logaddexp(0, np.multiply.outer(t, xs)), axis=-1) + stats.norm.logpdf(t, 0, 10)
+g_a = np.linspace(-5, 60, 200_001)
+# (b) boundary: 1 conversion in 30, flat prior on theta in (0, 1)
+lp_b = lambda t: stats.binom.logpmf(1, 30, np.clip(t, 1e-12, 1 - 1e-12))
+g_b = np.linspace(1e-7, 1 - 1e-7, 200_001)
+# (c) two modes: y_i ~ N(theta^2, 1); the sign of theta is not identified
+y_c = rng.normal(2.0 ** 2, 1, 15)
+lp_c = lambda t: stats.norm.logpdf(y_c[:, None], np.square(np.atleast_1d(t))[None, :], 1).sum(0).squeeze() + stats.norm.logpdf(t, 0, 3)
+g_c = np.linspace(-6, 6, 200_001)
+
+for name, lp, g, x0, tail in (("(a) skewed slope", lp_a, g_a, 2.0, ("P(slope > 10)", lambda t: t > 10)),
+                              ("(b) bounded rate", lp_b, g_b, 0.05, ("P(theta < 0)", lambda t: t < 0)),
+                              ("(c) bimodal", lp_c, g_c, 1.5, ("P(theta < 0)", lambda t: t < 0))):
+    w, m, s, lz = exact_1d(lp(g), g)
+    mode, s_l, lz_l = laplace_1d(lp, x0)
+    p_ex = w[tail[1](g)].sum()
+    p_l = stats.norm.cdf(10, mode, s_l, ) if "slope" in tail[0] else stats.norm.cdf(0, mode, s_l)
+    p_l = 1 - p_l if "slope" in tail[0] else p_l
+    print(f"{name}: mean exact {m:7.3f} vs Laplace {mode:7.3f} | sd {s:6.3f} vs {s_l:6.3f} | "
+          f"{tail[0]} {p_ex:.4f} vs {p_l:.4f} | log Z {lz:8.3f} vs {lz_l:8.3f}")
+```
+
+```output
+```
+
+Each failure is a different shape problem. In (a) the data are almost separable, so the likelihood
+keeps rising toward large slopes and only the weak prior stops it. The posterior has a long right
+tail that a symmetric Gaussian cannot follow: the mean, the sd and the tail probability are all
+badly understated. In (b) the Gaussian puts real probability on negative conversion rates. The usual
+fix is to apply Laplace to an unconstrained transform (the log-odds here), which is what Stan and
+PyMC do automatically for constrained parameters (ch. 8). In (c) Laplace finds one of two mirror-image
+modes. It reports a mean of about 2 where the truth is 0, says there is no mass at $\theta < 0$
+where there is half of it, and misses $\log Z$ by about $\log 2 = 0.693$, the mass of the mode it
+never saw. Optimising cannot discover what it does not climb.
+
+## Monte Carlo integration
+
+The way out of the $G^d$ wall is to stop placing points deterministically. If
+$\theta^{(1)}, \dots, \theta^{(N)}$ are independent draws from $p$, then
+
+$$
+\hat I_N = \frac{1}{N}\sum_{s=1}^{N} f\left(\theta^{(s)}\right) \quad\text{estimates}\quad I = \mathbb{E}_p[f(\theta)]
+$$
+
+### The error does not depend on dimension
+
+$\hat I_N$ is unbiased because each term has expectation $I$. The terms are independent, so
+
+$$
+\mathrm{Var}(\hat I_N) = \frac{\sigma_f^2}{N}, \qquad \sigma_f^2 = \mathrm{Var}_p[f(\theta)],
+\qquad \sqrt{N}\left(\hat I_N - I\right) \xrightarrow{d} \mathcal{N}(0, \sigma_f^2)
+$$
+
+The dimension $d$ appears nowhere. It can only enter through $\sigma_f$, which is a property of the
+function, not of the number of axes. Compare a product grid with $N$ points: it has
+$N^{1/d}$ points per axis, and the midpoint rule's error, $O(h^2) = O(N^{-2/d})$, decays more slowly
+than $N^{-1/2}$ as soon as $d > 4$. The test below estimates
+$P\left(\sum_j x_j / \sqrt{d} > 1\right)$ for $x \sim \mathcal{N}(0, I_d)$. The answer is
+$1 - \Phi(1) = 0.15866$ in every dimension, and $\sigma_f$ is the same Bernoulli sd in every dimension.
+Both methods get the same budget of $N = 2^{20}$ points.
+
+```python
+truth = stats.norm.sf(1)
+N_budget = 2 ** 20
+
+def grid_tail_prob(dd, G, box=5.0):
+    edges = np.linspace(-box, box, G + 1)
+    c, h = (edges[:-1] + edges[1:]) / 2, edges[1] - edges[0]
+    w = stats.norm.pdf(c); w /= w.sum()
+    dist = np.array([1.0])                     # a product grid's coordinate-sum lies on a lattice,
+    for _ in range(dd):                        # so the G^d-term sum is d convolutions of the 1-D weights
+        dist = np.convolve(dist, w)
+    s = dd * c[0] + h * np.arange(len(dist))
+    return dist[s / np.sqrt(dd) > 1].sum()
+
+print(f"truth {truth:.5f} | MC standard error at N = 2^20: {np.sqrt(truth * (1 - truth) / N_budget):.5f}")
+print(f"{'d':>3} {'G per axis':>11} {'grid error':>11} {'MC error':>10}")
+for dd in (1, 2, 4, 5, 10, 20):
+    G = round(N_budget ** (1 / dd))
+    x = rng.standard_normal((N_budget, dd), dtype=np.float32)
+    mc = np.mean(x.sum(1) / np.sqrt(dd) > 1)
+    print(f"{dd:>3} {G:>11} {grid_tail_prob(dd, G) - truth:>+11.5f} {mc - truth:>+10.5f}")
+
+print("\nMC RMSE over 200 repeats, d = 10:")
+for N in (100, 1_000, 10_000, 100_000):
+    est = np.array([np.mean(rng.standard_normal((N, 10)).sum(1) / np.sqrt(10) > 1) for _ in range(200)])
+    rmse = np.sqrt(np.mean((est - truth) ** 2))
+    print(f"  N = {N:>7,}: RMSE {rmse:.5f} | sigma_f / sqrt(N) = {np.sqrt(truth * (1 - truth) / N):.5f} | RMSE x sqrt(N) = {rmse * np.sqrt(N):.3f}")
+```
+
+```output
+```
+
+The grid wins easily in one and two dimensions, where it has a thousand or a million points per
+axis. By $d = 5$ it has 16 points per axis and its error is already larger than Monte Carlo's. At
+$d = 10$ (4 points per axis) and $d = 20$ (2 points per axis) it is useless. Monte Carlo's error
+stays at the size of its standard error, about 0.0004, in every row. The RMSE table confirms the
+rate: $\mathrm{RMSE}\times\sqrt{N}$ is constant at $\sigma_f = \sqrt{0.159 \times 0.841} = 0.365$.
+
+### You need draws, not the normaliser
+
+Monte Carlo needs *draws* from the posterior. It does not need $Z$: the average of $f$ over draws
+is already the ratio of integrals from the first section, normaliser included. So the problem
+changes from "integrate $\tilde p$" to "generate draws from a density known only up to a
+constant". The next two methods do this with independent draws. MCMC (ch. 4 to 6) gives up
+independence to get scalability.
+
+## Rejection sampling
+
+Pick a proposal $q$ you can sample and a constant $M$ with $\tilde p(\theta) \le M q(\theta)$
+everywhere (an **envelope**). Draw $\theta \sim q$ and accept it with probability
+$\tilde p(\theta) / (M q(\theta))$.
+
+### Why the accepted draws are exact
+
+For any set $\mathcal{A}$, the probability that a proposal lands in $\mathcal{A}$ *and* is accepted is
+
+$$
+P(\theta \in \mathcal{A},\ \text{accept}) = \int_{\mathcal{A}} q(\theta)\,\frac{\tilde p(\theta)}{M q(\theta)}\,d\theta
+= \frac{1}{M}\int_{\mathcal{A}} \tilde p(\theta)\,d\theta
+$$
+
+Setting $\mathcal{A}$ to the whole space gives $P(\text{accept}) = Z/M$. Dividing,
+$P(\theta \in \mathcal{A} \mid \text{accept}) = \int_{\mathcal{A}}\tilde p / Z$, which is exactly
+the posterior. The acceptance rate itself estimates $Z$.
+
+For a Bayesian model, the prior is a natural proposal. Then $\tilde p / q$ is the likelihood, so
+$M = L(\hat\beta_{\text{MLE}})$, the maximum of the likelihood, works as the envelope constant:
+
+```python
+neg_ll = lambda b: -(y * (X @ b) - np.logaddexp(0, X @ b)).sum()
+log_Lmax = -optimize.minimize(neg_ll, np.zeros(d), method="BFGS").fun
+N_prop = 400_000
+props = rng.normal(0, prior_sd, (N_prop, d))
+log_lik = (y * (props @ X.T) - np.logaddexp(0, props @ X.T)).sum(1)
+accepted = props[np.log(rng.random(N_prop)) < log_lik - log_Lmax]
+acc = len(accepted) / N_prop
+print(f"acceptance {acc:.5f} | theory Z/M = exp(log Z - log Lmax) = {np.exp(ref_grid['logZ'] - log_Lmax):.5f}")
+print(f"log Z from acceptance rate {np.log(acc) + log_Lmax:.4f} | grid {ref_grid['logZ']:.4f}")
+print(f"{len(accepted)} exact draws: mean {np.array2string(accepted.mean(0), precision=3)} | "
+      f"sd {np.array2string(accepted.std(0), precision=3)}")
+```
+
+```output
+```
+
+The accepted draws reproduce the grid mean and sd to within Monte Carlo error, skew included,
+because they are exact posterior draws. But only about one proposal in a few hundred survives. The
+acceptance rate is the evidence divided by the maximum likelihood, the ratio of the posterior's
+volume to the prior's. More data makes the posterior narrower relative to the prior, so the rate
+falls as $n$ grows.
+
+### The acceptance rate in high dimension
+
+The rate also falls exponentially with dimension, even when the proposal is almost perfect. Take
+the target $\mathcal{N}(0, I_d)$ and a proposal $\mathcal{N}(0, 1.2^2 I_d)$, only 20% wider in each
+direction. The tightest envelope is attained at the origin, where $p/q = 1.2^d$. So the acceptance
+rate is $1.2^{-d}$.
+
+```python
+for dd in (1, 5, 10, 25, 50, 100):
+    z = rng.normal(0, 1.2, (200_000, dd))
+    log_ratio = (stats.norm.logpdf(z) - stats.norm.logpdf(z, 0, 1.2)).sum(1)   # log p/q
+    acc_d = np.mean(np.log(rng.random(len(z))) < log_ratio - dd * np.log(1.2))
+    print(f"d = {dd:>3}: empirical acceptance {acc_d:.6f} | theory 1.2^-d = {1.2 ** -dd:.2e}")
+```
+
+```output
+```
+
+At $d = 50$ you need on the order of ten thousand proposals per accepted draw, and at $d = 100$ a
+hundred million. Nothing in the setup is badly chosen. The envelope has to cover the worst point,
+and the gap between $p$ and $q$ at that point compounds multiplicatively across coordinates.
+Rejection sampling remains useful as a building block in one or a few dimensions (many of numpy's
+own samplers use it), but not as a posterior engine.
+
+## Importance sampling
+
+Rejection sampling throws information away: a rejected draw still told you the value of $\tilde p$
+there. Importance sampling keeps every draw and weights it instead.
+
+### Derivation: unbiased evidence, self-normalised expectations
+
+For any proposal $q$ with $q > 0$ wherever $\tilde p > 0$, define the weight
+$w(\theta) = \tilde p(\theta) / q(\theta)$. Then
+
+$$
+Z = \int \tilde p(\theta)\,d\theta = \mathbb{E}_q[w(\theta)] \approx \hat Z = \frac{1}{N}\sum_{s} w_s,
+\qquad
+\mathbb{E}_p[f] = \frac{\mathbb{E}_q[w f]}{\mathbb{E}_q[w]} \approx \sum_{s}\bar w_s f(\theta_s),
+\quad \bar w_s = \frac{w_s}{\sum_r w_r}
+$$
+
+$\hat Z$ is unbiased. The second estimator is **self-normalised importance sampling** (SNIS). It is
+a ratio, so it has $O(1/N)$ bias, but it only needs $\tilde p$, which is all you have. The variance
+of $\hat Z$ is $\frac{1}{N}\left(\mathbb{E}_q[w^2] - Z^2\right)$, and
+
+$$
+\mathbb{E}_q[w^2] = \int \frac{\tilde p(\theta)^2}{q(\theta)}\,d\theta
+$$
+
+is finite only if $q$ has tails at least as heavy as $p$, roughly. A proposal that is too narrow
+gives infinite variance, which means an estimator whose error does not shrink like $1/\sqrt N$ and
+that looks fine in most runs.
+
+### Effective sample size
+
+If the weights were fixed and the $f(\theta_s)$ were independent with variance $\sigma^2$,
+$\mathrm{Var}(\sum_s \bar w_s f_s) = \sigma^2\sum_s \bar w_s^2$. Matching this to $\sigma^2 / N_{\text{eff}}$
+gives Kish's effective sample size:
+
+$$
+\mathrm{ESS} = \frac{1}{\sum_s \bar w_s^2} = \frac{\left(\sum_s w_s\right)^2}{\sum_s w_s^2}
+$$
+
+It equals $N$ for equal weights and 1 when a single draw holds all the weight. It is a heuristic (it
+ignores $f$), but it is the first number to look at. The code compares four proposals on the
+logistic posterior, all built from the Laplace fit except the last one.
+
+```python
+def snis(log_w, draws):
+    lw = log_w - log_w.max()
+    w = np.exp(lw)
+    logZ_hat = log_w.max() + np.log(w.mean())
+    wb = w / w.sum()
+    mean = wb @ draws
+    sd = np.sqrt(wb @ (draws - mean) ** 2)
+    return logZ_hat, mean, sd, 1 / np.sum(wb ** 2), wb.max()
+
+N_is = 20_000
+proposals = {
+    "Laplace N(mode, A^-1)": stats.multivariate_normal(b_map, cov_lap),
+    "Student-t4, same scale": stats.multivariate_t(b_map, cov_lap, df=4),
+    "narrow N(mode, A^-1/4)": stats.multivariate_normal(b_map, cov_lap / 4),
+    "prior N(0, 2.5^2 I)": stats.multivariate_normal(np.zeros(d), prior_sd ** 2 * np.eye(d)),
+}
+is_logw = {}
+print(f"{'proposal':>23} {'log Z':>8} {'ESS':>7} {'ESS/N':>6} {'max wbar':>9} {'max |mean err|/sd':>18} {'sd ratio':>20}")
+for name, q in proposals.items():
+    th = q.rvs(N_is, random_state=rng)
+    lw = log_joint(th) - q.logpdf(th)
+    is_logw[name] = lw
+    lz, m, s, ess, wmax = snis(lw, th)
+    err = np.max(np.abs(m - ref_grid["mean"]) / ref_grid["sd"])
+    print(f"{name:>23} {lz:8.4f} {ess:7.0f} {ess / N_is:6.3f} {wmax:9.4f} {err:18.3f} "
+          f"{np.array2string(s / ref_grid['sd'], precision=2):>20}")
+print(f"{'grid G=160':>23} {ref_grid['logZ']:8.4f}")
+```
+
+```output
+```
+
+The Laplace Gaussian is already a good proposal: most of its draws carry useful weight, and the
+mean error is a few hundredths of a posterior sd. Note what happened: IS **corrected** the
+Laplace approximation. The Laplace mean was off and its sds were too small (previous section), but
+reweighting its draws recovers the grid answer. The Student-t proposal is slightly less efficient
+on paper but safer, because its tails are heavier than the posterior's in every direction. The
+narrow proposal is the trap. Its ESS still looks respectable and its mean is not far off, yet it
+reports sds that are too small, because draws from the posterior's tails, where $q$ is tiny, are
+almost never generated. The prior is a correct but wasteful proposal, with a small ESS for the same
+reason rejection sampling had a low acceptance rate.
+
+### Tail mismatch: when the variance is infinite
+
+The narrow-proposal problem can be computed exactly. With target $\mathcal{N}(0, 1)$ and proposal
+$\mathcal{N}(0, \sigma^2)$,
+
+$$
+\mathbb{E}_q[w^2] = \int \frac{\phi(x)^2}{\phi(x/\sigma)/\sigma}\,dx = \frac{\sigma^2}{\sqrt{2\sigma^2 - 1}}
+\quad (\sigma^2 > \tfrac{1}{2}), \qquad \text{infinite for } \sigma^2 \le \tfrac{1}{2}
+$$
+
+The asymptotic ESS fraction is $1/\mathbb{E}_q[w^2] = \sqrt{2\sigma^2 - 1}/\sigma^2$. In $d$
+independent dimensions it is raised to the power $d$, which is the same exponential collapse that
+rejection sampling showed. The code estimates $\mathbb{E}_p[x^2] = 1$ by SNIS, 300 times per
+proposal.
+
+```python
+def ess_frac(sig):
+    return np.sqrt(2 * sig ** 2 - 1) / sig ** 2 if sig ** 2 > 0.5 else 0.0
+
+print(f"{'sigma_q':>7} {'theory ESS/N':>13} {'median ESS/N':>13} {'median est':>11} {'5%-95% of est':>17} {'worst':>7}")
+for sig in (0.6, 0.7, 0.8, 1.0, 1.5, 3.0):
+    ests, essf = [], []
+    for _ in range(300):
+        x = rng.normal(0, sig, 5_000)
+        lw = stats.norm.logpdf(x) - stats.norm.logpdf(x, 0, sig)
+        wb = np.exp(lw - lw.max()); wb /= wb.sum()
+        ests.append(wb @ x ** 2); essf.append(1 / np.sum(wb ** 2) / len(x))
+    ests = np.array(ests)
+    lo, hi = np.quantile(ests, [0.05, 0.95])
+    print(f"{sig:>7} {ess_frac(sig):>13.3f} {np.median(essf):>13.3f} {np.median(ests):>11.3f} "
+          f"[{lo:6.3f}, {hi:6.3f}] {ests[np.argmax(np.abs(ests - 1))]:>7.3f}")
+
+print("\nESS/N for proposal sigma = 1.2 per axis, as d grows: "
+      + ", ".join(f"d={dd}: {ess_frac(1.2) ** dd:.2e}" for dd in (1, 10, 50, 100)))
+```
+
+```output
+```
+
+Read the two narrowest rows. The median estimate of a quantity whose true value is 1 is about 0.6
+to 0.8, and the empirical ESS fraction is respectable. In a single run you would never know.
+Narrow proposals underestimate tail-sensitive quantities *systematically*, and the bias is hidden
+because the rare draws that would correct it are almost never sampled. Wider proposals are
+inefficient but honest: at $\sigma = 3$ the ESS fraction drops to about 0.5 and the estimates are
+centred on 1. The asymmetry is the practical rule. **Make the proposal too wide, never too
+narrow**, and prefer heavy tails (Student-t) to Gaussian ones. The last line shows the cost in
+high dimension: even a near-perfect 1.2-times-too-wide proposal leaves an ESS of about one draw in
+ten thousand at $d = 100$.
+
+## Diagnosing importance weights with Pareto $\hat k$
+
+ESS is computed from the very weights whose tail you are worried about, so it cannot detect a tail it
+has not sampled. Vehtari et al.'s **Pareto-smoothed importance sampling** (PSIS) looks at the shape
+of the weight distribution instead. It fits a generalised Pareto distribution to the largest weights.
+The fitted shape $\hat k$ estimates how many moments of $w$ exist: moments of order below $1/k$ are
+finite. So $\hat k < 0.5$ means finite variance. Between 0.5 and 0.7 the estimate is still usable with
+smoothing, and $\hat k > 0.7$ means the estimate cannot be trusted. PSIS also replaces the largest
+weights with quantiles of the fitted Pareto, which reduces the variance. The sketch below does only
+the diagnostic, with a plain maximum-likelihood fit (the reference implementation uses a regularised
+estimator).
+
+```python
+def pareto_khat(log_w):
+    w = np.sort(np.exp(log_w - log_w.max()))
+    M = int(min(0.2 * len(w), 3 * np.sqrt(len(w))))      # tail size used by PSIS
+    tail, u = w[-M:], w[-M - 1]
+    k, _, _ = stats.genpareto.fit(tail - u, floc=0)
+    return k
+
+for name, lw in is_logw.items():
+    print(f"logistic, {name:>23}: khat = {pareto_khat(lw):+.2f}")
+for sig in (0.6, 0.8, 1.0, 1.5):
+    x = rng.normal(0, sig, 20_000)
+    k = pareto_khat(stats.norm.logpdf(x) - stats.norm.logpdf(x, 0, sig))
+    print(f"N(0,1) target, sigma_q = {sig}: khat = {k:+.2f}")
+```
+
+```output
+```
+
+The narrow proposal on the logistic posterior now raises an alarm that ESS did not. The Gaussian
+experiment shows the diagnostic tracking the theory: $\hat k$ is above 0.5 exactly where the
+variance is infinite ($\sigma^2 \le 1/2$), and negative (bounded weights) once the proposal is wider
+than the target. Chapter 9 uses PSIS for its most important job, leave-one-out cross-validation
+from a single posterior fit (PSIS-LOO). There each data point's "proposal" is the full posterior,
+and $\hat k$ flags the observations that are too influential for the shortcut.
+
+## Concentration of measure and the typical set
+
+Every method so far has broken down in high dimension in the same way: a fixed, local inefficiency
+compounds multiplicatively across coordinates. The underlying cause is geometric, and it decides how
+MCMC has to work.
+
+### Mass is density times volume
+
+For $\theta \sim \mathcal{N}(0, I_d)$ the density is largest at the mode. Mass, however, is density
+times volume, and the volume of a shell at radius $r$ grows like $r^{d-1}$. The radius therefore
+has density
+
+$$
+p(r) \propto r^{d-1} e^{-r^2/2}, \qquad
+\frac{d}{dr}\left[(d-1)\log r - \frac{r^2}{2}\right] = 0 \;\Rightarrow\; r^{*} = \sqrt{d-1}
+$$
+
+and $r^2 = \lVert\theta\rVert^2 \sim \chi^2_d$ has mean $d$ and variance $2d$. By the delta method,
+$\mathrm{sd}(r) \approx \sqrt{2d}/(2\sqrt d) = 1/\sqrt{2}$, whatever $d$ is. The mass lives in a shell of
+radius about $\sqrt d$ and constant thickness. That shell is the **typical set**. The mode is not
+in it, and neither is anything near it.
+
+```python
+print(f"{'d':>5} {'mean radius':>12} {'sd radius':>10} {'P(r < 1)':>10} {'P(r < sqrt(d)/2)':>17} "
+      f"{'log p(mode) - E[log p]':>23}")
+for dd in (1, 2, 10, 100, 1000):
+    z = rng.standard_normal((20_000, dd))
+    r = np.linalg.norm(z, axis=1)
+    print(f"{dd:>5} {r.mean():>12.3f} {r.std():>10.3f} {stats.chi2.cdf(1, dd):>10.2e} "
+          f"{stats.chi2.cdf(dd / 4, dd):>17.2e} {0.5 * np.mean(r ** 2):>23.1f}")
+
+ref_draws = accepted                                   # exact posterior draws from rejection sampling
+gap = log_joint(b_map) - log_joint(ref_draws)
+print(f"\nlogistic posterior (d=3): log p(mode) - log p(draw): mean {gap.mean():.2f} (Gaussian theory d/2 = 1.5), "
+      f"5%-95% [{np.quantile(gap, .05):.2f}, {np.quantile(gap, .95):.2f}]")
+```
+
+```output
+```
+
+In 100 dimensions the probability of landing within distance 1 of the mode is about $10^{-79}$, and
+even the ball of half the typical radius holds essentially no mass. A typical draw has log density
+$d/2$ below the mode: 50 nats at $d = 100$, 500 at $d = 1000$. The mode is the single
+most likely *point* and a completely atypical *region*. The three-parameter logistic posterior
+already shows the effect at small scale: its draws sit about 1.5 nats below the mode on average.
+
+This explains the failures above. A grid and an optimiser both spend their effort near the mode.
+Rejection sampling and importance sampling have to hit a thin shell with a proposal whose own shell
+is slightly misplaced, and in $d$ dimensions "slightly" compounds. A sampler that scales has to
+*move along* the typical set once it has found it. That is what a Markov chain does (ch. 4). A
+random-walk chain moves through the shell diffusively, with step sizes that must shrink as $d$
+grows. Hamiltonian Monte Carlo (ch. 6) follows the shell using gradient information, which is
+why it is the default in Stan and PyMC.
+
+## The four approaches on one posterior
+
+The table below runs each method on the logistic posterior with a comparable budget of model
+evaluations. A short random-walk Metropolis chain stands in for MCMC. It is treated as a black box
+here, and chapter 4 derives it. The reference is a long SNIS run with the Student-t proposal (two
+million draws), checked against the $G = 160$ grid.
+
+```python
+def rwm(lj, x0, cov, n_steps, rng):
+    L = np.linalg.cholesky(cov * 2.38 ** 2 / len(x0))
+    x, lx, out, acc = x0.copy(), lj(x0), np.empty((n_steps, len(x0))), 0
+    for t in range(n_steps):
+        prop = x + L @ rng.standard_normal(len(x0))
+        lp = lj(prop)
+        if np.log(rng.random()) < lp - lx:
+            x, lx, acc = prop, lp, acc + 1
+        out[t] = x
+    return out, acc / n_steps
+
+t_ref = stats.multivariate_t(b_map, 1.5 * cov_lap, df=4)
+th_ref = t_ref.rvs(2_000_000, random_state=rng)
+lz_ref, m_ref, s_ref, ess_ref, _ = snis(log_joint(th_ref) - t_ref.logpdf(th_ref), th_ref)
+lw_ref = log_joint(th_ref) - t_ref.logpdf(th_ref)
+wb_ref = np.exp(lw_ref - lw_ref.max()); wb_ref /= wb_ref.sum()
+p_ref = wb_ref @ (th_ref[:, 1] > 2.0)
+print(f"reference: ESS {ess_ref:,.0f} | log Z {lz_ref:.4f} (grid {ref_grid['logZ']:.4f}) | "
+      f"mean {np.array2string(m_ref, precision=3)} | P(beta_1 > 2) {p_ref:.4f}\n")
+
+rows = []
+t0 = time.perf_counter(); lz, m, s, w, P = grid_posterior(40)
+rows.append(("grid G=40", 40 ** 3, time.perf_counter() - t0, lz, m, s, w @ (P[:, 1] > 2.0)))
+t0 = time.perf_counter(); bm, cv, lz = laplace()
+rows.append(("Laplace", 6, time.perf_counter() - t0, lz, bm, np.sqrt(np.diag(cv)), stats.norm.sf(2.0, bm[1], np.sqrt(cv[1, 1]))))
+t0 = time.perf_counter()
+tq = stats.multivariate_t(bm, cv, df=4); th = tq.rvs(20_000, random_state=rng)
+lw = log_joint(th) - tq.logpdf(th); lz, m, s, ess, _ = snis(lw, th)
+wb = np.exp(lw - lw.max()); wb /= wb.sum()
+rows.append(("SNIS t4, N=20k", 20_000, time.perf_counter() - t0, lz, m, s, wb @ (th[:, 1] > 2.0)))
+t0 = time.perf_counter(); ch, acc_rate = rwm(log_joint, bm, cv, 22_000, rng); ch = ch[2_000:]
+rows.append(("RW Metropolis 20k", 22_000, time.perf_counter() - t0, np.nan, ch.mean(0), ch.std(0), np.mean(ch[:, 1] > 2.0)))
+
+print(f"{'method':>18} {'evals':>7} {'seconds':>8} {'log Z err':>10} {'max |mean err|/sd':>18} "
+      f"{'max |sd ratio-1|':>17} {'P(b1>2) err':>12}")
+for name, ev, sec, lz, m, s, pt in rows:
+    lz_err = f"{lz - lz_ref:+10.4f}" if np.isfinite(lz) else f"{'n/a':>10}"
+    print(f"{name:>18} {ev:>7,} {sec:>8.3f} {lz_err} {np.max(np.abs(m - m_ref) / s_ref):>18.3f} "
+          f"{np.max(np.abs(s / s_ref - 1)):>17.3f} {pt - p_ref:>+12.4f}")
+print(f"RWM acceptance rate {acc_rate:.2f}")
+```
+
+```output
+```
+
+At $d = 3$ every method is serviceable and the grid is the most accurate, but the ranking is
+the wrong lesson. Look at what each row costs as $d$ grows. The grid's evaluations grow as $G^d$.
+Laplace stays cheap (one Newton solve, $O(d^3)$) at any $d$, but its errors are structural: the
+mean is a mode and the tails are Gaussian, so it does not improve with more compute. SNIS fixes
+Laplace's bias and gives $\log Z$ almost for free, but its ESS decays exponentially in $d$ unless
+the proposal is very good. The random-walk chain does not estimate $\log Z$ at all, and its
+20,000 correlated draws are worth fewer independent ones (ch. 7 measures how many). Its cost,
+however, grows only polynomially with $d$. That trade is why the rest of this course is about
+Markov chains.
+
+| Method | What it needs | Gives $\log Z$? | Cost as $d$ grows | Failure mode |
+|---|---|---|---|---|
+| Grid | $\tilde p$ on a box | yes | $G^d$, hopeless past $d \approx 6$ | the wall |
+| Laplace | mode, Hessian | yes (approx.) | $O(d^3)$ | skew, bounds, multimodality |
+| Importance sampling | proposal $q$ near $p$ | yes, unbiased | ESS decays like $c^{d}$ | narrow-tailed $q$, hidden bias |
+| MCMC (ch. 4 to 6) | $\tilde p$ (and its gradient for HMC) | no | polynomial in $d$ | slow mixing, needs diagnostics (ch. 7) |
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy import stats, special
+
+rng = np.random.default_rng(42)
+n, s = 200, 2.5                                   # try n = 30 or n = 2000
+
+def run(dim):
+    X = np.column_stack([np.ones(n), rng.normal(size=(n, dim - 1))])
+    beta = rng.normal(0, 1, dim)
+    y = (rng.random(n) < special.expit(X @ beta)).astype(float)
+    lj = lambda B: (y * (B @ X.T) - np.logaddexp(0, B @ X.T)).sum(-1) - 0.5 * (B ** 2).sum(-1) / s ** 2
+    b = np.zeros(dim)
+    for _ in range(25):                           # Newton to the mode
+        p = special.expit(X @ b)
+        H = -(X.T * (p * (1 - p))) @ X - np.eye(dim) / s ** 2
+        b = b - np.linalg.solve(H, X.T @ (y - p) - b / s ** 2)
+    cov = np.linalg.inv(-H)
+    out = []
+    for name, q in (("Gaussian", stats.multivariate_normal(b, cov)),
+                    ("t4", stats.multivariate_t(b, cov, df=4)),
+                    ("narrow", stats.multivariate_normal(b, cov / 2))):
+        th = q.rvs(10_000, random_state=rng)
+        lw = lj(th) - q.logpdf(th)
+        w = np.exp(lw - lw.max())
+        out.append(w.sum() ** 2 / (w ** 2).sum() / len(w))
+    return out
+
+print(f"{'d':>3} {'ESS/N Gaussian':>15} {'ESS/N t4':>9} {'ESS/N narrow':>13}")
+for dim in (2, 5, 10, 20, 40):
+    g, t, nr = run(dim)
+    print(f"{dim:>3} {g:>15.3f} {t:>9.3f} {nr:>13.3f}")
+```
+
+```output
+```
+
+Importance sampling with the Laplace fit as proposal is about as good as an independent-draw
+method gets, and you can watch it degrade as the dimension grows at fixed $n$. Raise $n$ and the
+posterior becomes more Gaussian (Bernstein-von Mises), so the Gaussian proposal recovers. Lower
+it and the skew returns. The "narrow" column is the one to distrust: when its ESS looks fine, its
+estimates are still biased in the tails.
+
+## Exercise
+
+Is the second feature worth including? Compare model $M_1$ (intercept and $x_1$) with model $M_2$
+(intercept, $x_1$ and $x_2$, the model used throughout) on the running dataset by their evidence.
+
+1. Compute $\log p(y \mid M_1)$ and $\log p(y \mid M_2)$ in three ways: Laplace, SNIS with a
+   Student-t proposal built from the Laplace fit, and a grid (two- and three-dimensional).
+2. Report the log Bayes factor $\log p(y\mid M_2) - \log p(y \mid M_1)$ from each method, and the
+   Monte Carlo standard error of the SNIS version (repeat it 20 times).
+3. Change the prior sd from 2.5 to 25 and recompute. Explain why the Bayes factor moves although
+   the posterior means hardly change.
+
+<details>
+<summary>Solution</summary>
+
+```python
+def evidence_all(Xm, s, reps=20):
+    dm = Xm.shape[1]
+    b, cv, lz_lap = laplace(Xm, y, s)
+    lz_is = []
+    for _ in range(reps):
+        q = stats.multivariate_t(b, 1.5 * cv, df=4)
+        th = q.rvs(20_000, random_state=rng)
+        lw = log_joint(th, Xm, y, s) - q.logpdf(th)
+        lz_is.append(lw.max() + np.log(np.mean(np.exp(lw - lw.max()))))
+    half = 8 * np.sqrt(np.diag(cv)).max()                      # box: mode +- 8 Laplace sds
+    G = 400 if dm == 2 else 120
+    axes = [np.linspace(bj - half, bj + half, G) for bj in b]
+    pts = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, dm)
+    lj = np.concatenate([log_joint(pts[i:i + 250_000], Xm, y, s) for i in range(0, len(pts), 250_000)])
+    h = axes[0][1] - axes[0][0]
+    lz_grid = lj.max() + np.log(np.exp(lj - lj.max()).sum()) + dm * np.log(h)
+    return lz_lap, np.array(lz_is), lz_grid, b
+
+for s in (2.5, 25.0):
+    r1 = evidence_all(X[:, :2], s)
+    r2 = evidence_all(X, s)
+    print(f"prior sd {s}: posterior mode of beta_2 under M2 = {r2[3][2]:+.3f}")
+    print(f"  Laplace  log BF = {r2[0] - r1[0]:+.4f}")
+    print(f"  SNIS     log BF = {r2[1].mean() - r1[1].mean():+.4f}  (MC se {np.sqrt(r2[1].var(ddof=1) / 20 + r1[1].var(ddof=1) / 20):.4f})")
+    print(f"  grid     log BF = {r2[2] - r1[2]:+.4f}")
+```
+
+```output
+```
+
+PLACEHOLDER
+</details>
