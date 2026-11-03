@@ -27,11 +27,13 @@ noise $\epsilon$, corrupt the image in one shot, and regress on the noise.
 import torch
 import torch.nn as nn
 import numpy as np
+torch.set_num_threads(1)
+torch.manual_seed(0)
 
 T = 1000
 betas = torch.linspace(1e-4, 0.02, T)           # linear schedule
 alphas = 1.0 - betas
-alpha_bar = torch.cumprod(alphas, dim=0)         # ᾱ_t
+alpha_bar = torch.cumprod(alphas, dim=0)         # alpha_bar_t
 
 def q_sample(x0, t, eps=None):
     """Forward process: sample x_t given x_0 and noise eps."""
@@ -62,7 +64,7 @@ print(f"alpha_bar[0]={alpha_bar[0]:.4f}  alpha_bar[999]={alpha_bar[999]:.6f}")
 x0 shape: torch.Size([4, 1, 8, 8])
 xt shape: torch.Size([4, 1, 8, 8])
 eps shape: torch.Size([4, 1, 8, 8])
-alpha_bar[0]=0.9999  alpha_bar[999]=0.000043
+alpha_bar[0]=0.9999  alpha_bar[999]=0.000040
 ```
 
 At $t=0$ the image is nearly unchanged; at $t=999$ it is almost pure noise.
@@ -102,7 +104,7 @@ print(emb(t)[0, :8].detach().numpy().round(3))  # first 8 dims for t=0
 
 ```output
 torch.Size([5, 64])
-[ 0.     0.     0.     0.     0.     0.     0.     0.   ]
+[0. 0. 0. 0. 0. 0. 0. 0.]
 ```
 
 ### Minimal U-Net block
@@ -151,7 +153,7 @@ where $z \sim \mathcal{N}(0, I)$ for $t > 1$, and $z = 0$ at $t = 1$.
 ```python
 @torch.no_grad()
 def ddpm_sample(model, shape, device="cpu"):
-    """Full reverse diffusion: x_T → x_0."""
+    """Full reverse diffusion: x_T -> x_0."""
     x = torch.randn(shape, device=device)
     for t_idx in reversed(range(T)):
         t_batch = torch.full((shape[0],), t_idx, dtype=torch.long, device=device)
@@ -201,7 +203,7 @@ def ddim_sample_step(model, x, t_now, t_prev, eta=0.0):
     return torch.sqrt(ab_prev) * x0_pred + dir_xt + noise
 
 # With 50 steps instead of 1000:
-step_seq = list(range(0, T, T // 50))[::-1]  # 50 evenly-spaced steps
+step_seq = list(range(T - 1, -1, -(T // 50)))  # 50 evenly-spaced steps, 999 down to 19
 print(f"DDIM uses {len(step_seq)} steps vs DDPM's {T}")
 print(f"Step sequence (first 5): {step_seq[:5]}")
 ```
@@ -235,16 +237,16 @@ def cfg_noise_pred(model, xt, t, condition, null_condition, w=7.5):
     return eps_uncond + w * (eps_cond - eps_uncond)
 
 print("CFG equation: eps_hat = eps_uncond + w * (eps_cond - eps_uncond)")
-print("w=1.0 → no guidance (unconditional)")
-print("w=7.5 → strong guidance (Stable Diffusion default)")
-print("w=15+ → oversaturation, artifacts")
+print("w=1.0 -> no guidance (unconditional)")
+print("w=7.5 -> strong guidance (Stable Diffusion default)")
+print("w=15+ -> oversaturation, artifacts")
 ```
 
 ```output
 CFG equation: eps_hat = eps_uncond + w * (eps_cond - eps_uncond)
-w=1.0 → no guidance (unconditional)
-w=7.5 → strong guidance (Stable Diffusion default)
-w=15+ → oversaturation, artifacts
+w=1.0 -> no guidance (unconditional)
+w=7.5 -> strong guidance (Stable Diffusion default)
+w=15+ -> oversaturation, artifacts
 ```
 
 ### Guidance scale tradeoff
@@ -276,8 +278,8 @@ def q_sample(x0, t, eps=None):
     return torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * eps, eps
 
 # Simulate one training step with a trivial "model" (predict zeros)
-x0 = torch.randn(8, 16)
-t  = torch.randint(0, T, (8,))
+x0 = torch.randn(512, 16)
+t  = torch.randint(0, T, (512,))
 xt, eps_true = q_sample(x0, t)
 eps_pred = torch.zeros_like(xt)            # terrible model
 loss = F.mse_loss(eps_pred, eps_true)
@@ -286,7 +288,7 @@ print("Expected ~1.0 (predicting zero for unit-variance noise)")
 ```
 
 ```output
-Loss with zero predictor: 0.9982
+Loss with zero predictor: 1.0169
 Expected ~1.0 (predicting zero for unit-variance noise)
 ```
 
@@ -308,7 +310,7 @@ $w$ causes over-saturation geometrically, and (b) what change to the sampling pr
 # x_0_pred to extreme pixel values (saturated colors, harsh edges).
 
 # (b) Fixes without retraining:
-# 1. Lower w to 5–8 (immediate, most effective).
+# 1. Lower w to 5-8 (immediate, most effective).
 # 2. Use DDIM with more steps (smoother trajectory, less overshoot per step).
 # 3. Dynamic thresholding (Imagen): clamp x_0_pred to percentile range
 #    instead of [-1,1]; prevents saturation while keeping high w.
@@ -320,8 +322,13 @@ def dynamic_threshold(x0_pred, p=0.995):
     return x0_pred.clamp(-s[:, None], s[:, None]) / s[:, None]
 
 x0_example = torch.randn(4, 64) * 3      # simulate saturated pred
-print("Before dynamic threshold:", x0_example.abs().max().item():.3f)
-print("After dynamic threshold: ", dynamic_threshold(x0_example).abs().max().item():.3f)
+print(f"Before dynamic threshold: {x0_example.abs().max().item():.3f}")
+print(f"After dynamic threshold:  {dynamic_threshold(x0_example).abs().max().item():.3f}")
+```
+
+```output
+Before dynamic threshold: 9.169
+After dynamic threshold:  1.000
 ```
 
 Dynamic thresholding clips the predicted $x_0$ to within the training distribution

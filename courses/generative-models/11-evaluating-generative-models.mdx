@@ -28,37 +28,47 @@ $$
 $$
 
 Lower FID = closer to the real distribution. A perfect model would have FID = 0. A random
-noise generator has FID in the thousands.
+noise generator scores far worse than a held-out real set (see the numbers above).
 
-### Practical FID with torchmetrics
+### Computing FID yourself
+
+The real metric uses 2048-d InceptionV3 features, whose pretrained weights need a download. The formula itself is just
+means and covariances, so you can implement it directly. Here the 64-pixel vectors of scikit-learn's bundled digits
+images stand in for Inception features: the numbers are not comparable to published FIDs, but the behaviour is the same.
 
 ```python
-from torchmetrics.image.fid import FrechetInceptionDistance
+import numpy as np
 import torch
+from scipy import linalg
+from sklearn.datasets import load_digits
+torch.set_num_threads(1)
 
-fid = FrechetInceptionDistance(feature=2048, normalize=True)
+def frechet_distance(a, b):
+    mu_a, mu_b = a.mean(0), b.mean(0)
+    cov_a, cov_b = np.cov(a, rowvar=False), np.cov(b, rowvar=False)
+    covmean = linalg.sqrtm(cov_a @ cov_b).real
+    return float(((mu_a - mu_b) ** 2).sum() + np.trace(cov_a + cov_b - 2 * covmean))
 
-# Simulate batches of real and generated images (B, C, H, W) in [0, 1]
-torch.manual_seed(0)
-real_imgs = torch.rand(128, 3, 299, 299)  # needs 299x299 for InceptionV3
-fake_imgs = torch.rand(128, 3, 299, 299) * 0.5  # dimmer → different distribution
+digits = load_digits()
+X = digits.data / 16.0                      # (1797, 64), values in [0, 1]
+rng = np.random.default_rng(0)
+perm = rng.permutation(len(X))
+real_a, real_b = X[perm[:900]], X[perm[900:]]   # two disjoint halves of the real data
 
-fid.update(real_imgs, real=True)
-fid.update(fake_imgs, real=False)
-score = fid.compute()
-print(f"FID (random noise vs dimmer noise): {score:.2f}")
+dimmer = real_b * 0.5                           # a "generator" that makes dim digits
+noise  = rng.random(real_b.shape)               # a "generator" that makes uniform noise
 
-# A model that generates images identical to the real set
-fid2 = FrechetInceptionDistance(feature=2048, normalize=True)
-fid2.update(real_imgs, real=True)
-fid2.update(real_imgs, real=False)   # same images
-score2 = fid2.compute()
-print(f"FID (real vs real):                 {score2:.2f}")
+print(f"FID (real vs real, same set):    {frechet_distance(real_a, real_a):.2f}")
+print(f"FID (real vs held-out real):     {frechet_distance(real_a, real_b):.2f}")
+print(f"FID (real vs dimmer digits):     {frechet_distance(real_a, dimmer):.2f}")
+print(f"FID (real vs uniform noise):     {frechet_distance(real_a, noise):.2f}")
 ```
 
 ```output
-FID (random noise vs dimmer noise): 312.47
-FID (real vs real):                 0.00
+FID (real vs real, same set):    0.00
+FID (real vs held-out real):     0.06
+FID (real vs dimmer digits):     3.77
+FID (real vs uniform noise):     10.00
 ```
 
 ### FID limitations
@@ -84,27 +94,29 @@ High IS means images are individually recognizable as a specific class AND the g
 covers many classes.
 
 ```python
-from torchmetrics.image.inception import InceptionScore
-import torch
+from sklearn.linear_model import LogisticRegression
 
-is_metric = InceptionScore(normalize=True)
-torch.manual_seed(42)
+# A digit classifier plays the role of InceptionV3 (10 classes instead of 1000)
+clf = LogisticRegression(max_iter=300).fit(real_a, digits.target[perm[:900]])
 
-# Low-quality: all images look like noise → low confidence, no recognizable class
-noise_imgs = torch.rand(100, 3, 299, 299)
-is_metric.update(noise_imgs)
-mean, std = is_metric.compute()
-print(f"IS (random noise):   {mean:.2f} ± {std:.2f}")
+def inception_score(images):
+    p_yx = clf.predict_proba(images)                 # p(y|x), shape (N, 10)
+    p_y = p_yx.mean(0, keepdims=True)                # marginal p(y)
+    kl = (p_yx * (np.log(p_yx + 1e-12) - np.log(p_y + 1e-12))).sum(1)
+    return float(np.exp(kl.mean()))
 
-# Higher-quality simulation: structured images would score much higher
-# (we can't fake this without a real trained generator)
+print(f"IS (held-out real digits): {inception_score(real_b):.2f}   (max possible = 10 classes)")
+print(f"IS (uniform noise):        {inception_score(noise):.2f}")
+print(f"IS (dimmer digits):        {inception_score(dimmer):.2f}")
 ```
 
 ```output
-IS (random noise):   1.02 ± 0.01
+IS (held-out real digits): 6.63   (max possible = 10 classes)
+IS (uniform noise):        1.81
+IS (dimmer digits):        2.48
 ```
 
-IS near 1.0 = random noise. A good GAN on ImageNet typically scores 100–300.
+IS is bounded by the number of classes (10 here) and is lowest when the classifier is unsure or predicts one class for everything. A good GAN on ImageNet (1000 classes) typically scores 100-300.
 IS is widely criticized because it ignores real images entirely and can be gamed by a
 model that memorizes the training set.
 
@@ -121,26 +133,33 @@ FID assumes Gaussian distributions; KID does not. KID can be computed reliably w
 few as 1 000 samples, making it better for small-scale experiments.
 
 ```python
-from torchmetrics.image.kid import KernelInceptionDistance
-import torch
+def kid(a, b, n_subsets=20, subset_size=100, seed=0):
+    """Unbiased MMD^2 with the cubic polynomial kernel k(x,y) = (x.y/d + 1)^3, averaged over subsets."""
+    rng = np.random.default_rng(seed)
+    d = a.shape[1]
+    vals = []
+    for _ in range(n_subsets):
+        x = a[rng.choice(len(a), subset_size, replace=False)]
+        y = b[rng.choice(len(b), subset_size, replace=False)]
+        kxx = (x @ x.T / d + 1) ** 3
+        kyy = (y @ y.T / d + 1) ** 3
+        kxy = (x @ y.T / d + 1) ** 3
+        m = subset_size
+        vals.append((kxx.sum() - np.trace(kxx)) / (m*(m-1)) + (kyy.sum() - np.trace(kyy)) / (m*(m-1)) - 2 * kxy.mean())
+    return np.mean(vals), np.std(vals)
 
-kid = KernelInceptionDistance(subset_size=50, normalize=True)
-torch.manual_seed(0)
-real = torch.rand(100, 3, 299, 299)
-fake = torch.rand(100, 3, 299, 299) * 0.8
-
-kid.update(real, real=True)
-kid.update(fake, real=False)
-mean_kid, std_kid = kid.compute()
-print(f"KID: {mean_kid:.4f} ± {std_kid:.4f}")
+for name, g in [("held-out real", real_b), ("dimmer digits", dimmer), ("uniform noise", noise)]:
+    m, sd = kid(real_a, g)
+    print(f"KID (real vs {name}): {m:.4f} +/- {sd:.4f}")
 ```
 
 ```output
-KID: 0.0089 ± 0.0031
+KID (real vs held-out real): -0.0011 +/- 0.0015
+KID (real vs dimmer digits): 0.1719 +/- 0.0093
+KID (real vs uniform noise): 0.4678 +/- 0.0104
 ```
 
-KID = 0 would mean the distributions match exactly. Values < 0.01 are considered good
-for high-quality generators on standard benchmarks.
+KID near 0 means the distributions match (the unbiased estimate can dip slightly below zero). Held-out real data scores near zero, while the dimmer and noise generators score clearly higher.
 
 ## Negative Log-Likelihood (NLL)
 
@@ -175,7 +194,7 @@ $$
 \text{CLIP Score} = w \cdot \max(0, \text{cos}(E_{\text{image}}, E_{\text{text}}))
 $$
 
-Higher is better. A model generating random images has CLIP Score ≈ 0; a good
+Higher is better. A model generating random images has CLIP Score near 0; a good
 text-to-image model scores 0.25–0.35.
 
 ## Choosing the right metric
@@ -193,36 +212,28 @@ text-to-image model scores 0.25–0.35.
 ## Try it Yourself
 
 ```python
-from torchmetrics.image.fid import FrechetInceptionDistance
-import torch
+# Compare two generators: one diverse, one mode-collapsed (reuses frechet_distance and the digits split above)
+rng = np.random.default_rng(1)
 
-# Compare two generators: one with low variance (mode collapse) vs high variance (diverse)
-torch.manual_seed(0)
-n = 128
-real = torch.rand(n, 3, 299, 299)
+# Generator 1: real-like and diverse (real digits plus a little noise)
+gen1 = np.clip(real_b + rng.normal(0, 0.05, real_b.shape), 0, 1)
 
-# Generator 1: mean-shifted but diverse
-gen1 = real + torch.randn_like(real) * 0.05
-
-# Generator 2: collapsed — all images near the mean
-gen2 = torch.full_like(real, 0.5) + torch.randn_like(real) * 0.01
+# Generator 2: collapsed, all images near the mean image
+gen2 = np.clip(real_a.mean(0) + rng.normal(0, 0.01, real_b.shape), 0, 1)
 
 for name, gen in [("diverse", gen1), ("collapsed", gen2)]:
-    fid = FrechetInceptionDistance(feature=2048, normalize=True)
-    fid.update(real, real=True)
-    fid.update(gen.clamp(0, 1), real=False)
-    print(f"FID ({name:>9}): {fid.compute():.2f}")
+    print(f"FID ({name:>9}): {frechet_distance(real_a, gen):.2f}")
 ```
 
 ```output
-FID (  diverse): 18.43
-FID (collapsed): 487.21
+FID (  diverse): 0.09
+FID (collapsed): 4.43
 ```
 
 ## Exercise
 
 You train a VAE and obtain ELBO values. You train a GAN on the same dataset and measure
-FID. The VAE has NLL ≈ 2.1 bits/dim and the GAN has FID = 15.
+FID. The VAE has NLL of about 2.1 bits/dim and the GAN has FID = 15.
 
 Which model generates better-looking images? Which has better probability estimates?
 

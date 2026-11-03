@@ -37,9 +37,9 @@ for n in [5, 8, 10]:
 ```
 
 ```output
-Hilbert 5×5: κ=4.77e+05  max error=7.32e-11
-Hilbert 8×8: κ=1.53e+10  max error=1.14e-05
-Hilbert 10×10: κ=1.60e+13  max error=1.41e-02
+Hilbert 5×5: κ=4.77e+05  max error=2.09e-12
+Hilbert 8×8: κ=1.53e+10  max error=1.31e-07
+Hilbert 10×10: κ=1.60e+13  max error=2.43e-05
 ```
 
 As the condition number grows, the solution error grows proportionally.
@@ -66,14 +66,14 @@ print(f"\nfloat64: (1 + 1e-7) - 1 = {result64}")
 ```
 
 ```output
-float32: (1 + 1e-7) - 1 = 0.0
+float32: (1 + 1e-7) - 1 = 1.1920928955078125e-07
 Expected: 1e-7 = 1e-07
-Relative error: 100.0%
-Relative error: 100.0%
-float64: (1 + 1e-7) - 1 = 1e-07
+Relative error: 19.2%
+
+float64: (1 + 1e-7) - 1 = 1.0000000005838672e-07
 ```
 
-Float32 drops the `1e-7` entirely — 100% error. Use float64 for accumulation, or restructure the computation.
+Float32 cannot represent $1 + 10^{-7}$: the nearest representable number above 1 is $1 + 2^{-23} \approx 1 + 1.19\times10^{-7}$, so the subtraction returns $1.19\times10^{-7}$, a 19% relative error from a single operation. Use float64 for accumulation, or restructure the computation.
 
 ## The log-sum-exp trick
 
@@ -96,6 +96,7 @@ print(f"Naive result: {naive_val}")   # will be inf
 ```
 
 ```output
+Naive log-sum-exp: inf
 Naive result: inf
 ```
 
@@ -150,8 +151,8 @@ The last logit dominates, so probability mass concentrates there — correct wit
 ## Never invert a matrix
 
 `np.linalg.inv(A) @ b` computes $A^{-1}$ explicitly. This is:
-1. **Slower** than `np.linalg.solve(A, b)` — roughly 3× for large matrices.
-2. **Less accurate** — the inversion itself introduces rounding errors that `solve` avoids.
+1. **More work** than `np.linalg.solve(A, b)` — an explicit inverse costs roughly three times the floating-point operations of one LU solve.
+2. **Potentially less accurate** — the inversion itself introduces rounding errors that `solve` avoids, which shows up when $A$ is ill-conditioned.
 
 ```python
 import numpy as np
@@ -178,10 +179,12 @@ print(f"solve is more accurate: {err_solve <= err_inv}")
 ```
 
 ```output
-solve residual : 3.55e-13
-inv residual   : 3.83e-12
-solve is more accurate: True
+solve residual : 3.55e-15
+inv residual   : 2.00e-15
+solve is more accurate: False
 ```
+
+On this well-conditioned matrix both residuals are at machine precision and the comparison can go either way, so the gap is not visible here. The exercise below uses an ill-conditioned matrix, where it is.
 
 ## Float traps summary
 
@@ -234,15 +237,15 @@ print("log Z > max:   ", log_Z > logits.max())   # always true: log(sum) > log(m
 ```
 
 ```output
-Logits: [ 12.94  -9.03  11.12   2.09   6.62  -7.12   0.22  15.79  -1.7   13.04]
-log Z (stable): 16.330408
-Max logit:      15.793476
+Logits: [  1.26  -1.32   6.4    1.05  -5.36   3.62  13.04   9.47  -7.04 -12.65]
+log Z (stable): 13.069158
+Max logit:      13.04
 log Z > max:    True
 ```
 
 ## Exercise
 
-Solve a 5×5 linear system both ways (matrix inversion then multiply vs `np.linalg.solve`) on an ill-conditioned matrix. Compare the residuals and explain the difference.
+Solve a $5 \times 5$ linear system both ways (matrix inversion then multiply vs `np.linalg.solve`) on an ill-conditioned matrix. Compare the residuals and explain the difference.
 
 <details>
 <summary>Solution</summary>
@@ -270,6 +273,12 @@ print(f"solve — residual: {res_solve:.2e}  solution error: {err_solve:.2e}")
 print(f"inv   — residual: {res_inv:.2e}  solution error: {err_inv:.2e}")
 ```
 
+```output
+Condition number κ(H) = 4.77e+05
+solve — residual: 2.22e-16  solution error: 2.09e-12
+inv   — residual: 3.55e-13  solution error: 4.40e-11
+```
+
 `np.linalg.solve` produces a smaller residual because it uses LU decomposition with pivoting rather than explicitly forming $H^{-1}$, which accumulates more rounding error.
 </details>
 
@@ -282,5 +291,5 @@ Rare and advanced topics you should at least know the name of.
 - **Automatic differentiation internals** — forward mode propagates $\dot{x}$ alongside $x$ (cheap for few inputs, many outputs); reverse mode backpropagates adjoints $\bar{x}$ from output to inputs (cheap for many inputs, one output — exactly what ML needs). The dual-number trick implements forward AD by augmenting scalars with an infinitesimal component $x + \dot{x}\varepsilon$.
 - **Proximal & subgradient methods** — when $f$ is non-smooth (L1 penalty, hinge loss), the gradient doesn't exist at kinks. The proximal operator for L1 is soft-thresholding: $\text{prox}_{\lambda\|\cdot\|_1}(v)_i = \text{sign}(v_i)\max(|v_i|-\lambda, 0)$. Subgradient methods use any element of the subdifferential.
 - **Conjugate gradient** — solves $Ax=b$ for symmetric PD $A$ in at most $d$ iterations (in exact arithmetic) without forming $A^{-1}$; in practice converges in $O(\sqrt{\kappa})$ iterations; the workhorse solver inside many optimisation libraries for large systems.
-- **Matrix factorizations (QR, Cholesky, LU)** — QR solves least-squares stably; Cholesky solves PD systems 2× faster than LU; LU with partial pivoting solves general square systems; all avoid the accuracy and cost penalty of explicit matrix inversion.
+- **Matrix factorizations (QR, Cholesky, LU)** — QR solves least-squares stably; Cholesky solves PD systems about twice as fast as LU; LU with partial pivoting solves general square systems; all avoid the accuracy and cost penalty of explicit matrix inversion.
 - **Tensor/Einstein notation & contractions** — `np.einsum('ij,jk->ik', A, B)` is matrix multiply; `'bij,bjk->bik'` is batched matrix multiply; `'bik,bjk->bij'` is batched outer products. Any linear contraction over any subset of indices is expressible as an einsum string, eliminating explicit loops.

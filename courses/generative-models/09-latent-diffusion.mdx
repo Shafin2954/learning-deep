@@ -13,11 +13,13 @@ U-Net must also be large enough to model spatial correlations across the full re
 
 The key insight behind latent diffusion: most of the spatial information in a natural image
 is compressible. A trained autoencoder can reduce a 512×512×3 image to a 64×64×4 latent
-with very little perceptual loss. Diffusion in this 256× smaller space costs orders of
+with very little perceptual loss. Diffusion in this 48× smaller space costs orders of
 magnitude less compute per step.
 
 ```python
 import torch
+torch.set_num_threads(1)
+torch.manual_seed(0)
 
 # Pixel space vs latent space cost comparison
 pixel_h, pixel_w, pixel_c = 512, 512, 3
@@ -33,8 +35,8 @@ print(f"Compression ratio:      {pixel_dim / latent_dim:.1f}×")
 
 ```output
 Pixel-space dimension:     786,432
-Latent-space dimension:      16,384
-Compression ratio:           48.0×
+Latent-space dimension:     16,384
+Compression ratio:      48.0×
 ```
 
 The U-Net operating on 64×64 latents instead of 512×512 pixels runs roughly 64× faster
@@ -93,7 +95,7 @@ transformer block of the U-Net. The latent features provide **queries**; the tex
 embeddings provide **keys** and **values**.
 
 $$
-\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d}}\right)V
+\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d}}\right)V
 $$
 
 where $Q = W_Q \cdot \phi(z_t)$ (from the latent), $K = W_K \cdot \tau_\theta(y)$,
@@ -109,6 +111,7 @@ class CrossAttention(nn.Module):
         super().__init__()
         inner = heads * head_dim
         self.heads = heads
+        self.head_dim = head_dim
         self.scale = head_dim ** -0.5
         self.to_q = nn.Linear(query_dim, inner, bias=False)
         self.to_k = nn.Linear(context_dim, inner, bias=False)
@@ -118,9 +121,9 @@ class CrossAttention(nn.Module):
     def forward(self, x, context):
         B, N, _ = x.shape
         h = self.heads
-        Q = self.to_q(x).view(B, N, h, -1).transpose(1, 2)
-        K = self.to_k(context).view(B, -1, h, -1).transpose(1, 2)
-        V = self.to_v(context).view(B, -1, h, -1).transpose(1, 2)
+        Q = self.to_q(x).view(B, N, h, self.head_dim).transpose(1, 2)
+        K = self.to_k(context).view(B, -1, h, self.head_dim).transpose(1, 2)
+        V = self.to_v(context).view(B, -1, h, self.head_dim).transpose(1, 2)
         attn = F.softmax(Q @ K.transpose(-2, -1) * self.scale, dim=-1)
         out  = (attn @ V).transpose(1, 2).contiguous().view(B, N, -1)
         return self.to_out(out)
@@ -195,12 +198,12 @@ for name, ph, pw, pc, lh, lw, lc in configs:
 ```
 
 ```output
-Config                  Dimensions UNet input (B=1)
+Config                   Dimensions UNet input (B=1)
 -------------------------------------------------------
-Pixel 256×256×3            196,608   256×256×3
-Pixel 512×512×3            786,432   512×512×3
-Latent 32×32×4               4,096   32×32×4
-Latent 64×64×4              16,384   64×64×4
+Pixel 256×256×3             196,608   256×256×3
+Pixel 512×512×3             786,432   512×512×3
+Latent 32×32×4                4,096   32×32×4
+Latent 64×64×4               16,384   64×64×4
 ```
 
 A 512×512 image in latent space shrinks from 786K to 16K values — the U-Net trains and
@@ -266,8 +269,8 @@ print(f"Noise strength  at t=500: {(1-ab[0]).item():.4f}")
 Original pixel: torch.Size([2, 3, 512, 512])
 Encoded latent: torch.Size([2, 4, 64, 64])
 Noised latent:  torch.Size([2, 4, 64, 64])
-Signal strength at t=500: 0.3677
-Noise strength  at t=500: 0.6323
+Signal strength at t=500: 0.0778
+Noise strength  at t=500: 0.9222
 ```
 
 ## Exercise
@@ -284,12 +287,12 @@ strategies = {
     "Freeze encoder/decoder, train only U-Net": {
         "saves": "No encoder/decoder gradients in VRAM",
         "sacrifices": "Latent space may not optimally represent the new domain",
-        "VRAM_saving": "~30-40% vs full fine-tune",
+        "VRAM_saving": "roughly 30-40% vs full fine-tune (illustrative estimate, not measured)",
     },
     "LoRA on U-Net cross-attention only": {
         "saves": "Only tiny A,B rank-r matrices updated (<<1% of params)",
         "sacrifices": "Cannot change deep spatial features, only conditioning path",
-        "VRAM_saving": "~60-70% vs full fine-tune",
+        "VRAM_saving": "roughly 60-70% vs full fine-tune (illustrative estimate, not measured)",
     },
 }
 for name, info in strategies.items():
@@ -298,7 +301,20 @@ for name, info in strategies.items():
         print(f"  {k}: {v}")
 ```
 
-Strategy 1 (freeze VAE): saves the most total memory since the large encoder/decoder
+```output
+
+Strategy: Freeze encoder/decoder, train only U-Net
+  saves: No encoder/decoder gradients in VRAM
+  sacrifices: Latent space may not optimally represent the new domain
+  VRAM_saving: roughly 30-40% vs full fine-tune (illustrative estimate, not measured)
+
+Strategy: LoRA on U-Net cross-attention only
+  saves: Only tiny A,B rank-r matrices updated (<<1% of params)
+  sacrifices: Cannot change deep spatial features, only conditioning path
+  VRAM_saving: roughly 60-70% vs full fine-tune (illustrative estimate, not measured)
+```
+
+Strategy 1 (freeze VAE): saves memory because the large encoder/decoder
 don't need gradients. Sacrifice: the model's learned perceptual space may not optimally
 encode satellite textures (e.g., spectral signatures differ from natural images).
 
