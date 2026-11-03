@@ -50,6 +50,7 @@ params = {
     'lambda': 1.0,         # L2 regularization
     'gamma': 0.0,          # min gain to split
     'seed': 0,
+    'nthread': 1,
 }
 evals_result = {}
 model = xgb.train(params, dtrain, num_boost_round=300,
@@ -63,7 +64,7 @@ print(f"XGBoost RMSE: {rmse:.2f} ({model.best_iteration} rounds)")
 ```
 
 ```output
-XGBoost RMSE: 15.23 (284 rounds)
+XGBoost RMSE: 66.23 (299 rounds)
 ```
 
 ## LightGBM: leaf-wise growth and histogram binning
@@ -96,6 +97,7 @@ params_lgb = {
     'reg_lambda': 1.0,
     'verbose': -1,
     'seed': 0,
+    'num_threads': 1,
 }
 
 callbacks = [lgb.early_stopping(20, verbose=False), lgb.log_evaluation(period=-1)]
@@ -108,8 +110,10 @@ print(f"LightGBM RMSE: {rmse_lgb:.2f} (best iter: {model_lgb.best_iteration})")
 ```
 
 ```output
-LightGBM RMSE: 14.87 (best iter: 291)
+LightGBM RMSE: 61.60 (best iter: 491)
 ```
+
+Both RMSEs are far above the noise level (15), because `make_regression` targets are an exact *linear* function of the features and trees approximate a linear surface only in steps. The two libraries land in the same ballpark; what matters here is the API, not the leaderboard. (Note also that both examples use the test set for early stopping, which is slightly optimistic; the pattern below uses a separate validation split.)
 
 ### Feature importance in LightGBM
 
@@ -125,11 +129,11 @@ for i in top:
 
 ```output
 Top 5 features by gain:
-  feature_7: 3412.8
-  feature_2: 2891.4
-  feature_15: 2234.9
-  feature_4: 1887.2
-  feature_11: 1623.6
+  feature_11: 55844910.3
+  feature_14: 50126154.4
+  feature_10: 43867510.1
+  feature_5: 41966663.4
+  feature_7: 37479674.2
 ```
 
 ## CatBoost: ordered boosting and native categoricals
@@ -138,28 +142,7 @@ CatBoost introduces **ordered boosting**: to avoid target leakage when computing
 
 **Native categorical handling:** CatBoost converts categoricals to numeric using ordered target statistics (a permutation-based form of target encoding that avoids leakage), so you don't need to one-hot encode.
 
-```python
-from catboost import CatBoostRegressor
-import numpy as np
-
-cb = CatBoostRegressor(
-    iterations=500,
-    learning_rate=0.05,
-    depth=4,
-    l2_leaf_reg=1.0,
-    random_seed=0,
-    verbose=0,
-    early_stopping_rounds=20,
-)
-cb.fit(X_tr, y_tr, eval_set=(X_te, y_te))
-preds_cb = cb.predict(X_te)
-rmse_cb  = np.sqrt(np.mean((preds_cb - y_te)**2))
-print(f"CatBoost RMSE: {rmse_cb:.2f} (best iter: {cb.best_iteration_})")
-```
-
-```output
-CatBoost RMSE: 15.06 (best iter: 276)
-```
+CatBoost is not installed in this course's environment, so there is no runnable example here. Its API mirrors the others: `CatBoostRegressor(iterations=500, learning_rate=0.05, depth=4, l2_leaf_reg=1.0)` with `.fit(X, y, eval_set=..., early_stopping_rounds=20)`, and a `cat_features=[...]` argument that names the categorical columns so you skip one-hot encoding. On a small, purely numeric problem like the ones in this chapter you should expect it to land within a few percent of XGBoost and LightGBM; its edge shows up with high-cardinality categoricals and small datasets.
 
 ## Key hyperparameters compared
 
@@ -185,7 +168,8 @@ d2 = lgb.Dataset(X_tr2, label=y_tr2)
 dv = lgb.Dataset(X_val, label=y_val, reference=d2)
 
 m = lgb.train({'objective': 'regression', 'metric': 'rmse',
-                'num_leaves': 31, 'learning_rate': 0.05, 'verbose': -1},
+                'num_leaves': 31, 'learning_rate': 0.3, 'verbose': -1,
+                'num_threads': 1},
                d2, num_boost_round=1000,
                valid_sets=[dv],
                callbacks=[lgb.early_stopping(50, verbose=False),
@@ -194,7 +178,7 @@ print(f"Best iteration: {m.best_iteration}, best val RMSE: {m.best_score['valid_
 ```
 
 ```output
-Best iteration: 312, best val RMSE: 14.93
+Best iteration: 157, best val RMSE: 88.98
 ```
 
 ## Try it Yourself
@@ -214,7 +198,7 @@ for num_leaves in [15, 31, 63, 127]:
     d = lgb.Dataset(X_tr2, y_tr2)
     dv = lgb.Dataset(X_val, y_val, reference=d)
     m = lgb.train({'objective':'regression','metric':'rmse',
-                   'num_leaves':num_leaves,'learning_rate':0.05,'verbose':-1},
+                   'num_leaves':num_leaves,'learning_rate':0.05,'verbose':-1,'num_threads':1},
                   d, 500, valid_sets=[dv],
                   callbacks=[lgb.early_stopping(30,verbose=False),lgb.log_evaluation(-1)])
     p = m.predict(X_te)
@@ -223,15 +207,15 @@ for num_leaves in [15, 31, 63, 127]:
 ```
 
 ```output
-num_leaves= 15: RMSE=22.84 (231 iters)
-num_leaves= 31: RMSE=21.57 (287 iters)
-num_leaves= 63: RMSE=21.23 (312 iters)
-num_leaves=127: RMSE=21.41 (298 iters)
+num_leaves= 15: RMSE=54.45 (349 iters)
+num_leaves= 31: RMSE=60.45 (224 iters)
+num_leaves= 63: RMSE=62.58 (259 iters)
+num_leaves=127: RMSE=62.58 (259 iters)
 ```
 
 ## Exercise
 
-Using `make_regression` (1500 samples, 25 features, noise=20), tune a LightGBM model: sweep `num_leaves` ∈ {15,31,63} and `learning_rate` ∈ {0.01, 0.05, 0.1} using early stopping (patience=30). Report the best combination and its test RMSE. Compare to a baseline `GradientBoostingRegressor` with default settings.
+Using `make_regression` (1500 samples, 25 features, noise=20), tune a LightGBM model: sweep `num_leaves` $\in \{15, 31, 63\}$ and `learning_rate` $\in \{0.01, 0.05, 0.1\}$ using early stopping (patience=30). Report the best combination and its test RMSE. Compare to a baseline `GradientBoostingRegressor` with default settings.
 
 <details>
 <summary>Solution</summary>
@@ -253,7 +237,7 @@ for nl in [15, 31, 63]:
         d  = lgb.Dataset(X_tr2, y_tr2)
         dv = lgb.Dataset(X_val, y_val, reference=d)
         m  = lgb.train({'objective':'regression','metric':'rmse','num_leaves':nl,
-                         'learning_rate':lr,'verbose':-1}, d, 1000, valid_sets=[dv],
+                         'learning_rate':lr,'verbose':-1,'num_threads':1}, d, 1000, valid_sets=[dv],
                         callbacks=[lgb.early_stopping(30,verbose=False),lgb.log_evaluation(-1)])
         rmse = np.sqrt(np.mean((m.predict(X_te)-y_te)**2))
         if rmse < best['rmse']:
@@ -262,5 +246,10 @@ for nl in [15, 31, 63]:
 print(f"Best: num_leaves={best['nl']}, lr={best['lr']}, RMSE={best['rmse']:.2f} ({best['iters']} iters)")
 baseline = GradientBoostingRegressor(random_state=0).fit(X_tr, y_tr)
 print(f"sklearn GBM baseline RMSE: {np.sqrt(np.mean((baseline.predict(X_te)-y_te)**2)):.2f}")
+```
+
+```output
+Best: num_leaves=15, lr=0.05, RMSE=43.07 (350 iters)
+sklearn GBM baseline RMSE: 50.59
 ```
 </details>

@@ -9,7 +9,7 @@ order: 8
 
 Node and link tasks operate on a fixed graph. Graph classification asks: given an entire
 graph (e.g., a molecule, a social network), predict a label for the whole graph. You need to
-aggregate all node embeddings into a single graph-level vector — this is **readout** or
+aggregate all node embeddings into a single graph-level vector; this is **readout** or
 **pooling**.
 
 ## Global pooling: simple and surprisingly strong
@@ -19,169 +19,176 @@ The three canonical flat readout functions:
 | Readout | Formula | Properties |
 |---------|---------|-----------|
 | Global sum | $h_G = \sum_{v} h_v$ | Sensitive to graph size |
-| Global mean | $h_G = \frac{1}{|V|}\sum_v h_v$ | Size-invariant |
+| Global mean | $h_G = \frac{1}{\lvert V\rvert}\sum_v h_v$ | Size-invariant |
 | Global max | $h_G = \max_v h_v$ (element-wise) | Robust to outliers |
 
 In practice, concatenating sum + mean + max often outperforms any single readout.
 
+A graph-classification dataset needs many small graphs. MUTAG would need a download (and `torch_geometric` is not installed), so you generate a synthetic MUTAG-like dataset: 240 small "molecules" of 12 to 20 atoms, each with a one-hot atom type (3 types). Class 0 graphs are tree-like (a random tree plus 4 extra edges). Class 1 graphs also contain rings (a random tree plus 4 extra edges that each close a short ring (a triangle)). Atom-type frequencies differ moderately between classes (class 1 has more of atom type 0), so atom counts alone give a partial signal and structure adds the rest.
+
 ```python
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.datasets import TUDataset
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool, global_max_pool
+torch.set_num_threads(1)
 
-dataset = TUDataset(root='/tmp/MUTAG', name='MUTAG')
-print(f"Graphs: {len(dataset)}, Classes: {dataset.num_classes}")
-print(f"Node features: {dataset.num_node_features}")
-print(f"Example graph — nodes: {dataset[0].num_nodes}, edges: {dataset[0].num_edges}")
-print(f"Graph label: {dataset[0].y.item()}")
+def make_molecule(label, rng):
+    n = int(rng.integers(12, 21))
+    edges = set()
+    for v in range(1, n):                        # random tree
+        u = int(rng.integers(max(0, v - 4), v)); edges.add((u, v))
+    adj = {i: set() for i in range(n)}
+    for u, v in edges: adj[u].add(v); adj[v].add(u)
+    added = 0
+    while added < 4:
+        if label == 1:                           # close a short ring: join two nodes at distance 2
+            u = int(rng.integers(n)); two_hop = {w for v in adj[u] for w in adj[v]} - adj[u] - {u}
+            if not two_hop: continue
+            v = int(rng.choice(sorted(two_hop)))
+        else:                                    # random extra edge (usually closes a long ring)
+            u, v = (int(t) for t in rng.integers(n, size=2))
+            if u == v or v in adj[u]: continue
+        adj[u].add(v); adj[v].add(u); added += 1
+    ei = sorted({(u, v) for u in adj for v in adj[u]})
+    p = [0.45, 0.35, 0.20] if label == 1 else [0.25, 0.35, 0.40]
+    atom = rng.choice(3, size=n, p=p)
+    return torch.eye(3)[atom], torch.tensor(ei).t(), label
+
+rng = np.random.default_rng(0)
+dataset = [make_molecule(i % 2, rng) for i in range(240)]
+print(f"Graphs: {len(dataset)}, Classes: 2")
+print(f"Node features: {dataset[0][0].shape[1]}")
+print(f"Example graph - nodes: {dataset[0][0].shape[0]}, edges: {dataset[0][1].shape[1]}")
+print(f"Graph label: {dataset[0][2]}")
 ```
 
 ```output
-Graphs: 188, Classes: 2
-Node features: 7
-Example graph — nodes: 17, edges: 38
-Graph label: 1
+Graphs: 240, Classes: 2
+Node features: 3
+Example graph - nodes: 19, edges: 44
+Graph label: 0
 ```
 
-## Training a GNN for graph classification
+## Batching graphs into one super-graph
+
+Mini-batching concatenates graphs into one big disconnected graph. A `batch` vector maps each node to its graph index, and edge indices are shifted by the number of nodes already placed. This is exactly what PyG's `DataLoader` does.
 
 ```python
-dataset = dataset.shuffle()
-train_dataset = dataset[:150]
-test_dataset  = dataset[150:]
+def collate(graphs):
+    xs, eis, batch, labels, offset = [], [], [], [], 0
+    for i, (xg, eig, lab) in enumerate(graphs):
+        xs.append(xg); eis.append(eig + offset)
+        batch.append(torch.full((xg.shape[0],), i)); labels.append(lab)
+        offset += xg.shape[0]
+    return torch.cat(xs), torch.cat(eis, dim=1), torch.cat(batch), torch.tensor(labels)
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader  = DataLoader(test_dataset,  batch_size=32)
+def pool(h, batch, kind):
+    G = int(batch.max()) + 1
+    if kind == 'sum':
+        return torch.zeros(G, h.shape[1]).index_add_(0, batch, h)
+    if kind == 'mean':
+        cnt = torch.zeros(G, 1).index_add_(0, batch, torch.ones(len(batch), 1))
+        return pool(h, batch, 'sum') / cnt
+    if kind == 'max':
+        return torch.full((G, h.shape[1]), float('-inf')).scatter_reduce(
+            0, batch[:, None].expand(-1, h.shape[1]), h, reduce='amax')
 
-class GNNClassifier(nn.Module):
-    def __init__(self, in_ch, hidden, out_ch):
-        super().__init__()
-        self.conv1 = GCNConv(in_ch, hidden)
-        self.conv2 = GCNConv(hidden, hidden)
-        self.conv3 = GCNConv(hidden, hidden)
-        self.lin   = nn.Linear(hidden, out_ch)
+perm = np.random.default_rng(1).permutation(len(dataset))
+train_set = [dataset[i] for i in perm[:180]]
+test_set = [dataset[i] for i in perm[180:]]
 
-    def forward(self, x, edge_index, batch):
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
-        x = F.relu(self.conv3(x, edge_index))
-        x = global_mean_pool(x, batch)   # (num_graphs, hidden)
-        x = F.dropout(x, 0.5, self.training)
-        return self.lin(x)
-
-model = GNNClassifier(dataset.num_node_features, 64, dataset.num_classes)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-def train_epoch():
-    model.train()
-    total_loss = 0
-    for batch in train_loader:
-        optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index, batch.batch)
-        loss = F.cross_entropy(out, batch.y)
-        loss.backward(); optimizer.step()
-        total_loss += float(loss) * batch.num_graphs
-    return total_loss / len(train_loader.dataset)
-
-@torch.no_grad()
-def test_epoch(loader):
-    model.eval()
-    correct = 0
-    for batch in loader:
-        out = model(batch.x, batch.edge_index, batch.batch)
-        correct += (out.argmax(1) == batch.y).sum().item()
-    return correct / len(loader.dataset)
-
-for epoch in range(1, 101):
-    loss = train_epoch()
-
-train_acc = test_epoch(train_loader)
-test_acc  = test_epoch(test_loader)
-print(f"Train acc: {train_acc:.3f}  Test acc: {test_acc:.3f}")
-```
-
-```output
-Train acc: 0.947  Test acc: 0.842
-```
-
-## How PyG batches graphs
-
-PyG's `DataLoader` concatenates graphs into a single disconnected "super-graph". A `batch`
-tensor maps each node to its graph index.
-
-```python
-batch = next(iter(train_loader))
-print(f"Batch contains {batch.num_graphs} graphs")
-print(f"Total nodes in batch: {batch.x.shape[0]}")
-print(f"Batch tensor (first 20): {batch.batch[:20].tolist()}")
-print(f"Graph sizes: {[(batch.batch==i).sum().item() for i in range(5)]}...")
+xb, eib, batch, yb = collate(train_set[:32])
+print(f"Batch contains {len(yb)} graphs")
+print(f"Total nodes in batch: {xb.shape[0]}")
+print(f"Batch tensor (first 20): {batch[:20].tolist()}")
+print(f"Graph sizes: {[(batch == i).sum().item() for i in range(5)]}...")
 ```
 
 ```output
 Batch contains 32 graphs
-Total nodes in batch: 539
-Batch tensor (first 20): [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1]
-Graph sizes: [17, 13, 28, 21, 19]...
+Total nodes in batch: 493
+Batch tensor (first 20): [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]
+Graph sizes: [18, 18, 17, 13, 13]...
 ```
 
-`global_mean_pool(x, batch)` computes mean over all nodes with the same batch index,
-producing one vector per graph.
+`pool(h, batch, 'mean')` computes the mean over all nodes with the same batch index, producing one vector per graph.
+
+## Training a GNN for graph classification
+
+A GCN layer on the batched graph (self-loops plus symmetric normalization, as in ch. 5), three layers, then a readout and a linear classifier.
+
+```python
+class GCNLayer(nn.Module):
+    def __init__(self, i, o):
+        super().__init__(); self.lin = nn.Linear(i, o)
+    def forward(self, h, ei):
+        n = h.shape[0]; loops = torch.arange(n)
+        src, dst = torch.cat([ei[0], loops]), torch.cat([ei[1], loops])
+        deg = torch.zeros(n).index_add_(0, dst, torch.ones(len(dst)))
+        norm = (deg[src] * deg[dst]).pow(-0.5)
+        return torch.zeros(n, self.lin.out_features).index_add_(0, dst, norm[:, None] * self.lin(h)[src])
+
+class GNNClassifier(nn.Module):
+    def __init__(self, in_ch, hidden, out_ch, readout='mean', layers=3):
+        super().__init__()
+        dims = [in_ch] + [hidden] * layers
+        self.convs = nn.ModuleList(GCNLayer(dims[i], dims[i + 1]) for i in range(layers))
+        self.readout = readout
+        self.lin = nn.Linear(hidden * (3 if readout == 'concat' else 1), out_ch)
+
+    def forward(self, x, ei, batch):
+        for conv in self.convs:
+            x = F.relu(conv(x, ei))
+        if self.readout == 'concat':
+            g = torch.cat([pool(x, batch, k) for k in ('mean', 'sum', 'max')], dim=-1)
+        else:
+            g = pool(x, batch, self.readout)
+        return self.lin(F.dropout(g, 0.5, self.training))
+
+def run(readout, epochs=60, seed=0, hidden=32, model=None):
+    torch.manual_seed(seed)
+    model = model or GNNClassifier(3, hidden, 2, readout)
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        model.train()
+        order = torch.randperm(len(train_set), generator=g).tolist()
+        for i in range(0, len(order), 32):
+            xb, eib, bb, yb = collate([train_set[j] for j in order[i:i + 32]])
+            opt.zero_grad(); F.cross_entropy(model(xb, eib, bb), yb).backward(); opt.step()
+    return accuracy(model, train_set), accuracy(model, test_set)
+
+@torch.no_grad()
+def accuracy(model, graphs):
+    model.eval()
+    xb, eib, bb, yb = collate(graphs)
+    return (model(xb, eib, bb).argmax(1) == yb).float().mean().item()
+
+train_acc, test_acc = run('mean')
+print(f"Train acc: {train_acc:.3f}  Test acc: {test_acc:.3f}")
+```
+
+```output
+Train acc: 0.850  Test acc: 0.800
+```
 
 ## Comparing readout strategies
 
 ```python
-class ReadoutComparison(nn.Module):
-    def __init__(self, readout='mean'):
-        super().__init__()
-        self.readout = readout
-        self.conv1 = GCNConv(dataset.num_node_features, 64)
-        self.conv2 = GCNConv(64, 64)
-        multiplier = 3 if readout == 'concat' else 1
-        self.lin = nn.Linear(64 * multiplier, dataset.num_classes)
-
-    def forward(self, x, edge_index, batch):
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
-        if self.readout == 'mean':
-            x = global_mean_pool(x, batch)
-        elif self.readout == 'sum':
-            x = global_add_pool(x, batch)
-        elif self.readout == 'max':
-            x = global_max_pool(x, batch)
-        elif self.readout == 'concat':
-            x = torch.cat([global_mean_pool(x, batch),
-                           global_add_pool(x, batch),
-                           global_max_pool(x, batch)], dim=-1)
-        return self.lin(x)
-
 for readout in ['mean', 'sum', 'max', 'concat']:
-    m = ReadoutComparison(readout)
-    o = torch.optim.Adam(m.parameters(), lr=0.01)
-    for _ in range(100):
-        m.train()
-        for b in train_loader:
-            o.zero_grad()
-            F.cross_entropy(m(b.x, b.edge_index, b.batch), b.y).backward(); o.step()
-    m.eval()
-    acc = test_epoch(test_loader) if False else None  # reuse test_epoch with m
-    with torch.no_grad():
-        correct = sum((m(b.x,b.edge_index,b.batch).argmax(1)==b.y).sum().item()
-                      for b in test_loader)
-    acc = correct / len(test_loader.dataset)
-    print(f"readout={readout:6s}  test acc={acc:.3f}")
+    accs_ = [run(readout, seed=s)[1] for s in range(3)]
+    print(f"readout={readout:6s}  mean test acc over 3 seeds={sum(accs_)/3:.3f}")
 ```
 
 ```output
-readout=mean    test acc=0.842
-readout=sum     test acc=0.816
-readout=max     test acc=0.789
-readout=concat  test acc=0.868
+readout=mean    mean test acc over 3 seeds=0.783
+readout=sum     mean test acc over 3 seeds=0.750
+readout=max     mean test acc over 3 seeds=0.733
+readout=concat  mean test acc over 3 seeds=0.794
 ```
 
-Concatenating all three readouts wins, as expected.
+All four readouts land between 0.73 and 0.79 test accuracy, and the gaps are within seed-to-seed noise on a 60-graph test set (one graph is 0.017). Concatenating mean, sum and max is the best by a hair, mean is close behind, and max alone is lowest, which is the usual ordering but not a decisive one here.
 
 ## Hierarchical pooling: DiffPool
 
@@ -193,78 +200,101 @@ S^{(l)} = \text{softmax}(\text{GNN}_{pool}(A^{(l)}, H^{(l)})) \in \mathbb{R}^{n^
 $$
 
 $$
-A^{(l+1)} = S^{(l)T} A^{(l)} S^{(l)}, \quad H^{(l+1)} = S^{(l)T} H^{(l)}_{emb}
+A^{(l+1)} = S^{(l)\top} A^{(l)} S^{(l)}, \quad H^{(l+1)} = S^{(l)\top} H^{(l)}_{emb}
 $$
 
 This introduces an auxiliary link prediction loss and an entropy loss to encourage sparse,
-confident assignments. DiffPool is expressive but expensive ($O(n^2)$ per pooling step).
+confident assignments. DiffPool is expressive but expensive ($O(n^2)$ per pooling step). One coarsening step is just two matrix products; with a random soft assignment you can see what it preserves.
+
+```python
+xg, eig, _ = dataset[0]
+n = xg.shape[0]
+A = torch.zeros(n, n); A[eig[0], eig[1]] = 1.0
+torch.manual_seed(0)
+S = torch.softmax(torch.randn(n, 4), dim=1)       # soft assignment of 17 nodes to 4 clusters
+A2, X2 = S.T @ A @ S, S.T @ xg
+print(f"Nodes {n} -> clusters {S.shape[1]}; A {tuple(A.shape)} -> {tuple(A2.shape)}; X {tuple(xg.shape)} -> {tuple(X2.shape)}")
+print(f"Total edge weight before: {A.sum().item():.2f}, after: {A2.sum().item():.2f}")
+```
+
+```output
+Nodes 19 -> clusters 4; A (19, 19) -> (4, 4); X (19, 3) -> (4, 3)
+Total edge weight before: 44.00, after: 44.00
+```
+
+Total edge weight is conserved, because each row of $S$ sums to 1. A learned $S$ would instead concentrate on communities so that $A^{(l+1)}$ has heavy diagonal entries (intra-cluster edges).
 
 ## Try it Yourself
 
 ```python
-import torch, torch.nn as nn, torch.nn.functional as F
-from torch_geometric.datasets import TUDataset
-from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool
-
-dataset = TUDataset(root='/tmp/MUTAG', name='MUTAG').shuffle()
-train_l = DataLoader(dataset[:150], batch_size=32, shuffle=True)
-test_l  = DataLoader(dataset[150:], batch_size=32)
-
-class Net(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.c1 = GCNConv(dataset.num_node_features, 64)
-        self.c2 = GCNConv(64, 64)
-        self.lin = nn.Linear(128, dataset.num_classes)
-    def forward(self, x, ei, batch):
-        x = F.relu(self.c1(x, ei)); x = F.relu(self.c2(x, ei))
-        return self.lin(torch.cat([global_mean_pool(x,batch), global_add_pool(x,batch)], -1))
-
-model = Net(); opt = torch.optim.Adam(model.parameters(), lr=0.01)
-for _ in range(100):
-    model.train()
-    for b in train_l:
-        opt.zero_grad(); F.cross_entropy(model(b.x,b.edge_index,b.batch),b.y).backward(); opt.step()
-model.eval()
-acc = sum((model(b.x,b.edge_index,b.batch).argmax(1)==b.y).sum().item() for b in test_l)/len(test_l.dataset)
-print(f"Test acc: {acc:.3f}")
-# Try: replace global_mean + add with just global_mean. How much does the concat help?
+# Reuses run, GNNClassifier, collate from earlier on this page (same kernel session).
+for hidden in [8, 32, 64]:
+    tr, te = run('concat', hidden=hidden)
+    print(f"hidden={hidden:2d}  train={tr:.3f}  test={te:.3f}")
+# Try: epochs=20 vs 100, or replace 'concat' with 'mean' and compare.
 ```
 
 ```output
-Test acc: 0.868
+hidden= 8  train=0.856  test=0.783
+hidden=32  train=0.878  test=0.767
+hidden=64  train=0.889  test=0.783
 ```
 
 ## Exercise
 
-Implement a **set2set** readout by hand: for each graph, compute $K$ rounds of an LSTM
+Implement a **set2set** readout by hand: for each graph, run $K$ rounds of an LSTM
 that attends over node embeddings. In round $t$, the LSTM hidden state $q_t$ is used as a
 query; attention weights over nodes produce a context vector $c_t$; the LSTM takes
 $[q_t, c_t]$ as input. The final $q_K$ is the graph representation. Compare to global mean
-pooling on MUTAG.
+pooling on this dataset.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-# Simplified set2set sketch (full implementation uses torch_geometric.nn.Set2Set)
-from torch_geometric.nn import Set2Set
-
-class S2SNet(nn.Module):
-    def __init__(self):
+class Set2Set(nn.Module):
+    def __init__(self, dim, steps=3):
         super().__init__()
-        self.c1 = GCNConv(dataset.num_node_features, 32)
-        self.c2 = GCNConv(32, 32)
-        self.pool = Set2Set(32, processing_steps=3)
-        self.lin = nn.Linear(64, dataset.num_classes)  # Set2Set doubles dim
-    def forward(self, x, ei, batch):
-        x = F.relu(self.c1(x, ei)); x = F.relu(self.c2(x, ei))
-        return self.lin(self.pool(x, batch))
+        self.dim, self.steps = dim, steps
+        self.lstm = nn.LSTMCell(2 * dim, dim)
 
-# Train and evaluate as above
-# Set2Set typically matches or slightly beats global_mean on MUTAG (~0.85 test acc)
-# The extra expressiveness matters more on tasks with diverse graph structures.
-print("Set2Set uses an LSTM to adaptively weight nodes — more powerful than fixed pooling.")
+    def forward(self, h, batch):
+        G = int(batch.max()) + 1
+        q_star = torch.zeros(G, 2 * self.dim)           # [q, c]
+        hc = (torch.zeros(G, self.dim), torch.zeros(G, self.dim))
+        for _ in range(self.steps):
+            q, c_state = self.lstm(q_star, hc); hc = (q, c_state)
+            e = (h * q[batch]).sum(-1)                       # score per node
+            e = e - torch.zeros(G).scatter_reduce(0, batch, e, reduce='amax', include_self=False)[batch]
+            a = torch.exp(e)
+            a = a / torch.zeros(G).index_add_(0, batch, a)[batch]
+            c = torch.zeros(G, self.dim).index_add_(0, batch, a[:, None] * h)
+            q_star = torch.cat([q, c], dim=-1)
+        return q_star                                        # (G, 2*dim)
+
+class S2SNet(GNNClassifier):
+    def __init__(self, hidden=32):
+        super().__init__(3, hidden, 2, 'mean', layers=3)
+        self.s2s = Set2Set(hidden, 3)
+        self.lin = nn.Linear(2 * hidden, 2)                 # Set2Set doubles the dimension
+    def forward(self, x, ei, batch):
+        for conv in self.convs:
+            x = F.relu(conv(x, ei))
+        return self.lin(F.dropout(self.s2s(x, batch), 0.5, self.training))
+
+for name in ['mean', 's2s']:
+    accs_ = []
+    for seed in range(3):
+        torch.manual_seed(seed)
+        m = S2SNet() if name == 's2s' else None
+        accs_.append(run('mean', seed=seed, model=m)[1])
+    print(f"{name:5s} mean test acc over 3 seeds: {sum(accs_)/3:.3f}")
 ```
+
+```output
+mean  mean test acc over 3 seeds: 0.783
+s2s   mean test acc over 3 seeds: 0.783
+```
+
+In this run Set2Set ties global mean pooling (0.783 each). The LSTM-attention readout has more parameters and more room to overfit 180 training graphs, and the label here depends on simple, evenly spread structure that a plain average already captures. Set2Set pays off when the graph label is decided by a few important nodes rather than the average node.
 </details>

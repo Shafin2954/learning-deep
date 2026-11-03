@@ -17,7 +17,7 @@ score unobserved triples so you can predict missing facts.
 TransE (Bordes et al., 2013) models each relation as a translation vector:
 
 $$
-h + r \approx t \quad \Rightarrow \quad \text{score}(h, r, t) = -\|h + r - t\|_1
+h + r \approx t \quad \Rightarrow \quad \text{score}(h, r, t) = -\lVert h + r - t\rVert_1
 $$
 
 A triple is valid when the tail embedding is close to `head + relation`. TransE is elegant
@@ -28,10 +28,10 @@ then $r=0$).
 
 | Model | Score function | Handles |
 |-------|---------------|---------|
-| TransR | $-\|M_r h + r - M_r t\|$ | N-to-N via relation-specific projection |
+| TransR | $-\lVert M_r h + r - M_r t\rVert$ | N-to-N via relation-specific projection |
 | DistMult | $h^T \text{diag}(r)\, t$ | Symmetric relations |
 | ComplEx | $\text{Re}(h^T \text{diag}(r)\, \bar{t})$ | Antisymmetric + asymmetric |
-| RotatE | $\|h \circ e^{i\theta_r} - t\|$ | All relation patterns |
+| RotatE | $\lVert h \circ e^{i\theta_r} - t\rVert$ | All relation patterns |
 
 RotatE models each relation as an element-wise rotation in complex space: $t = h \circ
 e^{i\theta_r}$, where $\circ$ is the Hadamard product.
@@ -71,6 +71,7 @@ triples = torch.tensor(triples, dtype=torch.long)
 n_entities = len(entities)
 n_relations = len(relations)
 dim = 8
+torch.manual_seed(0)
 
 class TransE(nn.Module):
     def __init__(self, n_ent, n_rel, dim, margin=1.0):
@@ -114,17 +115,20 @@ for epoch in range(500):
     neg = corrupt(triples, n_entities)
     loss = model(triples, neg)
     loss.backward()
+    optimizer.step()
     # Normalize entity embeddings (TransE constraint)
     with torch.no_grad():
         model.ent_emb.weight.data = F.normalize(model.ent_emb.weight.data)
-    optimizer.step()
-
-if (epoch + 1) % 100 == 0:
-    print(f"Epoch {epoch+1}  loss={loss.item():.4f}")
+    if (epoch + 1) % 100 == 0:
+        print(f"Epoch {epoch+1}  loss={loss.item():.4f}")
 ```
 
 ```output
-Epoch 500  loss=0.0312
+Epoch 100  loss=0.2578
+Epoch 200  loss=0.0422
+Epoch 300  loss=0.2147
+Epoch 400  loss=0.1683
+Epoch 500  loss=0.1667
 ```
 
 ```python
@@ -145,53 +149,15 @@ predict_tail(model, 0, 1, entities)  # Alice livesIn ?
 
 ```output
 Predicting tail for (Alice, livesIn, ?):
-  Rank 1: London    score=-0.041
-  Rank 2: Paris     score=-0.312
-  Rank 3: Bob       score=-0.531
-  Rank 4: Alice     score=-0.612
-  Rank 5: Carol     score=-0.714
-  Rank 6: Dan       score=-0.829
+  Rank 1: London    score=-7.294
+  Rank 2: Paris     score=-9.345
+  Rank 3: Carol     score=-9.733
+  Rank 4: Dan       score=-10.584
+  Rank 5: Bob       score=-10.767
+  Rank 6: Alice     score=-11.008
 ```
 
-London ranks first — the embedding captured `livesIn(Alice, London)`.
-
-## Training on FB15k-237 with PyKEEN
-
-```python
-# Conceptual: loading and training TransE on a real KG with PyKEEN
-# (requires: pip install pykeen)
-
-"""
-from pykeen.pipeline import pipeline
-
-result = pipeline(
-    dataset='FB15k-237',
-    model='TransE',
-    model_kwargs=dict(embedding_dim=128),
-    training_kwargs=dict(num_epochs=50, batch_size=1024),
-    evaluation_kwargs=dict(batch_size=256),
-    random_seed=42,
-)
-
-print(result.metric_results.to_df())
-# MRR, Hits@1, Hits@3, Hits@10 (filtered)
-"""
-
-# Typical results on FB15k-237 with TransE (dim=128, 100 epochs):
-print("TransE on FB15k-237 (reported results):")
-print("  MRR:      0.294")
-print("  Hits@1:   0.198")
-print("  Hits@3:   0.332")
-print("  Hits@10:  0.465")
-```
-
-```output
-TransE on FB15k-237 (reported results):
-  MRR:      0.294
-  Hits@1:   0.198
-  Hits@3:   0.332
-  Hits@10:  0.465
-```
+LONDONNOTE
 
 ## Filtered evaluation
 
@@ -229,6 +195,64 @@ print(f"Filtered rank for (Alice, livesIn, London): {rank}")
 Filtered rank for (Alice, livesIn, London): 1
 ```
 
+## MRR and Hits@k on a larger synthetic KG
+
+The toy KG has no held-out facts, so it cannot measure generalization. PyKEEN and FB15k-237 would need a package install and a download, so build a bigger synthetic KG instead: 150 people, 6 cities, and three relations. `livesIn` links a person to one city; `bornIn` agrees with `livesIn` 70% of the time; `knows` links (in both directions) pairs of people in the same city with probability 0.15. Hold out 25% of the `livesIn` triples and ask the model to rank the true city among all 156 entities, using filtered ranks from above. Ranking metrics summarize the ranks: MRR is the mean of $1/\text{rank}$, and Hits@$k$ is the fraction of ranks that are at most $k$.
+
+```python
+rng = np.random.default_rng(0)
+n_people, n_cities = 150, 6
+n_ent = n_people + n_cities
+city_of = rng.integers(0, n_cities, n_people)
+kg = []
+for p in range(n_people):
+    kg.append((p, 0, n_people + city_of[p]))                                   # livesIn
+    born = city_of[p] if rng.random() < 0.7 else rng.integers(0, n_cities)
+    kg.append((p, 1, n_people + born))                                          # bornIn
+    for q in range(p + 1, n_people):
+        if city_of[p] == city_of[q] and rng.random() < 0.15:
+            kg += [(p, 2, q), (q, 2, p)]                                        # knows (symmetric)
+kg = torch.tensor(kg)
+lives = torch.nonzero(kg[:, 1] == 0).squeeze(1)
+held = lives[torch.randperm(len(lives), generator=torch.Generator().manual_seed(0))[:len(lives) // 4]]
+is_test = torch.zeros(len(kg), dtype=torch.bool); is_test[held] = True
+kg_train, kg_test = kg[~is_test], kg[is_test]
+print(f"Triples: {len(kg)}  train: {len(kg_train)}  held-out livesIn: {len(kg_test)}  entities: {n_ent}")
+
+def train_transe(triples, n_ent, n_rel, dim=16, epochs=300, seed=0):
+    torch.manual_seed(seed)
+    m = TransE(n_ent, n_rel, dim)
+    opt = torch.optim.Adam(m.parameters(), lr=0.01)
+    for _ in range(epochs):
+        opt.zero_grad(); m(triples, corrupt(triples, n_ent)).backward(); opt.step()
+        with torch.no_grad():
+            m.ent_emb.weight.data = F.normalize(m.ent_emb.weight.data)
+    return m
+
+def ranking_metrics(m, test, known):
+    with torch.no_grad():
+        ranks = [filtered_rank(m, tuple(int(v) for v in tr), known, n_ent) for tr in test]
+    r = torch.tensor(ranks, dtype=torch.float)
+    return {'MRR': (1 / r).mean().item(), 'Hits@1': (r <= 1).float().mean().item(),
+            'Hits@3': (r <= 3).float().mean().item(), 'Hits@10': (r <= 10).float().mean().item()}
+
+big = train_transe(kg_train, n_ent, 3)
+for name, val in ranking_metrics(big, kg_test, kg).items():
+    print(f"  {name:8s}: {val:.3f}")
+print(f"Random-guess MRR over {n_ent} entities: {sum(1/k for k in range(1, n_ent+1)) / n_ent:.3f}")
+```
+
+```output
+Triples: 878  train: 841  held-out livesIn: 37  entities: 156
+  MRR     : 0.912
+  Hits@1  : 0.865
+  Hits@3  : 0.973
+  Hits@10 : 1.000
+Random-guess MRR over 156 entities: 0.036
+```
+
+MRRNOTE
+
 ## Try it Yourself
 
 ```python
@@ -262,6 +286,7 @@ def corrupt(triples, n):
     neg[mask,0] = r[mask]; neg[~mask,2] = r[~mask]
     return neg
 
+torch.manual_seed(0)
 model = DistMult(6, 3, 16)
 opt = torch.optim.Adam(model.parameters(), lr=0.01)
 for _ in range(500):
@@ -271,18 +296,18 @@ with torch.no_grad():
     scores = model.score(torch.zeros(6,dtype=torch.long),
                          torch.ones(6,dtype=torch.long)*1,
                          torch.arange(6))
-    print("Alice livesIn ? (DistMult):", sorted(zip(-scores.tolist(), entities))[:3])
+    top = sorted(zip(scores.tolist(), entities), reverse=True)[:3]
+    print("Alice livesIn ? (DistMult):", [(e, round(sc, 3)) for sc, e in top])
 ```
 
 ```output
-Alice livesIn ? (DistMult): [(-1.872, 'London'), (-0.943, 'Paris'), (-0.512, 'Carol')]
+Alice livesIn ? (DistMult): [('London', 1.377), ('Carol', -0.146), ('Paris', -0.437)]
 ```
 
 ## Exercise
 
 Implement **RotatE** scoring from scratch for the toy KG above. RotatE represents entities as
-complex vectors and relations as rotations: $\text{score}(h,r,t) = -\|h \circ e^{i\theta_r}
-- t\|$ where $h, t \in \mathbb{C}^{d/2}$ and $\theta_r \in \mathbb{R}^{d/2}$. Does it rank
+complex vectors and relations as rotations: $\text{score}(h,r,t) = -\lVert h \circ e^{i\theta_r} - t\rVert$ where $h, t \in \mathbb{C}^{d/2}$ and $\theta_r \in \mathbb{R}^{d/2}$. Does it rank
 London first for `(Alice, livesIn, ?)`?
 
 <details>
@@ -324,6 +349,7 @@ def corrupt(triples, n):
     r = torch.randint(0,n,(len(triples),)); neg[mask,0]=r[mask]; neg[~mask,2]=r[~mask]
     return neg
 
+torch.manual_seed(0)
 model = RotatE(6, 3, 16); opt = torch.optim.Adam(model.parameters(), lr=0.01)
 for _ in range(1000):
     opt.zero_grad(); model(triples, corrupt(triples,6)).backward(); opt.step()
@@ -335,7 +361,12 @@ with torch.no_grad():
     ranked = sorted(zip(scores.tolist(), entities), reverse=True)
     print("Alice livesIn ? (RotatE):", [(e, f"{s:.3f}") for s,e in ranked[:3]])
 ```
-RotatE also ranks London first. Its advantage over TransE shows on larger KGs with
+
+```output
+Alice livesIn ? (RotatE): [('London', '-0.771'), ('Bob', '-2.648'), ('Dan', '-2.675')]
+```
+
+ROTNOTE Its advantage over TransE shows on larger KGs with
 symmetric and N-to-N relations, where translation fails but rotation succeeds.
 </details>
 

@@ -7,7 +7,7 @@ order: 9
 
 ## The task
 
-Given a graph at time $t$, predict which edges will appear at time $t+1$ — or equivalently,
+Given a graph at time $t$, predict which edges will appear at time $t+1$, or equivalently,
 which pairs of nodes should be connected that aren't yet. Applications: friend recommendation,
 knowledge graph completion, drug-target interaction prediction.
 
@@ -23,9 +23,9 @@ Given node embeddings $h_u, h_v \in \mathbb{R}^d$:
 | Dot product | $h_u^T h_v$ | 0 |
 | Hadamard | $\text{MLP}(h_u \odot h_v)$ | MLP weights |
 | Bilinear | $h_u^T W h_v$ | $W \in \mathbb{R}^{d \times d}$ |
-| Concatenation | $\text{MLP}([h_u \| h_v])$ | MLP weights |
+| Concatenation | $\text{MLP}([h_u \mathbin\Vert h_v])$ | MLP weights |
 
-The dot product is the most parameter-efficient and works well in practice.
+The dot product is the most parameter-efficient and a strong default; the experiment in Try it Yourself compares it with a concatenation MLP.
 
 ## Negative sampling
 
@@ -34,48 +34,118 @@ cross-entropy training. **Uniform random negative sampling**: for each positive 
 sample $K$ random nodes $w$ and treat $(u,w)$ as negative (assuming the graph is sparse enough
 that randomly sampled pairs are unlikely to be true edges).
 
+Everything below is plain PyTorch on a synthetic graph (`torch_geometric` is not installed and Cora would need a download): a stochastic block model with 5 communities of 60 nodes (within-community edge probability 0.12, across 0.01) and 100 noisy bag-of-words features.
+
 ```python
+import numpy as np
 import torch
+torch.set_num_threads(1)
+
+def make_graph(n_per=60, k=5, p_in=0.06, p_out=0.015, d=100, seed=2):
+    """Stochastic block model + noisy bag-of-words features (a tiny Cora stand-in)."""
+    rng = np.random.default_rng(seed)
+    y = np.repeat(np.arange(k), n_per)
+    n = len(y)
+    P = np.where(y[:, None] == y[None, :], p_in, p_out)
+    U = np.triu(rng.random((n, n)) < P, 1)
+    A = U | U.T
+    base = np.full((k, d), 0.03)
+    for c in range(k):
+        base[c, c * 20:(c + 1) * 20] = 0.15        # class-favored words
+    X = (rng.random((n, d)) < base[y]).astype(np.float32)
+    X = X / np.maximum(X.sum(1, keepdims=True), 1)
+    train = np.zeros(n, bool)
+    for c in range(k):
+        train[np.nonzero(y == c)[0][:10]] = True
+    rest = np.nonzero(~train)[0]
+    rng.shuffle(rest)
+    val = np.zeros(n, bool); val[rest[:100]] = True
+    test = ~train & ~val
+    return (torch.tensor(X), torch.tensor(np.stack(np.nonzero(A))), torch.tensor(y),
+            torch.tensor(train), torch.tensor(val), torch.tensor(test))
+
+x, edge_index, y, train_mask, val_mask, test_mask = make_graph(p_in=0.12, p_out=0.01)
+num_nodes, num_classes = x.shape[0], 5
+
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.datasets import Planetoid
-from torch_geometric.utils import negative_sampling
 
-dataset = Planetoid(root='/tmp/Cora', name='Cora')
-data = dataset[0]
+# Unique undirected edges (u < v)
+und = edge_index[:, edge_index[0] < edge_index[1]]
+E = und.shape[1]
 
-# Split edges: 85% message passing, 10% positive test edges
-from torch_geometric.transforms import RandomLinkSplit
+# Split: 85% train (message passing + supervision), 5% val, 10% test positive edges
+g = torch.Generator().manual_seed(0)
+perm = torch.randperm(E, generator=g)
+n_val, n_test = int(0.05 * E), int(0.10 * E)
+val_pos, test_pos = und[:, perm[:n_val]], und[:, perm[n_val:n_val + n_test]]
+train_pos = und[:, perm[n_val + n_test:]]
+train_ei = torch.cat([train_pos, train_pos.flip(0)], dim=1)   # symmetric message-passing graph
 
-transform = RandomLinkSplit(
-    num_val=0.05,
-    num_test=0.10,
-    is_undirected=True,
-    add_negative_train_samples=False,  # we'll sample ourselves
-)
-train_data, val_data, test_data = transform(data)
-print(f"Train edges (pos): {train_data.edge_label_index.shape[1] // 2}")
-print(f"Val  edges (pos):  {val_data.edge_label_index.shape[1] // 2}")
-print(f"Test edges (pos):  {test_data.edge_label_index.shape[1] // 2}")
+print(f"Train edges (pos): {train_pos.shape[1]}")
+print(f"Val  edges (pos):  {val_pos.shape[1]}")
+print(f"Test edges (pos):  {test_pos.shape[1]}")
 ```
 
 ```output
-Train edges (pos): 4484
-Val  edges (pos):  527
-Test edges (pos):  527
+Train edges (pos): 1216
+Val  edges (pos):  71
+Test edges (pos):  142
+```
+
+## Manual negative sampling
+
+A negative sampler draws random node pairs and rejects self-pairs and real edges. Real edges include the held-out validation and test edges, otherwise a "negative" could secretly be a positive.
+
+```python
+A_full = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
+A_full[edge_index[0], edge_index[1]] = True       # every real edge, incl. held-out ones
+
+def my_negative_sampling(num_samples, forbidden, gen):
+    """Sample random non-edges (u, v), u != v, not in `forbidden`."""
+    out = []
+    while sum(o.shape[1] for o in out) < num_samples:
+        cand = torch.randint(0, num_nodes, (2, 4 * num_samples), generator=gen)
+        ok = (cand[0] != cand[1]) & ~forbidden[cand[0], cand[1]]
+        out.append(cand[:, ok])
+    return torch.cat(out, dim=1)[:, :num_samples]
+
+gen = torch.Generator().manual_seed(1)
+neg = my_negative_sampling(100, A_full, gen)
+print(f"Sampled {neg.shape[1]} negative edges")
+overlap = int(A_full[neg[0], neg[1]].sum())
+print(f"Overlap with real edges: {overlap} (should be 0)")
+
+# Fixed evaluation negatives: one per held-out positive
+val_neg = my_negative_sampling(val_pos.shape[1], A_full, gen)
+test_neg = my_negative_sampling(test_pos.shape[1], A_full, gen)
+```
+
+```output
+Sampled 100 negative edges
+Overlap with real edges: 0 (should be 0)
 ```
 
 ## Building the link predictor
 
 ```python
-from torch_geometric.nn import GCNConv
+class GCNLayer(nn.Module):
+    def __init__(self, i, o):
+        super().__init__(); self.lin = nn.Linear(i, o)
+    def forward(self, h, ei):
+        n = h.shape[0]; loops = torch.arange(n)
+        src, dst = torch.cat([ei[0], loops]), torch.cat([ei[1], loops])
+        deg = torch.zeros(n).index_add_(0, dst, torch.ones(len(dst)))
+        norm = (deg[src] * deg[dst]).pow(-0.5)
+        return torch.zeros(n, self.lin.out_features).index_add_(0, dst, norm[:, None] * self.lin(h)[src])
 
 class LinkPredictor(nn.Module):
-    def __init__(self, in_ch, hidden):
+    def __init__(self, in_ch, hidden, decoder='dot'):
         super().__init__()
-        # GNN encoder
-        self.conv1 = GCNConv(in_ch, hidden)
-        self.conv2 = GCNConv(hidden, hidden)
+        self.conv1, self.conv2 = GCNLayer(in_ch, hidden), GCNLayer(hidden, hidden)   # GNN encoder
+        self.decoder = decoder
+        if decoder == 'mlp':
+            self.mlp = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 
     def encode(self, x, edge_index):
         x = F.relu(self.conv1(x, edge_index))
@@ -83,61 +153,45 @@ class LinkPredictor(nn.Module):
         return self.conv2(x, edge_index)
 
     def decode(self, z, edge_index):
-        # Dot-product scoring
-        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)
+        if self.decoder == 'mlp':   # concatenation scorer
+            return self.mlp(torch.cat([z[edge_index[0]], z[edge_index[1]]], dim=-1)).squeeze(-1)
+        return (z[edge_index[0]] * z[edge_index[1]]).sum(dim=-1)   # dot-product scoring
 
-    def decode_all(self, z):
-        # Score all pairs (for small graphs only)
-        return torch.sigmoid((z @ z.t()))
-
-model = LinkPredictor(dataset.num_features, 64)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+torch.manual_seed(0)
+model = LinkPredictor(x.shape[1], 32)
+n_params = sum(p.numel() for p in model.parameters())
+print(f"Encoder + dot-product decoder: {n_params} parameters (the decoder adds none)")
 ```
 
 ```output
-
+Encoder + dot-product decoder: 4288 parameters (the decoder adds none)
 ```
 
 ## Training with negative sampling
 
+Each epoch draws fresh negatives, one per positive edge, and trains with binary cross-entropy.
+
 ```python
-def train():
-    model.train()
-    optimizer.zero_grad()
-
-    z = model.encode(train_data.x, train_data.edge_index)
-
-    # Positive edges from the training split
-    pos_edge_index = train_data.edge_label_index[:, train_data.edge_label == 1]
-
-    # Sample equal number of negatives
-    neg_edge_index = negative_sampling(
-        edge_index=train_data.edge_index,
-        num_nodes=train_data.num_nodes,
-        num_neg_samples=pos_edge_index.size(1),
-        method='sparse',
-    )
-
-    edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
-    labels = torch.cat([
-        torch.ones(pos_edge_index.size(1)),
-        torch.zeros(neg_edge_index.size(1)),
-    ])
-
-    out = model.decode(z, edge_index)
-    loss = F.binary_cross_entropy_with_logits(out, labels)
-    loss.backward()
-    optimizer.step()
+def train_lp(model, neg_fn=None, epochs=200, lr=0.01, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    neg_fn = neg_fn or (lambda pos: my_negative_sampling(pos.shape[1], A_full, gen))
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        model.train(); opt.zero_grad()
+        z = model.encode(x, train_ei)
+        neg = neg_fn(train_pos)
+        ei = torch.cat([train_pos, neg], dim=1)
+        labels = torch.cat([torch.ones(train_pos.shape[1]), torch.zeros(neg.shape[1])])
+        loss = F.binary_cross_entropy_with_logits(model.decode(z, ei), labels)
+        loss.backward(); opt.step()
     return float(loss)
 
-for epoch in range(1, 101):
-    loss = train()
-
+loss = train_lp(model)
 print(f"Final training loss: {loss:.4f}")
 ```
 
 ```output
-Final training loss: 0.4831
+Final training loss: 0.5558
 ```
 
 ## Evaluation: AUC-ROC and Average Precision
@@ -146,134 +200,80 @@ Final training loss: 0.4831
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 @torch.no_grad()
-def evaluate(split_data):
+def evaluate(model, pos, neg):
     model.eval()
-    z = model.encode(split_data.x, split_data.edge_index)
-    out = model.decode(z, split_data.edge_label_index).sigmoid()
-    return (
-        roc_auc_score(split_data.edge_label.numpy(), out.numpy()),
-        average_precision_score(split_data.edge_label.numpy(), out.numpy()),
-    )
+    z = model.encode(x, train_ei)                      # message passing uses training edges only
+    ei = torch.cat([pos, neg], dim=1)
+    labels = torch.cat([torch.ones(pos.shape[1]), torch.zeros(neg.shape[1])]).numpy()
+    out = model.decode(z, ei).sigmoid().numpy()
+    return roc_auc_score(labels, out), average_precision_score(labels, out)
 
-val_auc,  val_ap  = evaluate(val_data)
-test_auc, test_ap = evaluate(test_data)
+val_auc,  val_ap  = evaluate(model, val_pos, val_neg)
+test_auc, test_ap = evaluate(model, test_pos, test_neg)
 print(f"Val   AUC={val_auc:.4f}  AP={val_ap:.4f}")
 print(f"Test  AUC={test_auc:.4f}  AP={test_ap:.4f}")
 ```
 
 ```output
-Val   AUC=0.9134  AP=0.9201
-Test  AUC=0.9089  AP=0.9147
+Val   AUC=0.7437  AP=0.6830
+Test  AUC=0.7657  AP=0.7290
 ```
 
-## Manual negative sampling from scratch
-
-Understanding what `negative_sampling` does under the hood:
-
-```python
-def my_negative_sampling(edge_index, num_nodes, num_samples):
-    """Sample random non-edges."""
-    # Build a set of existing edges for fast lookup
-    existing = set(zip(edge_index[0].tolist(), edge_index[1].tolist()))
-    neg_edges = []
-    attempts = 0
-    while len(neg_edges) < num_samples and attempts < num_samples * 10:
-        u = torch.randint(0, num_nodes, (1,)).item()
-        v = torch.randint(0, num_nodes, (1,)).item()
-        if u != v and (u, v) not in existing and (v, u) not in existing:
-            neg_edges.append([u, v])
-        attempts += 1
-    neg_edges = torch.tensor(neg_edges, dtype=torch.long).t()
-    return neg_edges
-
-neg = my_negative_sampling(data.edge_index, data.num_nodes, 100)
-print(f"Sampled {neg.shape[1]} negative edges")
-# Verify none are real edges
-real_set = set(zip(data.edge_index[0].tolist(), data.edge_index[1].tolist()))
-overlap = sum(1 for u,v in zip(neg[0].tolist(), neg[1].tolist()) if (u,v) in real_set)
-print(f"Overlap with real edges: {overlap} (should be 0)")
-```
-
-```output
-Sampled 100 negative edges
-Overlap with real edges: 0 (should be 0)
-```
+AUC around 0.77 is well above chance (0.5) but far from perfect: with 1216 training edges and noisy features, the encoder can only learn "same community tends to link", so it ranks many same-community non-edges above true edges. The validation and test numbers are close, as they should be when no tuning has been done on either.
 
 ## Try it Yourself
 
 ```python
-import torch, torch.nn.functional as F
-from torch_geometric.datasets import Planetoid
-from torch_geometric.transforms import RandomLinkSplit
-from torch_geometric.nn import SAGEConv
-from torch_geometric.utils import negative_sampling
-from sklearn.metrics import roc_auc_score
-
-dataset = Planetoid(root='/tmp/Cora', name='Cora')
-data = dataset[0]
-transform = RandomLinkSplit(num_val=0.05, num_test=0.10, is_undirected=True,
-                             add_negative_train_samples=False)
-tr, va, te = transform(data)
-
-import torch.nn as nn
-class SAGE_LP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.c1 = SAGEConv(dataset.num_features, 64)
-        self.c2 = SAGEConv(64, 64)
-    def encode(self, x, ei):
-        return self.c2(F.relu(self.c1(x, ei)), ei)
-    def decode(self, z, ei):
-        return (z[ei[0]] * z[ei[1]]).sum(-1)
-
-model = SAGE_LP(); opt = torch.optim.Adam(model.parameters(), lr=0.005)
-for _ in range(100):
-    model.train(); opt.zero_grad()
-    z = model.encode(tr.x, tr.edge_index)
-    pos = tr.edge_label_index[:, tr.edge_label==1]
-    neg = negative_sampling(tr.edge_index, tr.num_nodes, pos.size(1))
-    ei = torch.cat([pos, neg], 1)
-    lbl = torch.cat([torch.ones(pos.size(1)), torch.zeros(neg.size(1))])
-    F.binary_cross_entropy_with_logits(model.decode(z,ei), lbl).backward(); opt.step()
-
-model.eval()
-with torch.no_grad():
-    z = model.encode(te.x, te.edge_index)
-    out = model.decode(z, te.edge_label_index).sigmoid()
-print(f"Test AUC: {roc_auc_score(te.edge_label.numpy(), out.numpy()):.4f}")
-# Try: replace dot-product decode with MLP([h_u || h_v]). Does AUC improve?
+# Reuses LinkPredictor, train_lp, evaluate from earlier on this page (same kernel session).
+for decoder in ['dot', 'mlp']:
+    torch.manual_seed(0)
+    m = LinkPredictor(x.shape[1], 32, decoder=decoder)
+    train_lp(m)
+    print(f"decoder={decoder:3s}  test AUC={evaluate(m, test_pos, test_neg)[0]:.4f}")
+# Try: change hidden size, epochs, or lr and watch the AUC move.
 ```
 
 ```output
-Test AUC: 0.9124
+decoder=dot  test AUC=0.7657
+decoder=mlp  test AUC=0.7861
 ```
 
 ## Exercise
 
-Implement **corrupted-head negative sampling**: instead of random node pairs, for each
-positive edge $(u,v)$, generate negatives by replacing $u$ with a random node (keeping $v$
-fixed). Then also generate negatives by replacing $v$ (keeping $u$ fixed). Does this harder
-negative strategy improve test AUC compared to uniform random negatives?
+Implement **corrupted-head/tail negative sampling**: for each positive edge $(u,v)$, generate negatives by
+replacing $u$ with a random node (keeping $v$ fixed), and also by replacing $v$ (keeping $u$ fixed). Compare test AUC
+against uniform random negatives, using the same number of negatives per positive.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-def corrupt_head_tail(pos_edge_index, num_nodes):
-    """For each positive (u,v), generate (rand,v) and (u,rand)."""
-    E = pos_edge_index.size(1)
-    rand_nodes = torch.randint(0, num_nodes, (E * 2,))
-    # Corrupt head
-    neg_head = torch.stack([rand_nodes[:E], pos_edge_index[1]])
-    # Corrupt tail
-    neg_tail = torch.stack([pos_edge_index[0], rand_nodes[E:]])
-    return torch.cat([neg_head, neg_tail], dim=1)
+def corrupt_head_tail(pos, gen):
+    """For each positive (u,v), one negative (rand,v) or (u,rand), chosen at random per edge."""
+    E_ = pos.shape[1]
+    rand_nodes = torch.randint(0, num_nodes, (E_,), generator=gen)
+    flip = torch.rand(E_, generator=gen) < 0.5
+    head = torch.where(flip, rand_nodes, pos[0])
+    tail = torch.where(flip, pos[1], rand_nodes)
+    return torch.stack([head, tail])
 
-# Use in training loop:
-# neg_edge_index = corrupt_head_tail(pos_edge_index, train_data.num_nodes)
-# This samples 2× more negatives but they are "harder" (share one endpoint with a positive).
-# Typically improves test AUC by 0.5–1% on citation networks.
-print("Corrupted negatives: replace head or tail with random node.")
-print("Harder negatives → model learns better boundary between real and fake edges.")
+res = {'uniform': [], 'corrupt': []}
+for seed in range(3):
+    for name in res:
+        torch.manual_seed(seed)
+        m = LinkPredictor(x.shape[1], 32)
+        gen_ = torch.Generator().manual_seed(seed)
+        fn = (lambda pos: corrupt_head_tail(pos, gen_)) if name == 'corrupt' else None
+        train_lp(m, neg_fn=fn, seed=seed)
+        res[name].append(evaluate(m, test_pos, test_neg)[0])
+for name, v in res.items():
+    print(f"{name:8s} mean test AUC over 3 seeds: {sum(v)/3:.4f}")
 ```
+
+```output
+uniform  mean test AUC over 3 seeds: 0.7390
+corrupt  mean test AUC over 3 seeds: 0.7494
+```
+
+Corrupting the head or tail gives 0.7494 versus 0.7390 for uniform negatives, a gain of about 0.01 that is the same size as the seed-to-seed spread, so it is suggestive rather than conclusive. On a graph this small, a random pair is already almost always a plausible easy negative, and corrupted pairs are only slightly harder because they share one endpoint with a true edge. Harder negatives matter more on large graphs where uniform negatives are trivially easy.
 </details>
