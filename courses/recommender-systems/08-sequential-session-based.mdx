@@ -1,0 +1,586 @@
+---
+course: recommender-systems
+chapter: 08-sequential-session-based
+title: "Sequential and Session-Based Recommendation"
+order: 8
+---
+
+## Order is information
+
+PROSE
+
+```python
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy import sparse
+
+torch.set_num_threads(1)
+rng = np.random.default_rng(0)
+n_users, n_items, n_genres = 3_000, 500, 8
+genre = rng.integers(0, n_genres, n_items)
+appeal = rng.lognormal(0, 1.2, n_items)
+
+succ = np.zeros((n_items, 3), dtype=int)        # each item has 3 natural "next" items
+for i in range(n_items):
+    same = np.flatnonzero(genre == genre[i])
+    same = same[same != i]
+    succ[i] = rng.choice(same, 3, replace=False, p=appeal[same] / appeal[same].sum())
+    if rng.random() < 0.3:
+        succ[i, 2] = rng.integers(0, n_items)   # some links cross genres
+
+def draw_from_genre(g, r):
+    c = np.flatnonzero(genre == g)
+    return r.choice(c, p=appeal[c] / appeal[c].sum())
+
+def make_sequences(n, p_follow=0.30, p_skip=0.15, p_intent=0.45, seed=0):
+    r = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        length = min(8 + r.geometric(1 / 18), 50)
+        intent = r.integers(n_genres)
+        s = [draw_from_genre(intent, r)]
+        while len(s) < length:
+            if r.random() < 0.05:
+                intent = r.integers(n_genres)                  # the user changes their mind
+            x = r.random()
+            if x < p_follow:                                    # follow the last item
+                nxt = succ[s[-1], r.choice(3, p=[0.5, 0.3, 0.2])]
+            elif x < p_follow + p_skip and len(s) >= 2:         # follow the item two back
+                nxt = succ[s[-2], 0]
+            elif x < p_follow + p_skip + p_intent:              # stay on the session's intent
+                nxt = draw_from_genre(intent, r)
+            else:                                               # global popularity
+                nxt = r.choice(n_items, p=appeal / appeal.sum())
+            s.append(int(nxt))
+        out.append(np.array(s))
+    return out
+
+seqs = make_sequences(n_users)
+lengths = np.array([len(s) for s in seqs])
+pairs = np.concatenate([np.stack([s[:-1], s[1:]], 1) for s in seqs])
+
+def entropy_bits(counts):
+    p = counts[counts > 0] / counts.sum()
+    return float(-(p * np.log2(p)).sum())
+
+h_next = entropy_bits(np.bincount(pairs[:, 1], minlength=n_items))
+joint = pd.Series(1, index=pd.MultiIndex.from_arrays([pairs[:, 0], pairs[:, 1]])).groupby(level=[0, 1]).sum()
+h_joint = entropy_bits(joint.values)
+h_prev = entropy_bits(np.bincount(pairs[:, 0], minlength=n_items))
+print(f"{len(seqs):,} sequences | {lengths.sum():,} events | length median {np.median(lengths):.0f}, max {lengths.max()}")
+print(f"H(next item)              = {h_next:.2f} bits")
+print(f"H(next item | last item)  = {h_joint - h_prev:.2f} bits  (plug-in estimate, biased low)")
+print(f"share of steps that go to one of the last item's 3 successors: "
+      f"{np.mean([b in succ[a] for a, b in pairs]):.3f}")
+```
+
+```output
+```
+
+PROSE
+
+## Leave-last-out, and what it does not protect you from
+
+PROSE
+
+```python
+train_seqs = [s[:-2] for s in seqs]                  # everything except the last two events
+valid = [(s[:-2], s[-2]) for s in seqs]              # predict the second-to-last
+test = [(s[:-1], s[-1]) for s in seqs]               # predict the last
+item_count = np.bincount(np.concatenate(train_seqs), minlength=n_items).astype(float)
+
+def ranks_of_target(score_fn, cases, chunk=1_000):
+    out = []
+    for st in range(0, len(cases), chunk):
+        part = cases[st:st + chunk]
+        S = np.asarray(score_fn([c[0] for c in part], st), dtype=np.float64)
+        tgt = np.array([c[1] for c in part])
+        out.append((S > S[np.arange(len(part)), tgt][:, None]).sum(1) + 1)   # full-catalogue rank
+    return np.concatenate(out)
+
+def metrics(ranks, k=10):
+    hit = ranks <= k
+    return float(hit.mean()), float(np.where(hit, 1 / np.log2(ranks + 1), 0.0).mean())
+
+def popularity(prefixes, offset):
+    return np.tile(item_count, (len(prefixes), 1))
+
+results = {}
+results["popularity"] = ranks_of_target(popularity, test)
+r, n = metrics(results["popularity"])
+print(f"train events {sum(map(len, train_seqs)):,} | test cases {len(test):,} (one per user)")
+print(f"popularity: recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+print(f"test target already in the user's history: {np.mean([t in set(p) for p, t in test]):.3f}")
+```
+
+```output
+```
+
+PROSE
+
+## Markov chains: the next item depends on the last one
+
+PROSE
+
+### The smoothed transition estimate
+
+PROSE
+
+$$
+\hat{P}(j \mid i) = \frac{C_{ij} + \beta\,\pi_j}{\sum_{j'} C_{ij'} + \beta}
+$$
+
+```python
+def transition_counts(seqs_, gap=1):
+    T = np.zeros((n_items, n_items))
+    for s in seqs_:
+        if len(s) > gap:
+            np.add.at(T, (s[:-gap], s[gap:]), 1.0)
+    return T
+
+prior = item_count / item_count.sum()
+T1, T2 = transition_counts(train_seqs, 1), transition_counts(train_seqs, 2)
+
+def smoothed(T, items, beta=1.0):
+    C = T[items]
+    return (C + beta * prior) / (C.sum(1, keepdims=True) + beta)
+
+def markov(prefixes, offset):
+    return smoothed(T1, [p[-1] for p in prefixes])
+
+def markov_two_back(prefixes, offset, w=0.5):
+    last2 = [p[-2] if len(p) >= 2 else p[-1] for p in prefixes]
+    return smoothed(T1, [p[-1] for p in prefixes]) + w * smoothed(T2, last2)
+
+shuffled = [np.random.default_rng(i).permutation(s) for i, s in enumerate(train_seqs)]
+T_shuf = transition_counts(shuffled, 1)
+markov_shuffled = lambda prefixes, offset: smoothed(T_shuf, [p[-1] for p in prefixes])
+
+for name, fn in (("Markov, shuffled training order", markov_shuffled),
+                 ("Markov (first order)", markov),
+                 ("Markov + gap-2 rules", markov_two_back)):
+    results[name] = ranks_of_target(fn, test)
+    r, n = metrics(results[name])
+    print(f"{name:>32}: recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+```
+
+```output
+```
+
+PROSE
+
+### FPMC: factorising the transition matrix
+
+PROSE
+
+$$
+\hat{x}_{u,\ell,j} = \underbrace{\mathbf{v}^{UI}_u \cdot \mathbf{v}^{IU}_j}_{\text{MF: long-term taste}}
++ \underbrace{\frac{1}{|B_{\ell}|}\sum_{i \in B_{\ell}} \mathbf{v}^{IL}_j \cdot \mathbf{v}^{LI}_i}_{\text{factorised Markov chain}}
+$$
+
+PROSE
+
+## Session-kNN: find sessions that look like this one
+
+PROSE
+
+```python
+rows = np.concatenate([np.full(len(s), i) for i, s in enumerate(train_seqs)])
+S_mat = sparse.csr_matrix((np.ones(len(rows)), (rows, np.concatenate(train_seqs))),
+                          shape=(len(train_seqs), n_items))
+S_mat.data[:] = 1.0                                   # binary session-item matrix
+sess_norm = np.sqrt(np.asarray(S_mat.sum(1)).ravel())
+
+def session_knn(prefixes, offset, k_nn=100, m=5):
+    Q = np.zeros((len(prefixes), n_items))
+    for r_, p in enumerate(prefixes):
+        recent = p[-m:]
+        np.add.at(Q[r_], recent, np.arange(1, len(recent) + 1) / len(recent))  # recency weights
+    sims = np.asarray((S_mat @ Q.T).T) / (sess_norm[None, :] + 1e-9)
+    own = np.arange(offset, offset + len(prefixes))
+    sims[np.arange(len(prefixes)), own] = 0.0          # never match the user's own training prefix
+    kth = -np.partition(-sims, k_nn, axis=1)[:, [k_nn]]
+    sims = np.where(sims > kth, sims, 0.0)
+    scores = np.asarray((sparse.csr_matrix(sims) @ S_mat).todense())
+    return scores + 1e-6 * prior                       # popularity breaks ties
+
+for m in (1, 2, 5, 10):
+    r, n = metrics(ranks_of_target(lambda P, o: session_knn(P, o, m=m), valid))
+    print(f"session-kNN, last {m:>2} items (validation): recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+results["session-kNN"] = ranks_of_target(lambda P, o: session_knn(P, o, m=2), test)
+r, n = metrics(results["session-kNN"])
+print(f"session-kNN, m=2 (test): recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+```
+
+```output
+```
+
+PROSE
+
+## GRU4Rec: a running summary of the session
+
+PROSE
+
+### Session-parallel mini-batches
+
+PROSE
+
+```python
+def session_parallel(sessions, width=3):
+    """Yield (inputs, targets, reset_mask) like GRU4Rec's original loader."""
+    queue = list(range(len(sessions)))
+    lanes = [queue.pop(0) for _ in range(width)]
+    pos = [0] * width
+    while True:
+        x, y, reset = [], [], []
+        for b in range(width):
+            s = sessions[lanes[b]]
+            x.append(s[pos[b]]); y.append(s[pos[b] + 1]); reset.append(pos[b] == 0)
+        yield x, y, reset
+        for b in range(width):
+            pos[b] += 1
+            if pos[b] + 1 >= len(sessions[lanes[b]]):
+                if not queue:
+                    return
+                lanes[b], pos[b] = queue.pop(0), 0
+
+toy = [[10, 11, 12, 13], [20, 21], [30, 31, 32], [40, 41, 42], [50, 51]]
+for step, (x, y, reset) in enumerate(session_parallel(toy)):
+    print(f"step {step}: input {x} -> target {y} | reset hidden state {reset}")
+```
+
+```output
+```
+
+PROSE
+
+```python
+MAXLEN, PAD = 30, n_items
+
+def pad_left(seq_list):
+    X = np.full((len(seq_list), MAXLEN), PAD, dtype=np.int64)
+    for r_, s in enumerate(seq_list):
+        s = s[-MAXLEN:]
+        X[r_, MAXLEN - len(s):] = s
+    return torch.from_numpy(X)
+
+inp = pad_left([s[:-1] for s in train_seqs])            # x_1 .. x_{n-1}
+tgt = pad_left([s[1:] for s in train_seqs])             # x_2 .. x_n: a target at every position
+
+class GRU4Rec(nn.Module):
+    def __init__(self, d=64, drop=0.2):
+        super().__init__()
+        self.emb = nn.Embedding(n_items + 1, d, padding_idx=PAD)
+        self.gru = nn.GRU(d, d, batch_first=True)
+        self.drop = nn.Dropout(drop)
+        self.out = nn.Linear(d, n_items)
+
+    def forward(self, x):                               # (B, L) -> hidden states (B, L, d)
+        h, _ = self.gru(self.drop(self.emb(x)))
+        return self.drop(h)
+
+    def logits(self, h):
+        return self.out(h)
+
+def full_softmax_loss(model, h, y):
+    return F.cross_entropy(model.logits(h), y)
+
+def train_seq_model(model, loss_fn=full_softmax_loss, epochs=16, lr=3e-3, batch=128, seed=0):
+    torch.manual_seed(seed)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    g = torch.Generator().manual_seed(seed)
+    for epoch in range(epochs):
+        model.train()
+        perm = torch.randperm(len(inp), generator=g)
+        for st in range(0, len(perm), batch):
+            b = perm[st:st + batch]
+            y = tgt[b]
+            keep = y != PAD                              # only real positions carry a loss
+            loss = loss_fn(model, model(inp[b])[keep], y[keep])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model
+
+def scorer(model):
+    @torch.no_grad()
+    def fn(prefixes, offset):
+        model.eval()
+        return model.logits(model(pad_left(prefixes))[:, -1]).numpy()
+    return fn
+
+gru = train_seq_model(GRU4Rec())
+for split, cases in (("validation", valid), ("test", test)):
+    r, n = metrics(ranks_of_target(scorer(gru), cases))
+    print(f"GRU4Rec, full softmax ({split}): recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+results["GRU4Rec"] = ranks_of_target(scorer(gru), test)
+```
+
+```output
+```
+
+PROSE
+
+## Which loss: full softmax, BPR, TOP1, sampled softmax
+
+PROSE
+
+$$
+\mathcal{L}_{\text{CE}} = -\log\frac{e^{r_{+}}}{\sum_{j=1}^{N} e^{r_j}}, \qquad
+\mathcal{L}_{\text{BPR}} = -\frac{1}{N_S}\sum_{j \in S}\log\sigma(r_{+} - r_j), \qquad
+\mathcal{L}_{\text{TOP1}} = \frac{1}{N_S}\sum_{j \in S}\left[\sigma(r_j - r_{+}) + \sigma(r_j^2)\right]
+$$
+
+```python
+log_q = torch.as_tensor(np.log(prior), dtype=torch.float32)
+sampler = torch.distributions.Categorical(probs=torch.as_tensor(prior, dtype=torch.float32))
+
+def sampled_losses(kind, n_neg=64):
+    def loss_fn(model, h, y):
+        neg = sampler.sample((n_neg,))                   # shared, popularity-distributed negatives
+        W, b = model.out.weight, model.out.bias
+        pos = (h * W[y]).sum(-1) + b[y]
+        negs = h @ W[neg].T + b[neg]
+        if kind == "bpr":
+            return -F.logsigmoid(pos[:, None] - negs).mean()
+        if kind == "top1":
+            return (torch.sigmoid(negs - pos[:, None]) + torch.sigmoid(negs ** 2)).mean()
+        logits = torch.cat([pos[:, None] - log_q[y][:, None], negs - log_q[neg][None]], 1)  # logQ
+        return F.cross_entropy(logits, torch.zeros(len(y), dtype=torch.long))
+    return loss_fn
+
+print(f"{'loss':>34} {'recall@10':>10} {'ndcg@10':>9}")
+r, n = metrics(results["GRU4Rec"])
+print(f"{'full softmax over 500 items':>34} {r:>10.4f} {n:>9.4f}")
+for kind, label in (("bpr", "BPR, 64 sampled negatives"), ("top1", "TOP1, 64 sampled negatives"),
+                    ("softmax", "sampled softmax + logQ, 64 neg")):
+    m_ = train_seq_model(GRU4Rec(), loss_fn=sampled_losses(kind), epochs=12)
+    r, n = metrics(ranks_of_target(scorer(m_), test))
+    print(f"{label:>34} {r:>10.4f} {n:>9.4f}")
+```
+
+```output
+```
+
+PROSE
+
+## SASRec: attention over the whole history
+
+PROSE
+
+### Causal self-attention
+
+PROSE
+
+$$
+\mathrm{Attn}(H)_t = \sum_{s \le t} \alpha_{ts}\, \mathbf{v}_s, \qquad
+\alpha_{ts} = \frac{\exp(\mathbf{q}_t \cdot \mathbf{k}_s / \sqrt{d})}{\sum_{s' \le t}\exp(\mathbf{q}_t \cdot \mathbf{k}_{s'} / \sqrt{d})}
+$$
+
+```python
+class CausalBlock(nn.Module):
+    def __init__(self, d, heads, drop):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.qkv, self.proj = nn.Linear(d, 3 * d), nn.Linear(d, d)
+        self.ff = nn.Sequential(nn.Linear(d, 2 * d), nn.GELU(), nn.Linear(2 * d, d))
+        self.heads, self.drop = heads, nn.Dropout(drop)
+
+    def forward(self, h, allowed):
+        B, L, d = h.shape
+        q, k, v = (self.qkv(self.n1(h)).reshape(B, L, 3, self.heads, d // self.heads)
+                   .permute(2, 0, 3, 1, 4))
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed[:, None],
+                                           dropout_p=self.drop.p if self.training else 0.0)
+        h = h + self.drop(self.proj(a.transpose(1, 2).reshape(B, L, d)))
+        return h + self.drop(self.ff(self.n2(h)))
+
+class SASRec(nn.Module):
+    def __init__(self, d=64, n_layers=1, heads=1, drop=0.1):
+        super().__init__()
+        self.emb = nn.Embedding(n_items + 1, d, padding_idx=PAD)
+        self.pos = nn.Embedding(MAXLEN, d)                 # learned absolute positions
+        nn.init.normal_(self.emb.weight, std=0.05)
+        nn.init.normal_(self.pos.weight, std=0.05)
+        self.blocks = nn.ModuleList([CausalBlock(d, heads, drop) for _ in range(n_layers)])
+        self.norm, self.drop = nn.LayerNorm(d), nn.Dropout(drop)
+        self.register_buffer("causal", torch.tril(torch.ones(MAXLEN, MAXLEN, dtype=torch.bool)))
+        self.register_buffer("diag", torch.eye(MAXLEN, dtype=torch.bool))
+
+    def forward(self, x):
+        allowed = (self.causal[None] & (x != PAD)[:, None, :]) | self.diag[None]
+        h = self.drop(self.emb(x) + self.pos.weight[None])
+        for blk in self.blocks:
+            h = blk(h, allowed)
+        return self.norm(h)
+
+    def logits(self, h):                                   # output layer tied to input embeddings
+        return h @ self.emb.weight[:n_items].T
+
+x_demo = pad_left([np.array([7, 3, 9])])
+m_demo = SASRec().eval()
+with torch.no_grad():
+    base = m_demo.logits(m_demo(x_demo))
+    x_future = x_demo.clone(); x_future[0, -1] = 123        # change the LAST item only
+    changed = m_demo.logits(m_demo(x_future))
+diff = (base - changed).abs().amax(-1)[0, -3:]
+print(f"max logit change at the last 3 positions after editing the final item: "
+      f"{[round(float(v), 6) for v in diff]}")
+
+sas = train_seq_model(SASRec())
+for split, cases in (("validation", valid), ("test", test)):
+    r, n = metrics(ranks_of_target(scorer(sas), cases))
+    print(f"SASRec ({split}): recall@10 {r:.4f} | ndcg@10 {n:.4f}")
+results["SASRec"] = ranks_of_target(scorer(sas), test)
+```
+
+```output
+```
+
+PROSE
+
+## BERT4Rec: predict hidden items instead of the next one
+
+PROSE
+
+$$
+\mathcal{L}_{\text{Cloze}} = -\frac{1}{|\mathcal{M}|}\sum_{t \in \mathcal{M}} \log P\big(x_t \mid x_{\setminus \mathcal{M}}\big)
+$$
+
+```python
+def cloze_batch(seq, mask_prob=0.3, seed=0):
+    r_ = np.random.default_rng(seed)
+    x = np.array(seq)
+    masked = r_.random(len(x)) < mask_prob
+    inputs = np.where(masked, -1, x)                    # -1 stands for the [MASK] token
+    labels = np.where(masked, x, -100)                  # -100: no loss at this position
+    return inputs, labels
+
+seq = test[0][0][-10:]
+inputs, labels = cloze_batch(seq)
+print("sequence:", seq.tolist())
+print("inputs  :", inputs.tolist())
+print("labels  :", labels.tolist())
+print("at inference: append [MASK] after the last real item and read its prediction")
+```
+
+```output
+```
+
+PROSE
+
+## The honest comparison
+
+PROSE
+
+```python
+def sampled_ranks(score_fn, cases, n_neg=100, seed=0):
+    r_ = np.random.default_rng(seed)
+    out = []
+    for st in range(0, len(cases), 1_000):
+        part = cases[st:st + 1_000]
+        S = np.asarray(score_fn([c[0] for c in part], st), dtype=np.float64)
+        for row, (p, t) in enumerate(part):
+            neg = r_.choice(np.delete(np.arange(n_items), t), n_neg, replace=False)
+            out.append(int((S[row, neg] > S[row, t]).sum()) + 1)
+    return np.array(out)
+
+fns = {"popularity": popularity, "Markov (first order)": markov,
+       "Markov + gap-2 rules": markov_two_back,
+       "session-kNN": lambda P, o: session_knn(P, o, m=2),
+       "GRU4Rec": scorer(gru), "SASRec": scorer(sas)}
+boot = np.random.default_rng(1).integers(0, len(test), (300, len(test)))
+rows_ = []
+for name, fn in fns.items():
+    rk = results[name]
+    ndcg_u = np.where(rk <= 10, 1 / np.log2(rk + 1), 0.0)
+    lo, hi = np.percentile(ndcg_u[boot].mean(1), [2.5, 97.5])
+    r, n = metrics(rk)
+    rows_.append({"model": name, "recall@10": round(r, 4), "ndcg@10": round(n, 4),
+                  "ndcg 95% CI": f"[{lo:.3f}, {hi:.3f}]",
+                  "HR@10, 100 sampled neg": round(float((sampled_ranks(fn, test) <= 10).mean()), 4)})
+print(pd.DataFrame(rows_).to_string(index=False))
+```
+
+```output
+```
+
+PROSE
+
+## Try it Yourself
+
+PROSE
+
+```python
+import numpy as np
+
+def experiment(p_follow, n_items=300, n_seq=2_000, seed=0):
+    r = np.random.default_rng(seed)
+    appeal = r.lognormal(0, 1.2, n_items)
+    succ = r.integers(0, n_items, (n_items, 2))
+    seqs = []
+    for _ in range(n_seq):
+        s = [r.integers(n_items)]
+        for _ in range(r.integers(5, 30)):
+            if r.random() < p_follow:
+                s.append(succ[s[-1], r.integers(2)])
+            else:
+                s.append(r.choice(n_items, p=appeal / appeal.sum()))
+        seqs.append(np.array(s))
+    train = [s[:-1] for s in seqs]
+    count = np.bincount(np.concatenate(train), minlength=n_items).astype(float)
+    T = np.zeros((n_items, n_items))
+    for s in train:
+        np.add.at(T, (s[:-1], s[1:]), 1.0)
+    prior = count / count.sum()
+    def rank(S, t):
+        return int((S > S[t]).sum()) + 1
+    hits = {"popularity": [], "Markov": []}
+    for s in seqs:
+        last, target = s[-2], s[-1]
+        hits["popularity"].append(rank(count, target) <= 10)
+        hits["Markov"].append(rank((T[last] + prior) / (T[last].sum() + 1), target) <= 10)
+    return {k: round(float(np.mean(v)), 4) for k, v in hits.items()}
+
+for p in (0.0, 0.2, 0.5, 0.8):
+    print(f"p_follow={p:.1f}: recall@10 {experiment(p)}")
+```
+
+```output
+```
+
+PROSE
+
+## Exercise
+
+PROSE
+
+<details>
+<summary>Solution</summary>
+
+```python
+def bce_one_negative(model, h, y):
+    neg = torch.randint(0, n_items, y.shape)              # SASRec's original: 1 uniform negative
+    E = model.emb.weight
+    pos = (h * E[y]).sum(-1)
+    negs = (h * E[neg]).sum(-1)
+    return -(F.logsigmoid(pos) + F.logsigmoid(-negs)).mean()
+
+sas_bce = train_seq_model(SASRec(), loss_fn=bce_one_negative)
+rk_bce = ranks_of_target(scorer(sas_bce), test)
+print(f"{'SASRec loss':>22} {'recall@10':>10} {'ndcg@10':>9} {'HR@10, 100 sampled':>19}")
+for label, model_, rk in (("full softmax (CE)", sas, results["SASRec"]),
+                          ("BCE, 1 negative", sas_bce, rk_bce)):
+    r, n = metrics(rk)
+    hr_s = float((sampled_ranks(scorer(model_), test) <= 10).mean())
+    print(f"{label:>22} {r:>10.4f} {n:>9.4f} {hr_s:>19.4f}")
+```
+
+```output
+```
+
+PROSE
+</details>

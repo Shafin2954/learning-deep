@@ -7,6 +7,21 @@ order: 6
 
 ## Random walks cannot follow the typical set
 
+Chapter 3 showed where the probability mass of a $d$-dimensional posterior lives: not at the mode,
+but in a thin shell, the **typical set**, at distance about $\sqrt{d}$ from it for a standard Normal.
+Chapter 4 showed what that does to random-walk Metropolis. A proposal that is isotropic in
+$\mathbb{R}^d$ points almost entirely *out* of the shell, so the step size has to shrink like
+$1/\sqrt{d}$ for anything to be accepted, and the chain diffuses around the shell with a cost per
+independent draw that grows like $d$.
+
+What you want is a proposal that moves *along* the shell. The gradient of $\log p$ does not give you
+that by itself: it points at the mode, perpendicular to the shell. Follow it and you collapse onto
+the one point that has almost no mass around it. The fix, due to Duane et al. (1987) and explained
+geometrically by Betancourt (2017), is to add **momentum**: a particle with the right amount of
+sideways velocity, pulled toward the mode by the gradient, goes into orbit instead of falling in.
+The block below sets up the helpers used all chapter (the ESS estimator and a vectorised
+random-walk Metropolis from ch. 4) and compares the three moves on $\mathcal{N}(0, I_{100})$.
+
 ```python
 import numpy as np
 from scipy import stats, special, optimize
@@ -75,7 +90,84 @@ for t in (0.25, 0.5, 1.0, np.pi / 2):
 (c) flow for time 1.57       : |q| =   8.92 | cos(q, q0) = +0.000
 ```
 
+Gradient ascent does exactly what it promises: 50 steps take you from radius 9.66 to 0.05, the
+mode, a point no posterior draw ever lands near. A thousand well-tuned random-walk steps
+(acceptance 0.23, the optimum of ch. 4) leave you still 0.19-correlated with where you started.
+The Hamiltonian flow keeps the radius near $\sqrt{d}$ while the direction rotates away from the start, and
+after time $\pi/2$ the cosine with the start is zero: for this target the flow at time $\pi/2$
+returns the momentum you drew, so one trajectory delivers an *independent* draw. The rest of the chapter is about
+getting that behaviour for targets where you cannot solve the flow exactly.
+
 ## Hamiltonian dynamics
+
+Picture the negative log posterior as a bowl-shaped landscape and the sampler as a frictionless puck
+on it. Pushed sideways, the puck does not slide to the bottom. It circles, trading height for speed
+and back, and it covers the whole rim at the height its energy allows. Hamiltonian dynamics is that
+physics written down.
+
+Augment the position $q \in \mathbb{R}^d$ (your parameters) with a momentum $p \in \mathbb{R}^d$ and
+define the joint density $\pi(q, p) \propto e^{-H(q,p)}$ with
+
+$$
+H(q, p) = \underbrace{-\log p(q \mid y)}_{U(q),\ \text{potential energy}} + \underbrace{\tfrac{1}{2} p^\top M^{-1} p}_{K(p),\ \text{kinetic energy}}
+$$
+
+The joint factorises as $p(q \mid y)\,\mathcal{N}(p \mid 0, M)$, so the $q$-marginal is exactly your
+posterior: sample $(q, p)$ jointly and throw $p$ away. The **mass matrix** $M$ is a free choice;
+take $M = I$ until the mass-matrix section. Hamilton's equations move the pair through phase space:
+
+$$
+\frac{dq}{dt} = \frac{\partial H}{\partial p} = M^{-1} p, \qquad
+\frac{dp}{dt} = -\frac{\partial H}{\partial q} = \nabla_q \log p(q \mid y)
+$$
+
+The gradient now changes the *momentum*, not the position. Three properties of this flow make it
+a valid MCMC proposal.
+
+### Energy is conserved
+
+This shows that $H$ stays constant along the exact flow. By the chain rule and the equations of motion,
+
+$$
+\frac{dH}{dt} = \frac{\partial H}{\partial q}^{\!\top}\frac{dq}{dt} + \frac{\partial H}{\partial p}^{\!\top}\frac{dp}{dt}
+= \frac{\partial H}{\partial q}^{\!\top}\frac{\partial H}{\partial p} - \frac{\partial H}{\partial p}^{\!\top}\frac{\partial H}{\partial q} = 0
+$$
+
+The flow moves along a level set of $H$, so $\pi(q,p) \propto e^{-H}$ is the same at the start and
+the end of a trajectory. A Metropolis step would accept with probability one.
+
+### Volume is preserved
+
+This shows that the flow neither squeezes nor stretches regions of phase space. The velocity field $F(q,p) = (\partial H/\partial p,\ -\partial H/\partial q)$ has divergence
+
+$$
+\nabla \cdot F = \sum_i \frac{\partial^2 H}{\partial q_i \partial p_i} - \frac{\partial^2 H}{\partial p_i \partial q_i} = 0
+$$
+
+so by Liouville's theorem the flow map has Jacobian determinant 1. No density correction for a
+change of variables is needed (contrast the Jacobian you had to add for $\log\sigma$ in ch. 4).
+
+### The flow is reversible
+
+This shows that the flow can be run backwards exactly. If you run the flow for time $T$, negate $p$, and run it for $T$ again, you return to the start with
+negated momentum. So the map "flow for $T$, then flip $p$" is its own inverse, an **involution**.
+That is what makes a deterministic proposal satisfy detailed balance, as the HMC section shows.
+
+## Euler drifts, leapfrog does not
+
+You cannot solve Hamilton's equations exactly for a real posterior, so you discretise with step
+size $\varepsilon$. The obvious scheme, Euler, updates $q$ and $p$ simultaneously from the old state.
+The **leapfrog** (Störmer–Verlet) integrator splits the momentum update into two half steps around a
+full position step:
+
+$$
+p_{1/2} = p_0 + \tfrac{\varepsilon}{2}\nabla \log p(q_0), \quad
+q_1 = q_0 + \varepsilon M^{-1} p_{1/2}, \quad
+p_1 = p_{1/2} + \tfrac{\varepsilon}{2}\nabla \log p(q_1)
+$$
+
+The test below integrates $U(q) = q^2/2$ (a standard Normal target) with all three schemes to time 100,
+and estimates the Jacobian determinant of one step by finite differences.
 
 ```python
 def leapfrog_1d(q, p, eps, n, grad):
@@ -139,7 +231,62 @@ leapfrog eps = 2.01: max |H - H0| over 200 steps = 6.77e+33
 leapfrog eps = 2.20: max |H - H0| over 200 steps = 1.95e+153
 ```
 
+Euler's energy goes from 0.5 to $10^4$: every step multiplies phase-space volume by
+$1 + \varepsilon^2 = 1.01$ (the determinant of $\begin{pmatrix}1 & \varepsilon\\ -\varepsilon & 1\end{pmatrix}$),
+so the orbit spirals outward and $1.01^{1000} \approx 2 \times 10^4$. Leapfrog's error stays bounded
+at $1.25 \times 10^{-3}$ forever. It is not zero, but it does not accumulate. Running leapfrog
+forward, flipping $p$ and running back returns to the start to $10^{-16}$; Euler misses by 0.28.
+
+### Why leapfrog works: shears and a shadow Hamiltonian
+
+This explains why leapfrog's energy error stays bounded. Each leapfrog sub-step changes only one of $q, p$ by an amount that depends only on the other.
+That is a **shear**, with Jacobian $\begin{pmatrix} I & 0 \\ \ast & I\end{pmatrix}$ or
+$\begin{pmatrix} I & \ast \\ 0 & I\end{pmatrix}$ and determinant exactly 1. A composition of shears
+is volume-preserving, and in fact **symplectic**, which is stronger. The symmetric
+half–full–half arrangement makes it time-reversible too. Symplectic Euler, a single
+momentum shear followed by a position shear, is also volume-preserving but not symmetric: its error
+is $O(\varepsilon)$ (2.6e-2 above) where leapfrog's is $O(\varepsilon^2)$ (1.25e-3). The deep reason
+the error stays bounded is backward error analysis. A symplectic integrator exactly conserves a
+nearby **shadow Hamiltonian** $\tilde H = H + O(\varepsilon^2)$, so $H$ can only oscillate around its
+initial value, never drift.
+
+### The stability limit
+
+This shows that leapfrog has a hard maximum step size. For $U = q^2/(2\sigma^2)$ one leapfrog step is a linear map with eigenvalues on the unit circle
+exactly when $\varepsilon < 2\sigma$. Beyond that they become real and one exceeds 1 in modulus, so
+the orbit grows geometrically. The table shows a cliff, not a slope: the energy error is 0.495 at
+$\varepsilon = 1.99$ and $10^{33}$ at $2.01$. In $d$ dimensions the binding constraint is the
+*smallest* posterior scale. Keep this in mind for divergences.
+
 ## The HMC algorithm
+
+Each iteration gives the puck a random kick, lets it slide for a while, and then runs a Metropolis
+check. The check only exists to correct the small energy error of the integrator.
+
+One HMC iteration from the current $q$:
+
+1. Draw a fresh momentum $p \sim \mathcal{N}(0, M)$. This is a Gibbs step on $p$ given $q$, and it is what lets the sampler change energy level.
+2. Run $L$ leapfrog steps of size $\varepsilon$ to get $(q^\ast, p^\ast)$, then negate $p^\ast$.
+3. Accept $q^\ast$ with probability $\min\left(1, e^{-\Delta H}\right)$, $\Delta H = H(q^\ast, p^\ast) - H(q, p)$.
+
+### Why the acceptance is $e^{-\Delta H}$
+
+This shows that the Metropolis ratio reduces to the energy error. The proposal $\Phi$ (leapfrog $L$ times, then flip $p$) is deterministic. For a deterministic
+proposal, the Metropolis–Hastings ratio of ch. 4 becomes a ratio of densities times the Jacobian of
+the map. It is valid only if $\Phi$ is an involution, $\Phi(\Phi(z)) = z$, so that the reverse move
+proposes the original point. Leapfrog plus flip is an involution (reversibility) and has
+$|\det \nabla\Phi| = 1$ (shears), so
+
+$$
+\alpha(z \to \Phi(z)) = \min\left(1, \frac{\pi(\Phi(z))}{\pi(z)}\,\lvert\det \nabla\Phi(z)\rvert\right) = \min\left(1, e^{H(z) - H(\Phi(z))}\right)
+$$
+
+The flip is never visible because the next step redraws $p$, and $K$ is symmetric anyway. The
+integrator's energy error is the *only* reason anything gets rejected. Since that error is bounded and
+$O(\varepsilon^2)$, you can take long trajectories with high acceptance. The implementation below runs
+$C$ chains in lockstep. It also records, for each transition, the largest energy error seen *along*
+the trajectory, which the divergence section needs. The test target is the banana of ch. 4, with a
+hand-derived gradient checked against finite differences.
 
 ```python
 def hmc(logp_grad, x0, n_iter, eps, L=None, Minv=None, jitter=False, rng=rng, adapt=None, T=None):
@@ -211,7 +358,23 @@ HMC : accept 0.971 | E[x1] -0.106 | E[x2] +0.155 | Var x1  104.9 (100) | Var x2 
 RWM : accept 0.456 | Var x1   96.7 | Var x2 19.40 | ESS [1279. 1662.] from 320000 evals -> ESS/eval 0.0040
 ```
 
+The hand gradient matches to $10^{-9}$. Check this every time: a wrong gradient does not crash HMC.
+The energy error grows instead, acceptance quietly drops, and you get a slow sampler, not an error. HMC
+recovers the banana's moments (the $x_2$ variance has a heavy tail, so its estimate is noisy for both samplers).
+
+The efficiency comparison is honest and unspectacular: 0.0116 ESS per gradient against 0.0040 ESS
+per density evaluation for RWM, about 3x. In two dimensions a random walk is not badly off, and a
+gradient costs at least as much as a density evaluation (reverse-mode autodiff costs a small constant
+multiple, typically 2–5x). The gap that matters opens with dimension, two sections down.
+
 ## Step size and path length
+
+HMC has two knobs. The step size $\varepsilon$ trades integration error (rejections) against cost
+per unit of simulated time. The integration time $T = L\varepsilon$ sets how far each proposal
+travels. The grid below is on a 50-dimensional Normal with scales from 0.5 to 2, so leapfrog is
+unstable above $\varepsilon = 1$. Efficiency is reported per gradient evaluation, for both the
+coordinates and their squares. Squares matter because they measure how well the sampler explores
+the *radius* of the typical set, and HMC can be good at one and bad at the other.
 
 ```python
 sd50 = np.linspace(0.5, 2.0, 50)                           # 50-d Gaussian, scales 0.5 .. 2
@@ -253,7 +416,20 @@ for e in (0.1, 0.3, 0.6, 0.9, 1.05):
  1.05  4.0    4   0.006       0.0023         0.0023
 ```
 
+Three regimes are visible. With small steps ($\varepsilon = 0.1$) acceptance is 0.99, and you are
+paying for precision you do not need: each unit of travel costs 10 gradients. Near the stability
+limit ($\varepsilon \ge 0.9$) acceptance collapses, from 0.31 at best down to 0.006 at $\varepsilon = 1.05$.
+In between, $\varepsilon = 0.6$ with acceptance around 0.7 gives the best
+numbers in the table, 0.078 ESS per gradient for $x^2$ at $T = 2$. The best $T$ also differs by
+statistic: $T = 4$ is best for the means ($x$) and worst for the squares. Theory (Beskos et al.,
+2013) says the optimal acceptance for HMC on product targets is about 0.65 as $d \to \infty$, and in
+practice slightly higher targets are more robust on non-Gaussian posteriors. That is why Stan aims at 0.8.
+
 ### Resonance: why the path length must be jittered
+
+For a Gaussian, every trajectory is a rotation in each $(q_i, p_i)$ plane with period $2\pi\sigma_i$.
+A fixed $T$ that hits a multiple of the half-period for some coordinate gives that coordinate a
+perfectly predictable move. Here is $\mathcal{N}(0, I_{10})$ with $\varepsilon = 0.2$.
 
 ```python
 target10 = gauss_diag(np.ones(10))
@@ -273,7 +449,43 @@ T = 3.2, jittered L            0.1466         0.0204
 T = 1.6 (about pi/2)           0.1089         0.0975
 ```
 
+At $T \approx 2\pi$ the trajectory comes back to where it started: 0.0002 ESS per gradient, the sampler does not move.
+At $T \approx \pi$ it lands at $-q$. That is **antithetic** for $x$ (excellent ESS, here capped at
+$n \log_{10} n$ as Stan does), and useless for $x^2$, which does not change at all (0.0007). Jittering
+$L$ uniformly on $[L/2, 3L/2]$ breaks the resonance (0.0204 for $x^2$). Real posteriors have a
+spread of scales, so some direction is always near-resonant with some fixed $T$. Always jitter $L$ or
+$\varepsilon$. The $T = \pi/2$ row is the oracle answer for this target, the quarter period where $q(T) = p(0)$.
+
 ## Tuning the step size by dual averaging
+
+You rarely know a good step size in advance, so you let warmup find it. Shrink the step when too many
+proposals are rejected, grow it when too few are, and settle on the size that gives about 80%
+acceptance.
+
+You want $\varepsilon$ such that the average acceptance statistic $\alpha_t = \min(1, e^{-\Delta H_t})$
+hits a target $\delta$ (0.8 by default). This is a stochastic root-finding problem in $\log\varepsilon$.
+The plain Robbins–Monro update of ch. 4 works but is slow to recover from a bad start. Hoffman and Gelman
+(2014) adapt Nesterov's **dual averaging**.
+
+### The update
+
+This is the recursion Stan runs during warmup. With $\bar H_t$ the running average of $\delta - \alpha_t$,
+
+$$
+\bar H_t = \left(1 - \frac{1}{t + t_0}\right)\bar H_{t-1} + \frac{\delta - \alpha_t}{t + t_0}, \qquad
+\log\varepsilon_t = \mu - \frac{\sqrt{t}}{\gamma}\,\bar H_t
+$$
+
+$$
+\log\bar\varepsilon_t = t^{-\kappa}\log\varepsilon_t + \left(1 - t^{-\kappa}\right)\log\bar\varepsilon_{t-1}
+$$
+
+If acceptance runs too low, $\bar H$ grows positive and $\varepsilon$ shrinks. The $\sqrt{t}/\gamma$
+gain lets early iterations take big exploratory jumps around the shrinkage point
+$\mu = \log(10\,\varepsilon_0)$. The $t_0$ term damps the first few, and $\gamma = 0.05$,
+$t_0 = 10$, $\kappa = 0.75$ are Stan's defaults. The iterate $\varepsilon_t$ keeps
+oscillating. What you *use* after warmup is the weighted average $\bar\varepsilon$, which converges.
+Then you freeze it: adapting forever breaks the Markov property (ch. 4).
 
 ```python
 class DualAveraging:
@@ -324,7 +536,38 @@ eps0 =  0.01: t=1: 0.144  t=5: 0.260  t=20: 0.264  t=50: 0.626  t=100: 0.492  t=
   0.99    0.144               0.987         0.0126
 ```
 
+From a step that is 4x too large or 50x too small, the iterate lands near 0.5 within 100 iterations
+and the averaged $\bar\varepsilon$ is 0.53 or 0.52 either way. The realised acceptance during
+sampling matches the target closely, 0.804 for $\delta = 0.8$. Raising $\delta$ buys a smaller step
+and a more accurate integrator at a proportional cost in efficiency: at $\delta = 0.99$ the
+sampler is 2.5x less efficient here than at 0.8. On this easy Gaussian that is pure waste. On a posterior with
+regions of high curvature it is the first thing you try (next sections show when it helps and when it
+does not).
+
 ## The mass matrix: preconditioning from warmup
+
+If one parameter has scale 0.1 and another has scale 3, a single step size is too big for the first
+and too small for the second. The mass matrix rescales the space so every direction looks about
+equally wide. This is the HMC version of preconditioning.
+
+The leapfrog stability limit is set by the smallest scale, while the time needed to cross the
+posterior is set by the largest. Their ratio, the square root of the condition number, is roughly the number of leapfrog
+steps per independent draw. The mass matrix fixes this.
+
+### A mass matrix is a change of coordinates
+
+This shows that a mass matrix is the same as running identity-mass HMC on rescaled parameters. Substitute $q = M^{-1/2} z$. Then $\mathcal{N}(p \mid 0, M)$ momentum with dynamics
+$\dot q = M^{-1}p$ is exactly identity-mass HMC on $z$, whose target has covariance
+$M^{1/2}\,\Sigma\,M^{1/2}$. Choosing $M^{-1} \approx \Sigma$, the posterior covariance, makes the $z$
+target close to isotropic, so one step size fits all directions. This is the same preconditioning
+as the proposal covariance of RWM in ch. 4. Here it lives in the kinetic energy, so the sampler's
+correctness never depends on it.
+
+Stan estimates $M^{-1}$ from warmup draws in expanding windows. The simplified version below uses
+three windows: tune $\varepsilon$, collect draws to estimate the metric (diagonal variances or the full
+covariance, shrunk slightly toward the identity), then re-tune $\varepsilon$ under the new metric. To
+isolate the metric's effect, the path length is set by an oracle, $\pi/2$ times the largest scale in
+the metric's coordinates. NUTS will remove the need for that oracle.
 
 ```python
 def warmup(logp_grad, x0, metric, T_fn, windows=(100, 300, 200), rng=rng):
@@ -370,7 +613,24 @@ same scales, rotated: condition number 1000
   dense     eps 0.756 | steps/iter   2.5 | accept 0.814 | min ESS(x^2)/grad 0.1065 | max sd error 7.4%
 ```
 
+On the axis-aligned target, the identity metric forces $\varepsilon \approx 0.13$ (the 0.1 scale)
+and 40 steps per iteration to cross the 3.2 scale. A diagonal metric learned from 300 warmup draws
+makes the problem isotropic: $\varepsilon \approx 0.7$, 2 steps per iteration, and 38x more ESS per
+gradient. The dense metric is slightly worse there, because it estimates 210 covariance entries
+instead of 20 from the same draws and has more noise to show for it. Rotate the same target and the
+picture flips. The marginal variances no longer carry the structure, so the diagonal metric is no
+better than the identity, and only the dense metric recovers the 2-step regime. Stan defaults to
+diagonal because dense costs $O(d^2)$ memory and $O(d^2)$ per leapfrog step and needs many more
+warmup draws to estimate. Use dense when $d$ is in the low hundreds or less and you see strong
+posterior correlations. The sd errors of 4–7% are Monte Carlo noise at about 2400 draws, not bias.
+
 ## Any differentiable model: gradients from autograd
+
+Hand gradients do not scale to real models. Write the log density in torch and let reverse-mode autodiff
+supply $\nabla \log p$ at a few times the cost of $\log p$ itself. The wrapper below turns any
+torch function of a $(C, d)$ tensor into the `(logp, grad)` interface `hmc()` already uses. Nothing
+else changes. The model is Bayesian logistic regression, 13 coefficients, correlated features,
+$\beta_j \sim \mathcal{N}(0, 2.5^2)$, checked against an importance-sampling reference as in ch. 4.
 
 ```python
 torch.set_default_dtype(torch.float64)
@@ -432,12 +692,41 @@ print(f"HMC: eps {eps_lr:.3f}, {r['n_grad'] / 4000:.1f} gradients per iteration,
 ```output
 autograd vs hand-derived gradient X^T(y - sigmoid) - B / tau^2: max diff 1.4e-13
 IS reference: effective sample size 55113 of 100000
-RWM, Laplace covariance        accept 0.265 | min ESS   1491 | ESS per eval/grad 0.0186 | max |err|/MCSE 2.15 | 4.2s
-HMC, dense metric (autograd)   accept 0.824 | min ESS   1962 | ESS per eval/grad 0.0471 | max |err|/MCSE 2.33 | 9.2s
-HMC: eps 0.747, 2.0 gradients per iteration, 33556 of the gradients were warmup
+RWM, Laplace covariance        accept 0.265 | min ESS   1491 | ESS per eval/grad 0.0207 | max |err|/MCSE 2.15
+HMC, dense metric (autograd)   accept 0.824 | min ESS   1962 | ESS per eval/grad 0.2418 | max |err|/MCSE 2.33
+HMC: eps 0.747, 2.0 gradients per iteration, plus 33556 gradients of warmup (not counted above)
 ```
 
+Autograd agrees with the hand-derived gradient $X^\top(y - \sigma(X\beta)) - \beta/\tau^2$ to
+$10^{-13}$. Both samplers match the reference within Monte Carlo error: the largest error over 13
+coefficients is about 2 MCSE, what you expect from the maximum of 13 roughly standard normal z-scores.
+HMC with a dense metric uses only 2 leapfrog steps per iteration at $\varepsilon \approx 0.75$ and
+gets 0.24 ESS per gradient. RWM was *given* the Laplace covariance for free and gets 0.021, about
+11x less per evaluation. Two caveats keep this honest. First, HMC's warmup spent 33556 gradients, about four times
+its sampling budget. That is a fixed cost, and it pays off only if you draw enough samples afterwards. Second, at $d = 13$ a
+torch gradient call costs much more than a vectorised numpy density evaluation, because of per-call
+overhead. The per-gradient advantage is what grows with $d$; the overhead does not.
+
 ## How the cost grows with dimension
+
+A random walk in 100 dimensions needs about 50 times as many steps per independent draw as in 2
+dimensions. HMC needs only slightly more. This section measures that.
+
+The scaling theory is the reason HMC exists. For product targets, optimally tuned RWM needs
+$O(d)$ density evaluations per independent draw (ch. 4). MALA, one Langevin step with a gradient, needs $O(d^{1/3})$. HMC needs
+$O(d^{1/4})$ gradients (Beskos et al., 2013).
+
+### Where $d^{1/4}$ comes from
+
+This shows why the step size only has to shrink like $d^{-1/4}$. Leapfrog's local energy error per unit time is $O(\varepsilon^2)$ per coordinate. Over a trajectory
+of fixed length $T$, the per-coordinate errors behave like independent terms with mean
+$O(\varepsilon^4)$ and comparable variance, so $\Delta H$ summed over $d$ coordinates has mean and
+variance $O(d\,\varepsilon^4)$. Acceptance stays bounded away from zero iff $d\,\varepsilon^4 = O(1)$,
+so $\varepsilon \propto d^{-1/4}$, and a fixed $T$ costs $T/\varepsilon \propto d^{1/4}$ gradients.
+
+The experiment uses $\mathcal{N}(0, I_d)$, $d$ from 2 to 100. RWM uses the optimal $2.38/\sqrt{d}$ scale.
+HMC uses dual-averaged $\varepsilon$ and a jittered $T = 1.5$. Cost per independent draw is measured
+on the worse of $x_j$ and $x_j^2$ for the first five coordinates.
 
 ```python
 rng = np.random.default_rng(7)
@@ -464,7 +753,27 @@ for d in (2, 5, 10, 20, 50, 100):
  100 |      0.237              376.3 |    0.474   0.816                7.5
 ```
 
+RWM's cost per independent draw goes from 7.8 to 376, almost exactly linear in $d$. HMC's goes from
+2.4 to 7.5 and is flat from $d = 5$ on. The adapted step size falls from 1.15 to 0.47, a factor
+2.4 over a 50-fold increase in $d$, which is close to $50^{1/4} = 2.66$. At $d = 100$ HMC needs
+50x fewer gradient evaluations than RWM needs density evaluations. Even at 5x the cost per gradient, that is
+an order of magnitude, and the gap keeps widening. This is the main reason HMC is the default engine in Stan, PyMC and NumPyro.
+
 ## Divergences: when the integrator breaks
+
+The stability limit $\varepsilon < 2\sigma$ is *local*. In a posterior whose curvature varies, a
+step size tuned to the bulk can be unstable in a small region of high curvature, and in that region
+the energy error explodes rather than oscillating. Stan calls a transition **divergent** when the energy
+error along the trajectory exceeds a threshold (1000 here, as in Stan). A divergence is not a numerical nuisance.
+It tells you the sampler cannot enter that region, so expectations computed from your draws are
+**biased**, not just noisy.
+
+Neal's funnel is the canonical example and the prototype of every hierarchical model (ch. 10):
+$v \sim \mathcal{N}(0, 3)$, $x_i \mid v \sim \mathcal{N}(0, e^{v/2})$ for $i = 1..9$. At $v = -5$
+the $x$-scale is $e^{-2.5} \approx 0.08$, so the stable step size there is about 0.16. At $v = 5$
+the $x$-scale is 12. No single step size works everywhere. The **non-centred** parameterisation samples
+$\tilde v, z_i \sim \mathcal{N}(0, 1)$ and computes $v = 3\tilde v$, $x_i = e^{v/2} z_i$ afterwards.
+Same model, but the geometry the sampler sees is an isotropic Gaussian.
 
 ```python
 def funnel(x):                                               # Neal's funnel: v ~ N(0, 3), x_i | v ~ N(0, e^{v/2}), 9 x's
@@ -497,7 +806,62 @@ centred, delta 0.95      eps 0.171 | divergent  0.00% | 5% -3.74 | P(v<-3) 0.112
 non-centred, delta 0.80  eps 0.873 | divergent  0.00% | 5% -4.94 | P(v<-3) 0.163 | sd 3.01 | min v -11.49
 ```
 
+The centred sampler with $\delta = 0.8$ reports divergences on only 0.29% of transitions, and they
+occur at $v \approx -2.2$, the mouth of the neck. It never gets below $v = -2.9$. The true 5%
+quantile is $-4.93$ and $P(v < -3) = 0.159$; the sampler reports $-2.54$ and $0.000$. The
+divergences are rare *because* the sampler does not go where they would happen. Raising $\delta$ to 0.95
+shrinks $\varepsilon$ to 0.17, removes the divergences and gets further down ($-4.69$), but the tail
+is still truncated ($P(v<-3) = 0.112$). Zero divergences does not prove you are unbiased. The
+non-centred version, with a step size five times larger and no divergences, matches every number.
+The diagnostic workflow for divergences (where they occur, pairs plots, energy plots) is ch. 7, and
+non-centring as a modelling tool is ch. 10.
+
 ## NUTS: let the trajectory decide when to stop
+
+Too short a trajectory wastes the momentum, and too long a trajectory comes back to where it started. NUTS keeps
+integrating until the path starts heading back toward its start, then stops, so you never choose
+$T$ yourself.
+
+The step-size and resonance tables showed that the best $T$ depends on the target, the statistic, and the
+region of the posterior. The No-U-Turn Sampler (Hoffman & Gelman, 2014) picks the trajectory length
+per iteration, adaptively, without breaking detailed balance.
+
+### The U-turn criterion
+
+This shows how to detect, from the two ends alone, that a trajectory has started coming back. The squared distance from the start grows at rate
+
+$$
+\frac{d}{dt}\,\frac{1}{2}\lVert q(t) - q(0)\rVert^2 = \bigl(q(t) - q(0)\bigr)^\top \frac{dq}{dt} = \bigl(q(t) - q(0)\bigr)^\top M^{-1} p(t)
+$$
+
+When this goes negative, the trajectory has started coming back and further simulation is wasted.
+NUTS applies the check symmetrically to both ends of a trajectory $[q^-, q^+]$. It stops when
+$(q^+ - q^-)^\top M^{-1} p^- < 0$ or $(q^+ - q^-)^\top M^{-1} p^+ < 0$. Stan uses a generalised
+version that replaces $q^+ - q^-$ by the sum of momenta along the trajectory, which also works on
+non-Euclidean metrics. The idea is the same.
+
+### Doubling keeps it reversible
+
+This explains why NUTS grows the trajectory by doubling. Stopping "when you U-turn" naively breaks detailed balance, because the trajectory you would build
+from the end point is not the one you built from the start. NUTS restores the symmetry by building
+the trajectory as a **random binary tree**. At each depth $j$ it picks a direction (forward or backward
+in time) with probability 1/2 and integrates $2^j$ new steps from that end, doubling the length.
+Any point on the final trajectory could have generated the same trajectory with the same probability,
+*except* that a new subtree which contains a U-turn among its own balanced sub-trees must be thrown
+away. From some of its points the trajectory would have stopped earlier. Those internal checks are
+the inner loop of the code below.
+
+### Choosing the next state: multinomial sampling
+
+This explains how one state is picked from the whole trajectory. Every state on the trajectory has weight $e^{-H}$. Choosing among them in proportion to that weight
+is a valid transition, a generalisation of the Metropolis step to many candidates (Betancourt,
+2017). The original NUTS used slice sampling for this. Modern Stan uses the multinomial version. It also
+biases the choice toward the newest subtree: it moves to the new subtree's candidate with probability
+$\min(1, W_{\text{new}}/W_{\text{old}})$, which favours states far from the start and stays valid.
+Divergences end the tree too: a step with energy error above 1000 stops the iteration and is
+flagged. The implementation below is a compact single-chain version of that scheme. It is tuned
+with the same dual averaging, using the mean acceptance statistic over the trajectory, and then
+compared with fixed-length HMC across a range of $T$ on the 50-dimensional target.
 
 ```python
 def nuts(logp_grad, x0, n_iter, eps, Minv=None, max_depth=10, rng=rng, adapt=None):
@@ -598,7 +962,22 @@ HMC, T = 4.0                  8.1       0.0783         0.0242
 HMC, T = 6.0                 11.9       0.0383         0.0156
 ```
 
+NUTS settled on trajectories of 15 leapfrog steps most of the time (tree depth 3, so
+$1 + 2 + 4 + 8$) and 7 steps the rest. With $\varepsilon \approx 0.5$ that is a total time of about 7,
+roughly a half-orbit of the widest coordinate. Is that good? Compared with the
+fixed-$T$ grid it is middling, and you should know why. For the means, NUTS (0.068) beats every $T$
+except 3 and 4. For the squares it is 3x worse than the best fixed $T$, because a half-orbit is the
+antithetic point for $x$ and the worst place for $x^2$, as the resonance section showed. Doubling
+also overshoots: the true U-turn length lies somewhere inside the last doubling, and you pay for all
+of it. What NUTS buys is not peak efficiency on a target you have already studied. It buys **not
+needing the grid at all**, and adapting $T$ per iteration on posteriors where the right length
+changes from region to region. Well-tuned static HMC can beat it by a small factor. A badly tuned one
+loses by an order of magnitude.
+
 ### NUTS on the funnel and on the logistic regression
+
+The same sampler on the logistic regression (diagonal metric taken from the warmup above, numpy
+gradient) and on both funnels.
 
 ```python
 def logit_hand(B):                                           # numpy log density + hand gradient, (C, 13)
@@ -625,7 +1004,21 @@ funnel, centred      eps 0.447 | steps/iter  34.2 | divergent  0.12% | 5% of v -
 funnel, non-centred  eps 0.824 | steps/iter   5.5 | divergent  0.00% | 5% of v -4.96 (-4.93) | P(v<-3) 0.154 (0.159) | min v -10.38
 ```
 
+On the logistic regression NUTS matches the reference within Monte Carlo error with no tuning of
+$T$. It takes 9 steps per iteration where dense-metric HMC took 2, because the diagonal metric
+leaves the feature correlations in place and NUTS correctly runs longer trajectories to cross them.
+On the centred funnel adaptive length does not save you. NUTS spends 34 steps per iteration, still
+cannot get below $v = -3.2$ (true 5% quantile $-4.93$), and flags divergences. Trajectory length
+cannot fix a step size that is wrong for part of the space. Changing the geometry can: the
+non-centred funnel needs 5.5 steps per iteration and reproduces the tail. Hierarchical models are
+built on exactly this lesson (ch. 10).
+
 ## Try it Yourself
+
+A complete HMC sampler in 20 lines on an equicorrelated 20-dimensional Gaussian: a narrow direction
+with scale 0.32 and a wide one (the sum of the coordinates) with scale 4.25. The last line of output
+checks a useful identity. Because the leapfrog map preserves volume and is reversible, $\mathbb{E}[e^{-\Delta H}] = 1$
+at stationarity. A value far from 1 means a bug in the gradient or the integrator.
 
 ```python
 import numpy as np
@@ -667,7 +1060,21 @@ accept 0.971 | mean |dH| 0.057 | E[exp(-dH)] 1.002 (theory 1)
 Var(sum x) 381.3 (truth 362.0) | lag-1 autocorr: x1 +0.721, sum x +0.780
 ```
 
+With $\varepsilon = 0.1$ the integrator is accurate (acceptance 0.97), but $T \approx 3$ is too short
+for the wide direction of scale 4.25, so the sum of the coordinates is still 0.78-autocorrelated at lag 1.
+Push $\varepsilon$ to 0.3, then past the stability limit of 0.63, and watch acceptance and
+$\mathbb{E}[e^{-\Delta H}]$. Lengthen $L$ until the lag-1 autocorrelation of the sum drops. Then set
+$\rho = 0.99$: the condition number becomes about 2000, and you will want the mass matrix.
+
 ## Exercise
+
+Robust regression. Simulate $n = 200$ points $y_i = 1 + 2x_{i1} - 0.5x_{i2} + 0.8\,t_3$ noise. Fit
+$y_i \sim \text{Student-}t_4(x_i^\top\beta, \sigma)$ with $\beta_j \sim \mathcal{N}(0, 5)$ and
+$\sigma \sim \mathrm{HalfNormal}(2)$.
+
+1. Write the log density in torch on the unconstrained space $(\beta, \log\sigma)$, including the Jacobian term (ch. 4).
+2. Sample it with this chapter's `hmc()` using the three-window warmup with a dense metric, and with `nuts()` using a diagonal metric.
+3. Report posterior means and sds of $\beta$ and $\sigma$ from both, the minimum ESS per gradient, and the divergence rate. Compare with ordinary least squares and explain any difference.
 
 <details>
 <summary>Solution</summary>
@@ -691,7 +1098,7 @@ lp_rr = autograd(lp_robust)
 x0 = rng.standard_normal((4, 4))
 xw, Minv_rr, eps_rr, ngw = warmup(lp_rr, x0, "dense", lambda M: 1.5 * np.sqrt(np.max(M)), rng=rng)
 r = hmc(lp_rr, xw, 800, eps_rr, T=1.5, Minv=Minv_rr, jitter=True, rng=rng)
-dr_n, st, e_n = run_nuts(one(lp_rr), x0, 300, 800, Minv=np.diag(Minv_rr), rng=rng)
+dr_n, st, e_n = run_nuts(one(lp_rr), x0, 200, 600, Minv=np.diag(Minv_rr), rng=rng)
 names = ["b0", "b1", "b2", "sigma"]
 for label, dr, ng, div in (("HMC dense", r["draws"], r["n_grad"], r["div"].mean()),
                            ("NUTS diag", dr_n, st[:, 1].sum(), st[:, 3].mean())):
@@ -707,5 +1114,14 @@ HMC dense  b0 +1.029+-0.077 b1 +2.093+-0.077 b2 -0.462+-0.074 sigma +0.865+-0.06
 NUTS diag  b0 +1.029+-0.075 b1 +2.095+-0.078 b2 -0.464+-0.077 sigma +0.867+-0.057 | min ESS/grad 0.2556 | divergent 0.0%
 OLS fit    b0 +1.019 b1 +2.103 b2 -0.508   (truth +1, +2, -0.5)
 ```
+
+Both samplers agree on every coefficient to within a few thousandths, far inside the posterior sds,
+which is the strongest check you have when there is no closed-form answer. The Jacobian term
+$+\log\sigma$ is what makes `sigma` come out right. Drop it and the posterior on $\sigma$ shifts
+downward (ch. 4). The $t_4$ likelihood down-weights the heavy-tailed residuals, so its $\beta_2$
+($-0.46$) is closer to the truth than OLS's ($-0.51$). It also reports $\sigma \approx 0.87$, a
+*scale*, not a standard deviation: a $t_4$ with scale 0.87 has sd $0.87\sqrt{2} \approx 1.2$. On
+four parameters the dense-metric HMC with 2 steps per iteration is more efficient per gradient than
+NUTS. That is the usual pattern on small, well-conditioned problems once the warmup has done its job.
 
 </details>

@@ -50,6 +50,10 @@ for name, df in (("history A (ranker features)", hist_A), ("window B (ranker lab
 ```
 
 ```output
+     history A (ranker features):  80,818 events, days   0-239
+        window B (ranker labels):  22,598 events, days 240-299
+  history A+B (serving features): 103,416 events, days   0-299
+                 window C (test):  23,087 events, days 300-359
 ```
 
 BUDGET PROSE
@@ -72,6 +76,14 @@ print(f"model time of the two rankers: {sum(k * us for _, k, us in funnel) / 1_0
 ```
 
 ```output
+                                             model  items in 100 ms  full catalogue
+                    dot product, d=64, brute force        5,000,000           0.2 s
+                  GBDT ranker, 500 trees x depth 8           20,000          50.0 s
+ deep cross-feature ranker (MLP over 300 features)            2,500         400.0 s
+       transformer cross-encoder over user history               50      20,000.0 s
+
+funnel: ANN retrieval (10,000,000) -> light ranker (2,000) -> heavy ranker (300) -> re-rank / rules (50)
+model time of the two rankers: 22.0 ms
 ```
 
 ## Several retrievers, one candidate set
@@ -143,6 +155,9 @@ print(f"items proposed by 1/2/3/4 sources: "
 ```
 
 ```output
+ranker-train users 2,395 | test users 2,381
+4 sources x 50 = 200 slots -> 83.8 unique candidates per user (min 65, max 119)
+items proposed by 1/2/3/4 sources: 22.8 / 26.9 / 13.1 / 21.0
 ```
 
 ## Candidate recall is the ceiling
@@ -163,6 +178,12 @@ for name in ("pop", "trend", "icf", "als", "union"):
 ```
 
 ```output
+  source    R@10    R@25    R@50   R@100
+     pop  0.0852  0.1612  0.2540  0.3874
+   trend  0.0838  0.1574  0.2514  0.3770
+     icf  0.1029  0.1978  0.3048  0.4504
+     als  0.1147  0.2231  0.3449  0.4927
+   union  0.1711  0.2940  0.4193  0.5587
 ```
 
 ### Why stage one bounds every later stage
@@ -188,6 +209,12 @@ for n in (5, 10, 25, 50, 100):
 ```
 
 ```output
+n per source    |C|  recall@|C|  oracle NDCG@10  iALS-order NDCG@10
+           5   10.7      0.1124          0.2011              0.1073
+          10   20.6      0.1711          0.2958              0.1136
+          25   44.9      0.2940          0.4613              0.1136
+          50   83.8      0.4193          0.6087              0.1136
+         100  155.6      0.5587          0.7407              0.1136
 ```
 
 ## Approximate nearest neighbours: scan less, miss a little
@@ -236,6 +263,13 @@ for n_probe in (1, 2, 4, 8, 16, 32):
 ```
 
 ```output
+ n_probe  recall@10  vectors scanned  share of brute force
+       1     0.4525              642                 0.64%
+       2     0.5810            1,039                 1.04%
+       4     0.7080            1,800                 1.80%
+       8     0.8265            3,429                 3.43%
+      16     0.9170            6,561                 6.56%
+      32     0.9705           12,764                12.76%
 ```
 
 ## The ranker's training table, built across a time gap
@@ -289,6 +323,22 @@ print(te[FEATS + ["label"]].describe().T[["mean", "std", "min", "max"]].round(3)
 ```
 
 ```output
+train (features <= t1, labels in (t1, t2]): 198,390 rows | 2,395 users | positive rate 0.0425
+test  (features <= t2, labels > t2): 199,522 rows | 2,381 users | positive rate 0.0408
+                   mean    std    min     max
+als               0.388  0.212 -0.229   1.251
+icf               6.237  4.668  0.045  38.795
+als_rank          3.699  1.189  0.000   6.801
+icf_rank          3.611  1.072  0.000   6.337
+log_pop           5.959  0.482  3.434   7.188
+log_trend         3.380  0.460  0.803   4.416
+trend_ratio      -2.579  0.134 -3.375  -1.952
+log_item_age      0.240  0.440  0.000   2.708
+user_log_n        3.468  0.840  0.693   5.617
+genre_aff         0.268  0.229  0.000   1.000
+genre_aff_recent  0.269  0.298  0.000   1.000
+n_sources         2.387  1.133  1.000   4.000
+label             0.041  0.198  0.000   1.000
 ```
 
 ## Pointwise: classify each candidate on its own
@@ -323,6 +373,11 @@ print("\nlogistic coefficients (standardised):",
 ```
 
 ```output
+retrieval only (iALS order) : NDCG@10 0.1136
+pointwise logistic          : NDCG@10 0.1151
+pointwise GBDT              : NDCG@10 0.1104
+
+logistic coefficients (standardised): als +0.43, user_log_n +0.34, genre_aff_recent +0.16, als_rank -0.15, icf -0.11, genre_aff +0.07
 ```
 
 ## Pairwise: RankNet and LambdaRank
@@ -398,6 +453,10 @@ for kind in ("pointwise", "ranknet", "lambdarank", "listwise"):
 ```
 
 ```output
+MLP  pointwise: NDCG@10 0.1076
+MLP    ranknet: NDCG@10 0.1168
+MLP lambdarank: NDCG@10 0.1167
+MLP   listwise: NDCG@10 0.1167
 ```
 
 ## End to end: does the ranker pay for itself?
@@ -420,6 +479,11 @@ print(pd.DataFrame(rows).to_string(index=False))
 ```
 
 ```output
+ n per source  mean |C|  cand. recall  iALS only  + GBDT  + LambdaRank MLP  oracle ceiling
+           10      20.6        0.1323     0.1136  0.1119            0.1165          0.2958
+           25      44.9        0.2377     0.1136  0.1098            0.1166          0.4613
+           50      83.8        0.3590     0.1136  0.1104            0.1167          0.6087
+          100     155.6        0.4955     0.1136  0.1097            0.1147          0.7407
 ```
 
 ## Leakage: the bug that makes a ranker look brilliant
@@ -443,6 +507,9 @@ for name, v, t in results:
 ```
 
 ```output
+ features  offline val NDCG@10  future test NDCG@10
+    clean               0.1150               0.1083
+    leaky               0.1163               0.1085
 ```
 
 ## Re-ranking: rules and diversity after the model
@@ -490,6 +557,12 @@ for name, pol in policies:
 ```
 
 ```output
+            policy  NDCG@10  genres in top-10  intra-list sim
+      ranker order   0.1103              2.68           0.675
+    MMR lambda=0.9   0.1102              2.81           0.666
+    MMR lambda=0.7   0.1093              3.20           0.636
+    MMR lambda=0.5   0.1049              3.83           0.584
+   cap 3 per genre   0.1010              4.41           0.552
 ```
 
 ## Try it Yourself
@@ -545,6 +618,11 @@ for kind in ("pointwise", "ranknet", "lambdarank", "listwise"):
 ```
 
 ```output
+random order NDCG@10: 0.1667
+ pointwise: NDCG@10 0.7451
+   ranknet: NDCG@10 0.7422
+lambdarank: NDCG@10 0.7452
+  listwise: NDCG@10 0.7431
 ```
 
 TRYIT PROSE
@@ -561,6 +639,7 @@ print(1)
 ```
 
 ```output
+1
 ```
 
 SOLUTION PROSE

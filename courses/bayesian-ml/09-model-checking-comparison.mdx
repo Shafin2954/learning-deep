@@ -34,6 +34,8 @@ print(f"posterior lambda: mean {lam.mean():.3f}, 95% [{np.quantile(lam, .025):.3
 ```
 
 ```output
+n=80 | mean 3.73 | var 18.00 | zeros 0.200 | max 22
+posterior lambda: mean 3.728, 95% [3.321, 4.180]
 ```
 
 ## Posterior predictive checks done properly
@@ -70,6 +72,11 @@ print("Poisson:"); ppc(y_c, y_rep_p)
 ```
 
 ```output
+Poisson:
+  mean       observed   3.73 | replicated 90% [  3.24,   4.24] | p_B 0.497
+  var/mean   observed   4.83 | replicated 90% [  0.75,   1.27] | p_B 0.000
+  frac zeros observed   0.20 | replicated 90% [  0.00,   0.06] | p_B 0.000
+  max        observed  22.00 | replicated 90% [  7.00,  11.00] | p_B 0.000
 ```
 
 FILL_PPC
@@ -91,13 +98,17 @@ for r in range(R):
     rep = rng.poisson(lam_r[:, None], (S_small, n_c))
     for name in pb:
         T = T_stats[name]
-        pb[name][r] = np.mean(T(rep) >= T(y_sim)) + 0.5 * np.mean(T(rep) == T(y_sim))  # mid-p for ties
+        t_rep, t_obs = T(rep), T(y_sim)
+        pb[name][r] = np.mean(t_rep > t_obs) + 0.5 * np.mean(t_rep == t_obs)   # mid-p for ties
 for name, v in pb.items():
     print(f"T = {name:9} sd(p_B) {v.std():.3f} (uniform 0.289) | "
           f"P(p_B < 0.05 or > 0.95) {np.mean((v < .05) | (v > .95)):.3f} (uniform 0.100)")
 ```
 
 ```output
+T = mean      sd(p_B) 0.022 (uniform 0.289) | P(p_B < 0.05 or > 0.95) 0.000 (uniform 0.100)
+T = var/mean  sd(p_B) 0.277 (uniform 0.289) | P(p_B < 0.05 or > 0.95) 0.095 (uniform 0.100)
+T = max       sd(p_B) 0.263 (uniform 0.289) | P(p_B < 0.05 or > 0.95) 0.068 (uniform 0.100)
 ```
 
 FILL_CONSERV
@@ -131,6 +142,13 @@ print("NegBin:"); ppc(y_c, y_rep_nb)
 ```
 
 ```output
+mu  posterior mean 3.76, 95% [2.93, 4.80]
+phi posterior mean 1.03, 95% [0.66, 1.53]
+NegBin:
+  mean       observed   3.73 | replicated 90% [  2.75,   4.97] | p_B 0.502
+  var/mean   observed   4.83 | replicated 90% [  2.85,   7.47] | p_B 0.406
+  frac zeros observed   0.20 | replicated 90% [  0.11,   0.33] | p_B 0.597
+  max        observed  22.00 | replicated 90% [ 13.00,  33.00] | p_B 0.377
 ```
 
 FILL_NB
@@ -163,6 +181,8 @@ for name, F in (("Poisson", cdf_p), ("NegBin", cdf_nb)):
 ```
 
 ```output
+Poisson  LOO-PIT counts per fifth [35 11  9  7 18] (expect 16 each) | outside [0.05, 0.95]: 0.412 (expect 0.10) | KS p 0.000
+NegBin   LOO-PIT counts per fifth [15 17 16 15 17] (expect 16 each) | outside [0.05, 0.95]: 0.113 (expect 0.10) | KS p 0.999
 ```
 
 FILL_PIT
@@ -253,27 +273,44 @@ def exact_loo(X, y, **kw):
     return np.array([nig_pred_logpdf(nig_fit(X[idx != i], y[idx != i], **kw), X[i:i+1], y[i:i+1])[0] for i in idx])
 
 n_r, w_true = 40, np.array([1.0, 0.6, 0.3, 0.15, 0, 0, 0, 0, 0, 0])
-X_r, X_te = rng.standard_normal((n_r, 10)), rng.standard_normal((20_000, 10))
-y_r, y_te = X_r @ w_true + rng.standard_normal(n_r), X_te @ w_true + rng.standard_normal(20_000)
-
-print(f"{'k':>2} {'lppd':>7} {'AIC':>7} {'DIC':>7} {'WAIC':>7} {'p_waic':>6} {'LOO':>7} {'true elpd':>9}")
-for k in (1, 2, 4, 7, 10):
-    X, Xt = X_r[:, :k], X_te[:, :k]
-    f = nig_fit(X, y_r)
-    W, s2 = nig_draws(f, S, rng)
-    ll = stats.norm.logpdf(y_r, W @ X.T, np.sqrt(s2)[:, None])            # (S, n) pointwise log-lik
-    lppd_i = logsumexp(ll, 0) - np.log(S)
-    beta = np.linalg.lstsq(X, y_r, rcond=None)[0]; s2_mle = np.mean((y_r - X @ beta) ** 2)
-    aic = stats.norm.logpdf(y_r, X @ beta, np.sqrt(s2_mle)).sum() - (k + 1)
-    ll_bar = stats.norm.logpdf(y_r, X @ W.mean(0), np.sqrt(s2.mean())).sum()
-    dic = ll_bar - 2 * (ll_bar - ll.sum(1).mean())
-    p_waic = ll.var(0, ddof=1).sum()
-    true_elpd = n_r * nig_pred_logpdf(f, Xt, y_te).mean()
-    print(f"{k:>2} {lppd_i.sum():7.2f} {aic:7.2f} {dic:7.2f} {lppd_i.sum() - p_waic:7.2f} {p_waic:6.2f} "
-          f"{exact_loo(X, y_r).sum():7.2f} {true_elpd:9.2f}")
+X_te = rng.standard_normal((20_000, 10))
+y_te = X_te @ w_true + rng.standard_normal(20_000)
+ks, R_ds, S_r = (1, 2, 4, 7, 10), 40, 2000
+crit = {c: np.zeros((R_ds, len(ks))) for c in ("lppd", "AIC", "DIC", "WAIC", "LOO", "true")}
+for r in range(R_ds):                                       # 40 independent training sets
+    X_r = rng.standard_normal((n_r, 10))
+    y_r = X_r @ w_true + rng.standard_normal(n_r)
+    for j, k in enumerate(ks):
+        X = X_r[:, :k]
+        f = nig_fit(X, y_r)
+        W, s2 = nig_draws(f, S_r, rng)
+        ll = stats.norm.logpdf(y_r, W @ X.T, np.sqrt(s2)[:, None])          # (S, n) pointwise log-lik
+        lppd_i = logsumexp(ll, 0) - np.log(S_r)
+        beta = np.linalg.lstsq(X, y_r, rcond=None)[0]
+        crit["lppd"][r, j] = lppd_i.sum()
+        crit["AIC"][r, j] = stats.norm.logpdf(y_r, X @ beta, np.sqrt(np.mean((y_r - X @ beta) ** 2))).sum() - (k + 1)
+        ll_bar = stats.norm.logpdf(y_r, X @ W.mean(0), np.sqrt(s2.mean())).sum()
+        crit["DIC"][r, j] = ll_bar - 2 * (ll_bar - ll.sum(1).mean())
+        crit["WAIC"][r, j] = lppd_i.sum() - ll.var(0, ddof=1).sum()
+        crit["LOO"][r, j] = exact_loo(X, y_r).sum()
+        crit["true"][r, j] = n_r * nig_pred_logpdf(f, X_te[:, :k], y_te).mean()   # elpd on fresh data
+print("averages over 40 training sets (elpd scale, higher is better)")
+print(f"{'k':>2}" + "".join(f"{c:>8}" for c in crit) + f"{'sd(LOO-true)':>14}")
+for j, k in enumerate(ks):
+    print(f"{k:>2}" + "".join(f"{v[:, j].mean():8.2f}" for v in crit.values())
+          + f"{(crit['LOO'][:, j] - crit['true'][:, j]).std():14.2f}")
+print(f"LOO picks the true-elpd-best k in {np.mean(crit['LOO'].argmax(1) == crit['true'].argmax(1)):.2f} of datasets")
 ```
 
 ```output
+averages over 40 training sets (elpd scale, higher is better)
+ k    lppd     AIC     DIC    WAIC     LOO    true  sd(LOO-true)
+ 1  -63.44  -65.32  -65.21  -65.28  -65.30  -65.19          4.28
+ 2  -58.12  -60.89  -60.75  -60.85  -60.89  -60.10          3.45
+ 4  -55.51  -60.11  -59.90  -60.20  -60.35  -59.17          3.83
+ 7  -54.33  -61.59  -61.30  -62.01  -62.44  -60.72          4.68
+10  -52.88  -62.72  -62.31  -63.54  -64.57  -62.76          6.10
+LOO picks the true-elpd-best k in 0.35 of datasets
 ```
 
 FILL_TABLE
@@ -325,6 +362,14 @@ def psis(log_r):
     lw[tail_idx] = np.minimum(smoothed, 0.0)                # never exceed the largest raw weight
     return lw - logsumexp(lw), k
 
+for sig in (0.8, 0.7, 0.5):                                 # ch. 3's test: N(0,1) target, N(0, sig^2) proposal
+    x = rng.normal(0, sig, S)
+    log_r = stats.norm.logpdf(x) - stats.norm.logpdf(x, 0, sig)
+    lw, k = psis(log_r)
+    raw = np.exp(log_r - logsumexp(log_r))
+    print(f"sigma_q {sig}: khat {k:.2f} (theory {1 - sig**2:.2f}) | E[x^2] raw IS {raw @ x**2:.3f}, "
+          f"PSIS {np.exp(lw) @ x**2:.3f} (truth 1)")
+
 def loo_estimates(ll):
     """ll: (S, n). Returns pointwise raw-IS LOO, PSIS-LOO and khat."""
     is_loo = -(logsumexp(-ll, 0) - np.log(ll.shape[0]))
@@ -334,6 +379,9 @@ def loo_estimates(ll):
 ```
 
 ```output
+sigma_q 0.8: khat 0.25 (theory 0.36) | E[x^2] raw IS 0.951, PSIS 0.953 (truth 1)
+sigma_q 0.7: khat 0.30 (theory 0.51) | E[x^2] raw IS 0.901, PSIS 0.899 (truth 1)
+sigma_q 0.5: khat 0.69 (theory 0.75) | E[x^2] raw IS 0.843, PSIS 0.801 (truth 1)
 ```
 
 ### One influential point
@@ -360,6 +408,13 @@ print(f"observations with khat > 0.7: {np.flatnonzero(khat_o > 0.7)}")
 ```
 
 ```output
+ obs   khat   lppd_i   raw IS     PSIS    exact
+  40   1.10    -4.61   -10.11    -9.89   -10.78
+  14   0.37    -1.78    -1.94    -1.94    -1.95
+  22   0.32    -1.46    -1.55    -1.55    -1.54
+   0   0.13    -1.35    -1.38    -1.38    -1.38
+sum: lppd -70.70 | raw IS -79.34 | PSIS -79.12 | exact -80.08 | p_loo = lppd - elpd_loo = 8.42
+observations with khat > 0.7: [40]
 ```
 
 FILL_OUTLIER
@@ -376,12 +431,15 @@ dt = az.from_dict({"posterior": {"w0": W_o[None, :, 0]},
 res_az = az.loo(dt, pointwise=True)
 k_az = np.asarray(res_az.pareto_k).ravel()
 print(f"ArviZ: elpd_loo {res_az.elpd:.2f} (se {res_az.se:.2f}) | p_loo {res_az.p:.2f} | max khat {k_az.max():.2f} at obs {k_az.argmax()}")
-print(f"ours : elpd_loo {psis_o.sum():.2f} (se {np.sqrt(len(psis_o) * psis_o.var()):.2f}) | p_loo {lppd_o.sum() - psis_o.sum():.2f} | "
+print(f"ours : elpd_loo {psis_o.sum():.2f} (se {np.sqrt(len(psis_o) * psis_o.var(ddof=1)):.2f}) | p_loo {lppd_o.sum() - psis_o.sum():.2f} | "
       f"max khat {khat_o.max():.2f} at obs {khat_o.argmax()}")
 print(f"max |khat ours - ArviZ| over all points {np.abs(khat_o - k_az).max():.3f}")
 ```
 
 ```output
+ArviZ: elpd_loo -79.11 (se 8.70) | p_loo 8.41 | max khat 1.10 at obs 40
+ours : elpd_loo -79.12 (se 8.71) | p_loo 8.42 | max khat 1.10 at obs 40
+max |khat ours - ArviZ| over all points 0.018
 ```
 
 FILL_AZ
@@ -404,9 +462,9 @@ within about two SEs as noise.
 ```python
 def compare(name, a, b):
     d = a - b
-    se = np.sqrt(len(d) * d.var())
+    se = np.sqrt(len(d) * d.var(ddof=1))
     print(f"{name:32} diff {d.sum():+7.2f} | SE {se:5.2f} | diff/SE {d.sum() / se:+5.1f} | "
-          f"SE(A) alone {np.sqrt(len(a) * a.var()):5.2f}")
+          f"SE(A) alone {np.sqrt(len(a) * a.var(ddof=1)):5.2f}")
 
 loo_pois = stats.nbinom.logpmf(y_c, a_i, b_i / (b_i + 1))                    # exact, closed form
 loo_nb = logsumexp(np.log(w_loo + 1e-300) + ll_grid_nb, 1)                   # exact, grid
@@ -416,6 +474,9 @@ compare("regression: k=4 - k=2", exact_loo(X_r[:, :4], y_r), exact_loo(X_r[:, :2
 ```
 
 ```output
+counts: NegBin - Poisson         diff  +72.58 | SE 21.70 | diff/SE  +3.3 | SE(A) alone  9.24
+regression: k=4 - k=3            diff   -1.22 | SE  0.48 | diff/SE  -2.5 | SE(A) alone  4.48
+regression: k=4 - k=2            diff   -2.13 | SE  0.88 | diff/SE  -2.4 | SE(A) alone  4.48
 ```
 
 FILL_DIFF
@@ -439,6 +500,12 @@ for tau in (0.5, 1, 10, 100, 1000):
 ```
 
 ```output
+   tau  log BF(k=4 vs 3)  LOO diff
+   0.5             -1.26     -1.09
+     1             -1.94     -1.22
+    10             -4.24     -1.27
+   100             -6.54     -1.27
+  1000             -8.85     -1.27
 ```
 
 FILL_BF
@@ -465,10 +532,10 @@ the EM update $w_k \leftarrow \frac1n\sum_i w_k p_{ik} / \sum_j w_j p_{ij}$ clim
 The test below uses three covariates of equal strength, and each candidate model sees only one of them.
 
 ```python
-n_s = 100
-X_s, X_st = rng.standard_normal((n_s, 3)), rng.standard_normal((20_000, 3))
-y_s = X_s @ [0.8, 0.7, 0.6] + rng.standard_normal(n_s)
-y_st = X_st @ [0.8, 0.7, 0.6] + rng.standard_normal(20_000)
+n_s, rng_s = 300, np.random.default_rng(18)
+X_s, X_st = rng_s.standard_normal((n_s, 3)), rng_s.standard_normal((20_000, 3))
+y_s = X_s @ [0.8, 0.7, 0.6] + rng_s.standard_normal(n_s)
+y_st = X_st @ [0.8, 0.7, 0.6] + rng_s.standard_normal(20_000)
 P_loo = np.column_stack([np.exp(exact_loo(X_s[:, [k]], y_s)) for k in range(3)])      # (n, K)
 P_test = np.column_stack([np.exp(nig_pred_logpdf(nig_fit(X_s[:, [k]], y_s), X_st[:, [k]], y_st)) for k in range(3)])
 log_ev = np.array([nig_fit(X_s[:, [k]], y_s)["log_ev"] for k in range(3)])
@@ -487,6 +554,11 @@ for name, w in weights.items():
 ```
 
 ```output
+elpd_loo per model [-526.43 -541.76 -545.95] | log evidence [-530.02 -545.42 -549.7 ]
+BMA (evidence)    weights [1. 0. 0.] | test log score per obs -1.7202
+pseudo-BMA (LOO)  weights [1. 0. 0.] | test log score per obs -1.7202
+stacking          weights [0.623 0.281 0.096] | test log score per obs -1.6957
+best single       weights [1. 0. 0.] | test log score per obs -1.7202
 ```
 
 FILL_STACK
@@ -524,6 +596,10 @@ for i in worst:
 ```
 
 ```output
+lppd -172.24 | WAIC -180.66 | IS-LOO -180.84 | exact LOO -180.75
+obs  0: y=40 x=+0.13 | Var(log-lik)   5.67 | IS  -62.17 | exact  -62.03
+obs 48: y=16 x=+1.80 | Var(log-lik)   0.94 | IS   -6.13 | exact   -6.12
+obs 47: y= 2 x=+1.96 | Var(log-lik)   0.69 | IS   -5.29 | exact   -5.30
 ```
 
 Push the outlier up and watch the pointwise variance of its log-likelihood explode, WAIC drift
@@ -566,6 +642,14 @@ print("ZIP:"); ppc(y_c, z_rep)
 ```
 
 ```output
+ZIP exact LOO -243.23 | PSIS-LOO -243.24 | max khat 0.25
+counts: NegBin - ZIP             diff  +46.14 | SE 16.13 | diff/SE  +2.9 | SE(A) alone  9.24
+stacking weights (Poisson, NegBin, ZIP): [0. 1. 0.]
+ZIP:
+  mean       observed   3.73 | replicated 90% [  3.01,   4.39] | p_B 0.466
+  var/mean   observed   4.83 | replicated 90% [  1.38,   2.54] | p_B 0.000
+  frac zeros observed   0.20 | replicated 90% [  0.11,   0.31] | p_B 0.566
+  max        observed  22.00 | replicated 90% [  8.00,  13.00] | p_B 0.000
 ```
 
 FILL_SOL
