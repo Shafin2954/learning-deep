@@ -7,6 +7,34 @@ order: 4
 
 ## A Markov chain forgets where it started
 
+Chapter 3 ended with a problem: in more than a handful of dimensions you cannot draw independent
+samples from a posterior you can only evaluate up to a constant. Markov chain Monte Carlo gives up
+independence. It builds a random walk whose long-run distribution *is* the posterior, and then it
+averages along the walk. Before you build one for a continuous posterior, it helps to see the
+machinery on a state space small enough to write down exactly.
+
+A Markov chain on $K$ states is a $K \times K$ **transition matrix** $P$ with
+$P_{ij} = p(x_{t+1} = j \mid x_t = i)$ and rows summing to one. If $\mu_t$ is the row vector of state
+probabilities at time $t$, then $\mu_{t+1} = \mu_t P$ and $\mu_t = \mu_0 P^t$. A **stationary
+distribution** is a fixed point, $\pi P = \pi$. So $\pi$ is a *left* eigenvector of $P$ with eigenvalue 1,
+which is an ordinary eigenvector of $P^\top$. The chain below is a daily user state for a shop.
+
+### Why the chain converges, and how fast
+
+If $P$ is diagonalisable with eigenvalues $1 = \lambda_1 > |\lambda_2| \ge \dots$, write
+$P^t = \mathbf{1}\pi + \sum_{k \ge 2} \lambda_k^t\, r_k l_k$ with right and left eigenvectors $r_k, l_k$. Then
+
+$$
+\mu_0 P^t - \pi = \sum_{k \ge 2} \lambda_k^t\,(\mu_0 r_k)\, l_k
+\quad\Longrightarrow\quad
+\lVert \mu_0 P^t - \pi \rVert = O\big(|\lambda_2|^t\big)
+$$
+
+whatever $\mu_0$ is, because $\mu_0 \mathbf{1} = 1$ always picks out $\pi$. The general theorem needs no
+diagonalisability: an **irreducible** (every state reachable from every other) and **aperiodic**
+finite chain has a unique $\pi$ and converges to it from any start. The spectral gap
+$1 - |\lambda_2|$ sets the speed.
+
 ```python
 import numpy as np
 from scipy import stats, special, optimize
@@ -40,7 +68,47 @@ for t in range(T):
 print("\nfraction of time in each state over one 200k-step path:", np.round(visits / T, 4))
 ```
 
+```output
+eigenvalue moduli: [1.     0.4441 0.0881 0.0881]
+stationary pi    : [0.643  0.2262 0.0909 0.0399] | max |pi P - pi| = 2.8e-17
+
+  t    TV from idle  TV from browse    TV from cart     TV from buy   lambda2^t
+  1        1.57e-01        2.43e-01        4.43e-01        1.43e-01    4.44e-01
+  2        7.00e-02        1.08e-01        2.03e-01        5.30e-02    1.97e-01
+  5        6.14e-03        9.56e-03        1.77e-02        4.54e-03    1.73e-02
+ 10        1.06e-04        1.65e-04        3.05e-04        7.85e-05    2.98e-04
+ 20        3.17e-08        4.93e-08        9.12e-08        2.34e-08    8.91e-08
+ 40        2.94e-15        4.18e-15        7.89e-15        2.01e-15    7.94e-15
+
+fraction of time in each state over one 200k-step path: [0.6456 0.2254 0.0895 0.0395]
+```
+
+The total-variation distance $\tfrac12\sum_j |(P^t)_{ij} - \pi_j|$ falls by a factor of
+$|\lambda_2| = 0.444$ per step from every starting state, tracking the $\lambda_2^t$ column almost
+exactly. After 40 steps the start is forgotten to $10^{-15}$. The last line is the result MCMC actually
+relies on, the **ergodic theorem**: the fraction of time *one* path spends in each state converges to
+$\pi$ (0.6456 vs 0.643, 0.0395 vs 0.0399). More generally $\frac{1}{T}\sum_t f(x_t) \to \mathbb{E}_\pi[f]$.
+MCMC runs this logic backwards. You are given $\pi$ (the posterior), and you must design a $P$ that
+has it as its stationary distribution.
+
 ## Detailed balance is a sufficient condition
+
+Stationarity, $\sum_i \pi_i P_{ij} = \pi_j$ for every $j$, is called **global balance**: total
+probability flowing into state $j$ equals $\pi_j$. It is a set of $K$ coupled equations and hard to
+design for. **Detailed balance** is a much stronger local condition: the flow from $i$ to $j$ equals
+the flow back, for every pair.
+
+### Detailed balance implies stationarity
+
+$$
+\pi_i P_{ij} = \pi_j P_{ji} \;\;\forall i, j
+\quad\Longrightarrow\quad
+\sum_i \pi_i P_{ij} = \sum_i \pi_j P_{ji} = \pi_j \sum_i P_{ji} = \pi_j
+$$
+
+The last step uses only that rows of $P$ sum to one. A chain satisfying detailed balance is
+**reversible**: run at stationarity, the sequence $(x_t)$ has the same law forwards and backwards. The
+condition is sufficient, not necessary. The shop chain is stationary but not reversible:
 
 ```python
 F = pi[:, None] * P                                   # F[i, j] = probability flow i -> j at stationarity
@@ -51,7 +119,52 @@ print(f"net circulation idle->browse {F[0,1]-F[1,0]:+.4f}, browse->cart {F[1,2]-
       f"cart->buy {F[2,3]-F[3,2]:+.4f}, buy->idle {F[3,0]-F[0,3]:+.4f}")
 ```
 
+```output
+flow matrix pi_i P_ij (x1000):
+ [[514.41  96.45  25.72   6.43]
+ [ 90.47  90.47  33.92  11.31]
+ [ 18.18  27.27  27.27  18.18]
+ [ 19.96  11.97   3.99   3.99]]
+global balance  max |sum_i F_ij - pi_j| = 2.8e-17
+detailed balance max |F_ij - F_ji|       = 0.0142
+net circulation idle->browse +0.0060, browse->cart +0.0067, cart->buy +0.0142, buy->idle +0.0135
+```
+
+Global balance holds to machine precision, but the flow matrix is not symmetric. There is a net
+probability current around the loop idle $\to$ browse $\to$ cart $\to$ buy $\to$ idle. Non-reversible
+chains can mix *faster* (lifted and non-reversible samplers exploit this), but they are harder to
+build. Detailed balance turns the design problem into $K(K-1)/2$ independent pairwise equations,
+and Metropolis–Hastings solves each pair separately.
+
 ## Building a chain for a target you can only evaluate up to a constant
+
+You have an unnormalised target $\tilde\pi = Z\pi$, where $Z$ is the evidence you cannot compute. You also
+have a **proposal** $Q_{ij} = q(j \mid i)$ that you can sample from. On its own $Q$ has the wrong
+stationary distribution. Metropolis–Hastings fixes it by accepting a proposed move $i \to j$ with
+probability $\alpha_{ij}$ and otherwise staying at $i$, so $P_{ij} = Q_{ij}\alpha_{ij}$ for $j \ne i$.
+
+### Deriving the acceptance probability
+
+Detailed balance for the pair $(i, j)$ reads
+$\pi_i Q_{ij}\alpha_{ij} = \pi_j Q_{ji}\alpha_{ji}$, so the acceptance probabilities need only satisfy
+
+$$
+\frac{\alpha_{ij}}{\alpha_{ji}} = \frac{\pi_j Q_{ji}}{\pi_i Q_{ij}} \equiv r_{ij}, \qquad r_{ji} = 1/r_{ij}
+$$
+
+You want both as large as possible (rejections waste work), and both are at most 1. So set the larger one to 1:
+
+$$
+\boxed{\alpha_{ij} = \min\!\left(1,\; \frac{\tilde\pi_j\, Q_{ji}}{\tilde\pi_i\, Q_{ij}}\right)}
+$$
+
+If $r_{ij} < 1$ then $\alpha_{ij} = r_{ij}$ and $\alpha_{ji} = 1$, and the ratio is right. The other case is the same with $i$ and $j$ swapped.
+$Z$ cancels in $\tilde\pi_j/\tilde\pi_i$, which is the whole reason MCMC works on posteriors:
+you only ever need $p(y\mid\theta)p(\theta)$. The factor $Q_{ji}/Q_{ij}$ is the **Hastings
+correction**. It vanishes for symmetric proposals (Metropolis et al., 1953), and Hastings (1970) added it
+for asymmetric ones. Other choices satisfy the ratio too. Barker's $\alpha = r/(1+r)$ is one, but
+$\min(1, r)$ accepts more often for every pair. By Peskun's theorem that makes its estimators'
+asymptotic variance no larger.
 
 ```python
 K = 12
@@ -87,7 +200,33 @@ for name, Q, h in (("symmetric proposal", Q_sym, True), ("asymmetric 0.8/0.2, Ha
           f"max|F - F^T| {np.abs(Fm - Fm.T).max():.1e} | TV {0.5 * np.abs(s - target).sum():.3f}")
 ```
 
+```output
+symmetric proposal                 max|stationary - target| 1.4e-15 | max|F - F^T| 2.0e-16 | TV 0.000
+asymmetric 0.8/0.2, Hastings       max|stationary - target| 3.1e-15 | max|F - F^T| 1.6e-16 | TV 0.000
+asymmetric 0.8/0.2, no correction  max|stationary - target| 2.0e-01 | max|F - F^T| 2.0e-02 | TV 0.333
+```
+
+The exact transition matrices confirm the derivation. With a symmetric $\pm 1$ proposal on a ring
+of 12 states, and with a drifting 0.8/0.2 proposal plus the Hastings factor, the stationary
+distribution matches the target to $10^{-15}$ and the flow matrix is symmetric. Drop the correction
+and the chain still converges, just to the wrong distribution, a total-variation distance of 0.333
+away. The code never computed `w.sum()` to build the chain. It only appears in `target` for checking.
+
 ## Random-walk Metropolis in log space
+
+On a continuous space the same construction gives a transition kernel
+$K(x, dx') = q(x'\mid x)\,\alpha(x, x')\,dx' + \big(1 - a(x)\big)\,\delta_x(dx')$, where $a(x)$ is the
+total acceptance probability from $x$. The simplest proposal is a Gaussian step,
+$x' = x + s\,\varepsilon$ with $\varepsilon \sim \mathcal{N}(0, I)$. It is symmetric, so
+$\alpha = \min(1, \tilde p(x')/\tilde p(x))$. That is **random-walk Metropolis** (RWM).
+
+Never compute $\tilde p$ itself. A likelihood is a product of $n$ numbers below one and underflows
+to 0.0 for any real dataset. Work with $\log\tilde p$, and accept when
+$\log u < \log\tilde p(x') - \log\tilde p(x)$ with $u \sim U(0,1)$. Mixture likelihoods need one more
+step. $\log(a + b)$ must be computed as
+$\mathrm{logsumexp}(\log a, \log b) = m + \log(e^{\log a - m} + e^{\log b - m})$ with $m = \max$, so no
+component density is ever formed outside log space. The model below has response times from a fast
+path (90%) and a slow path (10%, 300 ms slower) sharing the location $\mu$. It is a non-conjugate posterior.
 
 ```python
 rng = np.random.default_rng(1)
@@ -95,18 +234,19 @@ n_obs = 2000
 slow = rng.random(n_obs) < 0.1
 y_rt = np.where(slow, rng.normal(480, 80, n_obs), rng.normal(180, 20, n_obs))   # ms: fast path + slow path
 
-def log_post_naive(mu):          # mixture likelihood computed on the probability scale
+def log_post_naive(mu):          # mixture likelihood computed on the probability scale; mu: (C, 1)
     dens = 0.9 * stats.norm.pdf(y_rt, mu, 20) + 0.1 * stats.norm.pdf(y_rt, mu + 300, 80)
-    return np.log(dens).sum() + stats.norm.logpdf(mu, 200, 100)
+    return np.log(dens).sum(axis=-1) + stats.norm.logpdf(mu[..., 0], 200, 100)
 
 def log_post(mu):                # same thing, in log space with log-sum-exp; mu has shape (C, 1)
     a = np.log(0.9) + stats.norm.logpdf(y_rt, mu, 20)
     b = np.log(0.1) + stats.norm.logpdf(y_rt, mu + 300, 80)
     return np.logaddexp(a, b).sum(axis=-1) + stats.norm.logpdf(mu[..., 0], 200, 100)
 
-with np.errstate(divide="ignore"):
-    for m in (180.0, 100.0, -500.0):
-        print(f"mu = {m:6.0f}: naive {log_post_naive(m):12.2f} | log-sum-exp {log_post(np.array([[m]]))[0]:14.2f}")
+with np.errstate(divide="ignore", invalid="ignore"):
+    for m in (180.0, -700.0, -3000.0, -5000.0):
+        print(f"mu = {m:6.0f}: naive {log_post_naive(np.array([[m]]))[0]:12.2f} | "
+              f"log-sum-exp {log_post(np.array([[m]]))[0]:12.2f}")
 print("product of the 2000 mixture densities at mu=180:",
       np.prod(0.9 * stats.norm.pdf(y_rt, 180, 20) + 0.1 * stats.norm.pdf(y_rt, 480, 80)))
 
@@ -128,6 +268,10 @@ def rwm(logp, x0, n_iter, scale, L=None, rng=rng, keep=None):
         out[t] = x[:, keep]
     return out, acc / n_iter
 
+with np.errstate(divide="ignore", invalid="ignore"):
+    _, acc_naive = rwm(log_post_naive, np.array([[-5000.0]]), 500, 1.0)
+_, acc_lse = rwm(log_post, np.array([[-5000.0]]), 500, 1.0)
+print(f"500 iterations started at mu=-5000: acceptance naive {acc_naive[0]:.3f} | log-sum-exp {acc_lse[0]:.3f}")
 draws, acc = rwm(log_post, np.full((4, 1), 100.0), 6000, 1.0)
 mu_mc = draws[1000:, :, 0]
 g = np.linspace(170, 190, 4001)
@@ -138,7 +282,44 @@ print(f"posterior mean  RWM {mu_mc.mean():.3f} | grid {m_g:.3f}")
 print(f"posterior sd    RWM {mu_mc.std():.3f} | grid {np.sqrt(np.sum((g - m_g) ** 2 * pg)):.3f}")
 ```
 
+```output
+mu =    180: naive     -9731.72 | log-sum-exp     -9731.72
+mu =   -700: naive    -74576.76 | log-sum-exp    -74576.76
+mu =  -3000: naive         -inf | log-sum-exp  -1339180.48
+mu =  -5000: naive         -inf | log-sum-exp  -3783015.89
+product of the 2000 mixture densities at mu=180: 0.0
+500 iterations started at mu=-5000: acceptance naive 0.000 | log-sum-exp 0.462
+
+RWM (4 chains, 5000 kept each): acceptance [0.478 0.501 0.484 0.48 ]
+posterior mean  RWM 179.975 | grid 179.978
+posterior sd    RWM 0.459 | grid 0.471
+```
+
+Near the posterior the naive and log-sum-exp versions agree, because each observation's mixture
+density is still representable even though their product (last line before the chain) is 0.0. Far
+out, every component density underflows. The naive log posterior is $-\infty$ everywhere in the
+neighbourhood, every acceptance test compares $-\infty$ with $-\infty$ (NaN, so always rejected), and
+the chain never moves. The stable version still has a slope to climb. Started at $\mu = 100$, four
+chains agree with a 4001-point grid on the mean to 0.003 ms and on the sd to about 3%. That residual
+is Monte Carlo error, which the next section quantifies. The `rwm` function runs $C$ chains in lockstep, so the
+Python loop costs the same for 1 chain or 32, and it is reused for the rest of the chapter.
+
 ## Measuring efficiency: effective sample size
+
+Successive MCMC draws are correlated, so $N$ draws carry less information than $N$ independent
+ones. For a stationary chain with lag-$k$ autocorrelation $\rho_k$, the variance of the sample mean is
+
+$$
+\mathrm{Var}\big(\bar f_N\big) \approx \frac{\sigma_f^2}{N}\Big(1 + 2\sum_{k=1}^{\infty}\rho_k\Big) = \frac{\sigma_f^2}{N}\,\tau,
+\qquad \mathrm{ESS} = \frac{N}{\tau}
+$$
+
+$\tau$ is the **integrated autocorrelation time**: how many draws one independent draw is worth. The
+empirical $\rho_k$ are noisy at large lags, so the sum must be truncated. Geyer's initial positive
+sequence sums pairs $\Gamma_m = \rho_{2m} + \rho_{2m+1}$, which are positive for reversible chains,
+and stops at the first negative pair. Chapter 7 does the full multi-chain version (rank-normalised
+$\hat R$, bulk and tail ESS). This single-chain estimator is enough to compare samplers. It is
+validated here on AR(1) processes, where $\tau = (1+\phi)/(1-\phi)$ exactly.
 
 ```python
 def ess(x):
@@ -161,7 +342,40 @@ for phi in (0.0, 0.5, 0.9, 0.99):
 print(f"RWM chain above: ESS per chain {[round(ess(mu_mc[:, c])) for c in range(4)]} of 5000")
 ```
 
+```output
+AR(1) phi=0.0 : ESS   100238 | theory n(1-phi)/(1+phi) =   100000
+AR(1) phi=0.5 : ESS    33276 | theory n(1-phi)/(1+phi) =    33333
+AR(1) phi=0.9 : ESS     4728 | theory n(1-phi)/(1+phi) =     5263
+AR(1) phi=0.99: ESS      555 | theory n(1-phi)/(1+phi) =      503
+RWM chain above: ESS per chain [1228, 1268, 1091, 1147] of 5000
+```
+
+The estimator tracks theory within about 10% up to $\phi = 0.99$, where $\tau \approx 200$ and even
+100,000 draws give only around 500 effective ones. The RWM chains from the previous section kept
+5000 draws each, worth about 1090 to 1270 independent draws: $\tau \approx 4$. The quantity to optimise is
+**ESS per log-density evaluation**, since the evaluation is the expensive part in every real model.
+
 ## Tuning the proposal scale
+
+The step size $s$ trades two failure modes. Too small and almost every proposal is accepted, but
+the chain diffuses: covering a distance $D$ takes $(D/s)^2$ steps. Too large and proposals land in
+the tails and are rejected, so the chain sits still. Acceptance rate is a proxy you can observe;
+ESS per evaluation is what you actually want.
+
+### The optimal-scaling results
+
+Roberts, Gelman and Gilks (1997) analysed RWM on a product target
+$\prod_{i=1}^{d} f(x_i)$ with $s = \ell/\sqrt{d}$. As $d \to \infty$, each coordinate, sped up by a factor of
+$d$, converges to a Langevin diffusion with speed
+
+$$
+h(\ell) = 2\ell^2\,\Phi\!\left(-\frac{\ell\sqrt{I}}{2}\right), \qquad a(\ell) = 2\,\Phi\!\left(-\frac{\ell\sqrt{I}}{2}\right)
+$$
+
+where $a(\ell)$ is the limiting acceptance rate and $I = \mathbb{E}[(\log f)'^2]$ (equal to 1 for a standard normal). Maximising
+$h$ gives $\ell^\star \approx 2.38/\sqrt{I}$ and $\boxed{a(\ell^\star) \approx 0.234}$. In one
+dimension there is no limit theorem, but numerical work gives an optimum near $s = 2.4\sigma$ with
+acceptance about 0.44. The sweep below measures both regimes, using ESS per evaluation averaged over coordinates.
 
 ```python
 def sweep(d, scales, n_iter=30_000, seed=2):
@@ -185,7 +399,55 @@ for s, a, e in zip(c2, acc2, eff2):
     print(f"        {s:22.2f} {a:7.3f} {e:9.4f} {d * e:13.3f}")
 ```
 
+```output
+d = 1     scale  accept  ESS/eval
+           0.10   0.969    0.0024
+           0.50   0.844    0.0384
+           1.00   0.707    0.1195
+           1.80   0.535    0.2052
+           2.40   0.439    0.2168
+           3.00   0.374    0.2253
+           4.50   0.265    0.1621
+           8.00   0.160    0.1083
+          20.00   0.065    0.0452
+
+d = 20   c (scale = c/sqrt(d))  accept  ESS/eval  d x ESS/eval
+                          0.30   0.877    0.0011         0.023
+                          0.80   0.695    0.0052         0.104
+                          1.40   0.491    0.0118         0.236
+                          2.00   0.325    0.0146         0.293
+                          2.38   0.247    0.0153         0.306
+                          2.80   0.179    0.0161         0.322
+                          3.50   0.094    0.0127         0.254
+                          5.00   0.020    0.0039         0.079
+```
+
+In 1-D, efficiency peaks at scale 2.4 to 3.0 (acceptance 0.37 to 0.44) and the curve is flat near the
+top. Accepting 97% of proposals at scale 0.1 is about 90 times less efficient than the optimum.
+At $d = 20$ the peak sits at acceptance 0.18 to 0.25, around $c = 2.38$ to 2.8, matching the 0.234 theory.
+Efficiency stays within about 30% of the maximum anywhere between acceptance 0.1 and 0.5. That is why
+practitioners aim for "roughly 0.2 to 0.4" rather than chasing the third decimal. Notice the last
+column. Even at the optimum, $d \times$ ESS/eval is about 0.3, so every additional dimension costs a
+proportional amount of work. That fact returns at the end of the chapter.
+
 ## Asymmetric proposals need the Hastings correction
+
+Positive parameters (rates, scales, variances) invite multiplicative proposals,
+$x' = x\,e^{s\varepsilon}$, because the step automatically scales with $x$ and never leaves
+$(0, \infty)$. This proposal is a log-normal centred at $\log x$, and it is **not** symmetric in $x$:
+
+### The correction for a log-normal proposal
+
+$$
+q(x'\mid x) = \frac{1}{x' s\sqrt{2\pi}}\exp\!\left(-\frac{(\log x' - \log x)^2}{2s^2}\right)
+\quad\Longrightarrow\quad
+\frac{q(x\mid x')}{q(x'\mid x)} = \frac{x'}{x}
+$$
+
+The exponentials are identical and only the $1/x'$ prefactor differs. The correct acceptance ratio is
+$\tilde p(x')\,x' / (\tilde p(x)\,x)$. If you forget the factor, the chain is still a perfectly
+valid MH chain, but for the target $\tilde p(x)/x$. For a Gamma$(3, 2)$ target that is Gamma$(2, 2)$,
+so you can predict the wrong answer before you see it.
 
 ```python
 a_sh, b_rt = 3.0, 2.0                                    # target: Gamma(shape 3, rate 2), mean 1.5, var 0.75
@@ -221,7 +483,38 @@ wrong = stats.gamma(a_sh - 1, scale=1 / b_rt)
 print(f"{'Gamma(2, 2) = p(x)/x normalised':34} {wrong.mean():7.3f} {wrong.var():7.3f} {wrong.ppf(0.9):7.3f}")
 ```
 
+```output
+sampler                               mean     var     q90  accept
+exact Gamma(3, 2)                    1.500   0.750   2.661
+log-normal + Hastings x'/x           1.501   0.745   2.660   0.624
+log-normal, correction forgotten     1.003   0.501   1.951   0.685
+Gaussian RW, reject x <= 0           1.489   0.735   2.635   0.569
+Gamma(2, 2) = p(x)/x normalised      1.000   0.500   1.945
+```
+
+The forgotten correction gives a mean of 1.003 against a true 1.5 and reproduces the predicted
+Gamma$(2, 2)$ in mean, variance and 90th percentile to within Monte Carlo noise. That is a clean,
+confident and completely wrong answer, and no convergence diagnostic in chapter 7 will flag it,
+because the chain has converged. It has converged to the wrong target. Note also that a symmetric Gaussian
+walk that simply proposes negative values and rejects them (log density $-\infty$) is correct: the
+proposal is still symmetric, and the boundary is part of the target.
+
 ## Transformations and the Jacobian
+
+The cleaner way to handle constraints is to sample an unconstrained variable and transform it,
+which is what every probabilistic programming language does (ch. 8). If $u = \log\sigma$, the density of $u$ is
+
+$$
+p_u(u) = p_\sigma(e^u)\,\left|\frac{d\sigma}{du}\right| = p_\sigma(e^u)\,e^u
+\quad\Longrightarrow\quad
+\log p_u(u) = \log p_\sigma(e^u) + u
+$$
+
+A symmetric random walk on $u$ is exactly the log-normal proposal on $\sigma$. The ratio of
+Jacobians $e^{u'}/e^{u} = \sigma'/\sigma$ is the Hastings factor from the previous section, so the two views
+are the same algorithm. Bounded parameters use logit ($p_u = p_\theta\,\theta(1-\theta)$) and
+simplexes use stick-breaking, each with its own log-Jacobian term. Here is the two-parameter Normal model
+from chapter 1, sampled in $(\mu, \log\sigma)$ with a diagonal step matrix, and checked against a grid in $(\mu, \sigma)$.
 
 ```python
 rng = np.random.default_rng(3)
@@ -250,7 +543,33 @@ for name, jac in (("RWM on (mu, log sigma)", True), ("  ... Jacobian dropped", F
           f"{np.quantile(sg_s, .975):12.2f}   (accept {acc.mean():.2f})")
 ```
 
+```output
+                            E[mu]  E[sigma]  sigma 2.5%  sigma 97.5%
+grid on (mu, sigma)        206.32     38.14       26.50        56.20
+RWM on (mu, log sigma)     206.18     38.24       26.54        55.99   (accept 0.38)
+  ... Jacobian dropped     206.21     36.75       25.89        53.64   (accept 0.37)
+```
+
+With the $+u$ term the sampler matches the grid (E[sigma] 38.24 vs 38.14, interval endpoints within
+about 0.2). Without it the chain targets $p(\sigma\mid y)/\sigma$, which pulls the whole distribution
+of $\sigma$ downward: the mean drops by 1.4 and the upper end of the interval by 2.6. The bias here is
+milder than in the Gamma example only because 15 observations make the posterior of $\sigma$
+fairly concentrated, and a factor of $1/\sigma$ matters less over a narrow range. With fewer data,
+or for a hierarchical scale near zero (ch. 10), it gets much worse.
+
 ## The independence sampler
+
+The proposal does not have to depend on the current state at all. With $q(x'\mid x) = q(x')$ the
+Hastings ratio becomes
+
+$$
+\alpha(x, x') = \min\!\left(1, \frac{\tilde p(x')\,q(x)}{\tilde p(x)\,q(x')}\right) = \min\!\left(1, \frac{w(x')}{w(x)}\right), \qquad w = \tilde p / q
+$$
+
+These are exactly the importance weights of chapter 3. The independence sampler is uniformly ergodic
+if and only if $w$ is bounded (Mengersen and Tweedie, 1996): $q$ needs heavier tails than the posterior. If
+$q$ is too light somewhere, the chain eventually lands on a point with a huge weight and stays there
+for a very long time. The natural $q$ is the Laplace approximation (ch. 3), with Student-t tails.
 
 ```python
 th_map = optimize.minimize(lambda t: -lp_mu_logsig(t[None, :])[0], [200.0, 3.0]).x
@@ -283,7 +602,25 @@ for name, q in (("multivariate t_4, Laplace cov", stats.multivariate_t(th_map, S
           f"of 20000 | E[sigma] {np.exp(out[:, 1]).mean():6.2f} | sigma 97.5% {np.quantile(np.exp(out[:, 1]), .975):6.2f}")
 ```
 
+```output
+Laplace approximation (ch. 3): mode [206.365   3.557] sds [8.905 0.183]
+multivariate t_4, Laplace cov  accept 0.780 | ESS(mu)  11035 ESS(log sigma)  11579 of 20000 | E[sigma]  38.06 | sigma 97.5%  56.12
+Normal, Laplace cov x 0.25     accept 0.412 | ESS(mu)     55 ESS(log sigma)     65 of 20000 | E[sigma]  37.05 | sigma 97.5%  46.17
+```
+
+With $t_4$ tails, 78% of proposals are accepted and the 20,000 draws are worth about 11,000
+independent ones, better than any random walk. The narrow Normal proposal also accepts 41% of the
+time, which looks healthy, but its ESS is about 60 and its 97.5% quantile of $\sigma$ is 46.2 instead of
+56.2. It almost never proposes the upper tail, and when it does, the chain sticks there. Acceptance rate alone
+tells you nothing about an independence sampler. The method only works when you already have a good
+global approximation, and in high dimensions you rarely do.
+
 ## Warmup: forgetting a bad start
+
+The ergodic theorem holds from any start, but finite averages remember the start. The first stretch
+of the chain, while it travels from an arbitrary initial point to the typical set (ch. 3), is
+called **burn-in**. Modern samplers call it **warmup**, because they also tune the proposal
+during it (next section). Start the $(\mu, \log\sigma)$ chain at an absurd point and watch it travel.
 
 ```python
 rng = np.random.default_rng(4)
@@ -297,7 +634,41 @@ for burn in (0, 500, 2000):
     print(f"mean of mu over iterations {burn}..3999: {mu_tr[burn:].mean():8.2f}")
 ```
 
+```output
+start mu=900, sigma=1: first iteration within 30 of the posterior mean: 291
+  iter     0: mu   900.00  sigma     1.00
+  iter    50: mu   761.60  sigma   283.28
+  iter   100: mu   706.80  sigma   299.30
+  iter   200: mu   550.94  sigma   204.94
+  iter   400: mu   209.39  sigma    35.69
+  iter   800: mu   200.82  sigma    45.29
+  iter  1600: mu   223.45  sigma    33.52
+mean of mu over iterations 0..3999:   236.10
+mean of mu over iterations 500..3999:   206.50
+mean of mu over iterations 2000..3999:   206.58
+```
+
+From $\mu = 900, \sigma = 1$ the chain first inflates $\sigma$ to about 300, because with a tiny $\sigma$
+every data point is impossibly far away. Then it walks $\mu$ down and shrinks $\sigma$ back, reaching the
+bulk around iteration 290. Averaging everything gives $\mu$ = 236.1, which is 30 ms
+off. Discarding the first 500 gives 206.5, in line with the grid's 206.3. The common default is to discard the first half of each chain as
+warmup. That wastes draws when convergence is fast and protects you when it is not. Chapter 7 shows how
+to *detect* incomplete warmup with multiple dispersed chains instead of guessing.
+
 ## Adaptation: tune during warmup, then freeze
+
+Tuning by hand does not scale, so adapt the scale automatically. A Robbins–Monro update
+$\log s \leftarrow \log s + \gamma_t(\mathbb{1}[\text{accepted}] - a^\star)$ pushes the acceptance rate toward
+the target $a^\star$. The catch: once $s$ depends on the chain's history, the process is **no longer
+a Markov chain**, and the stationarity argument above no longer applies. Roberts and Rosenthal
+(2007) show that adaptive MCMC stays valid under **diminishing adaptation** ($\gamma_t \to 0$) plus a
+technical containment condition. The adaptive Metropolis algorithm of Haario et al. (2001) satisfies
+these. The safe engineering answer, used by Stan and PyMC, is simpler: adapt only during warmup,
+then freeze the tuning parameters and sample from a genuine Markov chain.
+
+The target below is a spike-and-slab mixture, $\tfrac12\mathcal{N}(0, 0.1^2) + \tfrac12\mathcal{N}(0, 3^2)$. The ideal
+step differs by a factor of 30 between the two parts, so any adaptation that tracks *where the chain
+currently is* changes the dynamics. Each variant runs 32 chains and keeps the second half of 40,000 iterations.
 
 ```python
 log_mix = lambda x: np.logaddexp(np.log(0.5) + stats.norm.logpdf(x[:, 0], 0, 0.1),
@@ -305,8 +676,8 @@ log_mix = lambda x: np.logaddexp(np.log(0.5) + stats.norm.logpdf(x[:, 0], 0, 0.1
 truth = 0.5 * (stats.norm.cdf(0.2, 0, 0.1) - stats.norm.cdf(-0.2, 0, 0.1)) + \
         0.5 * (stats.norm.cdf(0.2, 0, 3) - stats.norm.cdf(-0.2, 0, 3))
 
-def adaptive_rwm(n_iter, gain, freeze_at=None, C=16, rng=rng):
-    x = rng.standard_normal((C, 1)); lp = log_mix(x); log_s = np.zeros(C)
+def adaptive_rwm(n_iter, gain, freeze_at=None, C=32, rng=rng):
+    x = rng.standard_normal((C, 1)); lp = log_mix(x); log_s = np.zeros(C); avg = np.zeros(C)
     out = np.empty((n_iter, C))
     for t in range(n_iter):
         prop = x + np.exp(log_s)[:, None] * rng.standard_normal((C, 1))
@@ -315,6 +686,10 @@ def adaptive_rwm(n_iter, gain, freeze_at=None, C=16, rng=rng):
         x[ok], lp[ok] = prop[ok], lp_prop[ok]
         if freeze_at is None or t < freeze_at:
             log_s += gain(t) * (ok - 0.44)                    # Robbins-Monro toward 44% acceptance
+            if freeze_at is not None and t >= freeze_at // 2:
+                avg += log_s / (freeze_at - freeze_at // 2)   # average the iterates of late warmup
+        if t + 1 == freeze_at:
+            log_s = avg.copy()                                # freeze at the averaged scale
         out[t] = x[:, 0]
     return out[n_iter // 2:], np.exp(log_s)
 
@@ -323,11 +698,40 @@ for name, gain, frz in (("constant gain 0.1, never stops", lambda t: 0.1, None),
                         ("diminishing gain (t+1)^-0.7", lambda t: (t + 1) ** -0.7, None),
                         ("constant gain, frozen at warmup end", lambda t: 0.1, 20_000)):
     smp, s_final = adaptive_rwm(40_000, gain, frz)
-    print(f"{name:36} P(|x|<0.2) {np.mean(np.abs(smp) < 0.2):.4f} | var {smp.var():6.3f} | "
+    ind = (np.abs(smp) < 0.2).astype(float)
+    mcse = np.sqrt(ind.var() / sum(ess(ind[:, c]) for c in range(ind.shape[1])))
+    print(f"{name:36} P(|x|<0.2) {ind.mean():.4f} +- {2 * mcse:.4f} | var {smp.var():6.3f} | "
           f"final scales {np.quantile(s_final, [0, 0.5, 1]).round(2)}")
 ```
 
+```output
+target: P(|x| < 0.2) = 0.5038, var = 4.505
+constant gain 0.1, never stops       P(|x|<0.2) 0.5414 +- 0.0106 | var  3.448 | final scales [0.41 2.72 7.39]
+diminishing gain (t+1)^-0.7          P(|x|<0.2) 0.4996 +- 0.0064 | var  4.594 | final scales [1.48 1.89 2.35]
+constant gain, frozen at warmup end  P(|x|<0.2) 0.5053 +- 0.0067 | var  4.518 | final scales [0.76 1.27 1.83]
+```
+
+Constant-gain adaptation never settles. In the spike it shrinks the step, which makes leaving the
+spike harder, so the chain over-weights it: 0.541 against 0.504 (about 7 Monte Carlo standard
+errors off; the $\pm$ column is 2 standard errors), and the variance comes out 3.45 instead of 4.51. The final scales range from 0.4 to 7.4,
+which shows each chain's step is still chasing its current location. Diminishing adaptation and
+warmup-then-freeze both land within their error bars. Freezing at the *average* of the late-warmup
+iterates matters. Freezing at the last noisy iterate would give each chain a random step size, which
+is valid but needlessly inefficient. Stan's dual averaging does exactly this averaging.
+
 ## Preconditioning with an estimated covariance
+
+The scalar step is only half the story. On a posterior with strongly correlated or
+very differently scaled parameters, an isotropic proposal must use a step small enough for the
+*narrowest* direction, and then needs about $\kappa = \lambda_{\max}/\lambda_{\min}$ times more steps to cross the
+widest one. The fix is to propose from $\mathcal{N}(x, s^2\Sigma)$ with $\Sigma \approx$ the posterior
+covariance, i.e. $x' = x + sL\varepsilon$ with $LL^\top = \Sigma$. This is RWM on the whitened variable
+$z = L^{-1}x$, where the target is roughly isotropic, and the optimal scale is again $2.38/\sqrt{d}$.
+
+Haario's adaptive Metropolis uses $\Sigma_t = \frac{2.38^2}{d}\,\widehat{\mathrm{Cov}}(x_{0:t}) + \epsilon I$.
+The version below adapts in stages during warmup (500, 1000, 2000, 4000 iterations). After each stage it
+re-estimates $\Sigma$ from the later half of the warmup history, then freezes it. Two Gaussian targets
+are compared, so the truth is known exactly.
 
 ```python
 def gaussian_target(Sigma):
@@ -335,7 +739,7 @@ def gaussian_target(Sigma):
     return lambda x: -0.5 * np.einsum("ci,ij,cj->c", x, Pm, x)
 
 def adaptive_warmup(logp, x0, stages=(500, 1000, 2000, 4000), rng=rng):
-    """Haario-style stagewise adaptation: re-estimate the covariance from all warmup draws after each stage."""
+    """Haario-style stagewise adaptation: re-estimate the covariance from the later half of the warmup draws."""
     C, d = x0.shape
     x, L, hist = x0, np.eye(d) * 0.1, []
     for n in stages:
@@ -366,7 +770,37 @@ A = np.linalg.qr(np.random.default_rng(5).standard_normal((10, 10)))[0]
 compare(A @ np.diag(np.logspace(-2, 1, 10)) @ A.T, "10-D, eigenvalues 0.01 .. 10")
 ```
 
+```output
+2-D, sds (1, 10), corr 0.99: condition number 5124
+  isotropic, scale 2.38 sqrt(lam_min/d)  accept 0.556 | min ESS/eval 0.0004 | max |sd error| 0.6%
+  preconditioned, warmup cov (frozen)    accept 0.356 | min ESS/eval 0.1313 | max |sd error| 1.0%
+  preconditioned, true cov               accept 0.356 | min ESS/eval 0.1327 | max |sd error| 0.7%
+10-D, eigenvalues 0.01 .. 10: condition number 1000
+  isotropic, scale 2.38 sqrt(lam_min/d)  accept 0.640 | min ESS/eval 0.0003 | max |sd error| 17.2%
+  preconditioned, warmup cov (frozen)    accept 0.255 | min ESS/eval 0.0248 | max |sd error| 2.4%
+  preconditioned, true cov               accept 0.261 | min ESS/eval 0.0311 | max |sd error| 2.5%
+```
+
+In 2-D with correlation 0.99 the isotropic sampler gets an ESS per evaluation of 0.0004 in its worst
+direction. The preconditioned one gets 0.13, roughly 300 times better, and the high-acceptance
+isotropic chain (0.556) is the inefficient one. In 10-D with condition number 1000 the isotropic chain
+is so slow that after 20,000 iterations one marginal sd is still 17% wrong. The warmup-estimated
+covariance recovers almost all of the benefit of knowing the true one (0.025 vs 0.031). Note the
+preconditioned 10-D chain's ESS/eval of about 0.03, roughly $0.3/d$ again: preconditioning removes $\kappa$
+from the cost but cannot remove $d$. This is the "dense mass matrix" of HMC (ch. 6) in its simplest form.
+
 ## Bayesian logistic regression, checked against a reference
+
+Now a real posterior: logistic regression with an intercept, five correlated features, 300
+observations and a $\mathcal{N}(0, 2.5^2)$ prior on each coefficient. The log-likelihood
+$\sum_i y_i\eta_i - \log(1 + e^{\eta_i})$ uses `logaddexp(0, eta)`, the two-term log-sum-exp, so it never
+overflows for large $|\eta|$.
+
+You need a reference answer to trust any sampler. Here it is importance sampling (ch. 3) with a $t_5$
+proposal built from the Laplace approximation and 200,000 draws. In six dimensions with a near-Gaussian
+posterior that is very accurate, and its own effective sample size reports how accurate. Then two RWM
+variants each run 4 chains of 20,000 post-warmup iterations, and the error in each posterior mean is
+measured in units of its Monte Carlo standard error, $\mathrm{sd}/\sqrt{\mathrm{ESS}}$.
 
 ```python
 rng = np.random.default_rng(6)
@@ -413,7 +847,33 @@ for name, (out, acc) in runs.items():
           f"| max |error| / MCSE {z.max():.2f}")
 ```
 
+```output
+IS reference: 200000 draws, IS effective sample size 157910
+                                      b0      b1      b2      b3      b4      b5
+reference mean                    -0.818   1.149  -0.860   0.056   0.632   0.197
+reference sd                       0.150   0.194   0.178   0.178   0.177   0.179
+isotropic RWM                     -0.817   1.146  -0.858   0.052   0.629   0.202
+   accept 0.287, min ESS/eval     0.0299 | max |error| / MCSE 1.70
+preconditioned RWM (warmup cov)   -0.820   1.152  -0.862   0.053   0.634   0.195
+   accept 0.278, min ESS/eval     0.0456 | max |error| / MCSE 1.04
+```
+
+The importance-sampling reference has an effective sample size of 158,000 out of 200,000, so the
+Laplace-t proposal is an excellent fit. Both RWM samplers agree with it to within 2 Monte Carlo standard
+errors on every coefficient, which is what correct sampling with an honest ESS should give. The
+preconditioned sampler's worst-coordinate ESS/eval is 0.046 against 0.030. That is a smaller gain than
+on the synthetic targets, because this posterior is only mildly correlated (the prior and the
+intercept column keep it well conditioned). It is also an instructive negative result: for a
+six-parameter GLM, 80,000 log-density evaluations buy only about 2,400 to 3,600 effective draws. The
+importance sampler did far better here. MCMC earns its keep when no good global approximation exists.
+
 ## Why random-walk Metropolis does not scale
+
+The optimal-scaling theory makes a sharp prediction. At $s = 2.38/\sqrt{d}$ on an isotropic target, the
+efficiency per coordinate is $h(\ell^\star)/d \approx 1.3/d$ in diffusion time, which works out to an
+ESS per evaluation of about $0.3/d$ (Gelman et al., BDA3, ch. 12). The cost of one effective draw grows
+**linearly** in $d$ *after* perfect preconditioning, and it gets multiplied by the condition number when the
+preconditioning is imperfect.
 
 ```python
 rng = np.random.default_rng(7)
@@ -425,7 +885,32 @@ for d in (1, 2, 5, 10, 20, 50, 100):
     print(f"{d:4d} {acc.mean():7.3f} {e:9.4f} {d * e:13.3f} {1 / e:22.0f}")
 ```
 
+```output
+   d  accept  ESS/eval  d x ESS/eval  evals per indep. draw
+   1   0.445    0.2188         0.219                      5
+   2   0.356    0.1322         0.264                      8
+   5   0.288    0.0597         0.299                     17
+  10   0.260    0.0301         0.301                     33
+  20   0.249    0.0164         0.328                     61
+  50   0.239    0.0068         0.339                    147
+ 100   0.235    0.0033         0.329                    304
+```
+
+Acceptance falls from 0.445 to 0.235, converging on the 0.234 limit. $d \times$ ESS/eval settles at about
+0.33, so one independent draw costs 5 evaluations in one dimension and about 300 at $d = 100$. For a
+neural network with $10^5$ weights (ch. 13) that is hopeless. The reason is geometric. A random direction
+in high dimensions is almost orthogonal to the direction that keeps you in the typical set (ch. 3), so
+only tiny steps survive. Langevin proposals (MALA) use the gradient to choose the direction and scale
+as $d^{1/3}$. Hamiltonian Monte Carlo (ch. 6) follows the gradient for many steps and scales as
+$d^{1/4}$, with acceptance rates near 0.65 to 0.8 and ESS per *gradient evaluation* that barely moves with $d$.
+Gibbs sampling (ch. 5) takes another route: exact conditional draws, no tuning, when the model's structure allows them.
+
 ## Try it Yourself
+
+The "banana" of Haario et al. is a standard stress test: $x_1 \sim \mathcal{N}(0, 10^2)$ and
+$x_2 \mid x_1 \sim \mathcal{N}(b x_1^2 - 100b, 1)$. No single covariance fits it, because the local
+orientation changes along the curve. The moments are known exactly:
+$\mathbb{E}[x_2] = 0$ and $\mathrm{Var}(x_2) = 1 + 2b^2\cdot 10^4$.
 
 ```python
 import numpy as np
@@ -448,13 +933,37 @@ def run(n_iter, L, x0):
 
 warm, a0 = run(5_000, np.eye(2) * 1.0, [0.0, 0.0])               # try other isotropic scales
 L = np.linalg.cholesky(2.38 ** 2 / 2 * np.cov(warm[2_500:].T))  # freeze the warmup covariance
-draws, a1 = run(50_000, L, warm[-1])
+draws, a1 = run(200_000, L, warm[-1])
 print(f"warmup acceptance {a0:.3f} | sampling acceptance {a1:.3f}")
 print(f"E[x1] {draws[:, 0].mean():+.3f} (truth 0) | E[x2] {draws[:, 1].mean():+.3f} (truth 0)")
 print(f"Var x1 {draws[:, 0].var():.1f} (truth 100) | Var x2 {draws[:, 1].var():.2f} (truth {1 + 2 * 1e4 * b**2:.2f})")
 ```
 
+```output
+warmup acceptance 0.681 | sampling acceptance 0.176
+E[x1] +0.023 (truth 0) | E[x2] +0.005 (truth 0)
+Var x1 100.3 (truth 100) | Var x2 20.84 (truth 19.00)
+```
+
+With $b = 0.03$ the frozen global covariance gives an acceptance of only 0.18, and $\mathrm{Var}(x_2)$
+is still about 10% off after 200,000 iterations, because the heavy upper arms are visited rarely and
+in long excursions. Try $b = 0.1$, a shorter or longer warmup, a hand-picked isotropic scale for the
+whole run, or several independent chains from dispersed starts, and compare the moment errors.
+Position-dependent geometry like this is exactly what HMC's gradient (ch. 6) and Riemannian variants
+handle and what a fixed random walk cannot.
+
 ## Exercise
+
+Incident counts are logged for 150 services with exposure $e_i$ (thousands of requests) and two
+standardised covariates. The model is
+$y_i \sim \mathrm{Poisson}\big(e_i \exp(x_i^\top\beta)\big)$ with $\beta_j \sim \mathcal{N}(0, 1)$, three
+coefficients including the intercept. Simulate data with $\beta = (0.3, 0.5, -0.4)$, exposures
+uniform on $[0.5, 5]$, and seed 12.
+
+1. Write the log posterior in a form that cannot overflow or underflow for reasonable $\beta$ (log-rate with a $\log e_i$ offset).
+2. Build a reference: Laplace approximation (mode and inverse Hessian), then importance sampling with a $t_5$ proposal.
+3. Run an isotropic RWM with step $\frac{2.38}{\sqrt{3}}\min_j \mathrm{sd}_j$, and a preconditioned RWM whose covariance comes from staged adaptive warmup and is then frozen. Use 4 chains of 20,000 iterations each.
+4. Report posterior means, acceptance rates and the worst-coordinate ESS per evaluation, and say which sampler you would use and why.
 
 <details>
 <summary>Solution</summary>
@@ -488,4 +997,19 @@ for name, out, a in (("isotropic", iso[1000:], acc_i), ("preconditioned", pre, a
     print(f"{name:16} " + " ".join(f"{v:7.3f}" for v in out.reshape(-1, 3).mean(0)) + f" {a.mean():7.3f} {e:13.4f}")
 ```
 
+```output
+                      b0      b1      b2  accept  min ESS/eval
+IS reference       0.300   0.466  -0.413   (sd [0.045 0.035 0.04 ])
+isotropic          0.301   0.466  -0.413   0.336        0.0553
+preconditioned     0.300   0.466  -0.413   0.318        0.0912
+```
+
+Both samplers reproduce the importance-sampling reference to three decimals. The preconditioned
+chain's worst-coordinate ESS per evaluation is about 1.6 times the isotropic one's. The gain is modest because
+a Poisson GLM with standardised covariates and a unit prior has a nearly round posterior; the
+isotropic step is only limited by the smallest sd. Both acceptance rates (0.32 to 0.34) sit in
+the efficient band for $d = 3$. The log-gamma term `gammaln(y + 1)` is a constant and could be dropped. It is kept so the
+log posterior is the true normalised log-likelihood plus prior, which you will want for model
+comparison (ch. 9). With only three well-identified parameters, the Laplace-t importance sampler is again the cheaper
+correct answer. RWM is the tool you reach for when that approximation is not available.
 </details>
