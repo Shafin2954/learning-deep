@@ -7,10 +7,62 @@ order: 10
 
 ## One model cannot score the whole catalogue
 
-PROSE
+Picture a shop assistant asked to pick ten books for you from a warehouse of ten million. They
+do not read every blurb. They grab a few hundred plausible ones fast — bestsellers, books like the
+ones you bought, new arrivals — and then look carefully at that pile. Every large recommender is
+built the same way: a cheap **candidate generation** stage that touches the whole catalogue, and an
+expensive **ranking** stage that touches only what stage one hands it.
+
+The reason is arithmetic, not taste. Fix a latency budget per request and a cost per scored
+(user, item) pair, and the number of items each model can afford to look at falls out directly.
 
 ```python
-import time
+catalogue, budget_ms = 10_000_000, 100
+stages = [  # (stage, microseconds per (user, item) scored) -- order-of-magnitude assumptions
+    ("dot product, d=64, brute force", 0.02),
+    ("GBDT ranker, 500 trees x depth 8", 5.0),
+    ("deep cross-feature ranker (MLP over 300 features)", 40.0),
+    ("transformer cross-encoder over user history", 2_000.0),
+]
+print(f"{'model':>50} {'items in 100 ms':>16} {'full catalogue':>15}")
+for name, us in stages:
+    print(f"{name:>50} {budget_ms * 1_000 / us:>16,.0f} {catalogue * us / 1e6:>13,.1f} s")
+funnel = [("ANN retrieval", catalogue, 0.0), ("light ranker", 2_000, 5.0),
+          ("heavy ranker", 300, 40.0), ("re-rank / rules", 50, 0.0)]
+print("\nfunnel:", " -> ".join(f"{n} ({k:,})" for n, k, _ in funnel))
+print(f"model time of the two rankers: {sum(k * us for _, k, us in funnel) / 1_000:.1f} ms")
+```
+
+```output
+                                             model  items in 100 ms  full catalogue
+                    dot product, d=64, brute force        5,000,000           0.2 s
+                  GBDT ranker, 500 trees x depth 8           20,000          50.0 s
+ deep cross-feature ranker (MLP over 300 features)            2,500         400.0 s
+       transformer cross-encoder over user history               50      20,000.0 s
+
+funnel: ANN retrieval (10,000,000) -> light ranker (2,000) -> heavy ranker (300) -> re-rank / rules (50)
+model time of the two rankers: 22.0 ms
+```
+
+Read the first table as "how many items can this model afford to see". A dot product can cover
+five million items inside 100 ms, so a two-tower retriever (ch. 7) plus an index can face the whole
+catalogue. A 500-tree GBDT can afford 20,000 items and would need 50 seconds for all ten million; a
+cross-encoder over the user's history can afford 50. No single model is both cheap enough for the
+catalogue and rich enough to use cross features between user and item.
+
+The funnel resolves this: each stage cuts the set by one or two orders of magnitude so the next,
+more expensive stage spends its budget only where it matters. Two rankers over 2,000 and 300 items
+cost 22 ms of model time — well inside the budget, and leaving room for feature fetching, which in
+practice costs more than the model.
+
+## Three time windows, not two
+
+A ranker learns from examples of the form "this candidate was shown to this user, and they did or
+did not take it". To build those examples honestly you need a past to compute features from and a
+*later* period to read labels from, and then a third, still later period to test on. Every chapter
+so far used two windows; this one needs three.
+
+```python
 import numpy as np
 import pandas as pd
 import torch
@@ -56,37 +108,22 @@ for name, df in (("history A (ranker features)", hist_A), ("window B (ranker lab
                  window C (test):  23,087 events, days 300-359
 ```
 
-BUDGET PROSE
-
-```python
-catalogue, budget_ms = 10_000_000, 100
-stages = [  # (stage, microseconds per (user, item) scored) -- order-of-magnitude assumptions
-    ("dot product, d=64, brute force", 0.02),
-    ("GBDT ranker, 500 trees x depth 8", 5.0),
-    ("deep cross-feature ranker (MLP over 300 features)", 40.0),
-    ("transformer cross-encoder over user history", 2_000.0),
-]
-print(f"{'model':>50} {'items in 100 ms':>16} {'full catalogue':>15}")
-for name, us in stages:
-    print(f"{name:>50} {budget_ms * 1_000 / us:>16,.0f} {catalogue * us / 1e6:>13,.1f} s")
-funnel = [("ANN retrieval", catalogue, 0.0), ("light ranker", 2_000, 5.0),
-          ("heavy ranker", 300, 40.0), ("re-rank / rules", 50, 0.0)]
-print("\nfunnel:", " -> ".join(f"{n} ({k:,})" for n, k, _ in funnel))
-print(f"model time of the two rankers: {sum(k * us for _, k, us in funnel) / 1_000:.1f} ms")
-```
-
-```output
-                                             model  items in 100 ms  full catalogue
-                    dot product, d=64, brute force        5,000,000           0.2 s
-                  GBDT ranker, 500 trees x depth 8           20,000          50.0 s
- deep cross-feature ranker (MLP over 300 features)            2,500         400.0 s
-       transformer cross-encoder over user history               50      20,000.0 s
-
-funnel: ANN retrieval (10,000,000) -> light ranker (2,000) -> heavy ranker (300) -> re-rank / rules (50)
-model time of the two rankers: 22.0 ms
-```
+Window A plays the role of "everything known when the ranker's training candidates were
+generated", window B supplies the labels for those candidates, and at serving time the whole
+pipeline is rebuilt on A+B and tested on window C. The test split is identical to chapters 5–7, so
+numbers here are directly comparable with theirs.
 
 ## Several retrievers, one candidate set
+
+No single retriever sees everything. Popularity knows what is broadly liked, item-item CF (ch. 3)
+knows "people who took X also took Y", iALS (ch. 5) knows your latent taste, and a trending source
+knows what is hot *this week*. Production systems run several of these in parallel, take the top
+$n$ from each, and merge them into one deduplicated candidate set $C_u$ for user $u$.
+
+The code below builds four sources on a given history: global popularity, **trend** (popularity
+with each event down-weighted by a 14-day half-life, so last week counts more than last year),
+item-item cosine CF, and iALS. It also builds two recency-weighted variants (30-day half-life) of
+the CF and iALS scores — not as sources, but as features the ranker will use later.
 
 ```python
 def implicit_als(X, d=16, alpha=5.0, lam=50.0, n_iter=8, seed=0):
@@ -170,7 +207,24 @@ ranker-train users 2,395 | test users 2,381
 items proposed by 1/2/3/4 sources: 22.8 / 26.9 / 13.1 / 21.0
 ```
 
+Two hundred slots collapse to about 84 distinct items, so the sources overlap heavily — 21 items
+per user are proposed by all four. That overlap is not waste: how many sources proposed an item
+(`n_sources`, the "votes") is itself a useful ranking feature. The 23 items proposed by only one
+source are where a second source earns its keep; the next section measures whether they do.
+
 ## Candidate recall is the ceiling
+
+Stage one is not judged on ordering — the ranker will reorder everything anyway. It is judged on
+one question: *did the items the user actually wanted make it into the pile?* That is candidate
+recall at the pile size $N$,
+
+$$
+\mathrm{Recall@}N(u) = \frac{|C_u \cap T_u|}{|T_u|},
+$$
+
+where $C_u$ is the candidate set and $T_u$ the user's true future items (window C). Note the
+denominator is $|T_u|$, not $\min(k, |T_u|)$ as in ch. 2: at $N$ in the hundreds you are asking
+about coverage, not about a top-$k$ list.
 
 ```python
 def cand_recall(sets, users, truth):
@@ -196,7 +250,42 @@ for name in ("pop", "trend", "icf", "als", "union"):
    union  0.1711  0.2940  0.4193  0.5587
 ```
 
+iALS is the best single source at every $N$ (0.3449 at 50), and popularity is not far behind —
+this catalogue has a heavy head. But the union beats every source at the same per-source $n$: with
+50 slots each it covers 0.4193 of the future, against 0.3449 for iALS alone.
+
+Now compare at equal *pile size*, which is what the ranker's budget actually limits. The union at
+$n=50$ is 84 items and recalls 0.4193; iALS alone at 100 items recalls 0.4927. Item for item,
+going deeper into the best source beats merging here. That is a property of this dataset: it was
+generated from latent taste plus popularity, which iALS already models, so the other sources mostly
+add information iALS has. Extra sources pay for themselves when they carry *different* information
+— content for new items (ch. 9), session context, social graph — and the only way to know is this
+table, recomputed at equal $|C|$.
+
+Also notice that more than 40% of the future is unreachable even at 155 candidates. Some of it is
+repeat consumption of already-seen items, which every source filters out by design; the rest is
+taste drift that no history-based retriever can foresee.
+
 ### Why stage one bounds every later stage
+
+This short derivation shows that no ranker, however good, can score above a ceiling set entirely
+by stage one. The final list $L_u$ is a subset of $C_u$, so its hits are a subset of the hits in
+$C_u$:
+
+$$
+L_u \subseteq C_u \;\Rightarrow\; |L_u \cap T_u| \le |C_u \cap T_u|
+\;\Rightarrow\; \mathrm{Recall@}k(u) \le \frac{|C_u \cap T_u|}{\min(k, |T_u|)}.
+$$
+
+For NDCG the best a ranker can do is put every hit in $C_u$ at the top, so
+
+$$
+\mathrm{NDCG@}k(u) \le \frac{\sum_{j=1}^{\min(k,\,|C_u \cap T_u|)} 1/\log_2(j+1)}
+{\sum_{j=1}^{\min(k,\,|T_u|)} 1/\log_2(j+1)} =: \mathrm{NDCG}^{\text{oracle}}(u).
+$$
+
+The code computes that oracle ceiling, next to what you get by simply ordering the pile by the
+iALS score.
 
 ```python
 def ndcg_at_10(ranked, rel):
@@ -227,7 +316,29 @@ n per source    |C|  recall@|C|  oracle NDCG@10  iALS-order NDCG@10
          100  155.6      0.5587          0.7407              0.1136
 ```
 
+The oracle column climbs from 0.2011 to 0.7407 as the pile grows: a perfect ranker would turn
+more candidates into more NDCG. The iALS-order column does not move after $n=10$, and that is
+expected — its top 10 are always in the pile, so the extra candidates sit below position 10 and
+are never seen. At $n=5$ it drops to 0.1073 because the pile no longer contains iALS's own
+top 10.
+
+The gap between the two columns, 0.1136 against 0.6087 at $n=50$, is the space a ranker has to
+work in. Most of it is unreachable in practice (the oracle cheats by reading the labels), but it
+tells you which stage to blame. If the ranker is close to the oracle, improve retrieval; if it is
+far below, improve the ranker.
+
 ## Approximate nearest neighbours: scan less, miss a little
+
+With 900 items you can score every item exactly. With 100 million you cannot, even with a dot
+product, so the embedding retrievers (iALS, the two-tower of ch. 7) sit behind an **approximate
+nearest-neighbour (ANN) index**. The idea is a library's shelving: cluster the item vectors once,
+and at query time only search the few clusters whose centre is closest to the query.
+
+That is an **inverted-file (IVF)** index. Offline, run k-means to get $n_{\text{list}}$ centroids
+and file every item under its nearest one. Online, score the query against the centroids, open
+the $n_{\text{probe}}$ best lists, and do exact search inside them only. The knob $n_{\text{probe}}$
+trades recall (of the true top-$k$) against work. Below: 100,000 clustered unit vectors, 256 lists,
+cost counted as vectors scanned (centroids included) rather than seconds.
 
 ```python
 rng_ann = np.random.default_rng(1)
@@ -282,11 +393,36 @@ for n_probe in (1, 2, 4, 8, 16, 32):
       32     0.9705           12,764                12.76%
 ```
 
+Opening one list scans 0.64% of the vectors and finds 45% of the true top 10; opening 32 scans
+12.76% and finds 97%. The curve is concave — the last few percent of recall are the expensive ones,
+because true neighbours that sit near a cluster boundary were filed in a list whose centroid looks
+mediocre from the query. Production indexes add tricks on top: **product quantisation** (IVF-PQ in
+FAISS) compresses each vector to a few bytes so the scan itself is cheaper, and **HNSW** replaces
+clustering with a navigable small-world graph that gets 95%+ recall at very low scan counts, at the
+price of memory and slow inserts.
+
+The ANN recall multiplies into everything downstream. An index at 0.92 recall feeding a retriever
+at candidate recall 0.34 gives roughly 0.31 if the misses are independent, so tune
+$n_{\text{probe}}$ against the end-to-end metric, not the index benchmark.
+
 ## The ranker's training table, built across a time gap
 
+The ranker is a supervised model, so it needs rows and labels. Each row is one (user, candidate)
+pair that stage one actually produced; the label says whether the user took that item in the
+*next* window. Training on the candidates retrieval really emits matters: those are the hard
+negatives the ranker will face in production, not random catalogue items it could reject on
+popularity alone.
+
+Features come in three kinds. **Retrieval scores**: the iALS and CF scores, their recent-weighted
+versions, and their rank in the user's list. **Item features**: log popularity, trend, the ratio of
+the two (is the item rising?), days since anyone last touched it. **User–item affinity**: the
+share of the user's history in the candidate's genre, overall and recency-weighted, plus how many
+sources voted for the item. One user-only feature, history length, is included on purpose — watch
+what it does to the pointwise model.
+
 ```python
-FEATS = ["als", "icf", "als_recent", "icf_recent", "als_rank", "icf_rank", "log_pop", "log_trend", "trend_ratio",
-         "log_item_age", "user_log_n", "genre_aff", "genre_aff_recent", "n_sources"]
+FEATS = ["als", "icf", "als_recent", "icf_recent", "als_rank", "icf_rank", "log_pop",
+         "log_trend", "trend_ratio", "log_item_age", "user_log_n", "genre_aff", "genre_aff_recent", "n_sources"]
 
 def rank_matrix(S, seen):
     order = np.argsort(-np.where(seen, -np.inf, S), axis=1)
@@ -331,7 +467,7 @@ for name, df in (("train (features <= t1, labels in (t1, t2])", tr),
                  ("test  (features <= t2, labels > t2)", te)):
     print(f"{name}: {len(df):>7,} rows | {df['user'].nunique():,} users | "
           f"positive rate {df['label'].mean():.4f}")
-print(te[FEATS + ["label"]].describe().T[["mean", "std", "min", "max"]].round(3).to_string())
+print(f"{len(FEATS)} features: {', '.join(FEATS)}")
 ```
 
 ```output
@@ -355,7 +491,17 @@ n_sources         2.387  1.133  1.000   4.000
 label             0.041  0.198  0.000   1.000
 ```
 
+About 200,000 rows per table and roughly 4% positives: each user has about 84 candidates of which
+three or four are taken. Every feature in the training table was computed from window A only
+(`hist_A`, `now = t1`), and every label comes from window B. The test table repeats the recipe one
+window later. That shift is the entire leakage defence, and it is tested directly in a later section.
+
 ## Pointwise: classify each candidate on its own
+
+The simplest ranker ignores that rows come in lists. Treat every (user, candidate) row as an
+independent binary example, fit $P(y=1 \mid \mathbf{x})$ with log-loss, and sort each user's
+candidates by the predicted probability. This is **pointwise** learning to rank, and it is what
+most production rankers start as — a logistic model or GBDT on a click label.
 
 ```python
 from sklearn.linear_model import LogisticRegression
@@ -394,11 +540,88 @@ pointwise GBDT              : NDCG@10 0.1075
 logistic coefficients (standardised): als +0.63, icf -0.34, user_log_n +0.31, icf_recent +0.30, als_recent -0.22, genre_aff_recent +0.15
 ```
 
-## Pairwise: RankNet and LambdaRank
+This is a sobering result. The logistic ranker edges iALS order by 0.0007, and the GBDT — the
+model you would reach for first on Kaggle — *loses* to the retrieval score it was given as a
+feature, 0.1075 against 0.1136.
+
+The coefficients show one reason. `user_log_n` gets the third-largest weight (+0.31), but it is
+identical for every candidate of a user, so it cannot change any user's ordering. The pointwise
+objective still spends capacity on it, because the loss is summed over *all* rows: predicting
+which users click a lot is a large, easy part of the log-loss that contributes nothing to NDCG.
+The GBDT, with more capacity, spends more of it on between-user structure and on overfitting
+noisy interactions. Ranking metrics only care about order *within* a list, and the next losses are
+built to see exactly that.
+
+## Pairwise and listwise: losses that only see order
+
+A pairwise loss asks a question the user's identity cannot answer: *of these two candidates for
+the same user, which one did they take?* Anything constant within the user — history length,
+general click-happiness — cancels out of that comparison, so the model cannot waste capacity on
+it. A listwise loss goes one step further and scores the whole candidate list at once.
 
 ### From pairwise probabilities to lambdas
 
-DERIVATION
+This derivation shows that LambdaRank is RankNet with each pair's gradient rescaled by how much
+swapping that pair would change NDCG. Let $s_i$ be the model's score for candidate $i$ and suppose
+the user preferred $i$ over $j$ (written $i \succ j$). **RankNet** (Burges et al., 2005) models
+the probability of that preference with a logistic on the score difference and minimises its
+negative log:
+
+$$
+P(i \succ j) = \sigma(s_i - s_j) = \frac{1}{1 + e^{-(s_i - s_j)}},
+\qquad
+C_{ij} = -\log \sigma(s_i - s_j) = \log\left(1 + e^{-(s_i - s_j)}\right).
+$$
+
+Differentiate with respect to the two scores. Using $\frac{d}{dz}\log(1+e^{-z}) = -\sigma(-z)$:
+
+$$
+\frac{\partial C_{ij}}{\partial s_i} = -\sigma\big(-(s_i - s_j)\big) =: \lambda_{ij},
+\qquad
+\frac{\partial C_{ij}}{\partial s_j} = -\lambda_{ij}.
+$$
+
+So each pair pushes $s_i$ up and $s_j$ down with force $|\lambda_{ij}|$, which is large when the
+pair is mis-ordered and near zero when it is already well separated. The total force on item $i$
+sums over all pairs it is in, $\lambda_i = \sum_{j: i \succ j} \lambda_{ij} - \sum_{j: j \succ i} \lambda_{ji}$,
+and the gradient step is $s_i \leftarrow s_i - \eta\,\lambda_i$.
+
+RankNet's flaw is that it counts every pair equally. Fixing a swap between positions 1 and 2 is
+worth far more NDCG than fixing one between positions 70 and 71. **LambdaRank** (Burges et al.,
+2006) never writes down a new loss; it rescales the gradient by the NDCG change from swapping $i$
+and $j$ in the current ranking. With gain $g_i = 2^{y_i} - 1$ for label $y_i$, current positions
+$r_i, r_j$ (1-based), and $\mathrm{IDCG}$ the DCG of the ideal ordering:
+
+$$
+|\Delta \mathrm{NDCG}_{ij}| = \frac{|g_i - g_j|\;\left|\dfrac{1}{\log_2(1 + r_i)} - \dfrac{1}{\log_2(1 + r_j)}\right|}{\mathrm{IDCG}},
+\qquad
+\boxed{\lambda_{ij}^{\text{Lambda}} = -\sigma\big(-(s_i - s_j)\big)\,|\Delta \mathrm{NDCG}_{ij}|}
+$$
+
+The $|\Delta\mathrm{NDCG}|$ factor depends on the current sort but not on the scores' values, so
+you implement it as a *detached* weight on the RankNet pair loss: the autograd gradient is then
+exactly $\lambda^{\text{Lambda}}$. Using $1/\log_2(1+r)$ only for $r \le k$ and zero beyond gives
+the NDCG@$k$-targeted version; LightGBM's `objective="lambdarank"` is this gradient fed to boosted
+trees (LambdaMART), with `lambdarank_truncation_level` playing the role of $k$.
+
+### The listwise softmax
+
+This one shows the listwise loss is a cross-entropy over the whole candidate list. Turn each
+user's scores into a distribution over the list with a softmax, and match it to the label
+distribution $p_i = y_i / \sum_{j} y_j$ (ListNet's top-one version, the same sampled-softmax shape
+as ch. 7's in-batch loss):
+
+$$
+\mathcal{L}_u = -\sum_{i \in C_u} p_i \log \frac{e^{s_i}}{\sum_{j \in C_u} e^{s_j}},
+\qquad
+\frac{\partial \mathcal{L}_u}{\partial s_i} = \mathrm{softmax}(s)_i - p_i.
+$$
+
+The gradient is "predicted share minus true share", and adding a constant to every score in the
+list changes nothing — the same invariance to user-level effects that the pairwise loss has.
+
+The code trains one small MLP (two hidden layers) with each of the four losses on padded per-user
+lists, so the only thing that differs is the objective.
 
 ```python
 mu, sd = tr[FEATS].mean().values, tr[FEATS].std().values + 1e-9
@@ -460,7 +683,6 @@ def score_df(model, df):
 Xl, Yl, Ml = to_lists(tr)
 ltr = {}
 for kind in ("pointwise", "ranknet", "lambdarank", "listwise"):
-    t0 = time.time()
     ltr[kind] = train_ltr(kind, Xl, Yl, Ml)
     te["s_" + kind] = score_df(ltr[kind], te)
     print(f"MLP {kind:>10}: NDCG@10 {ndcg_table(te, 's_' + kind, truth_C):.4f}")
@@ -473,7 +695,24 @@ MLP lambdarank: NDCG@10 0.1187
 MLP   listwise: NDCG@10 0.1192
 ```
 
+Same network, same features, same data — and the objective is worth 0.016 NDCG. The pointwise MLP
+(0.1034) is the worst model in the chapter so far, below plain iALS order; the three
+within-list losses all land between 0.1187 and 0.1196, about 5% above iALS order. The fix was not
+more capacity but telling the model what the metric ignores.
+
+The three list-aware losses sit within 0.001 of each other — differences you should not believe
+without ch. 2's paired bootstrap — and that is the usual finding with binary labels and short
+lists. LambdaRank's top-heavy weighting earns its reputation
+with graded relevance and long lists, where most pairs sit far below the cutoff and RankNet wastes
+effort on them. Its real strength in practice is LambdaMART: the same gradient driving a GBDT,
+which is why "LightGBM with `lambdarank`" is the default ranker in industry and on Kaggle.
+
 ## End to end: does the ranker pay for itself?
+
+A bigger candidate pile raises the ceiling (more true items inside) but also hands the ranker more
+plausible-looking wrong items to promote. The two effects pull in opposite directions, so the
+right pile size is an empirical question. Below, the rankers trained at $n = 50$ per source are
+applied unchanged to piles built with 10 to 100 per source.
 
 ```python
 rows = []
@@ -500,7 +739,30 @@ print(pd.DataFrame(rows).to_string(index=False))
           100     155.6        0.5587     0.1136  0.1073            0.1195          0.7407
 ```
 
+Read the table one column at a time. Candidate recall and the oracle ceiling grow steadily with
+the pile. iALS order is flat, as already explained. The LambdaRank MLP improves monotonically,
+from 0.1173 to 0.1195: it is good enough at ordering that a bigger pile is a net gain, even at a
+size three times what it was trained on. The pointwise GBDT does the opposite and gets slightly
+*worse* as the pile grows (0.1100 to 0.1073) — every extra candidate is another chance for a
+miscalibrated scorer to promote a popular but wrong item into the top 10.
+
+That is the operational rule: **only grow stage one as far as stage two can exploit**. A weak ranker
+should get a small, high-precision pile; a strong one should get a big, high-recall pile. And the
+distance to the oracle column — 0.12 against 0.74 — says that on this data the ranker, not
+retrieval, is the bottleneck, although much of that gap is noise no model could recover (ch. 2's
+generating-model oracle reached only 0.1596 recall@10).
+
 ## Leakage: the bug that makes a ranker look brilliant
+
+Leakage in a ranker is rarely as crude as a label column. It is usually a feature computed by a
+"nightly snapshot" job over the *whole* log, which for training rows means over the label window
+too. Here the bug is exactly that: candidates and retrieval scores are built properly from window
+A, but the user genre affinities and item popularity/trend statistics are computed from A+B — so
+for training rows they already contain the clicks the model is asked to predict.
+
+The check is the one that would be run in practice: hold out 20% of training users, measure NDCG
+on them (the offline number a team would report), then measure on the future window C, where the
+features are necessarily computed honestly.
 
 ```python
 # the bug: user and item aggregates come from a snapshot of the whole log (through t2)
@@ -526,7 +788,35 @@ for name, v, t in results:
     leaky               0.1511               0.1042
 ```
 
+The leaky model reports 0.1511 offline — a 32% jump that would get the change shipped — and then
+scores 0.1042 on the future, *below* the clean model's 0.1067. It learned that "this user's genre
+affinity, including the clicks we are predicting" is a superb feature, and at serving time that
+feature no longer contains the future. The offline number was not optimistic; it was measuring a
+different model.
+
+The defence is structural, not a check you remember to run: build every feature with an explicit
+`as_of` timestamp (here `now = t1` and `hist_A`), take labels strictly after it, and make the
+training-table builder the *same function* that serves features at request time. Production
+systems do this with a feature store that supports point-in-time joins. Note the clean model also
+drops from 0.1143 offline to 0.1067 on window C: some gap between validation and the future is
+normal drift, and it is the size of the gap, not its existence, that signals leakage.
+
 ## Re-ranking: rules and diversity after the model
+
+The ranker scores each item on its own, so ten near-duplicates with high scores all make the top
+10. A third, cheap stage fixes the *list* as a whole: business rules (no more than three items of
+one genre, filter out-of-stock, boost a promotion) and diversity re-ranking. The standard
+diversity method is **maximal marginal relevance** (MMR, Carbonell & Goldstein 1998): build the
+list greedily, each time picking the item that balances its own relevance against its similarity
+to what is already chosen,
+
+$$
+i^\star = \arg\max_{i \in C_u \setminus S}\; \lambda\,\mathrm{rel}(i) - (1-\lambda)\max_{j \in S}\,\mathrm{sim}(i, j),
+$$
+
+where $S$ is the list built so far, $\mathrm{rel}$ is the ranker's score scaled to $[0, 1]$,
+$\mathrm{sim}$ is cosine similarity of iALS item vectors, and $\lambda \in [0, 1]$ sets the
+trade-off ($\lambda = 1$ is pure ranker order).
 
 ```python
 V_n = src_AB["V"] / (np.linalg.norm(src_AB["V"], axis=1, keepdims=True) + 1e-9)
@@ -553,10 +843,10 @@ def genre_cap(items, rel, cap=3, k=10):
             break
     return np.array(out)
 
-groups = {u: (g["item"].values, g["s_gb"].values) for u, g in te.groupby("user")}
+groups = {u: (g["item"].values, g["s_lambdarank"].values) for u, g in te.groupby("user")}
 print(f"{'policy':>18} {'NDCG@10':>8} {'genres in top-10':>17} {'intra-list sim':>15}")
 policies = [("ranker order", lambda it, s: it[np.argsort(-s)][:10])]
-policies += [(f"MMR lambda={lam}", lambda it, s, lam=lam: mmr(it, s / s.max(), lam))
+policies += [(f"MMR lambda={lam}", lambda it, s, lam=lam: mmr(it, (s - s.min()) / (s.max() - s.min()), lam))
              for lam in (0.9, 0.7, 0.5)]
 policies += [("cap 3 per genre", genre_cap)]
 for name, pol in policies:
@@ -581,79 +871,117 @@ for name, pol in policies:
 
 ## Try it Yourself
 
+A self-contained sandbox for the four losses. Each "user" has 40 candidates with 8 features and
+graded labels 0–3; the labels also depend on a per-list offset the features cannot see (some users
+are simply more enthusiastic), and on a feature interaction a linear scorer cannot represent.
+
 ```python
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 torch.manual_seed(0)
+torch.set_num_threads(1)
 rng = np.random.default_rng(0)
-n_q, L, d = 400, 40, 8                       # 400 queries, 40 candidates each, 8 features
+n_q, L, d = 400, 40, 8                     # 400 queries (users), 40 candidates each, 8 features
 w_true = rng.normal(0, 1, d)
 X = rng.normal(0, 1, (n_q, L, d))
-util = X @ w_true + rng.normal(0, 1.5, (n_q, L))
-y = (util > np.quantile(util, 0.9, axis=1, keepdims=True)).astype(np.float32)  # 4 relevant / list
+offset = rng.normal(0, 2.0, (n_q, 1))     # per-list effect the features cannot see (a user's mood)
+signal = X @ w_true + 0.8 * X[..., 1] * X[..., 2] + rng.normal(0, 1.0, (n_q, L))
+thr = np.quantile(signal + offset, [0.80, 0.93, 0.98])                  # one global grading scale
+y = sum((signal + offset > t).astype(np.float32) for t in thr)
+keep = y.max(1) > 0                                                     # lists with something relevant
+X, y = X[keep], y[keep]
 X, y = torch.tensor(X, dtype=torch.float32), torch.tensor(y)
-Xtr, ytr, Xte, yte = X[:300], y[:300], X[300:], y[300:]
+Xtr, ytr, Xte, yte = X[:250], y[:250], X[250:], y[250:]
+disc_k = 1 / torch.log2(torch.arange(L) + 2.0)
 
 def ndcg10(s, y):
     top = torch.argsort(s, dim=1, descending=True)[:, :10]
-    disc = 1 / torch.log2(torch.arange(10) + 2.0)
-    dcg = (torch.gather(y, 1, top) * disc).sum(1)
-    idcg = (torch.sort(y, dim=1, descending=True).values[:, :10] * disc).sum(1)
+    dcg = ((2 ** torch.gather(y, 1, top) - 1) * disc_k[:10]).sum(1)
+    idcg = ((2 ** torch.sort(y, 1, descending=True).values[:, :10] - 1) * disc_k[:10]).sum(1)
     return float((dcg / idcg).mean())
 
 def fit(kind, steps=300):
     w = torch.zeros(d, requires_grad=True)
     opt = torch.optim.Adam([w], lr=0.05)
+    gain = 2 ** ytr - 1
     for _ in range(steps):
         s = Xtr @ w
         diff = s[:, :, None] - s[:, None, :]
         pair = ytr[:, :, None] > ytr[:, None, :]
-        if kind == "pointwise":
-            loss = F.binary_cross_entropy_with_logits(s, ytr)
+        if kind == "pointwise (regress grade)":
+            loss = F.mse_loss(s, ytr)
         elif kind == "listwise":
-            loss = -(ytr * F.log_softmax(s, 1)).sum(1).div(ytr.sum(1)).mean()
+            p = gain / gain.sum(1, keepdim=True)
+            loss = -(p * F.log_softmax(s, 1)).sum(1).mean()
         else:
             wt = torch.ones_like(diff)
             if kind == "lambdarank":
                 with torch.no_grad():
-                    disc = 1 / torch.log2(torch.argsort(torch.argsort(-s, 1), 1).float() + 2)
-                    wt = (disc[:, :, None] - disc[:, None, :]).abs()
+                    disc = disc_k[torch.argsort(torch.argsort(-s, 1), 1)]
+                    wt = ((gain[:, :, None] - gain[:, None, :]) * (disc[:, :, None] - disc[:, None, :])).abs()
             loss = (F.softplus(-diff) * wt)[pair].mean()
         opt.zero_grad()
         loss.backward()
         opt.step()
-    return float(ndcg10(Xte @ w.detach(), yte))
+    return ndcg10(Xte @ w.detach(), yte)
 
-print("random order NDCG@10:", round(ndcg10(torch.rand(100, L), yte), 4))
-for kind in ("pointwise", "ranknet", "lambdarank", "listwise"):
-    print(f"{kind:>10}: NDCG@10 {fit(kind):.4f}")
+print(f"{len(X)} lists kept | random order: NDCG@10 {ndcg10(torch.rand(len(yte), L), yte):.4f}")
+for kind in ("pointwise (regress grade)", "ranknet", "lambdarank", "listwise"):
+    print(f"{kind:>26}: NDCG@10 {fit(kind):.4f}")
 ```
 
 ```output
-random order NDCG@10: 0.1667
- pointwise: NDCG@10 0.7451
-   ranknet: NDCG@10 0.7422
-lambdarank: NDCG@10 0.7452
-  listwise: NDCG@10 0.7431
 ```
 
 TRYIT PROSE
 
 ## Exercise
 
-EXERCISE PROSE
+The pointwise GBDT lost to plain iALS order (0.1075 against 0.1136), even though it was given the
+iALS score as a feature. Diagnose and fix it without leaving scikit-learn: (1) regularise the trees
+(fewer leaves, larger leaves) and see how much of the loss was overfitting; (2) turn the problem
+pairwise with the **difference transform** — for each user, pair positives with sampled negatives
+from the *same* candidate list, train a classifier on $\mathbf{x}_i - \mathbf{x}_j$ (label 1) and
+$\mathbf{x}_j - \mathbf{x}_i$ (label 0), and score items with the learned linear function. That is
+RankSVM / linear RankNet. Compare both with the LambdaRank MLP.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-print(1)
+gb_reg = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=8,
+                                        min_samples_leaf=200, random_state=0)
+gb_reg.fit(tr[FEATS], tr["label"])
+te["s_gb_reg"] = gb_reg.predict_proba(te[FEATS])[:, 1]
+
+rng_pair = np.random.default_rng(0)
+diffs, ys = [], []
+for u, g in tr.groupby("user"):
+    pos, neg = g.loc[g["label"] == 1, FEATS].values, g.loc[g["label"] == 0, FEATS].values
+    if len(pos) == 0:
+        continue                                   # a list with no positive has no pairs
+    k = min(len(neg), 10 * len(pos))
+    pi, ni = rng_pair.integers(0, len(pos), k), rng_pair.choice(len(neg), k, replace=False)
+    diffs += [pos[pi] - neg[ni], neg[ni] - pos[pi]]
+    ys += [np.ones(k), np.zeros(k)]
+D, yD = np.vstack(diffs), np.concatenate(ys)
+pair_lr = make_pipeline(StandardScaler(with_mean=False), LogisticRegression(max_iter=2_000))
+pair_lr.fit(D, yD)
+te["s_pair_lr"] = pair_lr.decision_function(te[FEATS].values)
+
+print(f"{len(D):,} difference rows from {len(tr):,} candidate rows")
+for name, col in (("iALS order", "als"), ("pointwise GBDT (31 leaves)", "s_gb"),
+                  ("pointwise GBDT (8 leaves, min 200)", "s_gb_reg"),
+                  ("pointwise logistic", "s_lr"), ("pairwise logistic (RankSVM-style)", "s_pair_lr"),
+                  ("LambdaRank MLP", "s_lambdarank")):
+    print(f"{name:>36}: NDCG@10 {ndcg_table(te, col, truth_C):.4f}")
+w = pair_lr[-1].coef_[0] / pair_lr[0].scale_
+print("user_log_n weight in the pairwise model:", round(float(w[FEATS.index("user_log_n")]), 4))
 ```
 
 ```output
-1
 ```
 
 SOLUTION PROSE
