@@ -1,0 +1,567 @@
+---
+course: recommender-systems
+chapter: 10-candidate-generation-ranking
+title: "Candidate Generation and Ranking: The Two-Stage Stack"
+order: 10
+---
+
+## One model cannot score the whole catalogue
+
+PROSE
+
+```python
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from scipy import sparse
+
+torch.manual_seed(0)
+torch.set_num_threads(4)
+rng = np.random.default_rng(0)
+
+n_users, n_items = 2_500, 900
+user_taste = rng.normal(0, 1, (n_users, 4))
+genre = rng.integers(0, 6, n_items)
+item_style = rng.normal(0, 1.4, (6, 4))[genre] + rng.normal(0, 0.35, (n_items, 4))
+activity = rng.lognormal(-0.4, 1.0, n_users)
+exposure = rng.lognormal(-1.0, 1.7, n_items) * np.where(genre == 0, 4.0, 1.0)
+
+months = []
+for month in range(12):
+    user_taste = user_taste + rng.normal(0, 0.25, (n_users, 4))
+    logit = (user_taste @ item_style.T / 2 - 4.0
+             + np.log(activity)[:, None] + np.log(exposure)[None, :])
+    r, c = np.nonzero(rng.random((n_users, n_items)) < 1 / (1 + np.exp(-logit)) / 12)
+    months.append(pd.DataFrame({"user": r, "item": c,
+                                "ts": month * 30 + rng.integers(0, 30, len(r))}))
+events = pd.concat(months).sort_values("ts").reset_index(drop=True)
+
+t2 = events["ts"].max() - 60          # test window starts after t2 (same split as ch. 5-7)
+t1 = t2 - 60                          # ranker-label window is (t1, t2]
+hist_A = events[events["ts"] <= t1]
+lab_B = events[(events["ts"] > t1) & (events["ts"] <= t2)]
+hist_AB = events[events["ts"] <= t2]
+test_C = events[events["ts"] > t2]
+for name, df in (("history A (ranker features)", hist_A), ("window B (ranker labels)", lab_B),
+                 ("history A+B (serving features)", hist_AB), ("window C (test)", test_C)):
+    print(f"{name:>32}: {len(df):>7,} events, days {df['ts'].min():>3}-{df['ts'].max():>3}")
+```
+
+```output
+```
+
+BUDGET PROSE
+
+```python
+catalogue, budget_ms = 10_000_000, 100
+stages = [  # (stage, microseconds per (user, item) scored) -- order-of-magnitude assumptions
+    ("dot product, d=64, brute force", 0.02),
+    ("GBDT ranker, 500 trees x depth 8", 5.0),
+    ("deep cross-feature ranker (MLP over 300 features)", 40.0),
+    ("transformer cross-encoder over user history", 2_000.0),
+]
+print(f"{'model':>50} {'items in 100 ms':>16} {'full catalogue':>15}")
+for name, us in stages:
+    print(f"{name:>50} {budget_ms * 1_000 / us:>16,.0f} {catalogue * us / 1e6:>13,.1f} s")
+funnel = [("ANN retrieval", catalogue, 0.0), ("light ranker", 2_000, 5.0),
+          ("heavy ranker", 300, 40.0), ("re-rank / rules", 50, 0.0)]
+print("\nfunnel:", " -> ".join(f"{n} ({k:,})" for n, k, _ in funnel))
+print(f"model time of the two rankers: {sum(k * us for _, k, us in funnel) / 1_000:.1f} ms")
+```
+
+```output
+```
+
+## Several retrievers, one candidate set
+
+```python
+def implicit_als(X, d=16, alpha=5.0, lam=50.0, n_iter=8, seed=0):
+    """Weighted ALS from ch. 5 (Hu, Koren, Volinsky)."""
+    U = np.random.default_rng(seed).normal(0, 0.01, (X.shape[0], d))
+    V = np.random.default_rng(seed + 1).normal(0, 0.01, (X.shape[1], d))
+    Xt, eye = X.T.tocsr(), lam * np.eye(d)
+    for _ in range(n_iter):
+        for M, F, O in ((X, U, V), (Xt, V, U)):
+            G = O.T @ O + eye
+            for row in range(M.shape[0]):
+                idx = M.indices[M.indptr[row]:M.indptr[row + 1]]
+                if len(idx) == 0:
+                    F[row] = 0
+                    continue
+                Oi = O[idx]
+                F[row] = np.linalg.solve(G + alpha * Oi.T @ Oi, (1 + alpha) * Oi.sum(0))
+    return U, V
+
+def item_stats(hist, now, half_life=14.0):
+    pop = np.bincount(hist["item"], minlength=n_items).astype(float)
+    w = 0.5 ** ((now - hist["ts"].values) / half_life)
+    trend = np.bincount(hist["item"], weights=w, minlength=n_items)
+    last = np.full(n_items, -1_000.0)
+    np.maximum.at(last, hist["item"].values, hist["ts"].values.astype(float))
+    return {"pop": pop, "trend": trend, "age": now - last}
+
+def build_sources(hist, now):
+    X = sparse.csr_matrix((np.ones(len(hist)), (hist["user"], hist["item"])),
+                          shape=(n_users, n_items))
+    X.data[:] = 1.0
+    C = (X.T @ X).toarray()
+    norm = np.sqrt(np.diag(C)) + 1e-9
+    S = C / norm[:, None] / norm[None, :]
+    np.fill_diagonal(S, 0.0)
+    U, V = implicit_als(X)
+    src = {"seen": X.toarray() > 0, "icf": np.asarray(X @ S), "als": U @ V.T, "V": V, "X": X}
+    src.update(item_stats(hist, now))
+    return src
+
+def generate(src, users, n_per):
+    """Top-n_per unseen items from each source, merged and deduplicated."""
+    seen = src["seen"][users]
+    per_source = {}
+    for name in ("pop", "trend", "icf", "als"):
+        S = np.broadcast_to(src[name], (n_users, n_items))[users] if src[name].ndim == 1 \
+            else src[name][users]
+        per_source[name] = np.argpartition(-np.where(seen, -np.inf, S), n_per, axis=1)[:, :n_per]
+    votes = np.zeros((len(users), n_items), dtype=np.int8)
+    for idx in per_source.values():
+        votes[np.arange(len(users))[:, None], idx] += 1
+    return per_source, votes
+
+src_A, src_AB = build_sources(hist_A, t1), build_sources(hist_AB, t2)
+truth_B = {u: set(g) for u, g in lab_B.groupby("user")["item"]}
+truth_C = {u: set(g) for u, g in test_C.groupby("user")["item"]}
+users_tr = np.array([u for u in range(n_users) if truth_B.get(u) and src_A["seen"][u].any()])
+users_te = np.array([u for u in range(n_users) if truth_C.get(u) and src_AB["seen"][u].any()])
+per_te, votes_te = generate(src_AB, users_te, 50)
+sizes = (votes_te > 0).sum(1)
+print(f"ranker-train users {len(users_tr):,} | test users {len(users_te):,}")
+print(f"4 sources x 50 = 200 slots -> {sizes.mean():.1f} unique candidates per user "
+      f"(min {sizes.min()}, max {sizes.max()})")
+print(f"items proposed by 1/2/3/4 sources: "
+      + " / ".join(f"{(votes_te == k).sum() / len(users_te):.1f}" for k in (1, 2, 3, 4)))
+```
+
+```output
+```
+
+## Candidate recall is the ceiling
+
+```python
+def cand_recall(sets, users, truth):
+    return float(np.mean([len(sets[r] & truth[u]) / len(truth[u]) for r, u in enumerate(users)]))
+
+print(f"{'source':>8} " + " ".join(f"{'R@' + str(n):>7}" for n in (10, 25, 50, 100)))
+for name in ("pop", "trend", "icf", "als", "union"):
+    row = []
+    for n in (10, 25, 50, 100):
+        per, votes = generate(src_AB, users_te, n)
+        sets = ([set(np.flatnonzero(v)) for v in votes] if name == "union"
+                else [set(x) for x in per[name]])
+        row.append(cand_recall(sets, users_te, truth_C))
+    print(f"{name:>8} " + " ".join(f"{x:>7.4f}" for x in row))
+```
+
+```output
+```
+
+### Why stage one bounds every later stage
+
+```python
+def ndcg_at_10(ranked, rel):
+    dcg = sum(1 / np.log2(j + 2) for j, i in enumerate(ranked[:10]) if i in rel)
+    return dcg / sum(1 / np.log2(j + 2) for j in range(min(10, len(rel))))
+
+print(f"{'n per source':>12} {'|C|':>6} {'recall@|C|':>11} {'oracle NDCG@10':>15} "
+      f"{'iALS-order NDCG@10':>19}")
+for n in (5, 10, 25, 50, 100):
+    _, votes = generate(src_AB, users_te, n)
+    orc, als_nd = [], []
+    for r, u in enumerate(users_te):
+        c = np.flatnonzero(votes[r])
+        hits = [i for i in c if i in truth_C[u]]
+        orc.append(ndcg_at_10(hits, truth_C[u]))
+        als_nd.append(ndcg_at_10(c[np.argsort(-src_AB["als"][u, c])], truth_C[u]))
+    sets = [set(np.flatnonzero(v)) for v in votes]
+    print(f"{n:>12} {(votes > 0).sum(1).mean():>6.1f} {cand_recall(sets, users_te, truth_C):>11.4f} "
+          f"{np.mean(orc):>15.4f} {np.mean(als_nd):>19.4f}")
+```
+
+```output
+```
+
+## Approximate nearest neighbours: scan less, miss a little
+
+```python
+rng_ann = np.random.default_rng(1)
+n_vec, d_ann = 100_000, 32
+centres = rng_ann.normal(0, 1, (400, d_ann))
+base = centres[rng_ann.integers(0, 400, n_vec)] + rng_ann.normal(0, 0.6, (n_vec, d_ann))
+base /= np.linalg.norm(base, axis=1, keepdims=True)
+queries = base[rng_ann.integers(0, n_vec, 200)] + rng_ann.normal(0, 0.3, (200, d_ann))
+queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+exact = np.argpartition(-(queries @ base.T), 10, axis=1)[:, :10]
+
+def kmeans(Z, k, iters=10, seed=0):
+    r = np.random.default_rng(seed)
+    cent = Z[r.choice(len(Z), k, replace=False)]
+    for _ in range(iters):
+        assign = np.argmax(Z @ cent.T, axis=1)
+        for j in range(k):
+            members = Z[assign == j]
+            if len(members):
+                cent[j] = members.mean(0) / np.linalg.norm(members.mean(0))
+    return cent
+
+n_list = 256
+cent = kmeans(base[rng_ann.choice(n_vec, 20_000, replace=False)], n_list)
+assign = np.argmax(base @ cent.T, axis=1)
+lists = [np.flatnonzero(assign == j) for j in range(n_list)]
+
+def ivf_search(q, n_probe, k=10):
+    probe = np.argsort(-(cent @ q))[:n_probe]
+    cand = np.concatenate([lists[j] for j in probe])
+    top = cand[np.argpartition(-(base[cand] @ q), min(k, len(cand) - 1))[:k]]
+    return top, len(cand)
+
+print(f"{'n_probe':>8} {'recall@10':>10} {'vectors scanned':>16} {'share of brute force':>21}")
+for n_probe in (1, 2, 4, 8, 16, 32):
+    rec, scanned = [], []
+    for qi, q in enumerate(queries):
+        top, n_scan = ivf_search(q, n_probe)
+        rec.append(len(set(top) & set(exact[qi])) / 10)
+        scanned.append(n_scan + n_list)
+    print(f"{n_probe:>8} {np.mean(rec):>10.4f} {np.mean(scanned):>16,.0f} "
+          f"{np.mean(scanned) / n_vec:>21.2%}")
+```
+
+```output
+```
+
+## The ranker's training table, built across a time gap
+
+```python
+FEATS = ["als", "icf", "als_rank", "icf_rank", "log_pop", "log_trend", "trend_ratio",
+         "log_item_age", "user_log_n", "genre_aff", "genre_aff_recent", "n_sources"]
+
+def rank_matrix(S, seen):
+    order = np.argsort(-np.where(seen, -np.inf, S), axis=1)
+    rk = np.empty_like(order)
+    np.put_along_axis(rk, order, np.arange(S.shape[1])[None, :].repeat(len(S), 0), axis=1)
+    return rk
+
+def feature_table(src, hist, now, users, truth, n_per=50, items_from=None):
+    """One row per (user, candidate). items_from lets you (wrongly) swap in item statistics."""
+    it = items_from or src
+    _, votes = generate(src, users, n_per)
+    r_idx, i_idx = np.nonzero(votes)
+    u_idx = users[r_idx]
+    seen = src["seen"][users]
+    G = np.zeros((n_users, 6))
+    np.add.at(G, (hist["user"].values, genre[hist["item"].values]), 1.0)
+    Gr = np.zeros((n_users, 6))
+    np.add.at(Gr, (hist["user"].values, genre[hist["item"].values]),
+              0.5 ** ((now - hist["ts"].values) / 14.0))
+    n_u = G.sum(1)
+    df = pd.DataFrame({
+        "user": u_idx, "item": i_idx,
+        "als": src["als"][u_idx, i_idx], "icf": src["icf"][u_idx, i_idx],
+        "als_rank": np.log1p(rank_matrix(src["als"][users], seen)[r_idx, i_idx]),
+        "icf_rank": np.log1p(rank_matrix(src["icf"][users], seen)[r_idx, i_idx]),
+        "log_pop": np.log1p(it["pop"][i_idx]), "log_trend": np.log1p(it["trend"][i_idx]),
+        "trend_ratio": np.log((it["trend"][i_idx] + 1) / (it["pop"][i_idx] + 1)),
+        "log_item_age": np.log1p(np.clip(it["age"][i_idx], 0, 1_000)),
+        "user_log_n": np.log1p(n_u[u_idx]),
+        "genre_aff": G[u_idx, genre[i_idx]] / np.maximum(n_u[u_idx], 1),
+        "genre_aff_recent": Gr[u_idx, genre[i_idx]] / np.maximum(Gr[u_idx].sum(1), 1e-9),
+        "n_sources": votes[r_idx, i_idx].astype(float),
+    })
+    df["label"] = [int(i in truth[u]) for u, i in zip(df["user"], df["item"])]
+    return df
+
+tr = feature_table(src_A, hist_A, t1, users_tr, truth_B)
+te = feature_table(src_AB, hist_AB, t2, users_te, truth_C)
+for name, df in (("train (features <= t1, labels in (t1, t2])", tr),
+                 ("test  (features <= t2, labels > t2)", te)):
+    print(f"{name}: {len(df):>7,} rows | {df['user'].nunique():,} users | "
+          f"positive rate {df['label'].mean():.4f}")
+print(te[FEATS + ["label"]].describe().T[["mean", "std", "min", "max"]].round(3).to_string())
+```
+
+```output
+```
+
+## Pointwise: classify each candidate on its own
+
+```python
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+def ndcg_table(df, score_col, truth, k=10):
+    d = df[["user", "item", score_col]].sort_values(["user", score_col], ascending=[True, False])
+    d = d[d.groupby("user").cumcount() < k]
+    out = []
+    for u, g in d.groupby("user", sort=False):
+        out.append(ndcg_at_10(g["item"].values, truth[u]))
+    return float(np.mean(out))
+
+lr_model = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2_000))
+lr_model.fit(tr[FEATS], tr["label"])
+gb_model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+                                          random_state=0)
+gb_model.fit(tr[FEATS], tr["label"])
+te["s_lr"] = lr_model.predict_proba(te[FEATS])[:, 1]
+te["s_gb"] = gb_model.predict_proba(te[FEATS])[:, 1]
+print(f"retrieval only (iALS order) : NDCG@10 {ndcg_table(te, 'als', truth_C):.4f}")
+print(f"pointwise logistic          : NDCG@10 {ndcg_table(te, 's_lr', truth_C):.4f}")
+print(f"pointwise GBDT              : NDCG@10 {ndcg_table(te, 's_gb', truth_C):.4f}")
+coef = lr_model[-1].coef_[0]
+print("\nlogistic coefficients (standardised):",
+      ", ".join(f"{f} {c:+.2f}" for f, c in sorted(zip(FEATS, coef), key=lambda t: -abs(t[1]))[:6]))
+```
+
+```output
+```
+
+## Pairwise: RankNet and LambdaRank
+
+### From pairwise probabilities to lambdas
+
+DERIVATION
+
+```python
+mu, sd = tr[FEATS].mean().values, tr[FEATS].std().values + 1e-9
+
+def to_lists(df):
+    groups = [g for _, g in df.groupby("user", sort=True)]
+    L = max(len(g) for g in groups)
+    Xl = np.zeros((len(groups), L, len(FEATS)), dtype=np.float32)
+    Yl = np.zeros((len(groups), L), dtype=np.float32)
+    Ml = np.zeros((len(groups), L), dtype=bool)
+    for g_i, g in enumerate(groups):
+        n = len(g)
+        Xl[g_i, :n] = (g[FEATS].values - mu) / sd
+        Yl[g_i, :n] = g["label"].values
+        Ml[g_i, :n] = True
+    return torch.as_tensor(Xl), torch.as_tensor(Yl), torch.as_tensor(Ml)
+
+def ltr_loss(s, y, m, kind):
+    if kind == "pointwise":
+        return nn.functional.binary_cross_entropy_with_logits(s[m], y[m])
+    if kind == "listwise":
+        logp = torch.log_softmax(s.masked_fill(~m, -1e9), dim=1)
+        has = y.sum(1) > 0
+        return -((y * logp).sum(1)[has] / y.sum(1)[has]).mean()
+    diff = s[:, :, None] - s[:, None, :]
+    pair = (y[:, :, None] > y[:, None, :]) & m[:, :, None] & m[:, None, :]
+    w = torch.ones_like(diff)
+    if kind == "lambdarank":
+        with torch.no_grad():
+            rank = torch.argsort(torch.argsort(s.masked_fill(~m, -1e9), dim=1, descending=True), dim=1)
+            disc = 1.0 / torch.log2(rank.float() + 2.0)
+            n_pos = y.sum(1, keepdim=True).clamp(min=1).long()
+            idcg = torch.cumsum(1.0 / torch.log2(torch.arange(s.shape[1]) + 2.0), 0)[n_pos - 1]
+            w = (y[:, :, None] - y[:, None, :]).abs() * (disc[:, :, None] - disc[:, None, :]).abs()
+            w = w / idcg[:, :, None]
+    return (nn.functional.softplus(-diff) * w)[pair].sum() / pair.sum().clamp(min=1)
+
+def train_ltr(kind, Xl, Yl, Ml, epochs=12, batch=64, lr=3e-3, seed=0):
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(len(FEATS), 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU(),
+                          nn.Linear(32, 1))
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(len(Xl), generator=g)
+        for st in range(0, len(perm), batch):
+            b = perm[st:st + batch]
+            loss = ltr_loss(model(Xl[b]).squeeze(-1), Yl[b], Ml[b], kind)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+    return model
+
+def score_df(model, df):
+    with torch.no_grad():
+        x = torch.as_tensor(((df[FEATS].values - mu) / sd).astype(np.float32))
+        return model(x).squeeze(-1).numpy()
+
+Xl, Yl, Ml = to_lists(tr)
+ltr = {}
+for kind in ("pointwise", "ranknet", "lambdarank", "listwise"):
+    t0 = time.time()
+    ltr[kind] = train_ltr(kind, Xl, Yl, Ml)
+    te["s_" + kind] = score_df(ltr[kind], te)
+    print(f"MLP {kind:>10}: NDCG@10 {ndcg_table(te, 's_' + kind, truth_C):.4f}")
+```
+
+```output
+```
+
+## End to end: does the ranker pay for itself?
+
+```python
+rows = []
+for n in (10, 25, 50, 100):
+    d = feature_table(src_AB, hist_AB, t2, users_te, truth_C, n_per=n)
+    d["s_gb"] = gb_model.predict_proba(d[FEATS])[:, 1]
+    d["s_lambdarank"] = score_df(ltr["lambdarank"], d)
+    d["oracle"] = d["label"] + 1e-6 * d["als"]
+    rows.append({"n per source": n, "mean |C|": round(d.groupby("user").size().mean(), 1),
+                 "cand. recall": round(d.groupby("user")["label"].sum().sum()
+                                       / sum(len(truth_C[u]) for u in users_te), 4),
+                 "iALS only": round(ndcg_table(d, "als", truth_C), 4),
+                 "+ GBDT": round(ndcg_table(d, "s_gb", truth_C), 4),
+                 "+ LambdaRank MLP": round(ndcg_table(d, "s_lambdarank", truth_C), 4),
+                 "oracle ceiling": round(ndcg_table(d, "oracle", truth_C), 4)})
+print(pd.DataFrame(rows).to_string(index=False))
+```
+
+```output
+```
+
+## Leakage: the bug that makes a ranker look brilliant
+
+```python
+leaky_items = item_stats(hist_AB, t1)          # item statistics computed through t2, served "as of" t1
+tr_leak = feature_table(src_A, hist_A, t1, users_tr, truth_B, items_from={**src_A, **leaky_items})
+val_users = set(users_tr[np.random.default_rng(0).random(len(users_tr)) < 0.2])
+results = []
+for name, table in (("clean", tr), ("leaky", tr_leak)):
+    fit_rows = ~table["user"].isin(val_users)
+    m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, random_state=0)
+    m.fit(table.loc[fit_rows, FEATS], table.loc[fit_rows, "label"])
+    val = table[~fit_rows].copy()
+    val["s"] = m.predict_proba(val[FEATS])[:, 1]
+    te["s_tmp"] = m.predict_proba(te[FEATS])[:, 1]
+    results.append((name, ndcg_table(val, "s", truth_B), ndcg_table(te, "s_tmp", truth_C)))
+print(f"{'features':>9} {'offline val NDCG@10':>20} {'future test NDCG@10':>20}")
+for name, v, t in results:
+    print(f"{name:>9} {v:>20.4f} {t:>20.4f}")
+```
+
+```output
+```
+
+## Re-ranking: rules and diversity after the model
+
+```python
+V_n = src_AB["V"] / (np.linalg.norm(src_AB["V"], axis=1, keepdims=True) + 1e-9)
+
+def mmr(items, rel, lam, k=10):
+    chosen, pool = [], list(range(len(items)))
+    while pool and len(chosen) < k:
+        if chosen:
+            sim = (V_n[items[pool]] @ V_n[items[chosen]].T).max(1)
+        else:
+            sim = np.zeros(len(pool))
+        best = pool[int(np.argmax(lam * rel[pool] - (1 - lam) * sim))]
+        chosen.append(best)
+        pool.remove(best)
+    return items[chosen]
+
+def genre_cap(items, rel, cap=3, k=10):
+    out, count = [], np.zeros(6, int)
+    for i in items[np.argsort(-rel)]:
+        if count[genre[i]] < cap:
+            out.append(i)
+            count[genre[i]] += 1
+        if len(out) == k:
+            break
+    return np.array(out)
+
+groups = {u: (g["item"].values, g["s_gb"].values) for u, g in te.groupby("user")}
+print(f"{'policy':>18} {'NDCG@10':>8} {'genres in top-10':>17} {'intra-list sim':>15}")
+policies = [("ranker order", lambda it, s: it[np.argsort(-s)][:10])]
+policies += [(f"MMR lambda={lam}", lambda it, s, lam=lam: mmr(it, s / s.max(), lam))
+             for lam in (0.9, 0.7, 0.5)]
+policies += [("cap 3 per genre", genre_cap)]
+for name, pol in policies:
+    nd, ng, ils = [], [], []
+    for u in users_te:
+        top = pol(*groups[u])
+        nd.append(ndcg_at_10(top, truth_C[u]))
+        ng.append(len(set(genre[top])))
+        sims = V_n[top] @ V_n[top].T
+        ils.append((sims.sum() - len(top)) / (len(top) * (len(top) - 1)))
+    print(f"{name:>18} {np.mean(nd):>8.4f} {np.mean(ng):>17.2f} {np.mean(ils):>15.3f}")
+```
+
+```output
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+rng = np.random.default_rng(0)
+n_q, L, d = 400, 40, 8                       # 400 queries, 40 candidates each, 8 features
+w_true = rng.normal(0, 1, d)
+X = rng.normal(0, 1, (n_q, L, d))
+util = X @ w_true + rng.normal(0, 1.5, (n_q, L))
+y = (util > np.quantile(util, 0.9, axis=1, keepdims=True)).astype(np.float32)  # 4 relevant / list
+X, y = torch.tensor(X, dtype=torch.float32), torch.tensor(y)
+Xtr, ytr, Xte, yte = X[:300], y[:300], X[300:], y[300:]
+
+def ndcg10(s, y):
+    top = torch.argsort(s, dim=1, descending=True)[:, :10]
+    disc = 1 / torch.log2(torch.arange(10) + 2.0)
+    dcg = (torch.gather(y, 1, top) * disc).sum(1)
+    idcg = (torch.sort(y, dim=1, descending=True).values[:, :10] * disc).sum(1)
+    return float((dcg / idcg).mean())
+
+def fit(kind, steps=300):
+    w = torch.zeros(d, requires_grad=True)
+    opt = torch.optim.Adam([w], lr=0.05)
+    for _ in range(steps):
+        s = Xtr @ w
+        diff = s[:, :, None] - s[:, None, :]
+        pair = ytr[:, :, None] > ytr[:, None, :]
+        if kind == "pointwise":
+            loss = F.binary_cross_entropy_with_logits(s, ytr)
+        elif kind == "listwise":
+            loss = -(ytr * F.log_softmax(s, 1)).sum(1).div(ytr.sum(1)).mean()
+        else:
+            wt = torch.ones_like(diff)
+            if kind == "lambdarank":
+                with torch.no_grad():
+                    disc = 1 / torch.log2(torch.argsort(torch.argsort(-s, 1), 1).float() + 2)
+                    wt = (disc[:, :, None] - disc[:, None, :]).abs()
+            loss = (F.softplus(-diff) * wt)[pair].mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    return float(ndcg10(Xte @ w.detach(), yte))
+
+print("random order NDCG@10:", round(ndcg10(torch.rand(100, L), yte), 4))
+for kind in ("pointwise", "ranknet", "lambdarank", "listwise"):
+    print(f"{kind:>10}: NDCG@10 {fit(kind):.4f}")
+```
+
+```output
+```
+
+TRYIT PROSE
+
+## Exercise
+
+EXERCISE PROSE
+
+<details>
+<summary>Solution</summary>
+
+```python
+print(1)
+```
+
+```output
+```
+
+SOLUTION PROSE
+</details>

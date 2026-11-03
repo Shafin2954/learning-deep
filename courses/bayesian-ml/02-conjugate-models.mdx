@@ -1,0 +1,779 @@
+---
+course: bayesian-ml
+chapter: 02-conjugate-models
+title: "Conjugate Models End to End"
+order: 2
+---
+
+## Conjugacy is an exponential-family property, not a coincidence
+
+You have already seen Beta-Binomial and Normal-Normal updates (Probability & Statistics, ch. 16).
+They looked like lucky algebra. They are not: every likelihood in the exponential family has a
+prior whose functional form survives multiplication by the likelihood, and the update rule is
+always "add the sufficient statistics to the prior's pseudo-data". This chapter derives that once
+and then cashes it in on five models you will actually use, including two (Bayesian linear
+regression and the evidence) that underpin Gaussian processes (ch. 12) and empirical Bayes in
+hierarchical models (ch. 10).
+
+### The general form
+
+Write a likelihood in exponential-family form with natural parameter $\eta$, sufficient statistic
+$T(x)$ and log-partition $A(\eta)$:
+
+$$
+p(x \mid \eta) = h(x)\exp\!\big(\eta^\top T(x) - A(\eta)\big)
+\quad\Longrightarrow\quad
+p(x_{1:n} \mid \eta) \propto \exp\!\Big(\eta^\top \textstyle\sum_i T(x_i) - n\,A(\eta)\Big)
+$$
+
+The data enter only through $\big(n, \sum_i T(x_i)\big)$ — that is what *sufficient* means. Now
+choose a prior with the same shape in $\eta$, indexed by a pseudo-statistic $\chi$ and a
+pseudo-count $\nu$:
+
+$$
+p(\eta \mid \chi, \nu) \propto \exp\!\big(\eta^\top \chi - \nu\,A(\eta)\big)
+$$
+
+Multiply and read off the result:
+
+$$
+p(\eta \mid x_{1:n}) \propto \exp\!\Big(\eta^\top \big(\chi + \textstyle\sum_i T(x_i)\big) - (\nu + n)\,A(\eta)\Big)
+\quad\Longrightarrow\quad
+\boxed{\chi_n = \chi + \textstyle\sum_i T(x_i), \quad \nu_n = \nu + n}
+$$
+
+The prior behaves exactly like $\nu$ imaginary observations whose sufficient statistics sum to
+$\chi$. For the Poisson, $\eta = \log\lambda$, $T(x) = x$, $A(\eta) = e^\eta$; changing variables
+back to $\lambda$ (Jacobian $1/\lambda$) turns the conjugate prior into
+$\lambda^{\chi - 1}e^{-\nu\lambda}$, a $\mathrm{Gamma}(a{=}\chi, b{=}\nu)$: $a$ pseudo-events seen in $b$
+pseudo-units of exposure.
+
+```python
+import numpy as np
+from scipy import stats, special
+
+rng = np.random.default_rng(0)
+a0, b0 = 3.0, 1.0                                  # prior: 3 events seen in 1 unit of exposure
+x1 = rng.poisson(4.2, 12)
+s = x1.sum()
+x2 = np.r_[np.full(11, s // 12), s - 11 * (s // 12)]   # different data, same (n, sum)
+grid = np.linspace(1e-3, 12, 4001)
+
+def grid_posterior(x):
+    logp = stats.gamma.logpdf(grid, a0, scale=1 / b0) + stats.poisson.logpmf(x[:, None], grid).sum(0)
+    p = np.exp(logp - logp.max())
+    return p / np.trapezoid(p, grid)
+
+conj = stats.gamma.pdf(grid, a0 + s, scale=1 / (b0 + len(x1)))
+print("data 1:", x1, " sum", x1.sum())
+print("data 2:", x2, " sum", x2.sum())
+print(f"max |grid(data 1) - Gamma(a0+sum, b0+n)| = {np.abs(grid_posterior(x1) - conj).max():.1e}")
+print(f"max |grid(data 1) - grid(data 2)|        = {np.abs(grid_posterior(x1) - grid_posterior(x2)).max():.1e}")
+a_n, b_n = a0 + s, b0 + len(x1)
+w = len(x1) / (b0 + len(x1))
+print(f"posterior Gamma({a_n:.0f}, {b_n:.0f}): mean {a_n / b_n:.4f} "
+      f"= {1 - w:.3f} x prior mean {a0 / b0:.1f} + {w:.3f} x MLE {x1.mean():.4f}")
+```
+
+```output
+data 1: [2 1 6 3 4 4 7 6 5 4 3 3]  sum 48
+data 2: [4 4 4 4 4 4 4 4 4 4 4 4]  sum 48
+max |grid(data 1) - Gamma(a0+sum, b0+n)| = 3.2e-14
+max |grid(data 1) - grid(data 2)|        = 7.9e-15
+posterior Gamma(51, 13): mean 3.9231 = 0.077 x prior mean 3.0 + 0.923 x MLE 4.0000
+```
+
+Two datasets that share $(n, \sum x)$ give the same posterior to numerical precision, and both
+match the closed form. The last line is the pseudo-count picture in one equation: the posterior
+mean is a convex combination of prior mean and MLE, with weight $n/(\nu + n)$ on the data.
+
+## Beta-Binomial, briefly: the prior is a sample size
+
+For the Bernoulli, $\eta = \operatorname{logit}\theta$, $T(x) = x$, and the conjugate prior is
+$\mathrm{Beta}(a, b)$ with $a$ pseudo-successes and $b$ pseudo-failures. The only question worth
+asking in practice is how *many* pseudo-observations your prior is worth relative to $n$:
+
+$$
+\mathbb{E}[\theta \mid k, n] = \frac{a + k}{a + b + n}
+= \underbrace{\frac{a + b}{a + b + n}}_{\text{prior weight}}\cdot\frac{a}{a+b}
++ \frac{n}{a + b + n}\cdot\frac{k}{n}
+$$
+
+```python
+k, n = 14, 20
+print(f"{'prior':>14} {'prior n':>8} {'data wt':>8} {'post mean':>10} {'95% interval':>18}")
+for a, b in [(1, 1), (5, 5), (20, 20), (100, 100)]:
+    post = stats.beta(a + k, b + n - k)
+    lo, hi = post.ppf([0.025, 0.975])
+    print(f"Beta({a:>3},{b:>3})  {a + b:>8} {n / (a + b + n):>8.2f} {post.mean():>10.4f}   [{lo:.3f}, {hi:.3f}]")
+```
+
+```output
+         prior  prior n  data wt  post mean       95% interval
+Beta(  1,  1)         2     0.91     0.6818   [0.478, 0.854]
+Beta(  5,  5)        10     0.67     0.6333   [0.457, 0.793]
+Beta( 20, 20)        40     0.33     0.5667   [0.441, 0.688]
+Beta(100,100)       200     0.09     0.5182   [0.452, 0.584]
+```
+
+A $\mathrm{Beta}(100, 100)$ prior is a claim that you have already watched 200 trials; with 20 real
+ones it keeps over 90% of the say. Always translate a conjugate prior into its pseudo-count before
+defending it.
+
+## Gamma-Poisson and the negative-binomial predictive
+
+The posterior over $\lambda$ is rarely the object you need; the distribution of the *next count*
+is. Integrating the Poisson against the $\mathrm{Gamma}(a_n, b_n)$ posterior has a closed form.
+
+### Deriving the posterior predictive
+
+$$
+\begin{aligned}
+p(\tilde{x} \mid x_{1:n}) &= \int_0^\infty \frac{\lambda^{\tilde{x}} e^{-\lambda}}{\tilde{x}!}\,
+\frac{b_n^{a_n}}{\Gamma(a_n)}\lambda^{a_n - 1}e^{-b_n\lambda}\,d\lambda
+= \frac{b_n^{a_n}}{\Gamma(a_n)\,\tilde{x}!}\int_0^\infty \lambda^{\tilde{x} + a_n - 1}e^{-(b_n + 1)\lambda}\,d\lambda \\
+&= \frac{\Gamma(\tilde{x} + a_n)}{\Gamma(a_n)\,\tilde{x}!}
+\left(\frac{b_n}{b_n + 1}\right)^{a_n}\left(\frac{1}{b_n + 1}\right)^{\tilde{x}}
+= \mathrm{NegBin}\!\left(\tilde{x}\;\middle|\; r = a_n,\; p = \tfrac{b_n}{b_n + 1}\right)
+\end{aligned}
+$$
+
+Its mean is $a_n/b_n$ (the posterior mean of $\lambda$), but its variance is
+$a_n/b_n + a_n/b_n^2$: the Poisson variance plus the posterior variance of $\lambda$. By the law of
+total variance, parameter uncertainty always *adds* spread to predictions.
+
+```python
+pred = stats.nbinom(a_n, b_n / (b_n + 1))           # scipy: pmf ∝ C(k+r-1,k) p^r (1-p)^k
+lam_draws = rng.gamma(a_n, 1 / b_n, 400_000)        # two-stage simulation: lambda, then x
+x_new = rng.poisson(lam_draws)
+plug = stats.poisson(x1.mean())                      # the "just use the MLE" predictive
+
+print(f"{'k':>3} {'NB formula':>11} {'simulated':>10} {'plug-in Poisson':>16}")
+for kk in [0, 1, 2, 4, 6, 8, 10, 12]:
+    print(f"{kk:>3} {pred.pmf(kk):>11.5f} {np.mean(x_new == kk):>10.5f} {plug.pmf(kk):>16.5f}")
+print(f"\nmean      formula {a_n / b_n:.4f}  sim {x_new.mean():.4f}  plug-in {x1.mean():.4f}")
+print(f"variance  formula {a_n / b_n + a_n / b_n**2:.4f}  sim {x_new.var():.4f}  plug-in {x1.mean():.4f}")
+print(f"P(x >= 10)  NB {pred.sf(9):.4f}   plug-in Poisson {plug.sf(9):.4f}")
+```
+
+```output
+  k  NB formula  simulated  plug-in Poisson
+  0     0.02283    0.02272          0.01832
+  1     0.08318    0.08298          0.07326
+  2     0.15448    0.15399          0.14653
+  4     0.18798    0.18834          0.19537
+  6     0.09846    0.09916          0.10420
+  8     0.02966    0.02971          0.02977
+ 10     0.00595    0.00584          0.00529
+ 12     0.00087    0.00088          0.00064
+
+mean      formula 3.9231  sim 3.9287  plug-in 4.0000
+variance  formula 4.2249  sim 4.2248  plug-in 4.0000
+P(x >= 10)  NB 0.0096   plug-in Poisson 0.0081
+```
+
+## Dirichlet-Multinomial: Laplace smoothing is a posterior mean
+
+For a categorical variable with $K$ outcomes, $T(x)$ is the one-hot vector, the sufficient
+statistic is the count vector $\mathbf{n}$, and the conjugate prior is
+$\mathrm{Dir}(\boldsymbol{\alpha})$. The posterior is $\mathrm{Dir}(\boldsymbol{\alpha} + \mathbf{n})$ with
+mean
+
+$$
+\mathbb{E}[\pi_k \mid \mathbf{n}] = \frac{n_k + \alpha_k}{N + \sum_j \alpha_j}
+$$
+
+With $\alpha_k = 1$ that is add-one (Laplace) smoothing; with $\alpha_k = \alpha$ it is add-$\alpha$
+(Lidstone). Smoothing in naive Bayes and n-gram models is not a hack — it is a symmetric Dirichlet
+prior. And because the model is conjugate, the marginal likelihood of the training sequence is
+available exactly, which lets the data choose $\alpha$:
+
+$$
+p(x_{1:N} \mid \boldsymbol{\alpha}) = \frac{\Gamma\!\left(\sum_k \alpha_k\right)}{\Gamma\!\left(N + \sum_k\alpha_k\right)}
+\prod_{k=1}^K \frac{\Gamma(n_k + \alpha_k)}{\Gamma(\alpha_k)}
+$$
+
+```python
+from scipy import optimize
+
+K = 1000
+p_true = 1 / np.arange(1, K + 1) ** 1.1
+p_true /= p_true.sum()                              # Zipf-like vocabulary
+train_counts = rng.multinomial(3_000, p_true)
+test_counts = rng.multinomial(100_000, p_true)
+N = train_counts.sum()
+
+def dm_log_evidence(counts, alpha):
+    A = alpha * len(counts)
+    return (special.gammaln(A) - special.gammaln(counts.sum() + A)
+            + (special.gammaln(counts + alpha) - special.gammaln(alpha)).sum())
+
+def test_logloss(alpha):
+    post_mean = (train_counts + alpha) / (N + K * alpha)
+    with np.errstate(divide="ignore"):
+        return -(test_counts * np.log(post_mean)).sum() / test_counts.sum()
+
+print(f"unseen in training: {np.mean(train_counts == 0):.1%} of vocabulary, "
+      f"{test_counts[train_counts == 0].sum() / test_counts.sum():.1%} of test tokens")
+print(f"{'alpha':>7} {'log evidence':>13} {'test log-loss':>14}")
+for alpha in [0.0, 0.01, 0.05, 0.1, 0.3, 1.0, 3.0]:
+    ev = dm_log_evidence(train_counts, alpha) if alpha > 0 else -np.inf
+    print(f"{alpha:>7} {ev:>13.1f} {test_logloss(alpha):>14.4f}")
+
+best_ev = optimize.minimize_scalar(lambda la: -dm_log_evidence(train_counts, np.exp(la)),
+                                   bounds=(-8, 3), method="bounded")
+best_te = optimize.minimize_scalar(lambda la: test_logloss(np.exp(la)), bounds=(-8, 3), method="bounded")
+print(f"\nalpha maximising evidence (train only): {np.exp(best_ev.x):.4f} "
+      f"-> test log-loss {test_logloss(np.exp(best_ev.x)):.4f}")
+print(f"alpha minimising test log-loss (oracle): {np.exp(best_te.x):.4f} "
+      f"-> test log-loss {best_te.fun:.4f}")
+```
+
+```output
+unseen in training: 46.9% of vocabulary, 8.4% of test tokens
+  alpha  log evidence  test log-loss
+    0.0          -inf            inf
+   0.01      -16069.2         5.0518
+   0.05      -15383.9         4.9248
+    0.1      -15179.1         4.8764
+    0.3      -15071.6         4.8226
+    1.0      -15425.9         4.8443
+    3.0      -16265.2         5.0200
+
+alpha maximising evidence (train only): 0.2472 -> test log-loss 4.8288
+alpha minimising test log-loss (oracle): 0.4601 -> test log-loss 4.8163
+```
+
+## Unknown mean and variance: the Normal-Inverse-Gamma model
+
+The known-variance Normal model is a teaching device. In real data $\sigma^2$ is unknown, and the
+conjugate prior for $(\mu, \sigma^2)$ jointly is the Normal-Inverse-Gamma:
+
+$$
+\sigma^2 \sim \mathrm{IG}(a_0, b_0), \qquad \mu \mid \sigma^2 \sim \mathcal{N}\!\left(m_0, \sigma^2/\kappa_0\right)
+$$
+
+Note the coupling: the prior on $\mu$ is scaled by $\sigma^2$, which is what makes the family
+closed. Here $\kappa_0$ is the pseudo-count for the mean and $2a_0$ the pseudo-count for the variance.
+
+### The update
+
+Multiply the prior by $\prod_i \mathcal{N}(x_i \mid \mu, \sigma^2)$, complete the square in $\mu$, and
+collect powers of $\sigma^2$:
+
+$$
+\kappa_n = \kappa_0 + n,\qquad m_n = \frac{\kappa_0 m_0 + n\bar{x}}{\kappa_n},\qquad
+a_n = a_0 + \frac{n}{2},\qquad
+b_n = b_0 + \frac12\sum_i (x_i - \bar{x})^2 + \frac{\kappa_0 n (\bar{x} - m_0)^2}{2\kappa_n}
+$$
+
+The last term in $b_n$ is the price of prior-data conflict: if $\bar{x}$ lands far from $m_0$, the
+posterior concludes the noise is larger.
+
+### The marginal posterior of the mean is a Student-t
+
+Integrate out $\sigma^2$. The joint posterior is
+$(\sigma^2)^{-(a_n + 3/2)}\exp\!\big(-[b_n + \tfrac{\kappa_n}{2}(\mu - m_n)^2]/\sigma^2\big)$, and
+$\int_0^\infty s^{-(c+1)}e^{-B/s}\,ds = \Gamma(c)B^{-c}$ gives
+
+$$
+p(\mu \mid x) \propto \Big[b_n + \tfrac{\kappa_n}{2}(\mu - m_n)^2\Big]^{-(a_n + 1/2)}
+\propto \left[1 + \frac{1}{2a_n}\frac{(\mu - m_n)^2}{b_n/(a_n\kappa_n)}\right]^{-\frac{2a_n + 1}{2}}
+$$
+
+which is $\boxed{\mu \mid x \sim t_{2a_n}\!\left(m_n,\; b_n/(a_n\kappa_n)\right)}$. With the improper
+prior $p(\mu, \sigma^2) \propto 1/\sigma^2$ (the limit $\kappa_0 \to 0$, $a_0 \to -\tfrac12$, $b_0 \to 0$) this is
+$t_{n-1}(\bar{x}, s^2/n)$ — the classical t interval, recovered as a posterior.
+
+```python
+def nig_update(x, m0, k0, a0, b0):
+    n, xbar = len(x), x.mean()
+    kn = k0 + n
+    mn = (k0 * m0 + n * xbar) / kn
+    an = a0 + n / 2
+    bn = b0 + 0.5 * ((x - xbar) ** 2).sum() + k0 * n * (xbar - m0) ** 2 / (2 * kn)
+    return mn, kn, an, bn
+
+rng = np.random.default_rng(1)
+y = rng.normal(10.0, 2.5, 9)
+mn, kn, an, bn = nig_update(y, m0=8.0, k0=1.0, a0=2.0, b0=4.0)
+t_post = stats.t(df=2 * an, loc=mn, scale=np.sqrt(bn / (an * kn)))
+
+sig2 = 1 / rng.gamma(an, 1 / bn, 400_000)            # sigma^2 ~ IG(an, bn)
+mu_mc = rng.normal(mn, np.sqrt(sig2 / kn))           # mu | sigma^2 ~ N(mn, sigma^2/kn)
+naive = stats.norm(mn, np.sqrt((bn / an) / kn))      # plug in a point estimate of sigma^2
+
+qs = [0.005, 0.025, 0.25, 0.5, 0.75, 0.975, 0.995]
+print(f"posterior: m_n={mn:.3f} kappa_n={kn:.0f} a_n={an:.1f} b_n={bn:.3f}  (df = {2 * an:.0f})")
+print(f"{'quantile':>9} {'Student-t':>10} {'Monte Carlo':>12} {'Normal plug-in':>15}")
+for q in qs:
+    print(f"{q:>9} {t_post.ppf(q):>10.4f} {np.quantile(mu_mc, q):>12.4f} {naive.ppf(q):>15.4f}")
+
+mj, kj, aj, bj = nig_update(y, m0=0.0, k0=0.0, a0=-0.5, b0=0.0)
+lo_b, hi_b = stats.t(df=2 * aj, loc=mj, scale=np.sqrt(bj / (aj * kj))).ppf([0.025, 0.975])
+lo_f, hi_f = stats.t.interval(0.95, len(y) - 1, loc=y.mean(), scale=y.std(ddof=1) / np.sqrt(len(y)))
+print(f"\nimproper-prior 95% credible interval: [{lo_b:.4f}, {hi_b:.4f}]")
+print(f"classical 95% t confidence interval:  [{lo_f:.4f}, {hi_f:.4f}]")
+```
+
+```output
+posterior: m_n=10.289 kappa_n=10 a_n=6.5 b_n=19.270  (df = 13)
+ quantile  Student-t  Monte Carlo  Normal plug-in
+    0.005     8.6486       8.6602          8.8862
+    0.025     9.1125       9.1155          9.2216
+     0.25     9.9110       9.9125          9.9215
+      0.5    10.2887      10.2892         10.2887
+     0.75    10.6665      10.6657         10.6560
+    0.975    11.4650      11.4698         11.3559
+    0.995    11.9289      11.9307         11.6912
+
+improper-prior 95% credible interval: [9.1919, 11.8942]
+classical 95% t confidence interval:  [9.1919, 11.8942]
+```
+
+## Bayesian linear regression with known noise
+
+Put a Gaussian prior on weights, $\mathbf{w} \sim \mathcal{N}(\mathbf{0}, \alpha^{-1}I)$, with
+Gaussian noise of precision $\beta$: $y = \boldsymbol{\phi}(x)^\top\mathbf{w} + \varepsilon$.
+The log posterior is a quadratic in $\mathbf{w}$:
+
+$$
+\log p(\mathbf{w} \mid \mathbf{y}) = -\frac{\beta}{2}\|\mathbf{y} - \Phi\mathbf{w}\|^2 - \frac{\alpha}{2}\|\mathbf{w}\|^2 + \text{const}
+$$
+
+### Posterior and predictive
+
+Matching the quadratic and linear terms to a Gaussian gives
+
+$$
+S_N = \left(\alpha I + \beta\,\Phi^\top\Phi\right)^{-1},\qquad
+\mathbf{m}_N = \beta\,S_N\Phi^\top\mathbf{y} = \Big(\Phi^\top\Phi + \tfrac{\alpha}{\beta}I\Big)^{-1}\Phi^\top\mathbf{y}
+$$
+
+so the posterior mean **is** the ridge solution with $\lambda = \alpha/\beta$ — and the MAP equals the
+mean because the posterior is Gaussian. What ridge throws away is $S_N$. Integrating the
+likelihood of a new point against the posterior gives
+
+$$
+p(\tilde{y} \mid \tilde{x}, \mathbf{y}) = \mathcal{N}\!\Big(\boldsymbol{\phi}(\tilde{x})^\top\mathbf{m}_N,\;
+\underbrace{\beta^{-1}}_{\text{noise}} + \underbrace{\boldsymbol{\phi}(\tilde{x})^\top S_N\,\boldsymbol{\phi}(\tilde{x})}_{\text{parameter uncertainty}}\Big)
+$$
+
+The second term depends on where $\tilde{x}$ sits relative to the training inputs, and that is
+where the honesty lives.
+
+```python
+from sklearn.linear_model import Ridge
+
+rng = np.random.default_rng(2)
+f = lambda x: np.sin(2.5 * x) + 0.5 * x
+sigma = 0.2
+beta, alpha, deg = 1 / sigma**2, 1.0, 5
+x_tr = np.r_[rng.uniform(-1, -0.3, 15), rng.uniform(0.3, 1, 15)]      # gap in the middle
+y_tr = f(x_tr) + rng.normal(0, sigma, len(x_tr))
+phi = lambda x: np.vander(np.atleast_1d(x), deg + 1, increasing=True)
+
+Phi = phi(x_tr)
+S_N = np.linalg.inv(alpha * np.eye(deg + 1) + beta * Phi.T @ Phi)
+m_N = beta * S_N @ Phi.T @ y_tr
+w_ridge = Ridge(alpha=alpha / beta, fit_intercept=False).fit(Phi, y_tr).coef_
+print(f"max |m_N - ridge(lambda = alpha/beta)| = {np.abs(m_N - w_ridge).max():.1e}")
+
+print(f"\n{'x':>5} {'region':>11} {'mean':>8} {'true f':>8} {'pred sd':>8} {'param sd':>9}")
+for xq in [-2.0, -1.5, -1.0, -0.6, 0.0, 0.6, 1.0, 1.5, 2.0]:
+    p = phi(xq)[0]
+    epi = p @ S_N @ p
+    region = "data" if 0.3 <= abs(xq) <= 1 else ("gap" if abs(xq) < 0.3 else "extrapolate")
+    print(f"{xq:>5} {region:>11} {p @ m_N:>8.3f} {f(xq):>8.3f} {np.sqrt(1 / beta + epi):>8.3f} {np.sqrt(epi):>9.3f}")
+```
+
+```output
+max |m_N - ridge(lambda = alpha/beta)| = 9.4e-14
+
+    x      region     mean   true f  pred sd  param sd
+ -2.0 extrapolate   39.707   -0.041   14.696    14.695
+ -1.5 extrapolate    7.738   -0.178    2.871     2.864
+ -1.0        data   -0.716   -1.098    0.262     0.170
+ -0.6        data   -1.305   -1.297    0.211     0.067
+  0.0         gap    0.025    0.000    0.240     0.132
+  0.6        data    1.345    1.297    0.210     0.065
+  1.0        data    1.090    1.098    0.252     0.154
+  1.5 extrapolate   -5.417    0.178    2.641     2.633
+  2.0 extrapolate  -31.780    0.041   13.728    13.726
+```
+
+## Unknown noise: the conjugate prior on weights and variance
+
+Assuming you know $\beta$ is the regression analogue of the known-variance Normal. The fix is the
+same Normal-Inverse-Gamma construction, with the weight prior scaled by $\sigma^2$:
+
+$$
+\mathbf{w} \mid \sigma^2 \sim \mathcal{N}(\mathbf{m}_0, \sigma^2 V_0), \qquad \sigma^2 \sim \mathrm{IG}(a_0, b_0)
+$$
+
+### Update and predictive
+
+Completing the square exactly as before,
+
+$$
+V_n = \left(V_0^{-1} + X^\top X\right)^{-1},\quad
+\mathbf{m}_n = V_n\left(V_0^{-1}\mathbf{m}_0 + X^\top\mathbf{y}\right),\quad
+a_n = a_0 + \tfrac{n}{2},\quad
+b_n = b_0 + \tfrac12\left(\mathbf{y}^\top\mathbf{y} + \mathbf{m}_0^\top V_0^{-1}\mathbf{m}_0 - \mathbf{m}_n^\top V_n^{-1}\mathbf{m}_n\right)
+$$
+
+and integrating out both $\mathbf{w}$ and $\sigma^2$ (same Gamma-integral trick as the t derivation):
+
+$$
+\tilde{y} \mid \tilde{\mathbf{x}}, \mathbf{y} \sim t_{2a_n}\!\left(\tilde{\mathbf{x}}^\top\mathbf{m}_n,\;
+\frac{b_n}{a_n}\big(1 + \tilde{\mathbf{x}}^\top V_n\tilde{\mathbf{x}}\big)\right)
+$$
+
+The test that matters is coverage on small samples, where the usual "fit OLS, add $\pm 1.645\hat\sigma$"
+habit is most tempting and most wrong.
+
+```python
+def nig_regression(X, y, m0, V0, a0, b0):
+    V0i = np.linalg.inv(V0)
+    Vn = np.linalg.inv(V0i + X.T @ X)
+    mn = Vn @ (V0i @ m0 + X.T @ y)
+    an = a0 + len(y) / 2
+    bn = b0 + 0.5 * (y @ y + m0 @ V0i @ m0 - mn @ np.linalg.solve(Vn, mn))
+    return mn, Vn, an, bn
+
+rng = np.random.default_rng(3)
+reps, n_small, x_star, z90 = 4000, 8, 1.3, stats.norm.ppf(0.95)
+m0, V0 = np.zeros(2), 100 * np.eye(2)
+hits = {"NIG Student-t": [], "known sigma, Gaussian": [], "plug-in OLS +/- z*sigma_hat": []}
+widths = {k: [] for k in hits}
+for _ in range(reps):
+    x = rng.uniform(-1, 1, n_small)
+    X = np.c_[np.ones(n_small), x]
+    yy = 1 + 2 * x + rng.normal(0, 1.0, n_small)
+    xs = np.array([1.0, x_star])
+    y_star = 1 + 2 * x_star + rng.normal(0, 1.0)
+    mn_, Vn_, an_, bn_ = nig_regression(X, yy, m0, V0, 0.01, 0.01)
+    sc = np.sqrt(bn_ / an_ * (1 + xs @ Vn_ @ xs))
+    half_t = stats.t.ppf(0.95, 2 * an_) * sc
+    Sk = np.linalg.inv(X.T @ X / 1.0 + np.eye(2) / 100)       # known sigma = 1, same prior scale
+    mk = Sk @ X.T @ yy
+    half_k = z90 * np.sqrt(1 + xs @ Sk @ xs)
+    w_ols = np.linalg.lstsq(X, yy, rcond=None)[0]
+    half_p = z90 * np.sqrt(np.mean((yy - X @ w_ols) ** 2))
+    for name, centre, half in [("NIG Student-t", xs @ mn_, half_t),
+                               ("known sigma, Gaussian", xs @ mk, half_k),
+                               ("plug-in OLS +/- z*sigma_hat", xs @ w_ols, half_p)]:
+        hits[name].append(abs(y_star - centre) <= half)
+        widths[name].append(2 * half)
+print(f"nominal 90% predictive interval at x* = {x_star}, n = {n_small}, {reps} replications")
+for name in hits:
+    print(f"  {name:<28} coverage {np.mean(hits[name]):.3f}   median width {np.median(widths[name]):.2f}")
+```
+
+```output
+nominal 90% predictive interval at x* = 1.3, n = 8, 4000 replications
+  NIG Student-t                coverage 0.839   median width 4.23
+  known sigma, Gaussian        coverage 0.894   median width 4.45
+  plug-in OLS +/- z*sigma_hat  coverage 0.649   median width 2.69
+```
+
+## The evidence: marginal likelihood in closed form
+
+Conjugacy gives you one more thing for free: the normaliser. For the known-noise model,
+$\mathbf{y} = \Phi\mathbf{w} + \boldsymbol{\varepsilon}$ is a linear map of two independent Gaussians,
+so $\mathbf{y}$ is Gaussian with
+
+$$
+p(\mathbf{y} \mid \alpha, \beta) = \mathcal{N}\!\left(\mathbf{y} \;\middle|\; \mathbf{0},\; C\right),\qquad
+C = \beta^{-1}I_N + \alpha^{-1}\Phi\Phi^\top
+$$
+
+(Bishop's eq. 3.86 is the same quantity rewritten in $M \times M$ form for speed.) The evidence
+integrates the fit over the *prior*, not the posterior, so a flexible model pays for every
+parameter setting it could have used and did not — Occam's razor with no penalty term bolted on.
+Compare it against training error and 5-fold CV on the classic $\sin(2\pi x)$ polynomial problem.
+
+```python
+from sklearn.model_selection import KFold
+
+def log_evidence(Phi, y, alpha, beta):
+    C = np.eye(len(y)) / beta + Phi @ Phi.T / alpha
+    return stats.multivariate_normal(np.zeros(len(y)), C).logpdf(y)
+
+def post_mean(Phi, y, alpha, beta):
+    return np.linalg.solve(alpha / beta * np.eye(Phi.shape[1]) + Phi.T @ Phi, Phi.T @ y)
+
+rng = np.random.default_rng(4)
+g = lambda x: np.sin(2 * np.pi * x)
+x_s = rng.uniform(0, 1, 20)
+y_s = g(x_s) + rng.normal(0, 0.3, 20)
+x_te = rng.uniform(0, 1, 5000)
+y_te = g(x_te) + rng.normal(0, 0.3, 5000)
+alpha_f, beta_f = 5e-3, 1 / 0.3**2
+poly = lambda x, M: np.vander(x, M + 1, increasing=True)
+kf = KFold(5, shuffle=True, random_state=0)
+
+print(f"{'degree':>6} {'train RMSE':>11} {'5-fold CV':>10} {'log evidence':>13} {'test RMSE':>10}")
+for M in range(10):
+    P_tr = poly(x_s, M)
+    w = post_mean(P_tr, y_s, alpha_f, beta_f)
+    cv = np.sqrt(np.mean(np.concatenate([
+        (y_s[va] - poly(x_s[va], M) @ post_mean(P_tr[tr], y_s[tr], alpha_f, beta_f)) ** 2
+        for tr, va in kf.split(x_s)])))
+    print(f"{M:>6} {np.sqrt(np.mean((y_s - P_tr @ w) ** 2)):>11.4f} {cv:>10.4f} "
+          f"{log_evidence(P_tr, y_s, alpha_f, beta_f):>13.3f} {np.sqrt(np.mean((y_te - poly(x_te, M) @ w) ** 2)):>10.4f}")
+```
+
+```output
+degree  train RMSE  5-fold CV  log evidence  test RMSE
+     0      0.5483     0.6023       -33.050     0.7819
+     1      0.4242     0.4913       -23.761     0.5712
+     2      0.3768     0.4727       -22.321     0.5779
+     3      0.2720     0.3285       -17.426     0.3827
+     4      0.2667     0.3112       -17.186     0.3702
+     5      0.2687     0.3174       -17.865     0.3747
+     6      0.2682     0.3232       -18.509     0.3735
+     7      0.2675     0.3286       -19.046     0.3702
+     8      0.2674     0.3338       -19.521     0.3682
+     9      0.2675     0.3379       -19.955     0.3677
+```
+
+### Empirical Bayes: let the evidence set the prior
+
+Instead of fixing $\alpha$ and $\beta$, maximise the evidence over them (type-II maximum likelihood).
+Setting the derivatives of $\log p(\mathbf{y} \mid \alpha, \beta)$ to zero gives MacKay's fixed-point
+updates, where $\lambda_i$ are the eigenvalues of $\beta\Phi^\top\Phi$:
+
+$$
+\gamma = \sum_i \frac{\lambda_i}{\alpha + \lambda_i},\qquad
+\alpha \leftarrow \frac{\gamma}{\mathbf{m}_N^\top\mathbf{m}_N},\qquad
+\beta \leftarrow \frac{N - \gamma}{\|\mathbf{y} - \Phi\mathbf{m}_N\|^2}
+$$
+
+$\gamma$ is the effective number of well-determined parameters; $N - \gamma$ is the degrees of
+freedom left for estimating noise, which is the Bayesian version of dividing by $N - p$. Run it on
+the degree-9 model — the one that overfits catastrophically under a fixed prior with weak
+regularisation — and compare against choosing $\lambda$ by cross-validation.
+
+```python
+from sklearn.model_selection import GridSearchCV
+
+def evidence_fixed_point(Phi, y, alpha=1.0, beta=1.0, iters=500):
+    eig0 = np.linalg.eigvalsh(Phi.T @ Phi)
+    for _ in range(iters):
+        m = post_mean(Phi, y, alpha, beta)
+        lam = beta * eig0
+        gamma = np.sum(lam / (alpha + lam))
+        alpha = gamma / (m @ m)
+        beta = (len(y) - gamma) / np.sum((y - Phi @ m) ** 2)
+    return alpha, beta, gamma
+
+from numpy.polynomial import legendre
+
+bases = {"monomials x^j": lambda x: poly(x, 9),
+         "Legendre P_j(2x-1)": lambda x: legendre.legvander(2 * x - 1, 9)}
+lam_grid = np.logspace(-10, 2, 41)
+
+def compare(basis, x_s, y_s, x_te, y_te):
+    B, B_te = basis(x_s), basis(x_te)
+    a, b, gam = evidence_fixed_point(B, y_s)
+    cvf = GridSearchCV(Ridge(fit_intercept=False), {"alpha": lam_grid}, cv=kf,
+                       scoring="neg_mean_squared_error").fit(B, y_s)
+    r = lambda w: np.sqrt(np.mean((y_te - B_te @ w) ** 2))
+    return dict(lam_eb=a / b, sd=1 / np.sqrt(b), gam=gam, eb=r(post_mean(B, y_s, a, b)),
+                lam_cv=cvf.best_params_["alpha"], cv=r(cvf.best_estimator_.coef_))
+
+print(f"{'degree-9 basis':>19} {'EB lambda':>10} {'gamma':>6} {'noise sd':>9} {'EB test':>8} "
+      f"{'CV lambda':>10} {'CV test':>8}")
+for name, basis in bases.items():
+    c = compare(basis, x_s, y_s, x_te, y_te)
+    print(f"{name:>19} {c['lam_eb']:>10.2e} {c['gam']:>6.2f} {c['sd']:>9.3f} {c['eb']:>8.4f} "
+          f"{c['lam_cv']:>10.2e} {c['cv']:>8.4f}")
+
+print("\n20 fresh datasets (n=20 each): test RMSE")
+print(f"{'degree-9 basis':>19} {'EB mean':>8} {'CV mean':>8} {'EB worst':>9} {'CV worst':>9} {'EB wins':>8}")
+for name, basis in bases.items():
+    res = []
+    for seed in range(100, 120):
+        r_ = np.random.default_rng(seed)
+        xs_ = r_.uniform(0, 1, 20)
+        res.append(compare(basis, xs_, g(xs_) + r_.normal(0, 0.3, 20), x_te, y_te))
+    eb, cvr = np.array([c["eb"] for c in res]), np.array([c["cv"] for c in res])
+    print(f"{name:>19} {eb.mean():>8.4f} {cvr.mean():>8.4f} {eb.max():>9.4f} {cvr.max():>9.4f} "
+          f"{np.sum(eb < cvr):>5d}/20")
+```
+
+```output
+     degree-9 basis  EB lambda  gamma  noise sd  EB test  CV lambda  CV test
+      monomials x^j   6.52e-02   3.32     0.319   0.4530   6.31e-06   0.3502
+ Legendre P_j(2x-1)   6.51e-01   6.40     0.312   0.4130   7.94e-01   0.4238
+
+20 fresh datasets (n=20 each): test RMSE
+     degree-9 basis  EB mean  CV mean  EB worst  CV worst  EB wins
+      monomials x^j   0.4744   0.8252    1.2269    9.6583     2/20
+ Legendre P_j(2x-1)   0.3635   0.3649    0.4403    0.4253     8/20
+```
+
+## A Beta-Bernoulli A/B test, decision included
+
+The question an A/B test answers is not "is the difference significant" but "which variant do I
+ship, and what does it cost me if I am wrong". With independent $\mathrm{Beta}(1,1)$ priors, each
+arm's conversion rate has a Beta posterior, and the two decision quantities are integrals over the
+joint posterior:
+
+$$
+P(\theta_B > \theta_A \mid \text{data}), \qquad
+\mathcal{L}(\text{ship } B) = \mathbb{E}\big[\max(\theta_A - \theta_B, 0)\big]
+$$
+
+The expected loss is the conversion rate you expect to give up by shipping $B$, averaged over the
+worlds in which $B$ is actually worse. It has units (conversions per visitor), so you can set a
+threshold in business terms — "stop when the expected cost of a wrong call is below 0.01
+percentage points" — instead of at an arbitrary probability.
+
+```python
+from scipy import integrate
+
+rng = np.random.default_rng(5)
+n_A, c_A, n_B, c_B = 12_000, 480, 12_000, 531
+post_A, post_B = stats.beta(1 + c_A, 1 + n_A - c_A), stats.beta(1 + c_B, 1 + n_B - c_B)
+tA, tB = post_A.rvs(1_000_000, random_state=rng), post_B.rvs(1_000_000, random_state=rng)
+
+exact, _ = integrate.quad(lambda t: post_B.pdf(t) * post_A.cdf(t), 0.02, 0.07, points=[0.04, 0.044])
+lift = tB / tA - 1
+print(f"observed: A {c_A / n_A:.4f}  B {c_B / n_B:.4f}  (relative lift {c_B * n_A / (c_A * n_B) - 1:+.2%})")
+print(f"P(B > A): Monte Carlo {np.mean(tB > tA):.4f}   quadrature {1 - exact:.4f}")
+print(f"relative lift 90% credible interval: [{np.quantile(lift, 0.05):+.2%}, {np.quantile(lift, 0.95):+.2%}]")
+print(f"expected loss if ship B: {np.mean(np.maximum(tA - tB, 0)):.6f}")
+print(f"expected loss if keep A: {np.mean(np.maximum(tB - tA, 0)):.6f}")
+```
+
+```output
+observed: A 0.0400  B 0.0442  (relative lift +10.62%)
+P(B > A): Monte Carlo 0.9493   quadrature 0.0507
+relative lift 90% credible interval: [-0.04%, +22.42%]
+expected loss if ship B: 0.000055
+expected loss if keep A: 0.004303
+```
+
+### What peeking does to each rule
+
+Bayesian posteriors are valid at every look, but a *decision rule* applied at every look has
+operating characteristics you should know. Simulate 20 daily looks and two stopping rules:
+"stop when $P(B > A) > 0.95$" and "stop when the expected loss of the better-looking arm is below
+$10^{-4}$". Run it where $B$ is identical to $A$, and where $B$ is truly 3% worse.
+
+```python
+def run_test(pA, pB, rule, days=20, per_day=1_000, draws=4_000, rng=None):
+    cA = cB = nA = nB = 0
+    for _ in range(days):
+        cA += rng.binomial(per_day, pA); cB += rng.binomial(per_day, pB)
+        nA += per_day; nB += per_day
+        a = rng.beta(1 + cA, 1 + nA - cA, draws)
+        b = rng.beta(1 + cB, 1 + nB - cB, draws)
+        if rule == "prob" and np.mean(b > a) > 0.95:
+            return "B"
+        if rule == "loss":
+            lossB, lossA = np.mean(np.maximum(a - b, 0)), np.mean(np.maximum(b - a, 0))
+            if min(lossA, lossB) < 1e-4:
+                return "B" if lossB < lossA else "A"
+    return "A"                                           # no decision: keep the control
+
+rng = np.random.default_rng(6)
+print(f"{'scenario':>18} {'rule':>16} {'ship B':>7} {'regret per 1k visitors':>23}")
+for label, pA, pB in [("A/A (identical)", 0.040, 0.040), ("B 3% worse", 0.040, 0.0388)]:
+    for rule, rname in [("prob", "P(B>A) > 0.95"), ("loss", "exp. loss < 1e-4")]:
+        out = np.array([run_test(pA, pB, rule, rng=rng) for _ in range(400)])
+        ship_b = np.mean(out == "B")
+        print(f"{label:>18} {rname:>16} {ship_b:>7.3f} {1000 * ship_b * max(pA - pB, 0):>23.3f}")
+```
+
+```output
+          scenario             rule  ship B  regret per 1k visitors
+   A/A (identical)    P(B>A) > 0.95   0.200                   0.000
+   A/A (identical) exp. loss < 1e-4   0.258                   0.000
+        B 3% worse    P(B>A) > 0.95   0.135                   0.162
+        B 3% worse exp. loss < 1e-4   0.105                   0.126
+```
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(10)
+f = lambda x: np.cos(3 * x)
+sigma, deg = 0.15, 7
+x = np.r_[rng.uniform(-1, -0.4, 12), rng.uniform(0.2, 1, 12)]   # move the gap, change n
+y = f(x) + rng.normal(0, sigma, len(x))
+Phi = np.vander(x, deg + 1, increasing=True)
+beta = 1 / sigma**2
+
+print(f"{'alpha':>7} {'log evidence':>13} {'sd at x=-0.1 (gap)':>19} {'sd at x=1.4':>12}")
+for alpha in [1e-3, 1e-2, 1e-1, 1.0, 10.0]:
+    S = np.linalg.inv(alpha * np.eye(deg + 1) + beta * Phi.T @ Phi)
+    C = np.eye(len(y)) / beta + Phi @ Phi.T / alpha
+    ev = stats.multivariate_normal(np.zeros(len(y)), C).logpdf(y)
+    sd = lambda x0: np.sqrt(1 / beta + np.vander([x0], deg + 1, increasing=True)[0] @ S
+                            @ np.vander([x0], deg + 1, increasing=True)[0])
+    print(f"{alpha:>7} {ev:>13.3f} {sd(-0.1):>19.3f} {sd(1.4):>12.3f}")
+```
+
+```output
+  alpha  log evidence  sd at x=-0.1 (gap)  sd at x=1.4
+  0.001       -19.341               0.359       16.237
+   0.01       -11.175               0.292       12.520
+    0.1        -4.823               0.212        7.015
+    1.0        -1.361               0.179        3.899
+   10.0        -8.227               0.164        2.123
+```
+
+## Exercise
+
+You have event counts $x_i$ for 300 stores observed over very different exposures $t_i$ (days open),
+with $x_i \sim \mathrm{Poisson}(\lambda_i t_i)$ and true rates $\lambda_i \sim \mathrm{Gamma}(a, b)$.
+(1) Show that marginally $x_i \sim \mathrm{NegBin}\big(a,\; b/(b + t_i)\big)$, and fit $(a, b)$ by
+maximising that marginal likelihood — empirical Bayes, the evidence idea applied to a population.
+(2) Using the fitted prior, compute each store's posterior mean rate $(a + x_i)/(b + t_i)$.
+(3) Compare its error against the raw rate $x_i/t_i$, overall and for stores with fewer than 5 days
+of exposure. This is the hierarchical-model idea of ch. 10 with the hyperparameters plugged in.
+
+<details>
+<summary>Solution</summary>
+
+```python
+rng = np.random.default_rng(11)
+n_st = 300
+t_i = rng.choice([1, 2, 3, 5, 10, 30, 90], n_st)
+lam_i = rng.gamma(4.0, 1 / 2.0, n_st)                  # true a=4, b=2: mean rate 2/day
+x_i = rng.poisson(lam_i * t_i)
+
+def neg_marginal(theta):
+    a, b = np.exp(theta)
+    return -stats.nbinom.logpmf(x_i, a, b / (b + t_i)).sum()
+
+fit = optimize.minimize(neg_marginal, x0=np.zeros(2), method="Nelder-Mead")
+a_hat, b_hat = np.exp(fit.x)
+raw = x_i / t_i
+shrunk = (a_hat + x_i) / (b_hat + t_i)
+small = t_i < 5
+print(f"fitted prior Gamma(a={a_hat:.2f}, b={b_hat:.2f}): mean {a_hat / b_hat:.3f}  (true 4, 2, mean 2.000)")
+print(f"{'':>16} {'raw rate':>9} {'posterior mean':>15}")
+print(f"{'RMSE all':>16} {np.sqrt(np.mean((raw - lam_i) ** 2)):>9.4f} {np.sqrt(np.mean((shrunk - lam_i) ** 2)):>15.4f}")
+print(f"{'RMSE t < 5 days':>16} {np.sqrt(np.mean((raw[small] - lam_i[small]) ** 2)):>9.4f} "
+      f"{np.sqrt(np.mean((shrunk[small] - lam_i[small]) ** 2)):>15.4f}")
+print(f"{'RMSE t >= 5':>16} {np.sqrt(np.mean((raw[~small] - lam_i[~small]) ** 2)):>9.4f} "
+      f"{np.sqrt(np.mean((shrunk[~small] - lam_i[~small]) ** 2)):>15.4f}")
+```
+
+```output
+fitted prior Gamma(a=3.81, b=1.89): mean 2.014  (true 4, 2, mean 2.000)
+                  raw rate  posterior mean
+        RMSE all    0.9209          0.5613
+ RMSE t < 5 days    1.3190          0.7623
+     RMSE t >= 5    0.4076          0.3340
+```
+
+PLACEHOLDER
+</details>

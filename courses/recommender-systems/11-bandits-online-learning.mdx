@@ -1,0 +1,523 @@
+---
+course: recommender-systems
+chapter: 11-bandits-online-learning
+title: "Bandits and Online Learning for Recommendation"
+order: 11
+---
+
+## The log only shows what the old policy chose
+
+Every model in chapters 3–10 was trained on interactions that a previous recommender caused. An
+item the old system never showed has no clicks, so it looks bad, so the new model never shows it
+either. Offline metrics cannot see the problem, because the held-out data was produced by the same
+loop (ch. 1, ch. 2). Simulate it: 200 items, a hidden CTR for each, and an inherited log in which
+the previous system only ever exposed 40 of them.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n_items = 200
+true_ctr = rng.beta(1.5, 40, n_items)
+old_favourites = rng.choice(n_items, 40, replace=False)    # the old system only ever showed these
+best10 = np.argsort(-true_ctr)[:10]
+
+def run_loop(policy, days=30, users=2_000, k=5, eps=0.0, seed=0):
+    r = np.random.default_rng(seed)
+    imps = np.zeros(n_items)
+    imps[old_favourites] = r.integers(20, 400, 40)
+    clicks = r.binomial(imps.astype(int), true_ctr).astype(float)
+    rows = []
+    for day in range(1, days + 1):
+        score = clicks if policy == "popularity" else (clicks + 1) / (imps + 30)
+        shown = np.tile(np.argsort(-score)[:k], (users, 1))      # same top-k for everyone
+        explore = r.random(shown.shape) < eps
+        shown[explore] = r.integers(0, n_items, explore.sum())   # random slots, if any
+        c = r.random(shown.shape) < true_ctr[shown]
+        np.add.at(imps, shown.ravel(), 1)
+        np.add.at(clicks, shown.ravel(), c.ravel())
+        if day in (1, 3, 10, 30):
+            top5 = np.argsort(-((clicks + 1) / (imps + 30)))[:5]
+            rows.append({"policy": policy + (f" + {eps:.0%} random" if eps else ""), "day": day,
+                         "true CTR shown": true_ctr[shown].mean(),
+                         "items shown": len(np.unique(shown)),
+                         "best-10 ever shown": int((imps[best10] > 0).sum()),
+                         "best-10 in top-5": len(set(top5) & set(best10))})
+    return rows
+
+print(f"catalogue mean CTR {true_ctr.mean():.4f} | oracle top-5 CTR {np.sort(true_ctr)[-5:].mean():.4f}")
+print(f"of the 10 truly best items, the old system showed {len(set(best10) & set(old_favourites))}")
+rows = run_loop("popularity") + run_loop("greedy CTR") + run_loop("greedy CTR", eps=0.05)
+print(pd.DataFrame(rows).to_string(index=False, float_format="%.4f"))
+```
+
+```output
+```
+
+PROSE_LOOP
+
+## A quick recap of the non-contextual bandit
+
+PROSE_RECAP
+
+```python
+def bernoulli_bandit(algo, p, T=50_000, seed=0, eps=0.05):
+    r = np.random.default_rng(seed)
+    K = len(p)
+    n, s, regret = np.zeros(K), np.zeros(K), np.zeros(T)
+    for t in range(T):
+        if algo == "eps-greedy":
+            a = r.integers(K) if r.random() < eps else np.argmax((s + 1) / (n + 2))
+        elif algo == "UCB1":
+            a = t if t < K else np.argmax(s / n + np.sqrt(2 * np.log(t) / n))
+        else:                                                    # Thompson, Beta(1, 1) prior
+            a = np.argmax(r.beta(s + 1, n - s + 1))
+        n[a] += 1
+        s[a] += r.random() < p[a]
+        regret[t] = p.max() - p[a]
+    return np.cumsum(regret)
+
+checks = [1_000, 5_000, 20_000, 50_000]
+table = {algo: [bernoulli_bandit(algo, true_ctr)[c - 1] for c in checks]
+         for algo in ("eps-greedy", "UCB1", "Thompson")}
+print("cumulative regret (expected clicks lost vs always showing the best item)")
+print(pd.DataFrame(table, index=[f"T={c:,}" for c in checks]).round(1).to_string())
+```
+
+```output
+```
+
+PROSE_RECAP2
+
+## Contextual bandits: let the features share the exploration
+
+PROSE_CTX
+
+```python
+rng = np.random.default_rng(1)
+K, d_u, d_i = 30, 6, 5
+item_feat = np.c_[np.ones(K), rng.normal(0, 1, (K, d_i - 1))]      # [1, 4 item attributes]
+B = rng.normal(0, 0.45, (d_u, d_i))
+B[0] = [-3.6, 0.2, -0.1, 0.15, 0.1]                                  # weak item main effects
+theta_true = item_feat @ B.T                                          # (K, d_u): one theta per arm
+
+def draw_users(n, r):
+    return np.c_[np.ones(n), r.normal(0, 1, (n, d_u - 1))]          # [1, 5 user features]
+
+def click_prob(X):
+    return 1 / (1 + np.exp(-(X @ theta_true.T)))                      # (n, K), logistic truth
+
+Xpop = draw_users(100_000, rng)
+P = click_prob(Xpop)
+print(f"CTR of a random item     {P.mean():.4f}")
+print(f"best single item for all {P.mean(0).max():.4f}")
+print(f"best item per user       {P.max(1).mean():.4f}   <- the prize for personalising")
+```
+
+```output
+```
+
+PROSE_CTX2
+
+### Deriving the LinUCB bonus
+
+PROSE_DERIV
+
+```python
+r = np.random.default_rng(2)
+theta, sigma, lam = r.normal(0, 1, d_u), 0.5, 1.0
+cover = []
+for n in (20, 200, 2_000):
+    Xd = draw_users(n, r)
+    y = Xd @ theta + r.normal(0, sigma, n)
+    A = Xd.T @ Xd + lam * np.eye(d_u)
+    th_hat = np.linalg.solve(A, Xd.T @ y)
+    Xq = draw_users(5_000, r)
+    width = sigma * np.sqrt(np.einsum("ni,ij,nj->n", Xq, np.linalg.inv(A), Xq))
+    err = np.abs(Xq @ (th_hat - theta))
+    cover.append({"n": n, "mean width": width.mean(), "coverage of 1.96 x width": (err <= 1.96 * width).mean()})
+print(pd.DataFrame(cover).to_string(index=False, float_format="%.4f"))
+```
+
+```output
+```
+
+PROSE_DERIV2
+
+### Linear Thompson sampling
+
+PROSE_LINTS
+
+```python
+def run_contextual(algo, T=20_000, alpha=1.0, v=0.5, lam=1.0, seed=0):
+    r = np.random.default_rng(seed)
+    X = draw_users(T, r)
+    Pt, U = click_prob(X), r.random(T)
+    A_inv = np.tile(np.eye(d_u) / lam, (K, 1, 1))
+    b = np.zeros((K, d_u))
+    n, s, regret, reward = np.zeros(K), np.zeros(K), np.zeros(T), np.zeros(T)
+    for t in range(T):
+        x = X[t]
+        if algo == "random":
+            a = r.integers(K)
+        elif algo == "Thompson (no context)":
+            a = np.argmax(r.beta(s + 1, n - s + 1))
+        else:
+            mean = np.einsum("kij,kj->ki", A_inv, b) @ x
+            width = np.sqrt(np.einsum("i,kij,j->k", x, A_inv, x))
+            if algo == "LinUCB":
+                a = np.argmax(mean + alpha * width)
+            else:                                   # LinTS: x.theta_a ~ N(mean_a, v^2 width_a^2)
+                a = np.argmax(mean + v * width * r.standard_normal(K))
+        y = float(U[t] < Pt[t, a])
+        n[a] += 1
+        s[a] += y
+        Ax = A_inv[a] @ x                           # Sherman-Morrison: O(d^2), no inversion
+        A_inv[a] -= np.outer(Ax, Ax) / (1 + x @ Ax)
+        b[a] += y * x
+        regret[t], reward[t] = Pt[t].max() - Pt[t, a], y
+    return np.cumsum(regret), np.einsum("kij,kj->ki", A_inv, b), reward
+
+checks = [1_000, 5_000, 10_000, 20_000]
+res = {}
+for algo, kw in (("random", {}), ("Thompson (no context)", {}), ("LinUCB", {"alpha": 0.0}),
+                 ("LinUCB", {"alpha": 0.5}), ("LinUCB", {"alpha": 1.0}),
+                 ("LinTS", {"v": 0.1}), ("LinTS", {"v": 0.25})):
+    name = algo + "".join(f" {k}={val}" for k, val in kw.items())
+    R, _, rew = run_contextual(algo, **kw)
+    res[name] = [R[c - 1] for c in checks] + [rew[-5_000:].mean()]
+print(pd.DataFrame(res, index=[f"regret@{c:,}" for c in checks] + ["CTR last 5k"]).T
+      .to_string(float_format=lambda v: f"{v:.4f}" if v < 1 else f"{v:.1f}"))
+```
+
+```output
+```
+
+PROSE_LINTS2
+
+## Off-policy evaluation: scoring a policy you never ran
+
+PROSE_OPE
+
+```python
+_, theta_lin, _ = run_contextual("LinUCB", alpha=0.5)
+
+def target_policy(X):                               # deterministic: greedy on what LinUCB learned
+    return np.argmax(X @ theta_lin.T, axis=1)
+
+V_true = P[np.arange(len(Xpop)), target_policy(Xpop)].mean()
+print(f"true CTR of the target policy (100k simulated users): {V_true:.4f}")
+```
+
+```output
+```
+
+### The replay method
+
+PROSE_REPLAY
+
+```python
+r = np.random.default_rng(5)
+n_log = 60_000
+Xl = draw_users(n_log, r)
+Al = r.integers(0, K, n_log)                                   # uniformly random logging
+Rl = (r.random(n_log) < click_prob(Xl)[np.arange(n_log), Al]).astype(float)
+match = target_policy(Xl) == Al
+print(f"fixed policy: {match.sum():,} of {n_log:,} events match | replay CTR "
+      f"{Rl[match].mean():.4f} +/- {Rl[match].std() / np.sqrt(match.sum()):.4f} (truth {V_true:.4f})")
+
+def replay_linucb(X, A, R, alpha=0.5, lam=1.0):
+    """Li et al. (2011): stream the log, keep only events where the learner agrees, learn from those."""
+    A_inv = np.tile(np.eye(d_u) / lam, (K, 1, 1))
+    b = np.zeros((K, d_u))
+    kept = []
+    for x, a_log, y in zip(X, A, R):
+        mean = np.einsum("kij,kj->ki", A_inv, b) @ x
+        width = np.sqrt(np.einsum("i,kij,j->k", x, A_inv, x))
+        if np.argmax(mean + alpha * width) != a_log:
+            continue                                            # the learner never "saw" this user
+        kept.append(y)
+        Ax = A_inv[a_log] @ x
+        A_inv[a_log] -= np.outer(Ax, Ax) / (1 + x @ Ax)
+        b[a_log] += y * x
+    return np.array(kept)
+
+kept = replay_linucb(Xl, Al, Rl)
+online = np.mean([run_contextual("LinUCB", T=len(kept), alpha=0.5, seed=s)[2].mean() for s in range(5)])
+print(f"learning LinUCB: replay kept {len(kept):,} events | replay CTR {kept.mean():.4f} "
+      f"| online CTR over the same horizon {online:.4f}")
+```
+
+```output
+```
+
+PROSE_REPLAY2
+
+### Inverse propensity scoring is unbiased
+
+PROSE_IPS
+
+### Self-normalised and doubly robust estimators
+
+PROSE_DR
+
+```python
+theta_rough = theta_true + np.random.default_rng(7).normal(0, 0.4, theta_true.shape)
+
+def logging_probs(X, beta):                         # softmax of an imperfect ranker's logits
+    z = beta * (X @ theta_rough.T)
+    e = np.exp(z - z.max(1, keepdims=True))
+    return e / e.sum(1, keepdims=True)
+
+def simulate_log(n, beta, r):
+    X = draw_users(n, r)
+    mu = logging_probs(X, beta)
+    A = (mu.cumsum(1) > r.random((n, 1))).argmax(1)
+    R = (r.random(n) < click_prob(X)[np.arange(n), A]).astype(float)
+    return X, A, mu[np.arange(n), A], R
+
+def ope(X, A, p, R, lam=1.0):
+    pi_a = target_policy(X)
+    w = (pi_a == A) / p                                         # importance weights
+    th = np.zeros((K, d_u))                                     # direct method: ridge per arm
+    for a in range(K):
+        m = A == a
+        th[a] = np.linalg.solve(X[m].T @ X[m] + lam * np.eye(d_u), X[m].T @ R[m])
+    q_pi, q_log = (X * th[pi_a]).sum(1), (X * th[A]).sum(1)
+    return {"DM": q_pi.mean(), "IPS": (w * R).mean(), "SNIPS": (w * R).sum() / w.sum(),
+            "DR": (q_pi + w * (R - q_log)).mean(), "ESS": w.sum() ** 2 / (w ** 2).sum(),
+            "max w": w.max()}
+
+rows = []
+for beta in (0.0, 1.0, 2.0, 4.0):
+    r = np.random.default_rng(11)
+    out = pd.DataFrame([ope(*simulate_log(3_000, beta, r)) for _ in range(200)])
+    row = {"beta": beta, "ESS": f"{out['ESS'].mean():.0f}", "max w": f"{out['max w'].max():.0f}"}
+    for e in ("DM", "IPS", "SNIPS", "DR"):
+        row[e + " bias / sd"] = f"{out[e].mean() - V_true:+.4f} / {out[e].std():.4f}"
+    rows.append(row)
+print(f"200 logs of 3,000 events each; target value {V_true:.4f}")
+print(pd.DataFrame(rows).to_string(index=False))
+```
+
+```output
+```
+
+PROSE_DR2
+
+## Slates and position bias
+
+PROSE_SLATE
+
+```python
+from scipy.stats import spearmanr
+
+r = np.random.default_rng(3)
+n_docs, slots = 40, 8
+relevance = r.beta(2, 8, n_docs)                               # P(click | examined)
+examine = 1 / (1 + np.arange(slots)) ** 0.9                    # P(examined | position)
+prior_score = relevance + r.normal(0, 0.12, n_docs)            # the logging ranker is decent
+clicks, imps, exam_w, pos_sum = (np.zeros(n_docs) for _ in range(4))
+for _ in range(50):                                            # 50 x 1,000 sessions
+    noisy = prior_score[None, :] + r.gumbel(0, 0.04, (1_000, n_docs))
+    rank = np.argsort(-noisy, 1)[:, :slots]
+    c = r.random(rank.shape) < examine[None, :] * relevance[rank]
+    np.add.at(clicks, rank.ravel(), c.ravel())
+    np.add.at(imps, rank.ravel(), 1)
+    np.add.at(exam_w, rank.ravel(), np.tile(examine, 1_000))   # sum of examination propensities
+    np.add.at(pos_sum, rank.ravel(), np.tile(np.arange(1, slots + 1), 1_000))
+ok = imps > 200
+naive, ips = clicks / np.maximum(imps, 1), clicks / np.maximum(exam_w, 1e-9)
+show = pd.DataFrame({"mean position": pos_sum / np.maximum(imps, 1), "relevance": relevance,
+                     "naive CTR": naive, "IPS estimate": ips})[ok].sort_values("mean position")
+print(show.iloc[::4].round(3).to_string())
+print(f"\ndocs with enough impressions: {ok.sum()}")
+print(f"Spearman with relevance: naive {spearmanr(naive[ok], relevance[ok])[0]:.3f} | "
+      f"IPS {spearmanr(ips[ok], relevance[ok])[0]:.3f}")
+print(f"mean abs error:          naive {np.abs(naive - relevance)[ok].mean():.3f} | "
+      f"IPS {np.abs(ips - relevance)[ok].mean():.3f}")
+```
+
+```output
+```
+
+PROSE_SLATE2
+
+## Running a bandit in production
+
+PROSE_PROD
+
+```python
+from collections import deque
+
+def bandit_run(algo, p_before, p_after=None, T=40_000, gamma=1.0, window=None, batch=1, seed=0):
+    r = np.random.default_rng(seed)
+    K_ = len(p_before)
+    n, s = np.zeros(K_), np.zeros(K_)
+    seen_n, seen_s = n.copy(), s.copy()                 # what the policy sees (stale if batched)
+    hist, reg = deque(), np.zeros(T)
+    for t in range(T):
+        p = p_before if p_after is None or t < T // 2 else p_after
+        if algo == "UCB1":
+            a = (int(np.argmin(seen_n)) if seen_n.min() == 0 else
+                 np.argmax(seen_s / seen_n + np.sqrt(2 * np.log(t + 1) / seen_n)))
+        else:
+            a = np.argmax(r.beta(seen_s + 1, seen_n - seen_s + 1))
+        y = r.random() < p[a]
+        n *= gamma                                      # discounting: forget old evidence
+        s *= gamma
+        n[a] += 1
+        s[a] += y
+        if window:                                      # sliding window: drop evidence older than W
+            hist.append((a, y))
+            if len(hist) > window:
+                a_old, y_old = hist.popleft()
+                n[a_old] -= 1
+                s[a_old] -= y_old
+        if (t + 1) % batch == 0:                        # delayed feedback: refresh every `batch`
+            seen_n, seen_s = n.copy(), s.copy()
+        reg[t] = p.max() - p[a]
+    return reg
+
+p0 = np.random.default_rng(42).uniform(0.02, 0.08, 10)
+p0[0] = 0.10
+p1 = p0.copy()
+p1[0], p1[1] = 0.03, 0.12                               # at T/2 the winner fades, a new one rises
+rows = []
+for name, kw in (("Thompson", {}), ("Thompson, discount 0.999", {"gamma": 0.999}),
+                 ("Thompson, window 2,000", {"window": 2_000})):
+    regs = np.array([bandit_run("TS", p0, p1, seed=sd, **kw) for sd in range(3)])
+    rows.append({"policy": name, "regret first half": regs[:, :20_000].sum(1).mean(),
+                 "regret second half": regs[:, 20_000:].sum(1).mean()})
+print("non-stationary: CTRs swap at t = 20,000 (mean of 3 seeds)")
+print(pd.DataFrame(rows).round(1).to_string(index=False))
+
+rows = []
+for batch in (1, 500, 2_000):
+    row = {"update every": batch}
+    for algo in ("UCB1", "TS"):
+        row[algo + " regret"] = np.mean([bandit_run(algo, p0, T=10_000, batch=batch, seed=sd).sum()
+                                         for sd in range(4)])
+    rows.append(row)
+print("\ndelayed / batched feedback, stationary CTRs, T = 10,000 (mean of 4 seeds)")
+print(pd.DataFrame(rows).round(1).to_string(index=False))
+```
+
+```output
+```
+
+PROSE_PROD2
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+n_seg, K = 20, 10                                       # user segments x items
+ctr = rng.beta(2, 30, (n_seg, K))
+target = np.argmax(ctr + rng.normal(0, 0.02, ctr.shape), axis=1)   # a decent but imperfect policy
+V = ctr[np.arange(n_seg), target].mean()
+
+def logging_probs(beta):
+    z = beta * np.log(ctr + rng.normal(0, 0.01, ctr.shape).clip(0))
+    e = np.exp(z - z.max(1, keepdims=True))
+    return e / e.sum(1, keepdims=True)
+
+mu = logging_probs(beta=3.0)                            # try 0.0 (uniform) up to 6.0 (peaked)
+
+def estimates(n, r, clips=(np.inf, 100, 20, 5)):
+    seg = r.integers(0, n_seg, n)
+    a = (mu[seg].cumsum(1) > r.random((n, 1))).argmax(1)
+    y = (r.random(n) < ctr[seg, a]).astype(float)
+    w = (a == target[seg]) / mu[seg, a]
+    out = {f"IPS clip {c:g}": (np.minimum(w, c) * y).mean() for c in clips}
+    out["SNIPS"] = (w * y).sum() / w.sum()
+    return out
+
+r = np.random.default_rng(1)
+runs = pd.DataFrame([estimates(5_000, r) for _ in range(300)])
+summary = pd.DataFrame({"bias": runs.mean() - V, "sd": runs.std()})
+summary["rmse"] = np.sqrt(summary["bias"] ** 2 + summary["sd"] ** 2)
+print(f"true value {V:.4f} | smallest logging propensity on the target's action "
+      f"{mu[np.arange(n_seg), target].min():.4f}")
+print(summary.round(4).to_string())
+```
+
+```output
+```
+
+PROSE_TRY
+
+## Exercise
+
+PROSE_EX
+
+<details>
+<summary>Solution</summary>
+
+```python
+rng = np.random.default_rng(9)
+K_new = 10
+feat_all = np.r_[item_feat, np.c_[np.ones(K_new), rng.normal(0, 1, (K_new, d_i - 1))]]
+theta_all = feat_all @ B.T                                  # same B: new items obey the same rule
+K_all = K + K_new
+
+def cross(x, F):                                            # z(x, a) = vec(x f_a^T), dim d_u * d_i
+    return (x[None, :, None] * F[:, None, :]).reshape(len(F), -1)
+
+def run_catalogue(algo, T=15_000, t_new=5_000, alpha=0.5, lam=1.0, seed=0):
+    r = np.random.default_rng(seed)
+    X = draw_users(T, r)
+    Pt = 1 / (1 + np.exp(-(X @ theta_all.T)))
+    U = r.random(T)
+    dz = d_u * d_i
+    Ad = np.tile(np.eye(d_u) / lam, (K_all, 1, 1))
+    bd = np.zeros((K_all, d_u))
+    As, bs = np.eye(dz) / lam, np.zeros(dz)
+    regret, new_pulls = np.zeros(T), 0
+    for t in range(T):
+        live = K_all if t >= t_new else K
+        x = X[t]
+        if algo == "disjoint":
+            mean = np.einsum("kij,kj->ki", Ad[:live], bd[:live]) @ x
+            width = np.sqrt(np.einsum("i,kij,j->k", x, Ad[:live], x))
+        else:
+            Z = cross(x, feat_all[:live])
+            mean = Z @ (As @ bs)
+            width = np.sqrt(np.einsum("ki,ij,kj->k", Z, As, Z))
+        a = int(np.argmax(mean + alpha * width))
+        y = float(U[t] < Pt[t, a])
+        if algo == "disjoint":
+            Ax = Ad[a] @ x
+            Ad[a] -= np.outer(Ax, Ax) / (1 + x @ Ax)
+            bd[a] += y * x
+        else:
+            z = cross(x, feat_all[a:a + 1])[0]
+            Az = As @ z
+            As -= np.outer(Az, Az) / (1 + z @ Az)
+            bs += y * z
+        regret[t] = Pt[t, :live].max() - Pt[t, a]
+        new_pulls += (a >= K) and t >= t_new
+    return regret, new_pulls
+
+rows = []
+for algo in ("disjoint", "shared"):
+    reg, new_pulls = run_catalogue(algo)
+    rows.append({"model": algo, "regret before launch": reg[:5_000].sum(),
+                 "regret 1k after launch": reg[5_000:6_000].sum(),
+                 "regret 10k after launch": reg[5_000:].sum(),
+                 "pulls of new items": new_pulls})
+print(pd.DataFrame(rows).round(1).to_string(index=False))
+```
+
+```output
+```
+
+PROSE_SOL
+</details>
+
+## Under the Trench
+
+UTT
