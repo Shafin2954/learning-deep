@@ -32,25 +32,27 @@ print(df)
 ```
 
 ```output
-utf-8 failed: 'utf-8' codec can't decode byte 0xe9 in position 0: inv
-  name   city
+utf-8 failed: 'utf-8' codec can't decode byte 0xe9 in position 17: invalid
+    name    city
 0  Alice  Résumé
-1    Bob   Café
+1    Bob    Café
 ```
 
 When you don't know the encoding, try `encoding='latin-1'` first (it never errors —
-every byte is valid Latin-1) or use `chardet`/`charset-normalizer` to detect it:
+every byte is valid Latin-1) or use a detector such as `charset-normalizer` (or `chardet`) to guess it:
 
 ```python
-import chardet, io
+from charset_normalizer import from_bytes
 
-raw = "name\nAlice\nMeiying".encode('gb2312')
-result = chardet.detect(raw)
-print(result)
+raw = "姓名,城市\n王小明,北京\n李华,上海\n张伟,广州".encode('gb2312')
+best = from_bytes(raw).best()
+print(best.encoding)
+print(raw.decode(best.encoding).splitlines()[1])
 ```
 
 ```output
-{'encoding': 'GB2312', 'confidence': 0.99, 'language': 'Chinese'}
+gb18030
+王小明,北京
 ```
 
 ## Dtype control at load time
@@ -88,20 +90,20 @@ print(df_typed.memory_usage(deep=True).sum(), "bytes")
 
 ```output
 auto dtypes:
-id           int64
+id            int64
 score       float64
 active        int64
-category     object
+category        str
 dtype: object
-341 bytes
+231 bytes
 
 explicit dtypes:
-id          object
-score      float32
-active       int64
-category  category
+id               str
+score        float32
+active         int64
+category    category
 dtype: object
-461 bytes
+225 bytes
 ```
 
 For large files the dtype savings compound: a 10 M-row `object` column of 4-character
@@ -133,11 +135,11 @@ print(df.isna().sum())
 ```
 
 ```output
-   age    income          note
-0   25  50000.0            ok
-1  NaN      NaN  missing income
-2   32      NaN  missing income
-3   40  75000.0            ok
+    age   income            note
+0  25.0  50000.0              ok
+1   NaN      NaN  missing income
+2  32.0      NaN  missing income
+3  40.0  75000.0              ok
 
 missing counts:
 age       1
@@ -162,11 +164,11 @@ print("dtype:", df['amount'].dtype)
 ```
 
 ```output
-   amount
-0  1234.56
-1  8901200
-2  5000.00
-dtype: float64
+       amount
+1234       56
+89012       0
+5000        0
+dtype: int64
 ```
 
 ## Bad rows: `on_bad_lines`
@@ -246,19 +248,19 @@ print("\nna counts:\n", df.isna().sum())
 ```
 
 ```output
-  product_id           name  price  stock   category
-0       P001       Widget A   1299     50  electronics
-1       P002       Gadget B    NaN      0  electronics
-2       P003            NaN  24.99   <NA>         NaN
-3       P004   Doohickey D   8.49    200     hardware
-4       P005  Thingamajig E    NaN     10     hardware
+  product_id           name   price  stock     category
+0       P001       Widget A   1.299     50  electronics
+1       P002       Gadget B     NaN      0  electronics
+2       P003            NaN  24.990   <NA>          NaN
+3       P004    Doohickey D   8.490    200     hardware
+4       P005  Thingamajig E     NaN     10     hardware
 
 dtypes:
- product_id     object
-name           object
+ product_id        str
+name              str
 price         float64
 stock           Int32
-category       object
+category          str
 dtype: object
 
 na counts:
@@ -273,7 +275,7 @@ dtype: int64
 ## Exercise
 
 Write a function `load_clean(path_or_buf)` that:
-1. Detects encoding automatically using `chardet`.
+1. Detects encoding automatically using `charset-normalizer`.
 2. Reads the CSV with a custom sentinel list and the detected encoding.
 3. Returns a DataFrame with `object` columns that have fewer than 20 unique values
    automatically converted to `category`.
@@ -284,7 +286,9 @@ Write a function `load_clean(path_or_buf)` that:
 
 ```python
 import pandas as pd
-import chardet
+import io
+import pandas as pd
+from charset_normalizer import from_bytes
 
 def load_clean(path_or_buf):
     # 1) detect encoding
@@ -294,7 +298,8 @@ def load_clean(path_or_buf):
     else:
         with open(path_or_buf, 'rb') as f:
             raw = f.read(100_000)   # sample first 100 KB
-    enc = chardet.detect(raw)['encoding'] or 'utf-8'
+    best = from_bytes(raw).best()
+    enc = best.encoding if best else 'utf-8'
 
     # 2) read with sentinels
     df = pd.read_csv(
@@ -304,7 +309,7 @@ def load_clean(path_or_buf):
     )
 
     # 3) auto-categorize low-cardinality object columns
-    for col in df.select_dtypes('object').columns:
+    for col in df.select_dtypes(include=['object', 'string']).columns:
         if df[col].nunique() < 20:
             df[col] = df[col].astype('category')
 
@@ -312,5 +317,14 @@ def load_clean(path_or_buf):
     mb = df.memory_usage(deep=True).sum() / 1e6
     print(f"shape={df.shape}  missing={df.isna().sum().sum()}  mem={mb:.2f} MB")
     return df
+
+buf = io.BytesIO("city,qty\nM\u00fcnchen,3\nK\u00f6ln,N/A\nM\u00fcnchen,-999\n".encode('latin-1'))
+df = load_clean(buf)
+print(df.dtypes.to_dict())
+```
+
+```output
+shape=(3, 2)  missing=2  mem=0.00 MB
+{'city': CategoricalDtype(categories=['Köln', 'München'], ordered=False, categories_dtype=str), 'qty': dtype('float64')}
 ```
 </details>
