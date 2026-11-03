@@ -48,7 +48,7 @@ export const COURSE_GROUPS = [
     courses: [
       { id: 'reinforcement-learning', name: 'Reinforcement Learning' },
       { id: 'graph-ml',               name: 'Graph ML' },
-      // { id: 'recommender-systems',    name: 'Recommender Systems' }, // coming soon
+      { id: 'recommender-systems',    name: 'Recommender Systems' },
       // { id: 'bayesian-ml',            name: 'Bayesian ML' },          // coming soon
     ],
   },

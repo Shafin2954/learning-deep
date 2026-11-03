@@ -95,6 +95,11 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 12,
     badge: 'Ch 1 – 12',
   },
+  'recommender-systems': {
+    tagline: '11 chapters: ranking metrics under temporal splits, neighborhood CF, ALS/iALS/BPR, factorization machines, two-tower retrieval, GRU4Rec/SASRec, cold start, two-stage ranking with LambdaRank, and contextual bandits with off-policy evaluation.',
+    chapters: 12,
+    badge: 'Ch 1 – 12',
+  },
   'eval-tuning': {
     tagline: '12 chapters: metrics that answer your question, cost-optimal thresholds, calibration, CV pitfalls, Optuna, permutation importance and SHAP, PDP/ICE/ALE, error analysis, and honest model comparison.',
     chapters: 13,
