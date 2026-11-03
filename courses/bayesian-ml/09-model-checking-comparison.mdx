@@ -1,0 +1,572 @@
+---
+course: bayesian-ml
+chapter: 09-model-checking-comparison
+title: "Model Checking and Comparison: PPCs, WAIC, and PSIS-LOO"
+order: 9
+---
+
+## Two different questions
+
+Model checking asks whether this model is *adequate*: can it generate data that look like yours,
+in the ways you care about? Model comparison asks which of several models will *predict new data*
+best. A model can pass every check you think of and still lose on prediction. A model can also win
+the comparison and still fail a check, because a comparison only ranks the candidates you gave it.
+The workflow (ch. 8) runs both. Checking tells you what to fix, and comparison tells you whether the
+fix was worth it.
+
+The running data are 80 days of failed-job counts from a batch cluster. The obvious model is
+Poisson with a Gamma prior. It is conjugate (ch. 2), so the posterior is
+$\mathrm{Gamma}(a_0 + \sum y_i,\; b_0 + n)$ and posterior draws cost nothing.
+
+```python
+import numpy as np
+from scipy import stats, optimize
+from scipy.special import logsumexp, gammaln
+
+rng = np.random.default_rng(9)
+n_c = 80
+y_c = stats.nbinom.rvs(1.5, 1.5 / (1.5 + 4.0), size=n_c, random_state=rng)   # truth: NegBin, mean 4
+a0, b0 = 2.0, 0.5                                                           # Gamma(shape, rate) prior
+S = 4000
+lam = rng.gamma(a0 + y_c.sum(), 1 / (b0 + n_c), S)                          # Poisson posterior draws
+print(f"n={n_c} | mean {y_c.mean():.2f} | var {y_c.var(ddof=1):.2f} | zeros {np.mean(y_c == 0):.3f} | max {y_c.max()}")
+print(f"posterior lambda: mean {lam.mean():.3f}, 95% [{np.quantile(lam, .025):.3f}, {np.quantile(lam, .975):.3f}]")
+```
+
+```output
+```
+
+## Posterior predictive checks done properly
+
+A posterior predictive check (ch. 1) simulates replicated data $y^{\text{rep}} \sim p(y^{\text{rep}}\mid y)$
+and compares a test statistic $T(y^{\text{rep}})$ with $T(y)$. The posterior predictive p-value is
+
+$$
+p_B = P\big(T(y^{\text{rep}}) \ge T(y) \,\big|\, y\big) = \iint \mathbb{1}\big[T(y^{\text{rep}}) \ge T(y)\big]\,
+p(y^{\text{rep}}\mid\theta)\,p(\theta\mid y)\,dy^{\text{rep}}\,d\theta .
+$$
+
+The choice of $T$ is everything. For the Poisson, $\sum y_i$ is sufficient for $\lambda$, so the
+posterior is built to reproduce the sample mean. Checking the mean is checking the fit against
+itself. Useful statistics are roughly **orthogonal to the fitted parameters**: features the model
+pins down *as a consequence* of its assumptions rather than by fitting them. For a Poisson, that means
+the dispersion ratio $s^2/\bar y$ (fixed at 1 by assumption), the fraction of zeros (fixed at
+$e^{-\lambda}$), and the maximum.
+
+```python
+y_rep_p = rng.poisson(lam[:, None], (S, n_c))
+T_stats = {"mean": lambda a: a.mean(axis=-1),
+           "var/mean": lambda a: a.var(axis=-1, ddof=1) / np.maximum(a.mean(axis=-1), 1e-9),
+           "frac zeros": lambda a: np.mean(a == 0, axis=-1),
+           "max": lambda a: a.max(axis=-1)}
+
+def ppc(y_obs, y_rep):
+    for name, T in T_stats.items():
+        t_obs, t_rep = T(y_obs), T(y_rep)
+        print(f"  {name:10} observed {t_obs:6.2f} | replicated 90% [{np.quantile(t_rep, .05):6.2f}, "
+              f"{np.quantile(t_rep, .95):6.2f}] | p_B {np.mean(t_rep >= t_obs):.3f}")
+
+print("Poisson:"); ppc(y_c, y_rep_p)
+```
+
+```output
+```
+
+FILL_PPC
+
+### Posterior predictive p-values are conservative
+
+The data are used twice: once to fit $\theta$, once to judge it. Unlike a classical p-value, $p_B$
+is therefore not uniform when the model is true. It is pulled toward 0.5, and the pull is
+strongest for statistics close to what was fitted. The simulation below draws 400 datasets *from the
+Poisson model itself* and records $p_B$ for three statistics. A calibrated p-value would put 10% of
+its mass outside $[0.05, 0.95]$ and have sd $1/\sqrt{12} = 0.289$.
+
+```python
+R, S_small = 400, 500
+pb = {name: np.empty(R) for name in ("mean", "var/mean", "max")}
+for r in range(R):
+    y_sim = rng.poisson(4.0, n_c)                                        # the model is TRUE here
+    lam_r = rng.gamma(a0 + y_sim.sum(), 1 / (b0 + n_c), S_small)
+    rep = rng.poisson(lam_r[:, None], (S_small, n_c))
+    for name in pb:
+        T = T_stats[name]
+        pb[name][r] = np.mean(T(rep) >= T(y_sim)) + 0.5 * np.mean(T(rep) == T(y_sim))  # mid-p for ties
+for name, v in pb.items():
+    print(f"T = {name:9} sd(p_B) {v.std():.3f} (uniform 0.289) | "
+          f"P(p_B < 0.05 or > 0.95) {np.mean((v < .05) | (v > .95)):.3f} (uniform 0.100)")
+```
+
+```output
+```
+
+FILL_CONSERV
+
+## Fixing the likelihood: negative binomial
+
+The negative binomial is a Gamma mixture of Poissons: $y \mid \mu, \phi \sim \mathrm{NB}(\mu, \phi)$
+with $\mathbb{E}y = \mu$ and $\mathrm{Var}\,y = \mu + \mu^2/\phi$. Small $\phi$ means strong
+overdispersion, and $\phi \to \infty$ recovers the Poisson. Two parameters fit comfortably on a grid
+(ch. 1), with priors $\log\mu \sim \mathcal{N}(\log 3, 1)$ and $\log\phi \sim \mathcal{N}(0, 1.5)$. You
+also keep the grid's log-likelihood matrix, because exact leave-one-out on a grid is just a reweighting.
+
+```python
+def nb_logpmf(y, mu, phi):
+    return stats.nbinom.logpmf(y, phi, phi / (phi + mu))
+
+lmu_g, lphi_g = np.linspace(np.log(2), np.log(8), 150), np.linspace(np.log(0.2), np.log(20), 150)
+LMU, LPHI = [a.ravel() for a in np.meshgrid(lmu_g, lphi_g, indexing="ij")]
+ll_grid_nb = nb_logpmf(y_c[:, None], np.exp(LMU), np.exp(LPHI))          # (n, G)
+log_prior_nb = stats.norm.logpdf(LMU, np.log(3), 1) + stats.norm.logpdf(LPHI, 0, 1.5)
+lp_nb = ll_grid_nb.sum(0) + log_prior_nb
+w_nb = np.exp(lp_nb - logsumexp(lp_nb))
+cell = rng.choice(LMU.size, S, p=w_nb)
+d_mu, d_phi = lmu_g[1] - lmu_g[0], lphi_g[1] - lphi_g[0]
+mu_s = np.exp(LMU[cell] + rng.uniform(-d_mu / 2, d_mu / 2, S))          # jitter within the cell
+phi_s = np.exp(LPHI[cell] + rng.uniform(-d_phi / 2, d_phi / 2, S))
+print(f"mu  posterior mean {mu_s.mean():.2f}, 95% [{np.quantile(mu_s, .025):.2f}, {np.quantile(mu_s, .975):.2f}]")
+print(f"phi posterior mean {phi_s.mean():.2f}, 95% [{np.quantile(phi_s, .025):.2f}, {np.quantile(phi_s, .975):.2f}]")
+y_rep_nb = stats.nbinom.rvs(phi_s[:, None], (phi_s / (phi_s + mu_s))[:, None], size=(S, n_c), random_state=rng)
+print("NegBin:"); ppc(y_c, y_rep_nb)
+```
+
+```output
+```
+
+FILL_NB
+
+## LOO-PIT: a calibration check that does not double-dip
+
+The probability integral transform fixes the double use of data by predicting each point from the
+others. If $F_{-i}$ is the leave-one-out predictive CDF, $u_i = F_{-i}(y_i)$ is uniform when the
+model is calibrated. Counts need the randomised version, $u_i = F_{-i}(y_i - 1) + v_i\,p_{-i}(y_i)$
+with $v_i \sim \mathcal{U}(0,1)$. A U-shape means predictive intervals that are too narrow
+(underdispersion), and a hump means intervals that are too wide.
+
+Both models allow exact LOO here. For the Poisson, $\lambda \mid y_{-i}$ is again Gamma, so
+$p(\tilde y \mid y_{-i})$ is negative binomial in closed form. On the NB grid, dividing the
+posterior weights by $p(y_i\mid\theta)$ and renormalising *is* the posterior given $y_{-i}$.
+
+```python
+a_i, b_i = a0 + y_c.sum() - y_c, b0 + n_c - 1                           # Gamma posterior without y_i
+cdf_p = lambda t: stats.nbinom.cdf(t, a_i, b_i / (b_i + 1))             # Poisson-Gamma predictive
+w_loo = w_nb[None, :] * np.exp(-ll_grid_nb)                             # posterior given y_{-i}, on the grid
+w_loo /= w_loo.sum(1, keepdims=True)
+cdf_nb = lambda t: np.sum(w_loo * stats.nbinom.cdf(t[:, None], np.exp(LPHI), np.exp(LPHI) / (np.exp(LPHI) + np.exp(LMU))), 1)
+v = rng.uniform(size=n_c)
+for name, F in (("Poisson", cdf_p), ("NegBin", cdf_nb)):
+    lo, hi = F(y_c - 1), F(y_c)
+    u = lo + v * (hi - lo)
+    hist = np.histogram(u, bins=5, range=(0, 1))[0]
+    print(f"{name:8} LOO-PIT counts per fifth {hist} (expect 16 each) | outside [0.05, 0.95]: "
+          f"{np.mean((u < .05) | (u > .95)):.3f} (expect 0.10) | KS p {stats.kstest(u, 'uniform').pvalue:.3f}")
+```
+
+```output
+```
+
+FILL_PIT
+
+## Predictive accuracy as the target
+
+To compare models you need a score, and the Bayesian default is the **expected log pointwise
+predictive density** for new data $\tilde y_i$ from the true process $p_t$:
+
+$$
+\mathrm{elpd} = \sum_{i=1}^{n} \int p_t(\tilde y_i)\,\log p(\tilde y_i \mid y)\,d\tilde y_i,
+\qquad p(\tilde y_i \mid y) = \int p(\tilde y_i\mid\theta)\,p(\theta\mid y)\,d\theta .
+$$
+
+The log score is the only proper local scoring rule, and it rewards the whole predictive
+distribution, not just a point forecast. You do not know $p_t$. The naive plug-in reuses the
+observed data, giving the **log pointwise predictive density**, computed from $S$ draws as
+
+$$
+\mathrm{lppd} = \sum_{i=1}^{n} \log \frac{1}{S}\sum_{s=1}^{S} p(y_i\mid\theta^{(s)}) .
+$$
+
+The lppd is optimistic, because each $y_i$ helped choose the $\theta$ that is now scoring it.
+The bias grows with the effective number of parameters. Every criterion below is an
+estimate of this optimism.
+
+### The classical corrections, briefly
+
+AIC subtracts the parameter count $k$ from the maximised log-likelihood: $\widehat{\mathrm{elpd}}_{\mathrm{AIC}} = \log p(y\mid\hat\theta_{\mathrm{MLE}}) - k$.
+It conditions on a point estimate and assumes flat priors and a regular model. DIC replaces the MLE by
+the posterior mean and $k$ by $p_{\mathrm{DIC}} = 2\big(\log p(y\mid\bar\theta) - \mathbb{E}_{\text{post}}\log p(y\mid\theta)\big)$,
+which shrinks when the prior regularises. Both still plug in a point, and DIC can go negative or
+behave badly when the posterior mean is a poor summary (multimodality, constraints).
+
+### WAIC derived from a cumulant expansion
+
+Write $L_i = \log p(y_i\mid\theta)$ as a random variable under the posterior, with mean $\mu_i$ and
+variance $\sigma_i^2$. The cumulant generating function gives
+$\log\mathbb{E}[e^{tL_i}] = t\mu_i + \tfrac{t^2}{2}\sigma_i^2 + O(t^3)$. At $t = 1$ this is the
+lppd term. At $t = -1$ it is the *leave-one-out* term, because by Bayes' rule
+
+$$
+p(y_i\mid y_{-i}) = \frac{1}{\mathbb{E}_{\theta\mid y}\big[1/p(y_i\mid\theta)\big]}
+\;\Rightarrow\; \log p(y_i\mid y_{-i}) = -\log\mathbb{E}[e^{-L_i}] \approx \mu_i - \tfrac12\sigma_i^2 .
+$$
+
+Subtracting, $\log \mathbb{E}[e^{L_i}] - \log p(y_i\mid y_{-i}) \approx \sigma_i^2$. So the optimism of
+the lppd for point $i$ is approximately the posterior variance of its log-likelihood:
+
+$$
+\boxed{\;\widehat{\mathrm{elpd}}_{\mathrm{WAIC}} = \mathrm{lppd} - p_{\mathrm{WAIC}},
+\qquad p_{\mathrm{WAIC}} = \sum_{i=1}^{n} \mathrm{Var}_{\theta\mid y}\big[\log p(y_i\mid\theta)\big]\;}
+$$
+
+Watanabe proved the asymptotic equivalence with LOO for singular models too. It is fully Bayesian
+(it averages over the posterior and uses no point estimate) and pointwise. It fails when a single
+$\sigma_i^2$ is large, which is exactly when the expansion is invalid.
+
+## All the criteria against the truth
+
+A conjugate Normal-inverse-Gamma regression gives closed forms for everything: posterior draws,
+the evidence, and the predictive distribution, which is Student-t. So you can refit $n$ times for
+exact LOO and compute the true elpd on a large test set from the known generator. The models use
+the first $k$ of 10 covariates, and only the first four have nonzero effects.
+
+```python
+def nig_fit(X, y, tau=1.0, a=2.0, b=2.0):
+    """w | s2 ~ N(0, s2 tau^2 I), s2 ~ InvGamma(a, b). Returns posterior params and log evidence."""
+    n, k = X.shape
+    Vn = np.linalg.inv(X.T @ X + np.eye(k) / tau**2)
+    mn = Vn @ X.T @ y
+    an, bn = a + n / 2, b + 0.5 * (y @ y - mn @ (X.T @ X + np.eye(k) / tau**2) @ mn)
+    log_ev = (-n / 2 * np.log(2 * np.pi) + 0.5 * np.linalg.slogdet(Vn)[1] - k * np.log(tau)
+              + a * np.log(b) - an * np.log(bn) + gammaln(an) - gammaln(a))
+    return dict(Vn=Vn, mn=mn, an=an, bn=bn, log_ev=log_ev)
+
+def nig_pred_logpdf(f, Xnew, ynew):                       # Student-t posterior predictive
+    scale = np.sqrt(f["bn"] / f["an"] * (1 + np.einsum("ij,jk,ik->i", Xnew, f["Vn"], Xnew)))
+    return stats.t.logpdf(ynew, 2 * f["an"], Xnew @ f["mn"], scale)
+
+def nig_draws(f, S, rng):
+    s2 = 1 / rng.gamma(f["an"], 1 / f["bn"], S)
+    z = rng.standard_normal((S, len(f["mn"]))) @ np.linalg.cholesky(f["Vn"]).T
+    return f["mn"] + np.sqrt(s2)[:, None] * z, s2
+
+def exact_loo(X, y, **kw):
+    idx = np.arange(len(y))
+    return np.array([nig_pred_logpdf(nig_fit(X[idx != i], y[idx != i], **kw), X[i:i+1], y[i:i+1])[0] for i in idx])
+
+n_r, w_true = 40, np.array([1.0, 0.6, 0.3, 0.15, 0, 0, 0, 0, 0, 0])
+X_r, X_te = rng.standard_normal((n_r, 10)), rng.standard_normal((20_000, 10))
+y_r, y_te = X_r @ w_true + rng.standard_normal(n_r), X_te @ w_true + rng.standard_normal(20_000)
+
+print(f"{'k':>2} {'lppd':>7} {'AIC':>7} {'DIC':>7} {'WAIC':>7} {'p_waic':>6} {'LOO':>7} {'true elpd':>9}")
+for k in (1, 2, 4, 7, 10):
+    X, Xt = X_r[:, :k], X_te[:, :k]
+    f = nig_fit(X, y_r)
+    W, s2 = nig_draws(f, S, rng)
+    ll = stats.norm.logpdf(y_r, W @ X.T, np.sqrt(s2)[:, None])            # (S, n) pointwise log-lik
+    lppd_i = logsumexp(ll, 0) - np.log(S)
+    beta = np.linalg.lstsq(X, y_r, rcond=None)[0]; s2_mle = np.mean((y_r - X @ beta) ** 2)
+    aic = stats.norm.logpdf(y_r, X @ beta, np.sqrt(s2_mle)).sum() - (k + 1)
+    ll_bar = stats.norm.logpdf(y_r, X @ W.mean(0), np.sqrt(s2.mean())).sum()
+    dic = ll_bar - 2 * (ll_bar - ll.sum(1).mean())
+    p_waic = ll.var(0, ddof=1).sum()
+    true_elpd = n_r * nig_pred_logpdf(f, Xt, y_te).mean()
+    print(f"{k:>2} {lppd_i.sum():7.2f} {aic:7.2f} {dic:7.2f} {lppd_i.sum() - p_waic:7.2f} {p_waic:6.2f} "
+          f"{exact_loo(X, y_r).sum():7.2f} {true_elpd:9.2f}")
+```
+
+```output
+```
+
+FILL_TABLE
+
+## Importance-sampling LOO and Pareto smoothing
+
+Refitting $n$ times is cheap only for conjugate models. The identity in the WAIC derivation gives
+LOO from one fit: the posterior is the proposal and $p(\theta\mid y_{-i})$ the target, so the
+importance ratios are $r_i^{(s)} \propto 1/p(y_i\mid\theta^{(s)})$ (ch. 3) and
+
+$$
+p(y_i\mid y_{-i}) \approx \frac{\sum_s r_i^{(s)}\,p(y_i\mid\theta^{(s)})}{\sum_s r_i^{(s)}}
+= \frac{1}{\frac{1}{S}\sum_s 1/p(y_i\mid\theta^{(s)})} .
+$$
+
+That is a harmonic mean, and its variance can be infinite. When $y_i$ is influential the full
+posterior is much narrower than the leave-$i$-out one, so the proposal has lighter tails than the
+target, which is the failure mode you met in ch. 3. **PSIS** (Vehtari, Gelman and Gabry 2017; Vehtari et al. 2024)
+fits a generalised Pareto distribution to the largest $M = \min(S/5,\, 3\sqrt{S})$ ratios.
+It replaces them with the fitted distribution's expected order statistics, truncates at the raw maximum, and reports
+the shape $\hat k$. Below is the reference algorithm written out: the Zhang–Stephens profile
+estimator with a weak prior shrinking $\hat k$ toward 0.5.
+
+```python
+def gpd_fit(x):
+    """Zhang & Stephens (2009) GPD fit to sorted exceedances x, with PSIS's prior on k."""
+    n = len(x)
+    m = 30 + int(np.sqrt(n))
+    b = 1 - np.sqrt(m / (np.arange(1, m + 1) - 0.5))
+    b = b / (3 * x[int(n / 4 + 0.5) - 1]) + 1 / x[-1]
+    k = np.log1p(-b[:, None] * x).mean(1)
+    L = n * (np.log(-b / k) - k - 1)                       # profile log-likelihood for each b
+    wts = 1 / np.exp(L[None, :] - L[:, None]).sum(1)
+    b_post = np.sum(b * wts) / wts.sum()
+    k_post = np.log1p(-b_post * x).mean()
+    sigma = -k_post / b_post
+    return (n * k_post + 10 * 0.5) / (n + 10), sigma        # prior: 10 pseudo-obs at k = 0.5
+
+def psis(log_r):
+    """Pareto-smoothed log weights (normalised) and khat for one observation."""
+    S_ = len(log_r)
+    lw = log_r - log_r.max()
+    M = int(np.ceil(min(0.2 * S_, 3 * np.sqrt(S_))))
+    order = np.argsort(lw)
+    tail_idx, cutoff = order[-M:], lw[order[-M - 1]]
+    k, sigma = gpd_fit(np.exp(lw[tail_idx]) - np.exp(cutoff))
+    p = (np.arange(M) + 0.5) / M
+    smoothed = np.log(np.exp(cutoff) + sigma / k * np.expm1(-k * np.log1p(-p)))
+    lw[tail_idx] = np.minimum(smoothed, 0.0)                # never exceed the largest raw weight
+    return lw - logsumexp(lw), k
+
+def loo_estimates(ll):
+    """ll: (S, n). Returns pointwise raw-IS LOO, PSIS-LOO and khat."""
+    is_loo = -(logsumexp(-ll, 0) - np.log(ll.shape[0]))
+    res = [psis(-ll[:, i]) for i in range(ll.shape[1])]
+    psis_loo = np.array([logsumexp(lw + ll[:, i]) for i, (lw, _) in enumerate(res)])
+    return is_loo, psis_loo, np.array([k for _, k in res])
+```
+
+```output
+```
+
+### One influential point
+
+Now append one corrupted record to the regression: a high-leverage row ($x_1 = 4.5$) whose
+response is 8 units below the line. Fit the $k = 4$ model and compare the three LOO estimates
+point by point.
+
+```python
+X_o = np.vstack([X_r[:, :4], [4.5, 0, 0, 0]])
+y_o = np.append(y_r, 4.5 * w_true[0] - 8.0)
+f_o = nig_fit(X_o, y_o)
+W_o, s2_o = nig_draws(f_o, S, rng)
+ll_o = stats.norm.logpdf(y_o, W_o @ X_o.T, np.sqrt(s2_o)[:, None])
+is_o, psis_o, khat_o = loo_estimates(ll_o)
+ex_o = exact_loo(X_o, y_o)
+lppd_o = logsumexp(ll_o, 0) - np.log(S)
+print(f"{'obs':>4} {'khat':>6} {'lppd_i':>8} {'raw IS':>8} {'PSIS':>8} {'exact':>8}")
+for i in list(np.argsort(khat_o)[-3:][::-1]) + [0]:
+    print(f"{i:>4} {khat_o[i]:6.2f} {lppd_o[i]:8.2f} {is_o[i]:8.2f} {psis_o[i]:8.2f} {ex_o[i]:8.2f}")
+print(f"sum: lppd {lppd_o.sum():.2f} | raw IS {is_o.sum():.2f} | PSIS {psis_o.sum():.2f} | exact {ex_o.sum():.2f}"
+      f" | p_loo = lppd - elpd_loo = {lppd_o.sum() - psis_o.sum():.2f}")
+print(f"observations with khat > 0.7: {np.flatnonzero(khat_o > 0.7)}")
+```
+
+```output
+```
+
+FILL_OUTLIER
+
+### Checking against ArviZ
+
+ArviZ 1.x takes a `DataTree` with `posterior` and `log_likelihood` groups. Here are the same
+draws, reshaped to (chain, draw, obs).
+
+```python
+import arviz as az
+dt = az.from_dict({"posterior": {"w0": W_o[None, :, 0]},
+                   "log_likelihood": {"y": ll_o[None, :, :]}})
+res_az = az.loo(dt, pointwise=True)
+k_az = np.asarray(res_az.pareto_k).ravel()
+print(f"ArviZ: elpd_loo {res_az.elpd:.2f} (se {res_az.se:.2f}) | p_loo {res_az.p:.2f} | max khat {k_az.max():.2f} at obs {k_az.argmax()}")
+print(f"ours : elpd_loo {psis_o.sum():.2f} (se {np.sqrt(len(psis_o) * psis_o.var()):.2f}) | p_loo {lppd_o.sum() - psis_o.sum():.2f} | "
+      f"max khat {khat_o.max():.2f} at obs {khat_o.argmax()}")
+print(f"max |khat ours - ArviZ| over all points {np.abs(khat_o - k_az).max():.3f}")
+```
+
+```output
+```
+
+FILL_AZ
+
+## Differences, standard errors, and ties
+
+The elpd of a single model has a standard error, but what matters for comparison is the *paired*
+difference. Both models score the same $y_i$, so you take pointwise differences
+$d_i = \widehat{\mathrm{elpd}}_{A,i} - \widehat{\mathrm{elpd}}_{B,i}$ and
+
+$$
+\widehat{\Delta} = \sum_i d_i, \qquad \mathrm{SE}(\widehat\Delta) = \sqrt{n\,\mathrm{Var}(d_i)} .
+$$
+
+This SE is usually far smaller than either model's own SE, because the hard and easy points are
+shared. Rules of thumb: $|\Delta| < 4$ is a tie whatever the SE, and the SE itself is only
+trustworthy when $n$ is not tiny and the models are not badly misspecified. Treat a difference
+within about two SEs as noise.
+
+```python
+def compare(name, a, b):
+    d = a - b
+    se = np.sqrt(len(d) * d.var())
+    print(f"{name:32} diff {d.sum():+7.2f} | SE {se:5.2f} | diff/SE {d.sum() / se:+5.1f} | "
+          f"SE(A) alone {np.sqrt(len(a) * a.var()):5.2f}")
+
+loo_pois = stats.nbinom.logpmf(y_c, a_i, b_i / (b_i + 1))                    # exact, closed form
+loo_nb = logsumexp(np.log(w_loo + 1e-300) + ll_grid_nb, 1)                   # exact, grid
+compare("counts: NegBin - Poisson", loo_nb, loo_pois)
+compare("regression: k=4 - k=3", exact_loo(X_r[:, :4], y_r), exact_loo(X_r[:, :3], y_r))
+compare("regression: k=4 - k=2", exact_loo(X_r[:, :4], y_r), exact_loo(X_r[:, :2], y_r))
+```
+
+```output
+```
+
+FILL_DIFF
+
+## Bayes factors versus LOO: prior sensitivity
+
+The Bayes factor compares **prior** predictive performance: the evidence
+$p(y\mid M) = \int p(y\mid\theta)p(\theta\mid M)\,d\theta$ scores how well the model predicted the data
+before seeing any of it. LOO compares **posterior** predictive performance. The difference is
+practical. For one extra coefficient with prior sd $\tau$, the evidence carries an Occam factor
+of roughly $\sigma_{\text{post}}/\tau$, so every tenfold widening of a vague prior costs
+$\log 10 \approx 2.3$ nats. That is Lindley's paradox (ch. 3). The LOO predictive
+conditions on $n-1$ points, and the prior washes out.
+
+```python
+print(f"{'tau':>6} {'log BF(k=4 vs 3)':>17} {'LOO diff':>9}")
+for tau in (0.5, 1, 10, 100, 1000):
+    log_bf = nig_fit(X_r[:, :4], y_r, tau=tau)["log_ev"] - nig_fit(X_r[:, :3], y_r, tau=tau)["log_ev"]
+    d = exact_loo(X_r[:, :4], y_r, tau=tau).sum() - exact_loo(X_r[:, :3], y_r, tau=tau).sum()
+    print(f"{tau:>6g} {log_bf:17.2f} {d:9.2f}")
+```
+
+```output
+```
+
+FILL_BF
+
+## Stacking predictive distributions
+
+When you cannot pick a winner, you can average. **Bayesian model averaging** weights model $k$
+by its posterior probability $p(M_k\mid y) \propto p(y\mid M_k)\,p(M_k)$. That is the right
+answer only in the $\mathcal{M}$-closed case, where one candidate is true. Then BMA weights
+converge to 1 on that model. When no candidate is true ($\mathcal{M}$-open), BMA still converges to a
+single model, the one closest in KL divergence, even when a mixture would predict better.
+*Pseudo-BMA* swaps the evidence for LOO, $w_k \propto \exp(\widehat{\mathrm{elpd}}_{\mathrm{loo},k})$,
+and inherits the same winner-take-all behaviour.
+
+**Stacking** (Yao, Vehtari, Simpson and Gelman 2018) optimises the weights for prediction directly. It maximises the LOO
+log score of the mixture over the simplex:
+
+$$
+\hat w = \arg\max_{w \in \Delta_K} \sum_{i=1}^{n} \log \sum_{k=1}^{K} w_k\, p(y_i\mid y_{-i}, M_k).
+$$
+
+The objective is concave in $w$. It is the log-likelihood of a mixture with *fixed* components, so
+the EM update $w_k \leftarrow \frac1n\sum_i w_k p_{ik} / \sum_j w_j p_{ij}$ climbs to the global optimum.
+The test below uses three covariates of equal strength, and each candidate model sees only one of them.
+
+```python
+n_s = 100
+X_s, X_st = rng.standard_normal((n_s, 3)), rng.standard_normal((20_000, 3))
+y_s = X_s @ [0.8, 0.7, 0.6] + rng.standard_normal(n_s)
+y_st = X_st @ [0.8, 0.7, 0.6] + rng.standard_normal(20_000)
+P_loo = np.column_stack([np.exp(exact_loo(X_s[:, [k]], y_s)) for k in range(3)])      # (n, K)
+P_test = np.column_stack([np.exp(nig_pred_logpdf(nig_fit(X_s[:, [k]], y_s), X_st[:, [k]], y_st)) for k in range(3)])
+log_ev = np.array([nig_fit(X_s[:, [k]], y_s)["log_ev"] for k in range(3)])
+
+w_stack = np.full(3, 1 / 3)
+for _ in range(2000):                                       # EM for fixed-component mixture weights
+    w_stack = (w_stack * P_loo / (P_loo @ w_stack)[:, None]).mean(0)
+elpd_k = np.log(P_loo).sum(0)
+weights = {"BMA (evidence)": np.exp(log_ev - logsumexp(log_ev)),
+           "pseudo-BMA (LOO)": np.exp(elpd_k - logsumexp(elpd_k)),
+           "stacking": w_stack,
+           "best single": np.eye(3)[np.argmax(elpd_k)]}
+print(f"elpd_loo per model {np.round(elpd_k, 2)} | log evidence {np.round(log_ev, 2)}")
+for name, w in weights.items():
+    print(f"{name:17} weights {np.round(w, 3)} | test log score per obs {np.log(P_test @ w).mean():.4f}")
+```
+
+```output
+```
+
+FILL_STACK
+
+## Try it Yourself
+
+```python
+import numpy as np
+from scipy import stats
+from scipy.special import logsumexp
+
+rng = np.random.default_rng(0)
+n, S = 60, 4000
+x = rng.standard_normal(n)
+y = rng.poisson(np.exp(1.0 + 0.5 * x))
+y[0] = 40                                         # try: remove the outlier, or set y[0] = 15
+
+# Poisson regression posterior by brute force on a grid, then draws
+a_g, b_g = np.linspace(0.3, 1.8, 120), np.linspace(-0.4, 1.2, 120)
+A, B = [m.ravel() for m in np.meshgrid(a_g, b_g, indexing="ij")]
+ll_g = stats.poisson.logpmf(y[:, None], np.exp(A + B * x[:, None]))       # (n, G)
+lp = ll_g.sum(0) + stats.norm.logpdf(A, 0, 2) + stats.norm.logpdf(B, 0, 1)
+w = np.exp(lp - logsumexp(lp))
+idx = rng.choice(A.size, S, p=w)
+ll = ll_g[:, idx].T                                                        # (S, n) pointwise log-lik
+
+lppd = logsumexp(ll, 0) - np.log(S)
+p_waic = ll.var(0, ddof=1)
+loo_is = -(logsumexp(-ll, 0) - np.log(S))
+loo_exact = -logsumexp(np.log(w) - ll_g, 1)       # grid reweighting = exact LOO up to resolution
+print(f"lppd {lppd.sum():.2f} | WAIC {(lppd - p_waic).sum():.2f} | IS-LOO {loo_is.sum():.2f} | exact LOO {loo_exact.sum():.2f}")
+worst = np.argsort(p_waic)[-3:][::-1]
+for i in worst:
+    print(f"obs {i:2d}: y={y[i]:2d} x={x[i]:+.2f} | Var(log-lik) {p_waic[i]:6.2f} | IS {loo_is[i]:7.2f} | exact {loo_exact[i]:7.2f}")
+```
+
+```output
+```
+
+Push the outlier up and watch the pointwise variance of its log-likelihood explode, WAIC drift
+away from exact LOO, and raw IS start to wobble. Paste the `psis` function from above to see its
+$\hat k$ cross 0.7 at the same time. The next chapter's hierarchical models are where PSIS-LOO earns
+its keep, because "leave one group out" and "leave one observation out" answer different questions.
+
+## Exercise
+
+Take the overdispersed counts `y_c` and add a third candidate: a zero-inflated Poisson with
+$P(y=0) = \pi + (1-\pi)e^{-\lambda}$, priors $\pi \sim \mathrm{Beta}(1,1)$ and
+$\log\lambda \sim \mathcal{N}(\log 3, 1)$. Fit it on a grid, compute its exact LOO (grid reweighting)
+and its PSIS-LOO from 4000 grid draws with the `psis` function, and report max $\hat k$. Then compare it with
+the negative binomial (difference and SE), and compute stacking weights over all three models. Does
+the zero-inflated model fix the PPC on the fraction of zeros, and does it fix the maximum?
+
+<details>
+<summary>Solution</summary>
+
+```python
+pi_g, ll_g2 = np.linspace(0.005, 0.8, 120), np.linspace(np.log(1.5), np.log(12), 150)
+PI, LL = [a.ravel() for a in np.meshgrid(pi_g, ll_g2, indexing="ij")]
+lam_z = np.exp(LL)
+ll_zip = np.where(y_c[:, None] == 0, np.log(PI + (1 - PI) * np.exp(-lam_z)),
+                  np.log1p(-PI) + stats.poisson.logpmf(y_c[:, None], lam_z))          # (n, G)
+lp_z = ll_zip.sum(0) + stats.norm.logpdf(LL, np.log(3), 1)                            # flat on pi
+w_z = np.exp(lp_z - logsumexp(lp_z))
+loo_zip = -logsumexp(np.log(w_z + 1e-300) - ll_zip, 1)                                # exact on the grid
+cz = rng.choice(PI.size, S, p=w_z)
+_, psis_z, k_z = loo_estimates(ll_zip[:, cz].T)
+print(f"ZIP exact LOO {loo_zip.sum():.2f} | PSIS-LOO {psis_z.sum():.2f} | max khat {k_z.max():.2f}")
+compare("counts: NegBin - ZIP", loo_nb, loo_zip)
+P3 = np.exp(np.column_stack([loo_pois, loo_nb, loo_zip]))
+w3 = np.full(3, 1 / 3)
+for _ in range(2000):
+    w3 = (w3 * P3 / (P3 @ w3)[:, None]).mean(0)
+print(f"stacking weights (Poisson, NegBin, ZIP): {np.round(w3, 3)}")
+z_rep = np.where(rng.uniform(size=(S, n_c)) < PI[cz, None], 0, rng.poisson(lam_z[cz, None], (S, n_c)))
+print("ZIP:"); ppc(y_c, z_rep)
+```
+
+```output
+```
+
+FILL_SOL
+</details>
