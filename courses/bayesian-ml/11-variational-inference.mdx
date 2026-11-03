@@ -7,272 +7,203 @@ order: 11
 
 ## Inference as optimization
 
-MCMC answers "what does the posterior look like?" by wandering around it. Variational inference
-(VI) answers a different question: "which member of a simple family, say Gaussians, is closest to
-the posterior?" That turns integration into optimization. You pick a family $\mathcal{Q}$ of
-densities $q_\lambda(z)$ with parameters $\lambda$ (a mean and a scale, for instance), and you solve
+MCMC describes the posterior by wandering around it. Variational inference (VI) asks a different
+question: which member of a simple family, say Gaussians, is closest to the posterior? That turns
+integration into optimization. You choose a family $\mathcal{Q}$ of densities $q_\lambda(z)$ with
+parameters $\lambda$ (a mean and a scale, for instance), where $z$ is everything unknown and $x$ is the data, and solve
 
 $$
 q^\star = \arg\min_{q \in \mathcal{Q}} \mathrm{KL}\big(q(z)\,\|\,p(z \mid x)\big),
 \qquad \mathrm{KL}(q\,\|\,p) = \mathbb{E}_q\left[\log q(z) - \log p(z \mid x)\right]
 $$
 
-Here $z$ is everything unknown (parameters and latent variables) and $x$ is the data. The price is
-a bias you cannot reduce with more compute: if the posterior is not in $\mathcal{Q}$, the best
-$q$ is still wrong. The reward is speed, a deterministic answer, minibatch training, and a lower
-bound on $\log p(x)$ for free. This chapter follows Blei, Kucukelbir & McAuliffe (2017) and
-Murphy (PML2, ch. 10).
+The price is a bias that more compute cannot remove: if the posterior is not in $\mathcal{Q}$, the
+best $q$ is still wrong. The reward is speed, minibatch training, and a lower bound on $\log p(x)$
+for free (Blei, Kucukelbir & McAuliffe, 2017; Murphy PML2, ch. 10).
 
 ### The ELBO, derived two ways
 
-This derivation shows that you can minimise the KL without ever knowing the normaliser $p(x)$. First
-by Jensen's inequality. For any $q$ that covers the posterior's support, $\log$ is concave, so
+This shows that you can minimise the KL without knowing the normaliser $p(x)$. By Jensen's
+inequality ($\log$ is concave):
 
 $$
-\log p(x) = \log \int q(z)\,\frac{p(x, z)}{q(z)}\,dz \;\ge\; \int q(z) \log \frac{p(x, z)}{q(z)}\,dz
-= \underbrace{\mathbb{E}_q[\log p(x, z)] - \mathbb{E}_q[\log q(z)]}_{\mathrm{ELBO}(q)}
+\log p(x) = \log \int q(z)\,\frac{p(x, z)}{q(z)}\,dz \;\ge\;
+\underbrace{\mathbb{E}_q[\log p(x, z)] - \mathbb{E}_q[\log q(z)]}_{\mathrm{ELBO}(q)}
 $$
 
-Second, exactly. Write $\log p(z \mid x) = \log p(x, z) - \log p(x)$ inside the KL:
+Exactly, by writing $\log p(z \mid x) = \log p(x, z) - \log p(x)$ inside the KL:
 
 $$
-\mathrm{KL}(q\,\|\,p(\cdot \mid x)) = \mathbb{E}_q[\log q(z)] - \mathbb{E}_q[\log p(x, z)] + \log p(x)
-\quad\Longrightarrow\quad
 \boxed{\log p(x) = \mathrm{ELBO}(q) + \mathrm{KL}\big(q\,\|\,p(\cdot \mid x)\big)}
 $$
 
-$\log p(x)$ does not depend on $q$, so maximising the ELBO is the same as minimising the KL, and the
-gap in Jensen's inequality is exactly that KL. The ELBO needs only the unnormalised joint
-$p(x, z)$, the same thing MCMC needs. A second reading is useful too:
-$\mathrm{ELBO} = \mathbb{E}_q[\log p(x \mid z)] - \mathrm{KL}(q(z)\,\|\,p(z))$, which is fit to the data minus distance
-from the prior. The check below uses a model where everything is closed form: $x_i \sim
-\mathcal{N}(\theta, 1)$, $\theta \sim \mathcal{N}(0, 1)$, 20 observations.
+$\log p(x)$ does not depend on $q$, so maximising the ELBO is minimising the KL, and the Jensen gap
+is that KL. The ELBO needs only the unnormalised joint, like MCMC. Rearranged, it is
+$\mathbb{E}_q[\log p(x \mid z)] - \mathrm{KL}(q(z)\,\|\,p(z))$: fit to the data minus distance from
+the prior. The check uses $x_i \sim \mathcal{N}(\theta, 1)$, $\theta \sim \mathcal{N}(0, 1)$,
+where everything is closed form.
 
 ```python
 import numpy as np
 from scipy import stats, special, optimize
 
-# x_i ~ N(theta, 1), theta ~ N(0, 1): exact posterior and evidence are known
-rng = np.random.default_rng(11)
+rng = np.random.default_rng(11)                   # x_i ~ N(theta, 1), theta ~ N(0, 1)
 x = rng.normal(1.3, 1.0, 20); n = len(x)
-v_post = 1 / (1 + n); m_post = v_post * x.sum()
+v_post = 1 / (1 + n); m_post = v_post * x.sum(); s_post = np.sqrt(v_post)
 log_px = stats.multivariate_normal(np.zeros(n), np.eye(n) + np.ones((n, n))).logpdf(x)
 
-def elbo_gauss(m, s):
-    e_loglik = np.sum(-0.5 * np.log(2 * np.pi) - 0.5 * ((x - m) ** 2 + s ** 2))
-    e_logprior = -0.5 * np.log(2 * np.pi) - 0.5 * (m ** 2 + s ** 2)
-    entropy = 0.5 * np.log(2 * np.pi * np.e * s ** 2)
-    return e_loglik + e_logprior + entropy
-
+def elbo_gauss(m, s):                             # E_q log p(x|theta) + E_q log p(theta) + entropy
+    return (np.sum(-0.5 * np.log(2 * np.pi) - 0.5 * ((x - m) ** 2 + s ** 2))
+            - 0.5 * np.log(2 * np.pi) - 0.5 * (m ** 2 + s ** 2) + 0.5 * np.log(2 * np.pi * np.e * s ** 2))
 def kl_gauss(m1, s1, m2, s2):
     return np.log(s2 / s1) + (s1 ** 2 + (m1 - m2) ** 2) / (2 * s2 ** 2) - 0.5
 
-print(f"exact posterior N({m_post:.4f}, {np.sqrt(v_post):.4f}^2), log p(x) = {log_px:.4f}\n")
-print(f"{'q = N(m, s^2)':>22} {'ELBO':>10} {'KL(q||p)':>9} {'ELBO + KL':>10}")
-for m, s in ((0.0, 1.0), (1.0, 0.5), (m_post, 0.4), (m_post + 0.1, np.sqrt(v_post)), (m_post, np.sqrt(v_post))):
-    L, K = elbo_gauss(m, s), kl_gauss(m, s, m_post, np.sqrt(v_post))
-    print(f"   N({m:.3f}, {s:.3f}^2) {L:10.4f} {K:9.4f} {L + K:10.4f}")
+print(f"exact posterior N({m_post:.4f}, {s_post:.4f}^2), log p(x) = {log_px:.4f}")
+print(f"{'q = N(m, s^2)':>18} {'ELBO':>9} {'KL(q||p)':>9} {'ELBO + KL':>10}")
+for m, s in ((0.0, 1.0), (1.0, 0.5), (m_post, 0.4), (m_post + 0.1, s_post), (m_post, s_post)):
+    L, K = elbo_gauss(m, s), kl_gauss(m, s, m_post, s_post)
+    print(f"N({m:.3f}, {s:.3f}^2) {L:9.4f} {K:9.4f} {L + K:10.4f}")
 ```
 
 ```output
-exact posterior N(1.4261, 0.2182^2), log p(x) = -26.9755
-
-         q = N(m, s^2)       ELBO  KL(q||p)  ELBO + KL
-   N(0.000, 1.000^2)   -56.8091   29.8336   -26.9755
-   N(1.000, 0.500^2)   -30.1782    3.2027   -26.9755
-   N(1.426, 0.400^2)   -27.5495    0.5740   -26.9755
-   N(1.526, 0.218^2)   -27.0805    0.1050   -26.9755
-   N(1.426, 0.218^2)   -26.9755    0.0000   -26.9755
 ```
 
-Every row sums to the same number, $\log p(x) = -26.98$, whatever $q$ you plug in. A bad $q$
-(the prior, first row) has a low ELBO because almost 30 nats of the evidence are lost in the KL. As
-$q$ approaches the exact posterior, the KL drains to zero and the ELBO rises to touch $\log p(x)$.
-Being off by 0.1 in the mean, about half a posterior sd, costs 0.1 nats. That identity is the
-whole of VI: climb the ELBO, and you are descending the KL you cannot compute.
+Every row sums to $\log p(x) = -26.98$, whatever $q$ is. The prior as $q$ (first row) loses almost
+30 nats to the KL. As $q$ approaches the posterior, the KL drains to zero and the ELBO touches
+$\log p(x)$. Half a posterior sd of error in the mean costs 0.1 nats. That identity is all of VI:
+climb the ELBO, and you descend a KL you cannot compute.
 
 ## Reverse KL hunts modes, forward KL covers mass
 
-The direction of the KL decides what kind of mistake $q$ makes. Think of a target with two
-bumps and a Gaussian that can only make one. $\mathrm{KL}(q\,\|\,p)$ (VI's "reverse" KL) averages
-$\log q/p$ under $q$. Wherever $p \approx 0$ and $q > 0$ the integrand blows up, so $q$ is forced to
-be zero wherever $p$ is: it is **zero-forcing**, and in practice it sits inside one bump.
-$\mathrm{KL}(p\,\|\,q)$ (the "forward" KL, what maximum likelihood and expectation propagation
-minimise) averages under $p$, so it punishes $q \approx 0$ where $p > 0$. It is **mass-covering**: $q$
-stretches over both bumps, even if that puts mass in the gap between them.
-
-For a Gaussian $q$ the forward-KL optimum is moment matching. Setting the gradient of
-$-\mathbb{E}_p[\log q]$ to zero gives $\mu = \mathbb{E}_p[z]$ and $\sigma^2 = \mathrm{Var}_p[z]$.
-The reverse KL has no such closed form and, on a multimodal target, several local optima. Below,
-both are minimised numerically on a fine grid, from several starting points.
+The direction of the KL decides what mistake $q$ makes. Picture a target with two bumps and a
+Gaussian that can make only one. VI's **reverse** KL, $\mathrm{KL}(q\,\|\,p)$, averages $\log q/p$
+under $q$. It explodes wherever $q > 0$ and $p \approx 0$, so $q$ is **zero-forcing** and sits
+inside one bump. The **forward** KL, $\mathrm{KL}(p\,\|\,q)$ (maximum likelihood, expectation
+propagation), averages under $p$ and punishes $q \approx 0$ where $p > 0$. It is
+**mass-covering**. For a Gaussian $q$, setting the gradient of $-\mathbb{E}_p[\log q]$ to zero gives
+moment matching: $\mu = \mathbb{E}_p[z]$, $\sigma^2 = \mathrm{Var}_p[z]$. Below, both are minimised
+numerically on a grid from several starts.
 
 ```python
 g = np.linspace(-10, 10, 40_001); h = g[1] - g[0]
 log_p = np.logaddexp(np.log(0.6) + stats.norm.logpdf(g, -2.0, 0.7), np.log(0.4) + stats.norm.logpdf(g, 2.5, 0.9))
 p = np.exp(log_p)
+lq = lambda par: stats.norm.logpdf(g, par[0], np.exp(par[1]))
+kl_rev = lambda par: np.sum(np.exp(lq(par)) * (lq(par) - log_p)) * h      # E_q[log q - log p]
+kl_fwd = lambda par: np.sum(p * (log_p - lq(par))) * h                    # E_p[log p - log q]
+in_gap = lambda mu, sd: stats.norm.cdf(1.25, mu, sd) - stats.norm.cdf(-0.75, mu, sd)
 
-def kl_rev(par):                                   # KL(q || p) = E_q[log q - log p]
-    q_log = stats.norm.logpdf(g, par[0], np.exp(par[1]))
-    return np.sum(np.exp(q_log) * (q_log - log_p)) * h
-def kl_fwd(par):                                   # KL(p || q) = E_p[log p - log q]
-    return np.sum(p * (log_p - stats.norm.logpdf(g, par[0], np.exp(par[1])))) * h
-
-mp = np.sum(g * p) * h; sp = np.sqrt(np.sum((g - mp) ** 2 * p) * h)
-print(f"target: mixture 0.6 N(-2, 0.7^2) + 0.4 N(2.5, 0.9^2), mean {mp:.3f}, sd {sp:.3f}\n")
-print(f"{'objective':>16} {'init mu':>8} {'mu':>7} {'sd':>6} {'KL(q||p)':>9} {'KL(p||q)':>9} {'q mass in gap |x-0.25|<1':>25}")
-for name, f, inits in (("reverse KL(q||p)", kl_rev, (-3.0, 1.0, 3.0)), ("forward KL(p||q)", kl_fwd, (-3.0, 3.0))):
+mp = np.sum(g * p) * h
+print(f"target mean {mp:.3f}, sd {np.sqrt(np.sum((g - mp) ** 2 * p) * h):.3f}, "
+      f"mass in the gap -0.75 < x < 1.25: {np.sum(p[np.abs(g - 0.25) < 1]) * h:.3f}")
+print(f"{'objective':>9} {'init':>5} {'mu':>7} {'sd':>6} {'KL(q||p)':>9} {'KL(p||q)':>9} {'q mass in gap':>14}")
+for name, f, inits in (("reverse", kl_rev, (-3.0, 1.0, 3.0)), ("forward", kl_fwd, (-3.0, 3.0))):
     for mu0 in inits:
         r = optimize.minimize(f, [mu0, 0.0], method="BFGS")
-        mu, sd = r.x[0], np.exp(r.x[1])
-        gap = stats.norm.cdf(1.25, mu, sd) - stats.norm.cdf(-0.75, mu, sd)
-        print(f"{name:>16} {mu0:>8.1f} {mu:>7.3f} {sd:>6.3f} {kl_rev(r.x):>9.3f} {kl_fwd(r.x):>9.3f} {gap:>25.3f}")
-p_gap = np.sum(p[np.abs(g - 0.25) < 1]) * h
-print(f"\ntarget mass in the same gap: {p_gap:.3f}")
+        print(f"{name:>9} {mu0:>5.1f} {r.x[0]:>7.3f} {np.exp(r.x[1]):>6.3f} {kl_rev(r.x):>9.3f} "
+              f"{kl_fwd(r.x):>9.3f} {in_gap(r.x[0], np.exp(r.x[1])):>14.3f}")
 ```
 
 ```output
-target: mixture 0.6 N(-2, 0.7^2) + 0.4 N(2.5, 0.9^2), mean -0.200, sd 2.341
-
-       objective  init mu      mu     sd  KL(q||p)  KL(p||q)  q mass in gap |x-0.25|<1
-reverse KL(q||p)     -3.0  -1.987  0.719     0.505     7.152                     0.043
-reverse KL(q||p)      1.0   0.357  2.080     0.753     0.491                     0.369
-reverse KL(q||p)      3.0   2.454  0.962     0.904     5.816                     0.105
-forward KL(p||q)     -3.0  -0.200  2.341     0.898     0.440                     0.325
-forward KL(p||q)      3.0  -0.200  2.341     0.898     0.440                     0.325
-
-target mass in the same gap: 0.055
 ```
 
-The reverse KL has three local optima. Started on the left, $q$ locks onto the heavier mode
-(sd 0.72, almost the component's 0.7) and puts only 4% of its mass in the gap, which is about
-what the target has there (5.5%). Started on the right, it finds the smaller mode, a worse optimum
-(KL 0.90 against 0.51). Started in the middle, it finds a third local optimum, a wide Gaussian
-(sd 2.08) that straddles both modes. All three understate the target's spread of 2.34 or misplace
-its centre. The forward KL has one optimum, $\mu = -0.20$ and sd 2.34, the target's exact moments.
-It spreads mass over both modes, but 33% of it sits in a gap that holds 5.5% of the target. So
-neither fit is "right". Reverse KL gives you a confident, local description and underestimates
-uncertainty. Forward KL gives honest moments but puts its density where there is none. Standard VI
-is reverse KL, so keep the first failure mode in mind for the rest of the chapter.
+The reverse KL has three local optima. From the left it locks onto the heavier mode (sd 0.72, the
+component's 0.7) with 4% of its mass in the gap, close to the target's 5.5%. From the right it finds
+the lighter mode, a worse optimum (KL 0.90 against 0.51). From the middle it finds a wide
+Gaussian straddling both. The forward KL has one optimum, the target's exact moments
+($-0.20$, sd 2.34), but it puts 33% of its mass in a gap holding 5.5% of the target. Neither is
+"right": reverse KL is confident and local, forward KL has honest moments and density where there is none.
+Standard VI is reverse KL, so expect the first failure mode.
 
 ## Mean-field families and coordinate ascent
 
-The simplest useful family is a product of independent factors, one per block of unknowns:
-$q(z) = \prod_{j} q_j(z_j)$. It is called **mean-field**, after the physics approximation that
-replaces the interactions with other particles by their average. You give up correlations between
-blocks. In return each factor has a closed-form optimal update, provided the model is
-conditionally conjugate, which makes coordinate ascent possible.
+The simplest useful family is a product of independent factors, $q(z) = \prod_j q_j(z_j)$, called
+**mean-field** after the physics trick of replacing interactions by their average. You give up
+correlations between blocks. In conditionally conjugate models you get closed-form updates in return.
 
 ### The optimal factor is the exponentiated expected log joint
 
-This derivation shows what the best $q_j$ is when all other factors are held fixed. Write
-$\mathbb{E}_{-j}$ for the expectation over every factor except $q_j$. Keep only the terms of the ELBO that
-depend on $q_j$:
+This shows what the best $q_j$ is with the other factors fixed. Write $\mathbb{E}_{-j}$ for the
+expectation over all factors but $q_j$. The terms of the ELBO involving $q_j$ are
 
 $$
-\mathrm{ELBO}(q_j) = \int q_j(z_j)\,\mathbb{E}_{-j}[\log p(x, z)]\,dz_j - \int q_j(z_j)\log q_j(z_j)\,dz_j + \text{const}
+\int q_j(z_j)\,\mathbb{E}_{-j}[\log p(x, z)]\,dz_j - \int q_j\log q_j\,dz_j
+= -\mathrm{KL}\big(q_j\,\|\,\tilde q_j\big) + \text{const},
+\qquad \tilde q_j \propto e^{\mathbb{E}_{-j}[\log p(x, z)]}
 $$
 
-Define $\log \tilde q_j(z_j) = \mathbb{E}_{-j}[\log p(x, z)] + \text{const}$ (normalised). Then
-the expression is $-\mathrm{KL}(q_j\,\|\,\tilde q_j) + \text{const}$, maximised by
+so the maximiser is
 
 $$
 \boxed{q_j^\star(z_j) \propto \exp\left\{\mathbb{E}_{-j}\left[\log p(z_j \mid z_{-j}, x)\right]\right\}}
 $$
 
-(the full conditional and the joint differ by terms that do not involve $z_j$). It is the Gibbs
-sampler's full conditional (ch. 5), with the other variables averaged out of the log density rather
-than sampled. If the complete conditional is in an exponential family, $q_j^\star$ is in the same
-family, with its natural parameter replaced by its expectation under $q_{-j}$. **CAVI**
-(coordinate ascent VI) cycles through $j$ and applies the update. Each step maximises the ELBO
-exactly in one coordinate, so the ELBO can never decrease. That makes a monotone ELBO trace the
-standard unit test for a CAVI implementation.
+It is the Gibbs full conditional (ch. 5) with the other variables averaged out of the log density
+rather than sampled. If that conditional is in an exponential family, so is $q_j^\star$, with its
+natural parameter replaced by its expectation. **CAVI** (coordinate ascent VI) cycles through $j$.
+Each update maximises the ELBO exactly in one coordinate, so the ELBO never decreases, and a
+monotone trace is the standard unit test.
 
 ### Example (a): a Normal with unknown mean and precision
 
-This is the classic warm-up (Bishop PRML 10.1.3). The model is $x_i \sim \mathcal{N}(\mu, 1/\tau)$ with the
-Normal-Gamma prior $\mu \mid \tau \sim \mathcal{N}(\mu_0, 1/(\lambda_0\tau))$ and
-$\tau \sim \mathrm{Gamma}(a_0, b_0)$. The exact posterior is Normal-Gamma (ch. 2), so you can grade
-the approximation. Applying the boxed update to $q(\mu)\,q(\tau)$ gives
+Take $x_i \sim \mathcal{N}(\mu, 1/\tau)$ with $\mu \mid \tau \sim \mathcal{N}(\mu_0, 1/(\lambda_0\tau))$
+and $\tau \sim \mathrm{Gamma}(a_0, b_0)$ (Bishop PRML 10.1.3). The exact posterior is
+Normal-Gamma (ch. 2), so you can grade the fit. The boxed update gives
 
 $$
 q(\mu) = \mathcal{N}\left(\frac{\lambda_0\mu_0 + N\bar x}{\lambda_0 + N},\; \frac{1}{(\lambda_0 + N)\,\mathbb{E}[\tau]}\right),
-\qquad
+\quad
 q(\tau) = \mathrm{Gamma}\left(a_0 + \tfrac{N + 1}{2},\; b_0 + \tfrac12\mathbb{E}_\mu\Big[\textstyle\sum_i (x_i - \mu)^2 + \lambda_0(\mu - \mu_0)^2\Big]\right)
 $$
 
-Each factor needs one moment of the other: $q(\mu)$ needs $\mathbb{E}[\tau]$, and $q(\tau)$ needs
-$\mathbb{E}[\mu]$ and $\mathrm{Var}[\mu]$. The ELBO is computed in closed form from Gamma and Gaussian
-expectations ($\mathbb{E}[\log\tau] = \psi(a) - \log b$, with $\psi$ the digamma function).
+Each factor needs moments of the other. The ELBO is closed form via
+$\mathbb{E}[\log\tau] = \psi(a) - \log b$ ($\psi$ is the digamma function).
 
 ```python
 from scipy.special import digamma, gammaln
-
 rng = np.random.default_rng(5)
 xs = rng.normal(4.0, 3.0, 12); N = len(xs); xbar = xs.mean()
 mu0, lam0, a0, b0 = 0.0, 0.1, 1.0, 1.0           # mu | tau ~ N(mu0, 1/(lam0 tau)), tau ~ Gamma(a0, b0)
 
 def elbo_ng(muN, lamN, aN, bN):
     Et, Elt = aN / bN, digamma(aN) - np.log(bN)
-    Esq = np.sum((xs - muN) ** 2) + N / lamN       # E sum (x_i - mu)^2
-    Esq0 = (muN - mu0) ** 2 + 1 / lamN
-    e_lik = 0.5 * N * (Elt - np.log(2 * np.pi)) - 0.5 * Et * Esq
-    e_mu = 0.5 * (np.log(lam0) + Elt - np.log(2 * np.pi)) - 0.5 * lam0 * Et * Esq0
+    e_lik = 0.5 * N * (Elt - np.log(2 * np.pi)) - 0.5 * Et * (np.sum((xs - muN) ** 2) + N / lamN)
+    e_mu = 0.5 * (np.log(lam0) + Elt - np.log(2 * np.pi)) - 0.5 * lam0 * Et * ((muN - mu0) ** 2 + 1 / lamN)
     e_tau = a0 * np.log(b0) - gammaln(a0) + (a0 - 1) * Elt - b0 * Et
-    h_mu = 0.5 * np.log(2 * np.pi * np.e / lamN)
-    h_tau = aN - np.log(bN) + gammaln(aN) + (1 - aN) * digamma(aN)
-    return e_lik + e_mu + e_tau + h_mu + h_tau
+    ent = 0.5 * np.log(2 * np.pi * np.e / lamN) + aN - np.log(bN) + gammaln(aN) + (1 - aN) * digamma(aN)
+    return e_lik + e_mu + e_tau + ent
 
-aN, bN = a0 + (N + 1) / 2, 1.0 * (a0 + (N + 1) / 2)  # init q(tau) with E[tau] = 1 (data sd is ~3)
-muN = (lam0 * mu0 + N * xbar) / (lam0 + N)           # fixed: does not depend on q(tau)
-trace = []
-for it in range(8):
-    lamN = (lam0 + N) * aN / bN                                   # update q(mu)
-    bN = b0 + 0.5 * (np.sum((xs - muN) ** 2) + N / lamN + lam0 * ((muN - mu0) ** 2 + 1 / lamN))  # update q(tau)
+muN, aN = (lam0 * mu0 + N * xbar) / (lam0 + N), a0 + (N + 1) / 2   # neither depends on the other factor
+bN, trace = aN, []                                                  # init E[tau] = 1; the data sd is ~3
+for it in range(6):
+    lamN = (lam0 + N) * aN / bN                                                              # q(mu)
+    bN = b0 + 0.5 * (np.sum((xs - muN) ** 2) + N / lamN + lam0 * ((muN - mu0) ** 2 + 1 / lamN))  # q(tau)
     trace.append(elbo_ng(muN, lamN, aN, bN))
     print(f"sweep {it}: E[tau] = {aN / bN:.5f}  sd(mu) = {lamN ** -0.5:.5f}  ELBO = {trace[-1]:.6f}")
-print("ELBO increments all >= 0:", bool(np.all(np.diff(trace) >= -1e-12)))
+print("ELBO never decreases:", bool(np.all(np.diff(trace) >= -1e-12)))
 
-# exact Normal-Gamma posterior
-lam_n, a_n = lam0 + N, a0 + N / 2
+lam_n, a_n = lam0 + N, a0 + N / 2                  # exact Normal-Gamma posterior (ch. 2)
 b_n = b0 + 0.5 * np.sum((xs - xbar) ** 2) + lam0 * N * (xbar - mu0) ** 2 / (2 * lam_n)
 log_ev = gammaln(a_n) - gammaln(a0) + a0 * np.log(b0) - a_n * np.log(b_n) + 0.5 * np.log(lam0 / lam_n) - 0.5 * N * np.log(2 * np.pi)
 mu_marg = stats.t(2 * a_n, muN, np.sqrt(b_n / (a_n * lam_n)))
-print(f"\n{'':>10} {'E[mu]':>8} {'sd(mu)':>8} {'E[tau]':>8} {'sd(tau)':>8} {'log p(x)':>9}")
-print(f"{'exact':>10} {mu_marg.mean():8.4f} {mu_marg.std():8.4f} {a_n / b_n:8.4f} {np.sqrt(a_n) / b_n:8.4f} {log_ev:9.4f}")
-print(f"{'CAVI':>10} {muN:8.4f} {lamN ** -0.5:8.4f} {aN / bN:8.4f} {np.sqrt(aN) / bN:8.4f} {trace[-1]:9.4f} (ELBO)")
+print(f"exact: E[mu] {mu_marg.mean():.4f} sd(mu) {mu_marg.std():.4f} E[tau] {a_n / b_n:.4f} log p(x) {log_ev:.4f}")
+print(f"CAVI:  E[mu] {muN:.4f} sd(mu) {lamN ** -0.5:.4f} E[tau] {aN / bN:.4f} ELBO     {trace[-1]:.4f}")
 ```
 
 ```output
-sweep 0: E[tau] = 0.16417  sd(mu) = 0.28748  ELBO = -34.053830
-sweep 1: E[tau] = 0.15551  sd(mu) = 0.70951  ELBO = -33.557098
-sweep 2: E[tau] = 0.15496  sd(mu) = 0.72901  ELBO = -33.556329
-sweep 3: E[tau] = 0.15493  sd(mu) = 0.73029  ELBO = -33.556326
-sweep 4: E[tau] = 0.15492  sd(mu) = 0.73037  ELBO = -33.556326
-sweep 5: E[tau] = 0.15492  sd(mu) = 0.73038  ELBO = -33.556326
-sweep 6: E[tau] = 0.15492  sd(mu) = 0.73038  ELBO = -33.556326
-sweep 7: E[tau] = 0.15492  sd(mu) = 0.73038  ELBO = -33.556326
-ELBO increments all >= 0: True
-
-              E[mu]   sd(mu)   E[tau]  sd(tau)  log p(x)
-     exact   3.8125   0.7889   0.1549   0.0586  -33.5210
-      CAVI   3.8125   0.7304   0.1549   0.0566  -33.5563 (ELBO)
 ```
 
-CAVI starts from $\mathbb{E}[\tau] = 1$, which assumes a data sd of 1 when the real one is near 3. It converges
-in four sweeps, and the ELBO rises every time. The mean is exact, and so is $\mathbb{E}[\tau]$ to
-four digits. The final ELBO is 0.035 nats below the true $\log p(x)$, and that gap is
-$\mathrm{KL}(q\,\|\,p)$. The error is concentrated in the uncertainty: the sd of $\mu$ is 0.730
-against 0.789 (7% too small). The exact posterior couples $\mu$ and $\tau$: when the precision is
-low, the mean is less certain, which turns the marginal of $\mu$ into a Student-t. The factorised
-$q$ cannot express that coupling and reports a single, Gaussian width. You will see this
-underestimation again in its pure form below.
+Started from $\mathbb{E}[\tau] = 1$ (a data sd of 1 when the truth is near 3), CAVI converges in
+four sweeps and the ELBO rises at every one. The mean and $\mathbb{E}[\tau]$ are exact. The ELBO sits
+0.035 nats below $\log p(x)$, which is $\mathrm{KL}(q\,\|\,p)$, and the error lives in the
+uncertainty: sd($\mu$) is 0.730 against 0.789, 7% too small. The exact posterior couples $\mu$ and
+$\tau$ (low precision means an uncertain mean, which makes the marginal of $\mu$ a Student-t). The
+factorised $q$ cannot express that and reports a single Gaussian width.
 
 ### Example (b): a Bayesian Gaussian mixture
 
-This is the running example of Blei et al. (2017). Its latent cluster labels make the posterior
-hard for MCMC (label switching, ch. 5). The model is
-$\mu_k \sim \mathcal{N}(0, \sigma^2)$, $c_i \sim \mathrm{Categorical}(1/K)$ and
-$x_i \mid c_i, \mu \sim \mathcal{N}(\mu_{c_i}, 1)$. The mean-field family is
+This is Blei et al.'s running example: $\mu_k \sim \mathcal{N}(0, \sigma^2)$,
+$c_i \sim \mathrm{Categorical}(1/K)$, $x_i \mid c_i, \mu \sim \mathcal{N}(\mu_{c_i}, 1)$, with
 $q(\mu_k) = \mathcal{N}(m_k, s_k^2)$ and $q(c_i) = \mathrm{Categorical}(\varphi_i)$. The boxed update gives
 
 $$
@@ -283,342 +214,249 @@ m_k = \frac{\sum_i \varphi_{ik}x_i}{1/\sigma^2 + \sum_i\varphi_{ik}},
 s_k^2 = \frac{1}{1/\sigma^2 + \sum_i\varphi_{ik}}
 $$
 
-This is soft k-means with a Bayesian twist. The responsibilities $\varphi$ play EM's E-step, but
-each $\mu_k$ carries a variance, and its mean is shrunk towards the prior. Below are 300 points from three
-clusters (true means $-3$, $0.5$, $4$), with eight random restarts.
+It is soft k-means with uncertainty: $\varphi$ is EM's E-step, but each $\mu_k$ carries a variance
+and is shrunk to the prior. The data are 300 points from clusters at $-3$, $0.5$ and $4$, fitted
+from eight random starts.
 
 ```python
 rng = np.random.default_rng(7)
 K, sigma2 = 3, 10.0 ** 2                          # mu_k ~ N(0, sigma^2), c_i ~ Uniform(K), x_i ~ N(mu_{c_i}, 1)
-true_mu = np.array([-3.0, 0.5, 4.0])
-xg = rng.normal(true_mu[rng.integers(0, K, 300)], 1.0)
+xg = rng.normal(np.array([-3.0, 0.5, 4.0])[rng.integers(0, K, 300)], 1.0)
 
 def gmm_elbo(phi, m, s2):
-    e_prior = np.sum(-0.5 * np.log(2 * np.pi * sigma2) - (m ** 2 + s2) / (2 * sigma2))
-    e_lik = np.sum(phi * (-0.5 * np.log(2 * np.pi) - 0.5 * (xg[:, None] ** 2 - 2 * xg[:, None] * m + m ** 2 + s2)))
-    e_c = -len(xg) * np.log(K)
-    h_c = -np.sum(phi * np.log(phi + 1e-300))
-    h_mu = np.sum(0.5 * np.log(2 * np.pi * np.e * s2))
-    return e_prior + e_lik + e_c + h_c + h_mu
+    e_mu = np.sum(-0.5 * np.log(2 * np.pi * sigma2) - (m ** 2 + s2) / (2 * sigma2))
+    e_x = np.sum(phi * (-0.5 * np.log(2 * np.pi) - 0.5 * (xg[:, None] ** 2 - 2 * xg[:, None] * m + m ** 2 + s2)))
+    ent = -np.sum(phi * np.log(phi + 1e-300)) + np.sum(0.5 * np.log(2 * np.pi * np.e * s2))
+    return e_mu + e_x - len(xg) * np.log(K) + ent
 
-def cavi_gmm(seed, sweeps=200, tol=1e-10):
-    r = np.random.default_rng(seed)
-    m, s2 = r.normal(0, 6, K), np.ones(K)
-    trace = []
+def cavi_gmm(seed, sweeps=200):
+    m, s2, trace = np.random.default_rng(seed).normal(0, 6, K), np.ones(K), []
     for _ in range(sweeps):
-        logits = xg[:, None] * m - 0.5 * (m ** 2 + s2)          # q(c_i) update
+        logits = xg[:, None] * m - 0.5 * (m ** 2 + s2)                     # q(c_i)
         phi = np.exp(logits - logits.max(1, keepdims=True)); phi /= phi.sum(1, keepdims=True)
-        s2 = 1 / (1 / sigma2 + phi.sum(0))                      # q(mu_k) update
-        m = s2 * (phi * xg[:, None]).sum(0)
+        s2 = 1 / (1 / sigma2 + phi.sum(0)); m = s2 * (phi * xg[:, None]).sum(0)   # q(mu_k)
         trace.append(gmm_elbo(phi, m, s2))
-        if len(trace) > 1 and trace[-1] - trace[-2] < tol:
+        if len(trace) > 1 and trace[-1] - trace[-2] < 1e-10:
             break
     return np.array(trace), m, s2, phi
 
-print(f"{'restart':>7} {'sweeps':>6} {'final ELBO':>11} {'ELBO monotone':>14} {'used':>5}  sorted E[mu_k]")
+print(f"{'restart':>7} {'sweeps':>6} {'final ELBO':>11} {'monotone':>9} {'used':>5}  sorted E[mu_k]")
 for seed in range(8):
     tr, m, s2, phi = cavi_gmm(seed)
-    o = np.argsort(m)
-    print(f"{seed:>7} {len(tr):>6} {tr[-1]:>11.3f} {str(bool(np.diff(tr).min() >= 0)):>14} {int((phi.sum(0) > 1).sum()):>5}  " + "  ".join(f"{np.round(v, 3) + 0.0:+.3f}" for v in m[o]))
-tr, m, s2, phi = cavi_gmm(0)
-print(f"\nrestart 0, first ELBO values: {np.array2string(tr[:5], precision=2)}")
-print(f"posterior sd of each mu_k: {np.array2string(np.sqrt(s2[np.argsort(m)]), precision=3)}")
+    print(f"{seed:>7} {len(tr):>6} {tr[-1]:>11.3f} {str(bool(np.diff(tr).min() >= 0)):>9} {int((phi.sum(0) > 1).sum()):>5}  "
+          + "  ".join(f"{np.round(v, 3) + 0.0:+.3f}" for v in np.sort(m)))
+print(f"restart 0: first ELBOs {np.array2string(cavi_gmm(0)[0][:4], precision=2)}, sd(mu_k) {np.array2string(np.sqrt(cavi_gmm(0)[2]), precision=3)}")
 ```
 
 ```output
-restart sweeps  final ELBO  ELBO monotone  used  sorted E[mu_k]
-      0     23    -713.501           True     3  -3.030  +0.536  +3.845
-      1     21    -713.501           True     3  -3.030  +0.536  +3.845
-      2     27    -713.501           True     3  -3.030  +0.536  +3.845
-      3      3   -1886.451           True     1  +0.000  +0.000  +0.642
-      4     24    -713.501           True     3  -3.030  +0.536  +3.845
-      5     36    -949.083           True     2  -2.098  +0.000  +2.869
-      6     37    -949.083           True     2  -2.098  +0.000  +2.869
-      7     22    -713.501           True     3  -3.030  +0.536  +3.845
-
-restart 0, first ELBO values: [-773.64 -722.72 -715.65 -714.09 -713.67]
-posterior sd of each mu_k: [0.106 0.097 0.097]
 ```
 
-All eight runs climb the ELBO monotonically, as the theory promises. They do not all reach the
-same place. Five restarts find the three clusters (ELBO $-713.5$, means within 0.16 of the truth,
-posterior sds near 0.1). Two settle at $-949.1$ with one component "dead": it received no responsibility, so its
-mean fell back to the prior mean 0, and the other two components split the data. One run
-collapsed to a single component in three sweeps. CAVI is coordinate ascent on a non-convex
-objective. Monotone means "never worse", not "global". The standard remedy is the one used
-here: run several restarts and keep the highest ELBO, which is a fair comparison because each ELBO is a
-bound on the same $\log p(x)$.
+Every run climbs monotonically, and they do not all end in the same place. Five find the three
+clusters (ELBO $-713.5$, means within 0.16 of the truth, sds near 0.1). Two stop at $-949.1$ with
+a dead component: it got no responsibility, so its mean fell back to the prior's 0 and two components
+split the data. One collapses to a single cluster in three sweeps. Monotone means "never worse", not "global".
+The remedy is restarts, keeping the highest ELBO. That comparison is fair, because every ELBO bounds the same $\log p(x)$.
 
 ## Mean-field underestimates posterior variance
 
-Mean-field VI is systematically overconfident. You can see why with a correlated 2-D Gaussian. If
-$z_1$ and $z_2$ move together, a product of independent factors has to choose a width for each, and the reverse KL,
-which forbids mass where $p$ is small, picks the narrow width of the conditional
-rather than the wide width of the marginal.
+Mean-field VI is systematically overconfident. If $z_1$ and $z_2$ move together, a product of
+independent factors must pick one width for each. The reverse KL forbids mass where $p$ is small, so it
+picks the narrow conditional width, not the wide marginal one.
 
 ### Deriving the mean-field solution for a Gaussian target
 
-This derivation shows that each mean-field factor gets the conditional variance, not the marginal one. Take $p(z) = \mathcal{N}(\mu, \Sigma)$
-with precision $\Lambda = \Sigma^{-1}$. In $\log p$, the terms involving $z_j$ are
+This shows that each factor gets the conditional variance. Let $p = \mathcal{N}(\mu, \Sigma)$ with
+precision $\Lambda = \Sigma^{-1}$. The terms of $\log p$ in $z_j$ are
 $-\tfrac12\Lambda_{jj}z_j^2 + z_j\big(\Lambda_{jj}\mu_j - \sum_{k\ne j}\Lambda_{jk}(z_k - \mu_k)\big)$.
-Averaging over $q_{-j}$ replaces $z_k$ by $m_k$, so
+Averaging over $q_{-j}$ replaces $z_k$ by $m_k$:
 
 $$
-q_j^\star(z_j) = \mathcal{N}\left(\mu_j - \Lambda_{jj}^{-1}\sum_{k \ne j}\Lambda_{jk}(m_k - \mu_k),\; \frac{1}{\Lambda_{jj}}\right)
+q_j^\star = \mathcal{N}\left(\mu_j - \Lambda_{jj}^{-1}\textstyle\sum_{k \ne j}\Lambda_{jk}(m_k - \mu_k),\; \Lambda_{jj}^{-1}\right),
+\qquad
+\frac{\mathrm{sd}_q(z_1)}{\mathrm{sd}_p(z_1)} = \sqrt{1 - \rho^2}\ \text{ (two unit variances, correlation } \rho)
 $$
 
-The fixed point of the means is $m = \mu$, so the means are exact. The variance is
-$1/\Lambda_{jj}$, the conditional variance $\mathrm{Var}(z_j \mid z_{-j})$, which is never larger
-than the marginal $\Sigma_{jj}$. For two unit-variance variables with correlation $\rho$,
-$\Lambda_{11} = 1/(1-\rho^2)$, so
-
-$$
-\frac{\mathrm{sd}_q(z_1)}{\mathrm{sd}_p(z_1)} = \sqrt{1 - \rho^2}
-$$
+The means' fixed point is $m = \mu$, exact. The variance $1/\Lambda_{jj} = \mathrm{Var}(z_j \mid z_{-j})$ is never
+larger than $\Sigma_{jj}$.
 
 ```python
 mu_t = np.array([1.0, -1.0])
-print(f"{'rho':>5} {'sweeps to 1e-8':>15} {'MF mean':>15} {'MF sd (true 1)':>15} {'sqrt(1-rho^2)':>14} {'KL(q||p)':>9}")
+print(f"{'rho':>5} {'sweeps':>7} {'MF mean':>10} {'MF sd (true 1)':>15} {'sqrt(1-rho^2)':>14} {'KL(q||p)':>9}")
 for rho in (0.0, 0.5, 0.9, 0.99):
-    Sig = np.array([[1.0, rho], [rho, 1.0]]); Lam = np.linalg.inv(Sig)
-    m = np.array([4.0, 4.0])
+    Lam = np.linalg.inv(np.array([[1.0, rho], [rho, 1.0]])); m = np.array([4.0, 4.0])
     for sweep in range(1, 5000):
         m_old = m.copy()
-        for j in range(2):                         # m_j = mu_j - Lam_jj^{-1} sum_{k != j} Lam_jk (m_k - mu_k)
-            k = 1 - j
+        for j, k in ((0, 1), (1, 0)):              # m_j = mu_j - Lam_jj^{-1} Lam_jk (m_k - mu_k)
             m[j] = mu_t[j] - Lam[j, k] * (m[k] - mu_t[k]) / Lam[j, j]
         if np.abs(m - m_old).max() < 1e-8:
             break
-    S_q = np.diag(1 / np.diag(Lam))
-    kl = 0.5 * (np.trace(Lam @ S_q) - 2 + np.log(np.linalg.det(Sig) / np.linalg.det(S_q)))
-    print(f"{rho:>5} {sweep:>15} {np.array2string(m, precision=4):>15} {np.sqrt(S_q[0, 0]):>15.3f} "
-          f"{np.sqrt(1 - rho ** 2):>14.3f} {kl:>9.3f}")
+    v = 1 / np.diag(Lam)
+    kl = 0.5 * (np.sum(np.diag(Lam) * v) - 2 + np.log((1 - rho ** 2) / np.prod(v)))
+    print(f"{rho:>5} {sweep:>7} {np.array2string(m, precision=4):>10} {np.sqrt(v[0]):>15.3f} {np.sqrt(1 - rho ** 2):>14.3f} {kl:>9.3f}")
 ```
 
 ```output
-  rho  sweeps to 1e-8         MF mean  MF sd (true 1)  sqrt(1-rho^2)  KL(q||p)
-  0.0               2       [ 1. -1.]           1.000          1.000     0.000
-  0.5              16       [ 1. -1.]           0.866          0.866     0.144
-  0.9              89       [ 1. -1.]           0.436          0.436     0.830
- 0.99             804       [ 1. -1.]           0.141          0.141     1.959
 ```
 
-The means converge to the true $(1, -1)$ at every $\rho$, and the sds follow
-$\sqrt{1-\rho^2}$ to three digits: at $\rho = 0.9$ the mean-field posterior is 2.3 times too
-narrow, and at $\rho = 0.99$ seven times. A 95% interval from that $q$ would cover far less
-than 95% of the target. Two other costs grow with $\rho$. CAVI needs 804 sweeps at $\rho = 0.99$, because the means
-contract by a factor $\rho^2$ per sweep, the same slow zig-zag that hurts the Gibbs sampler on
-correlated targets (ch. 5). And the KL left over (1.96 nats) is all due to the missing correlation.
-Real posteriors have correlated parameters (intercept and slopes, hierarchical means and their
-scales), so expect mean-field sds to be too small by a factor that depends on how strongly the
-parameters are coupled.
+The means are exact at every $\rho$, and the sds follow $\sqrt{1-\rho^2}$: 2.3 times too narrow
+at $\rho = 0.9$, seven times at $0.99$. A 95% interval from that $q$ covers far less than 95%. CAVI
+also slows down (804 sweeps at $0.99$), because the error contracts by $\rho^2$ per sweep, the same
+zig-zag that hurts Gibbs (ch. 5). Real posteriors have coupled parameters (intercepts and slopes,
+group means and their scale), so expect mean-field sds to be too small by a factor set by the coupling.
 
 ## Black-box VI: two gradient estimators
 
-CAVI needs conditional conjugacy and a hand-derived update for each model. Black-box VI
-(Ranganath et al., 2014) needs only $\log p(x, z)$. You estimate $\nabla_\lambda\mathrm{ELBO}$ with Monte Carlo
-draws from $q_\lambda$ and run stochastic gradient ascent. The difficulty is that $\lambda$ appears in
-the distribution you are averaging over. The two estimators below handle that in different ways.
+CAVI needs conjugacy and hand-derived updates. Black-box VI (Ranganath et al., 2014) needs only
+$\log p(x, z)$: estimate $\nabla_\lambda\mathrm{ELBO}$ from draws of $q_\lambda$ and run stochastic
+gradient ascent. The difficulty is that $\lambda$ sits inside the distribution you average over.
 
 ### Score-function (REINFORCE) gradient
 
-This derivation moves the gradient onto $\log q$ so that the draws can come from any $q$. Write
-$f(z) = \log p(x, z) - \log q_\lambda(z)$. Then $\nabla_\lambda q = q\,\nabla_\lambda\log q$, and
-$\mathbb{E}_q[\nabla_\lambda \log q] = \nabla_\lambda\int q = 0$, so
+This moves the gradient onto $\log q$. With $f(z) = \log p(x, z) - \log q_\lambda(z)$,
+$\nabla_\lambda q = q\,\nabla_\lambda\log q$ and $\mathbb{E}_q[\nabla_\lambda\log q] = 0$:
 
 $$
-\nabla_\lambda\mathrm{ELBO} = \int \nabla_\lambda q_\lambda(z)\,f(z)\,dz + \mathbb{E}_q[\nabla_\lambda f]
-= \mathbb{E}_{q_\lambda}\big[\nabla_\lambda\log q_\lambda(z)\,f(z)\big]
+\nabla_\lambda\mathrm{ELBO} = \mathbb{E}_{q_\lambda}\big[\nabla_\lambda\log q_\lambda(z)\,f(z)\big]
 $$
 
-because $\nabla_\lambda f = -\nabla_\lambda\log q$ has mean zero. This works for any $q$ you can
-sample and differentiate, including discrete ones, and needs no gradient of the model. Since
-$\mathbb{E}[\nabla\log q] = 0$, you can subtract any constant $b$ from $f$ (a **baseline**, or
-control variate) without adding bias.
+It works for any $q$ you can sample and differentiate, discrete included, without the model's
+gradient. Because $\mathbb{E}[\nabla\log q] = 0$, you can subtract any constant **baseline** from $f$ without bias.
 
 ### Reparameterization gradient
 
-This derivation moves the randomness out of $q$ so that the gradient can go through the model. Write
-$z = T_\lambda(\varepsilon)$ with $\varepsilon$ from a fixed distribution, for example
-$z = m + s \odot \varepsilon$ with $\varepsilon \sim \mathcal{N}(0, I)$. Then the expectation is over
-$\varepsilon$, which does not depend on $\lambda$:
+This moves the randomness out of $q$. Write $z = T_\lambda(\varepsilon) = m + s \odot \varepsilon$
+with $\varepsilon \sim \mathcal{N}(0, I)$, so the expectation no longer depends on $\lambda$:
 
 $$
 \nabla_\lambda\mathrm{ELBO} = \mathbb{E}_{\varepsilon}\left[\nabla_z\log p(x, z)\big|_{z = T_\lambda(\varepsilon)}\,\nabla_\lambda T_\lambda(\varepsilon)\right] + \nabla_\lambda\mathbb{H}[q_\lambda]
 $$
 
-For the diagonal Gaussian, the entropy is $\sum_j\log s_j + \text{const}$. That gives
-$\nabla_{m}= \mathbb{E}[\nabla_z\log p]$ and $\nabla_{\log s_j} = \mathbb{E}[(\nabla_z\log p)_j\,\varepsilon_j s_j] + 1$.
-The estimator uses the model's gradient, so it knows which direction is uphill. The score function only
-learns that from the correlation between $f$ and $\nabla\log q$. The comparison below uses the Bayesian logistic regression
-of ch. 3 (40 users, intercept and two features, prior sd 2.5), with $q$ placed slightly off the
-optimum, and 200,000 single-draw gradient estimates of each kind.
+With entropy $\sum_j\log s_j + \text{const}$, $\nabla_m = \mathbb{E}[\nabla_z\log p]$ and
+$\nabla_{\log s_j} = \mathbb{E}[(\nabla_z\log p)_j\,\varepsilon_j s_j] + 1$. It uses the model's
+gradient, so it knows which way is uphill. The test below uses the Bayesian logistic regression of
+ch. 3 (40 users, three coefficients, prior sd 2.5), a $q$ slightly off the optimum, and 200,000
+single-draw estimates of each kind.
 
 ```python
 rng = np.random.default_rng(3)                    # the running dataset of ch. 3
 n, d, prior_sd = 40, 3, 2.5
 X = np.column_stack([np.ones(n), rng.normal(size=(n, 2))])
 y = (rng.random(n) < special.expit(X @ np.array([-0.5, 1.5, -1.0]))).astype(float)
-
 def log_joint(B):
     eta = B @ X.T
     return (y * eta - np.logaddexp(0, eta)).sum(-1) - 0.5 * (B ** 2).sum(-1) / prior_sd ** 2 - d * np.log(prior_sd * np.sqrt(2 * np.pi))
-def grad_log_joint(B):
-    return (y - special.expit(B @ X.T)) @ X - B / prior_sd ** 2
-
+grad_log_joint = lambda B: (y - special.expit(B @ X.T)) @ X - B / prior_sd ** 2
 b_map = np.zeros(d)
-for _ in range(25):                                # Newton to the mode, then Laplace covariance
-    p_ = special.expit(X @ b_map)
-    H = -(X.T * (p_ * (1 - p_))) @ X - np.eye(d) / prior_sd ** 2
+for _ in range(25):                               # Newton to the mode; Laplace covariance
+    pr = special.expit(X @ b_map)
+    H = -(X.T * (pr * (1 - pr))) @ X - np.eye(d) / prior_sd ** 2
     b_map = b_map - np.linalg.solve(H, grad_log_joint(b_map))
 cov_lap = np.linalg.inv(-H)
 
-# per-draw ELBO-gradient estimates for q = N(m, diag(s^2)), lambda = (m, log s)
-m, s = b_map + 0.3, 0.8 * np.sqrt(np.diag(cov_lap))
-def log_q(Z): return stats.norm.logpdf(Z, m, s).sum(-1)
+m, s = b_map + 0.3, 0.8 * np.sqrt(np.diag(cov_lap))   # q = N(m, diag(s^2)), lambda = (m, log s)
 eps = np.random.default_rng(0).standard_normal((200_000, d)); Z = m + s * eps
-f = log_joint(Z) - log_q(Z)                         # log p(x, z) - log q(z)
-score_m, score_ls = (Z - m) / s ** 2, ((Z - m) / s) ** 2 - 1    # grad of log q wrt m and log s
-g_sf = np.hstack([score_m * f[:, None], score_ls * f[:, None]])
-g_sf_b = np.hstack([score_m, score_ls]) * (f - f.mean())[:, None]     # with a baseline
+f = log_joint(Z) - stats.norm.logpdf(Z, m, s).sum(-1)
+score = np.hstack([(Z - m) / s ** 2, ((Z - m) / s) ** 2 - 1])     # grad of log q wrt (m, log s)
+g_sf, g_sfb = score * f[:, None], score * (f - f.mean())[:, None] # score function, with baseline
 gz = grad_log_joint(Z)
-g_rp = np.hstack([gz, gz * eps * s + 1])            # reparam: grad wrt m, and wrt log s (+1 from entropy)
-
-print(f"{'component':>10} {'mean RP':>9} {'mean SF':>9} {'var SF':>10} {'var SF+base':>12} {'var RP':>9} {'SF/RP':>8}")
-names = [f"m[{j}]" for j in range(d)] + [f"log s[{j}]" for j in range(d)]
-for j, nm in enumerate(names):
-    print(f"{nm:>10} {g_rp[:, j].mean():>9.3f} {g_sf[:, j].mean():>9.3f} {g_sf[:, j].var():>10.1f} "
-          f"{g_sf_b[:, j].var():>12.1f} {g_rp[:, j].var():>9.3f} {g_sf[:, j].var() / g_rp[:, j].var():>8.0f}")
+g_rp = np.hstack([gz, gz * eps * s + 1])                          # reparameterisation (+1: entropy)
+print(f"{'':>8} {'mean RP':>8} {'mean SF':>8} {'var SF':>8} {'var SF+base':>12} {'var RP':>7} {'SF/RP':>6}")
+for j, nm in enumerate([f"m[{j}]" for j in range(d)] + [f"logs[{j}]" for j in range(d)]):
+    print(f"{nm:>8} {g_rp[:, j].mean():>8.3f} {g_sf[:, j].mean():>8.3f} {g_sf[:, j].var():>8.1f} "
+          f"{g_sfb[:, j].var():>12.1f} {g_rp[:, j].var():>7.3f} {g_sf[:, j].var() / g_rp[:, j].var():>6.0f}")
 ```
 
 ```output
- component   mean RP   mean SF     var SF  var SF+base    var RP    SF/RP
-      m[0]    -1.775    -1.985     3416.1         13.5     5.063      675
-      m[1]    -0.890    -0.951     1435.7          4.7     1.993      720
-      m[2]    -1.522    -1.483     2844.3         11.2     4.644      612
-  log s[0]     0.189     0.043      964.9          7.3     1.836      525
-  log s[1]     0.263     0.277      940.1          4.2     1.599      588
-  log s[2]     0.146     0.152      952.3          7.4     2.074      459
 ```
 
-Both estimators agree on the gradient, within the score function's own noise. Their single-draw
-variances differ by a factor of 460 to 720. To get the score-function gradient of $m_0$ to a standard error of 0.1
-you would need about 340,000 draws per step, against 500 for the reparameterization gradient. A
-baseline helps a lot (variance falls by a factor of 100 to 300), but it still leaves the score function 2 to 4 times worse
-here, and the gap widens with dimension, because $f$ sums the noise of every coordinate. That is
-why continuous models use reparameterization (ADVI, VAEs) and the score function is kept for
-discrete latents and non-differentiable models, always with control variates.
+Both agree on the gradient (up to the score function's noise), but the single-draw variances differ
+by a factor of 460 to 720. A standard error of 0.1 on the $m_0$ component would need about 340,000
+score-function draws per step, against 500 reparameterised ones. A baseline cuts the variance by
+100 to 300 times, yet still leaves it 2 to 4 times worse, and the gap widens with dimension since $f$
+carries every coordinate's noise. So continuous models use reparameterization (ADVI, VAEs). The
+score function is kept for discrete latents, always with control variates.
 
 ## ADVI: automatic VI in unconstrained space
 
-ADVI (Kucukelbir et al., 2017) is what Stan, PyMC and NumPyro run when you ask them for VI. It
-does three things. First, it maps every constrained parameter to $\mathbb{R}^d$, for example
-$\sigma = e^{\zeta}$ or a probability through the logit, and adds the log-Jacobian to the target:
-$\log p(x, T^{-1}(\zeta)) + \log\lvert\det J_{T^{-1}}(\zeta)\rvert$. A Gaussian on $\mathbb{R}^d$
-then always respects the constraints. Second, it fits either a **mean-field** Gaussian
-$\mathcal{N}(m, \mathrm{diag}(s^2))$ or a **full-rank** Gaussian $\mathcal{N}(m, LL^\top)$, with $L$
-lower-triangular and a positive diagonal. Third, it climbs the ELBO with reparameterization gradients and
-automatic differentiation.
+ADVI (Kucukelbir et al., 2017) is what Stan, PyMC and NumPyro run when you ask for VI. First, it maps
+constrained parameters to $\mathbb{R}^d$ ($\sigma = e^{\zeta}$, logits for probabilities) and adds
+the log-Jacobian, $\log p(x, T^{-1}(\zeta)) + \log\lvert\det J_{T^{-1}}(\zeta)\rvert$, so a
+Gaussian respects every constraint. Second, it fits a **mean-field**
+$\mathcal{N}(m, \mathrm{diag}(s^2))$ or **full-rank** $\mathcal{N}(m, LL^\top)$ Gaussian, with $L$
+lower-triangular and a positive diagonal. Third, it climbs with reparameterization gradients from autodiff.
 
-The logistic regression coefficients are already unconstrained, so the Jacobian is 1 here. The
-implementation below parameterises the diagonal of $L$ through its log and uses 16 draws per step.
-It runs Adam with a decaying step size and averages the iterates over the second half of the run
-(Polyak averaging), which removes most of the optimiser noise. The reference is the 1M-draw
-importance sampler of ch. 3.
+The logistic coefficients are already unconstrained (Jacobian 1). Below: 16 draws per step, Adam
+with a decaying step, and the iterates averaged over the second half (Polyak averaging) to remove optimiser noise.
+The reference is ch. 3's 1M-draw importance sampler.
 
 ```python
 import torch
 torch.set_num_threads(1)
-
-# reference posterior: SNIS with a Student-t proposal around the Laplace fit (ch. 3), 1M draws
-t_ref = stats.multivariate_t(b_map, 1.5 * cov_lap, df=4)
+t_ref = stats.multivariate_t(b_map, 1.5 * cov_lap, df=4)      # reference: 1M-draw SNIS of ch. 3
 th_ref = t_ref.rvs(1_000_000, random_state=np.random.default_rng(1))
 lw_ref = log_joint(th_ref) - t_ref.logpdf(th_ref)
 w_ref = np.exp(lw_ref - lw_ref.max()); w_ref /= w_ref.sum()
-m_ref = w_ref @ th_ref
-cov_ref = (th_ref - m_ref).T @ ((th_ref - m_ref) * w_ref[:, None])
-s_ref = np.sqrt(np.diag(cov_ref))
-log_Z_ref = lw_ref.max() + np.log(np.mean(np.exp(lw_ref - lw_ref.max())))
+m_ref = w_ref @ th_ref; cov_ref = (th_ref - m_ref).T @ ((th_ref - m_ref) * w_ref[:, None])
+s_ref, log_Z_ref = np.sqrt(np.diag(cov_ref)), lw_ref.max() + np.log(np.mean(np.exp(lw_ref - lw_ref.max())))
 
-Xt, yt = torch.tensor(X), torch.tensor(y)
-def log_joint_t(B, Xb=Xt, yb=yt, scale=1.0):        # B: (S, d); scale = n / batch for minibatches
+def log_joint_t(B, Xb=torch.tensor(X), yb=torch.tensor(y), scale=1.0):   # scale = n / B for minibatches
     eta = B @ Xb.T
     return scale * (yb * eta - torch.nn.functional.softplus(eta)).sum(-1) - 0.5 * (B ** 2).sum(-1) / prior_sd ** 2
 
-def advi(full_rank, steps=4000, S=16, lr=0.05, decay=500, init_log_sd=0.0, seed=0, lj=log_joint_t, dim=d):
-    torch.manual_seed(seed)
-    mu = torch.zeros(dim, dtype=torch.float64, requires_grad=True)
-    L_raw = (init_log_sd * torch.eye(dim, dtype=torch.float64)).requires_grad_(True)   # diag holds log sd
+def advi(full_rank, steps=4000, S=16, lr=0.05, decay=500, init_log_sd=0.0, lj=log_joint_t, dim=d):
+    torch.manual_seed(0); kw = dict(dtype=torch.float64)
+    mu = torch.zeros(dim, **kw, requires_grad=True)
+    L_raw = (init_log_sd * torch.eye(dim, **kw)).requires_grad_(True)       # diagonal holds log sd
+    mask = torch.tril(torch.ones(dim, dim, **kw), -1) * float(full_rank)
     opt = torch.optim.Adam([mu, L_raw], lr=lr)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda t: 1 / (1 + t / decay))
-    mask = torch.tril(torch.ones(dim, dim, dtype=torch.float64), -1) if full_rank else torch.zeros(dim, dim, dtype=torch.float64)
-    avg_mu, avg_C = torch.zeros(dim, dtype=torch.float64), torch.zeros(dim, dim, dtype=torch.float64)
+    avg_mu, avg_C, n_avg = torch.zeros(dim, **kw), torch.zeros(dim, dim, **kw), steps - steps // 2
     for t in range(steps):
         L = torch.diag(torch.exp(torch.diagonal(L_raw))) + L_raw * mask
-        eps = torch.randn(S, dim, dtype=torch.float64)
-        Z = mu + eps @ L.T                                  # reparameterised draws
-        elbo = lj(Z).mean() + torch.log(torch.diagonal(L)).sum()   # + entropy (up to a constant)
+        Zs = mu + torch.randn(S, dim, **kw) @ L.T                          # reparameterised draws
+        elbo = lj(Zs).mean() + torch.diagonal(L_raw).sum()                 # + entropy, up to a constant
         opt.zero_grad(); (-elbo).backward(); opt.step(); sched.step()
-        if t >= steps // 2:                                 # Polyak-average the second half
+        if t >= steps // 2:                                                # Polyak averaging
             with torch.no_grad():
                 L = torch.diag(torch.exp(torch.diagonal(L_raw))) + L_raw * mask
-                avg_mu, avg_C = avg_mu + mu / (steps - steps // 2), avg_C + L @ L.T / (steps - steps // 2)
+                avg_mu += mu / n_avg; avg_C += L @ L.T / n_avg
     return avg_mu.numpy(), avg_C.numpy()
 
 fits = {"Laplace": (b_map, cov_lap), "ADVI mean-field": advi(False), "ADVI full-rank": advi(True)}
-print(f"{'':>16} {'means':>27} {'sds':>23} {'corr(b0,b1)':>12}")
-print(f"{'reference':>16} {np.array2string(m_ref, precision=3):>27} {np.array2string(s_ref, precision=3):>23} "
-      f"{cov_ref[0, 1] / (s_ref[0] * s_ref[1]):>12.3f}")
+print(f"{'':>16} {'means':>23} {'sds':>21} {'corr(b0,b1)':>12} {'max|mean err|/sd':>17} {'sd / ref':>12}")
+print(f"{'reference':>16} {np.array2string(m_ref, precision=3):>23} {np.array2string(s_ref, precision=3):>21} {cov_ref[0, 1] / s_ref[0] / s_ref[1]:>12.3f}")
 for name, (mq, Cq) in fits.items():
-    sq = np.sqrt(np.diag(Cq))
-    print(f"{name:>16} {np.array2string(mq, precision=3):>27} {np.array2string(sq, precision=3):>23} "
-          f"{Cq[0, 1] / (sq[0] * sq[1]):>12.3f}")
-print(f"\nmax |mean error| / ref sd and sd ratio range:")
-for name, (mq, Cq) in fits.items():
-    r = np.sqrt(np.diag(Cq)) / s_ref
-    print(f"{name:>16}: {np.max(np.abs(mq - m_ref) / s_ref):.3f} | {r.min():.3f} to {r.max():.3f}")
+    sq = np.sqrt(np.diag(Cq)); r = sq / s_ref
+    print(f"{name:>16} {np.array2string(mq, precision=3):>23} {np.array2string(sq, precision=3):>21} {Cq[0, 1] / sq[0] / sq[1]:>12.3f} "
+          f"{np.max(np.abs(mq - m_ref) / s_ref):>17.3f} {r.min():>5.3f}-{r.max():.3f}")
 ```
 
 ```output
-                                       means                     sds  corr(b0,b1)
-       reference      [-1.089  2.344 -1.112]     [0.5   0.771 0.548]       -0.431
-         Laplace      [-0.958  2.023 -0.956]     [0.471 0.721 0.515]       -0.419
- ADVI mean-field      [-1.05   2.297 -1.073]     [0.435 0.646 0.484]        0.000
-  ADVI full-rank      [-1.086  2.342 -1.111]     [0.484 0.715 0.526]       -0.384
-
-max |mean error| / ref sd and sd ratio range:
-         Laplace: 0.417 | 0.935 to 0.941
- ADVI mean-field: 0.079 | 0.839 to 0.882
-  ADVI full-rank: 0.006 | 0.928 to 0.967
 ```
 
-Read the means first. Laplace, centred on the mode, is 0.42 posterior sds off in the slope (2.02
-against 2.34). Mean-field ADVI is within 0.08 sd, and full-rank ADVI is within 0.006 sd, essentially exact.
-VI targets the posterior mass, not the peak, so it moves past the mode in the direction of the
-skew. Now the sds. Mean-field is 12 to 16% too narrow, which is the correlation penalty you just
-derived: the intercept and slope have correlation $-0.43$, and mean-field reports 0. Full-rank recovers the
-correlation ($-0.38$) and gets the sds to within 3 to 7%. What is left over is the reverse KL at
-work: the posterior is skewed, and the best Gaussian under $\mathrm{KL}(q\,\|\,p)$ makes its tails
-lighter than the long tail of the target. So even with the right family, VI tends to report slightly
-too little uncertainty.
+The means first. Laplace, centred on the mode, is 0.42 sds off in the slope. Mean-field ADVI is
+within 0.08 sd, and full-rank is within 0.006, essentially exact: VI targets mass, not the peak, so it
+follows the skew past the mode. The sds come next. Mean-field is 12 to 16% too narrow, the penalty you just
+derived, since it reports a correlation of 0 where the truth is $-0.43$. Full-rank recovers $-0.38$ and gets the
+sds within 3 to 7%. What is left over is reverse KL again: the best Gaussian under
+$\mathrm{KL}(q\,\|\,p)$ has lighter tails than the skewed target. Even with the right family, VI
+reports slightly too little uncertainty.
 
 ## Stochastic VI with minibatches
 
-The likelihood is a sum over data points, so each step can look at a random minibatch of $B$ out of $n$
-points and scale it up:
+The likelihood is a sum over points, so each step can use a random minibatch $\mathcal{B}$ of $B$
+of the $n$ points and scale it up:
 
 $$
 \widehat{\log p}(x, z) = \frac{n}{B}\sum_{i \in \mathcal{B}}\log p(x_i \mid z) + \log p(z),
-\qquad \mathbb{E}_{\mathcal{B}}\left[\widehat{\log p}\right] = \log p(x, z)
+\qquad \mathbb{E}_{\mathcal{B}}\big[\widehat{\log p}\big] = \log p(x, z)
 $$
 
-The estimate is unbiased, so its gradient is too, and Robbins-Monro step sizes
-($\sum_t\rho_t = \infty$, $\sum_t\rho_t^2 < \infty$) still give convergence (Hoffman et al., 2013, who
-also use natural gradients for conjugate models). Each step costs $B$ likelihood evaluations
-instead of $n$. That is what lets VI scale to datasets MCMC cannot touch. The factor $n/B$ is easy to forget, and
-forgetting it silently fits the posterior you would get from only $B$ data points. The comparison
-below uses 20,000 points and 5 coefficients with mean-field ADVI. For a near-Gaussian posterior,
-the exact mean-field sds are $1/\sqrt{\Lambda_{jj}}$ (see above).
+That is unbiased, so Robbins-Monro steps ($\sum_t\rho_t = \infty$, $\sum_t\rho_t^2 < \infty$) still
+converge (Hoffman et al., 2013, who add natural gradients for conjugate models). Each step costs $B$
+likelihood evaluations instead of $n$. Forgetting $n/B$ silently fits the posterior of a $B$-point
+dataset. The test uses 20,000 points and 5 coefficients with mean-field ADVI. The exact mean-field
+sds of a near-Gaussian posterior are $1/\sqrt{\Lambda_{jj}}$ (previous section).
 
 ```python
 rb = np.random.default_rng(8)
@@ -626,7 +464,6 @@ N_big, d_big, B = 20_000, 5, 200
 Xb = np.column_stack([np.ones(N_big), rb.normal(size=(N_big, d_big - 1))])
 yb = (rb.random(N_big) < special.expit(Xb @ np.array([-1.0, 0.8, -0.5, 0.3, 0.0]))).astype(float)
 Xbt, ybt = torch.tensor(Xb), torch.tensor(yb)
-
 def minibatch_lj(scale):
     def lj(Z):
         idx = torch.randint(0, N_big, (B,))
@@ -634,132 +471,98 @@ def minibatch_lj(scale):
     return lj
 
 runs = {"full batch": (lambda Z: log_joint_t(Z, Xbt, ybt), N_big),
-        f"minibatch {B}, x n/B": (minibatch_lj(N_big / B), B),
-        f"minibatch {B}, unscaled": (minibatch_lj(1.0), B)}
-steps, S_b = 4000, 4
-res = {}
-for name, (lj, per_step) in runs.items():
-    res[name] = advi(False, steps=steps, S=S_b, lr=0.02, decay=1000, init_log_sd=-2.0, lj=lj, dim=d_big)
-m_fb = res["full batch"][0]
-p_fb = special.expit(Xb @ m_fb)
-Lam_big = Xb.T @ (Xb * (p_fb * (1 - p_fb))[:, None]) + np.eye(d_big) / prior_sd ** 2
-print(f"{'':>24} {'lik. evals':>12} {'means':>38} {'sds x 100':>32}")
-for name, (mq, Cq) in res.items():
-    ev = steps * S_b * runs[name][1]
-    print(f"{name:>24} {ev:>12,} {np.array2string(mq, precision=3):>38} {np.array2string(100 * np.sqrt(np.diag(Cq)), precision=2):>32}")
-print(f"{'1/sqrt(Lambda_jj) x 100':>24} {'':>12} {'':>38} {np.array2string(100 / np.sqrt(np.diag(Lam_big)), precision=2):>32}")
+        "minibatch, x n/B": (minibatch_lj(N_big / B), B), "minibatch, unscaled": (minibatch_lj(1.0), B)}
+res = {k: advi(False, steps=4000, S=4, lr=0.02, decay=1000, init_log_sd=-2.0, lj=lj, dim=d_big) for k, (lj, _) in runs.items()}
+pr = special.expit(Xb @ res["full batch"][0])
+Lam_big = Xb.T @ (Xb * (pr * (1 - pr))[:, None]) + np.eye(d_big) / prior_sd ** 2
+print(f"{'':>19} {'lik. evals':>12} {'means':>38} {'sds x 100':>31}")
+for k, (mq, Cq) in res.items():
+    print(f"{k:>19} {4000 * 4 * runs[k][1]:>12,} {np.array2string(mq, precision=3):>38} {np.array2string(100 * np.sqrt(np.diag(Cq)), precision=2):>31}")
+print(f"{'1/sqrt(Lam_jj)':>19} {'':>12} {'':>38} {np.array2string(100 / np.sqrt(np.diag(Lam_big)), precision=2):>31}")
 ```
 
 ```output
-                           lik. evals                                  means                        sds x 100
-              full batch  320,000,000   [-1.016  0.834 -0.51   0.323 -0.029]       [1.82 1.89 1.74 1.7  1.68]
-    minibatch 200, x n/B    3,200,000   [-1.018  0.83  -0.512  0.324 -0.026]       [1.86 1.84 1.8  1.7  1.68]
- minibatch 200, unscaled    3,200,000   [-1.04   0.85  -0.524  0.329 -0.027]  [17.05 18.49 17.68 17.05 16.9 ]
- 1/sqrt(Lambda_jj) x 100                                                           [1.69 1.82 1.73 1.7  1.68]
 ```
 
-The scaled minibatch run uses 1% of the likelihood evaluations of the full-batch run. Its means agree to
-the third decimal, and its sds match $1/\sqrt{\Lambda_{jj}}$ about as well as the full-batch fit does (within
-a few percent; the remaining noise comes from the optimiser). The unscaled run gets roughly the
-right means but sds near 0.17, ten times too wide: that is $\sqrt{n/B} = 10$, the uncertainty
-of a 200-point dataset. Nothing in its training curve would warn you.
+The scaled minibatch run uses 1% of the likelihood evaluations. Its means agree to about the third
+decimal, and its sds track $1/\sqrt{\Lambda_{jj}}$ as closely as the full-batch fit does (within a
+few percent, which is optimiser noise). The unscaled run has fine means but sds ten times too wide,
+$\sqrt{n/B} = 10$: the uncertainty of 200 data points. Nothing in its loss curve warns you.
 
-## Is the approximation any good? PSIS $\hat k$ and the importance-weighted ELBO
+## Is the approximation good enough? PSIS $\hat k$ and the importance-weighted ELBO
 
-The ELBO tells you which of two $q$'s is better. It does not tell you whether either is good enough,
-because $\log p(x)$ is unknown. Yao et al. (2018) proposed using $q$ as an importance-sampling
-proposal and asking how heavy-tailed the weights $w = p(x, z)/q(z)$ are. That is the PSIS
-diagnostic of ch. 3, which ch. 9 applies to LOO. A Pareto $\hat k < 0.5$ means $q$ is close enough
-that importance sampling from it is reliable. In $0.5 < \hat k < 0.7$ it is usable with smoothing, and $\hat k > 0.7$
-means the approximation should not be trusted and cannot be repaired by reweighting. The same weights
-give two more things. Self-normalised IS from $q$ corrects its moments. The **importance-weighted
-ELBO** (Burda et al., 2016)
+The ELBO ranks two $q$'s but cannot say whether either is good, because $\log p(x)$ is unknown. Yao
+et al. (2018) use $q$ as an importance-sampling proposal and look at the tail of
+$w = p(x, z)/q(z)$ with the Pareto $\hat k$ of ch. 3 (applied to LOO in ch. 9). Below $0.5$ the fit
+is reliable, between $0.5$ and $0.7$ usable with smoothing, and above $0.7$ untrustworthy. The same
+weights correct $q$'s moments by self-normalised IS and give the **importance-weighted ELBO**
+(Burda et al., 2016), a bound that tightens with $K$ (Jensen on an average of $K$ weights):
 
 $$
 \mathcal{L}_K = \mathbb{E}_{z_{1:K} \sim q}\left[\log\frac1K\sum_{k=1}^{K}\frac{p(x, z_k)}{q(z_k)}\right],
-\qquad \mathcal{L}_1 = \mathrm{ELBO} \le \mathcal{L}_K \le \mathcal{L}_{K+1} \le \log p(x)
+\qquad \mathrm{ELBO} = \mathcal{L}_1 \le \mathcal{L}_K \le \mathcal{L}_{K+1} \le \log p(x)
 $$
 
-tightens towards $\log p(x)$ as $K$ grows. It is a lower bound for every $K$ (Jensen again, now on the
-average of $K$ weights). The estimator below follows the Zhang-Stephens fit that the reference
-PSIS implementation uses, applied to 100,000 draws from each fit of the last section.
+The $\hat k$ below uses the Zhang-Stephens fit of the reference PSIS code on 100,000 draws per fit.
 
 ```python
 @np.errstate(over="ignore")
 def pareto_khat(log_w):
-    """Generalised-Pareto shape of the largest weights, Zhang-Stephens estimator as in PSIS."""
+    """Generalised-Pareto shape of the largest weights (Zhang-Stephens fit, as in PSIS)."""
     w = np.sort(np.exp(log_w - log_w.max()))
-    M = int(np.ceil(min(0.2 * len(w), 3 * np.sqrt(len(w)))))
-    x = w[-M:] - w[-M - 1]
+    M = int(np.ceil(min(0.2 * len(w), 3 * np.sqrt(len(w))))); x = w[-M:] - w[-M - 1]
     nm = 30 + int(np.sqrt(M))
     bs = 1 / x[-1] + (1 - np.sqrt(nm / (np.arange(1, nm + 1) - 0.5))) / (3 * x[int(M / 4 + 0.5) - 1])
     ks = -np.mean(np.log1p(-bs[:, None] * x), axis=1)
     L = M * (np.log(bs / ks) + ks - 1)
     b = np.sum(bs / np.sum(np.exp(L[None, :] - L[:, None]), axis=1))
-    k = np.mean(np.log1p(-b * x))
-    return (M * k + 5) / (M + 10)                   # shrink towards 0.5 for small tails
+    return (M * np.mean(np.log1p(-b * x)) + 5) / (M + 10)     # shrink towards 0.5 for short tails
 
 rq = np.random.default_rng(9)
-print(f"{'q':>16} {'khat':>6} {'ESS/S':>6} {'IS-corrected sds':>22} {'IW-ELBO K=1':>12} {'K=10':>8} {'K=100':>8} {'K=1000':>8}")
+print(f"{'q':>16} {'khat':>5} {'ESS/S':>6} {'IS-corrected sds':>21} {'IW-ELBO K=1':>12} {'K=10':>8} {'K=100':>8} {'K=1000':>8}")
 for name, (mq, Cq) in fits.items():
-    q = stats.multivariate_normal(mq, Cq)
-    Zq = q.rvs(100_000, random_state=rq)
+    q = stats.multivariate_normal(mq, Cq); Zq = q.rvs(100_000, random_state=rq)
     lw = log_joint(Zq) - q.logpdf(Zq)
-    w = np.exp(lw - lw.max()); w /= w.sum()
-    mc = w @ Zq; sc = np.sqrt(w @ (Zq - mc) ** 2)
-    iw = [np.mean(special.logsumexp(lw.reshape(-1, K), axis=1) - np.log(K)) for K in (1, 10, 100, 1000)]
-    print(f"{name:>16} {pareto_khat(lw):>6.2f} {1 / np.sum(w ** 2) / len(w):>6.2f} {np.array2string(sc, precision=3):>22} "
+    w = np.exp(lw - lw.max()); w /= w.sum(); mc = w @ Zq
+    iw = [np.mean(special.logsumexp(lw.reshape(-1, k), axis=1) - np.log(k)) for k in (1, 10, 100, 1000)]
+    print(f"{name:>16} {pareto_khat(lw):>5.2f} {1 / np.sum(w ** 2) / len(w):>6.2f} {np.array2string(np.sqrt(w @ (Zq - mc) ** 2), precision=3):>21} "
           + " ".join(f"{v:>8.3f}" for v in iw))
-print(f"{'reference':>16} {'':>6} {'':>6} {np.array2string(s_ref, precision=3):>22}  log Z = {log_Z_ref:.3f}")
-
-z1 = rq.normal(-1.987, 0.719, 10_000)               # the reverse-KL fit to one mode of the bimodal target
+print(f"{'reference':>16} {'':>12} {np.array2string(s_ref, precision=3):>21}  log Z = {log_Z_ref:.3f}")
+z1 = rq.normal(-1.987, 0.719, 10_000)              # reverse-KL fit to the left mode of the bimodal target
 lw1 = np.interp(z1, g, log_p) - stats.norm.logpdf(z1, -1.987, 0.719)
-print(f"\nbimodal target, q fitted to the left mode: khat = {pareto_khat(lw1):.2f}, "
-      f"draws beyond x = 0.5: {int((z1 > 0.5).sum())} of {len(z1):,}")
+print(f"bimodal target, q on the left mode: khat = {pareto_khat(lw1):.2f}, draws beyond x = 0.5: {int((z1 > 0.5).sum())} of 10,000")
 ```
 
 ```output
-               q   khat  ESS/S       IS-corrected sds  IW-ELBO K=1     K=10    K=100   K=1000
-         Laplace   0.59   0.51    [0.499 0.774 0.547]  -21.375  -21.227  -21.208  -21.204
- ADVI mean-field   0.57   0.35    [0.488 0.739 0.527]  -21.389  -21.259  -21.225  -21.219
-  ADVI full-rank   0.57   0.77    [0.5   0.772 0.548]  -21.248  -21.213  -21.207  -21.206
-       reference                  [0.5   0.771 0.548]  log Z = -21.207
-
-bimodal target, q fitted to the left mode: khat = 2.33, draws beyond x = 0.5: 3 of 10,000
 ```
 
-The $K = 1$ column is the ELBO of each fit. Full-rank ADVI has the highest ELBO, $-21.248$, so its KL to the
-posterior is only 0.04 nats, against 0.18 for mean-field. As $K$ grows, every bound climbs to the
-reference $\log Z = -21.207$ (Laplace and full-rank reach it at $K = 100$). Importance reweighting
-then repairs the moments. From full-rank and Laplace the corrected sds match the reference to three
-digits. From mean-field they move most of the way (0.739 against 0.771 for the slope),
-held back by an ESS of only 35%. Here $\hat k$ is the
-reverse KL's light-tail fingerprint. It is near 0.5 for all three fits, because each Gaussian is
-slightly narrower than the skewed posterior in some direction. The estimate is noisy at this
-boundary, so treat 0.45 versus 0.55 as the same verdict: usable, with smoothing. The bimodal case is the
-one that matters. A $q$ fitted to one mode draws only a handful of points near the second, but their weights are
-enormous, and $\hat k = 2.33$ flags the fit as useless for the global picture. If a $q$ never visits a
-mode at all, no weight-based diagnostic can see it. So $\hat k$ is necessary, not sufficient, and
-multimodality is still best probed with multiple restarts, as with the mixture.
+The $K = 1$ column is the ELBO: full-rank has the highest, so its KL to the posterior is 0.04 nats,
+against 0.18 for mean-field. With growing $K$ every bound climbs to $\log Z = -21.207$ (within
+Monte Carlo error by $K = 100$ to $1000$). Reweighting repairs the moments: from full-rank and
+Laplace the corrected sds match the reference to three digits, and from mean-field they move most of the way (0.739 against
+0.771), held back by an ESS of 35%. All three $\hat k$ sit near 0.57, the reverse KL's light-tail fingerprint:
+each Gaussian is a little narrower than the skewed posterior somewhere. The verdict is "usable,
+with smoothing". The bimodal case is the one to remember. Three draws in 10,000 reach the
+second mode, but their weights are enormous, and $\hat k = 2.33$ flags the fit. If $q$ never visited
+that mode, no weight diagnostic could see it, so $\hat k$ is necessary, not sufficient. Probe
+multimodality with restarts, as with the mixture.
 
 ## When to prefer VI and when to prefer MCMC
 
-MCMC is asymptotically exact, and its error falls as you run it longer, with diagnostics (ch. 7)
-that tell you when it has failed. VI is biased by its family, and more compute does not remove the bias.
-In exchange it is fast, deterministic once converged, and works with minibatches. The decision is about
-which error you can afford.
+MCMC is asymptotically exact, and it comes with diagnostics that say when it failed (ch. 7). VI is biased by its
+family, but it is fast and deterministic once converged, and it works with minibatches. Choose by which error you can afford.
 
 | Situation | Prefer | Why |
 |---|---|---|
-| Final inference for a moderate model, tail probabilities or intervals matter | MCMC (NUTS, ch. 6) | VI underestimates variance and distorts tails |
-| Huge $n$ (millions of rows) or streaming data | SVI | minibatch gradients, cost per step $O(B)$ |
-| Many latent variables, one per data point (topic models, VAEs) | amortised VI (Generative Models) | an encoder predicts each $q(z_i \mid x_i)$ |
-| Model iteration, initialising or tuning MCMC | ADVI or Pathfinder | minutes instead of hours, decent means |
-| Multimodal or strongly correlated posteriors | MCMC with several chains, or full-rank VI plus $\hat k$ | mean-field misses correlation, any VI can miss modes |
-| Bayesian neural networks (ch. 13) | VI, ensembles, Laplace | MCMC is rarely practical at that scale |
+| Final inference where intervals and tails matter | MCMC (NUTS, ch. 6) | VI underestimates variance |
+| Millions of rows, streaming data | SVI | minibatch gradients, $O(B)$ per step |
+| One latent per data point (topic models, VAEs) | amortised VI (Generative Models) | an encoder predicts each $q(z_i \mid x_i)$ |
+| Fast model iteration, initialising MCMC | ADVI, Pathfinder | minutes, decent means |
+| Strong correlations or several modes | MCMC with many chains, or full-rank VI plus $\hat k$ | mean-field drops correlation, VI can miss modes |
+| Bayesian neural networks (ch. 13) | VI, ensembles, Laplace | MCMC rarely scales there |
 
-In practice the two are combined: VI to get close quickly, $\hat k$ to decide whether that is enough,
-and MCMC (or importance sampling with $q$ as the proposal) when it is not.
+In practice you combine them. VI gets close fast, $\hat k$ decides whether that is enough, and MCMC (or IS with $q$
+as proposal) takes over when it is not.
 
 ## Try it Yourself
 
@@ -769,59 +572,48 @@ from scipy import stats
 
 rng = np.random.default_rng(0)
 counts = np.array([0, 1, 0, 2, 0, 0, 1])          # Poisson counts; try [0, 0, 0] or 50 counts near 4
-prior_mu, prior_sd = 0.0, 2.0                      # z = log rate ~ N(0, 2^2)
+prior_sd = 2.0                                     # z = log rate ~ N(0, 2^2)
+grad = lambda z: counts.sum() - len(counts) * np.exp(z) - z / prior_sd ** 2   # d/dz log p(y, z)
 
-def grad_log_joint(z):                             # d/dz [sum(y z - e^z) + log N(z; 0, 2^2)]
-    return counts.sum() - len(counts) * np.exp(z) - (z - prior_mu) / prior_sd ** 2
-
-m, log_s, S, steps = 0.0, 0.0, 8, 5000             # q(z) = N(m, s^2), reparameterised z = m + s * eps
-avg = np.zeros(2)
+m, log_s, S, steps, avg = 0.0, 0.0, 8, 5000, np.zeros(2)   # q(z) = N(m, s^2), z = m + s * eps
 for t in range(steps):
-    eps = rng.standard_normal(S); s = np.exp(log_s)
-    g = grad_log_joint(m + s * eps)
+    eps = rng.standard_normal(S); s = np.exp(log_s); gz = grad(m + s * eps)
     lr = 0.05 / (1 + t / 500)
-    m += lr * g.mean()
-    log_s += lr * (np.mean(g * eps * s) + 1.0)     # +1 is the entropy gradient
+    m, log_s = m + lr * gz.mean(), log_s + lr * (np.mean(gz * eps * s) + 1.0)  # +1: entropy
     if t >= steps // 2:
         avg += np.array([m, np.exp(log_s)]) / (steps - steps // 2)
 
 grid = np.linspace(-12, 6, 200_001)
-lp = counts.sum() * grid - len(counts) * np.exp(grid) + stats.norm.logpdf(grid, prior_mu, prior_sd)
-w = np.exp(lp - lp.max()); w /= w.sum()
-gm = w @ grid; gs = np.sqrt(w @ (grid - gm) ** 2)
-print(f"log-rate z:   VI mean {avg[0]:+.3f} sd {avg[1]:.3f} | exact mean {gm:+.3f} sd {gs:.3f}")
+lp = counts.sum() * grid - len(counts) * np.exp(grid) + stats.norm.logpdf(grid, 0, prior_sd)
+w = np.exp(lp - lp.max()); w /= w.sum(); gm = w @ grid
 lam_vi = stats.lognorm(avg[1], scale=np.exp(avg[0]))
-print(f"rate e^z:     VI mean {lam_vi.mean():.3f} | exact mean {w @ np.exp(grid):.3f}")
-print(f"P(rate > 1):  VI {lam_vi.sf(1.0):.3f} | exact {w[grid > 0].sum():.3f}")
+print(f"log-rate z:  VI mean {avg[0]:+.3f} sd {avg[1]:.3f} | exact mean {gm:+.3f} sd {np.sqrt(w @ (grid - gm) ** 2):.3f}")
+print(f"rate e^z:    VI mean {lam_vi.mean():.3f} | exact mean {w @ np.exp(grid):.3f}")
+print(f"P(rate > 1): VI {lam_vi.sf(1.0):.3f} | exact {w[grid > 0].sum():.3f}")
 ```
 
 ```output
-log-rate z:   VI mean -0.634 sd 0.472 | exact mean -0.637 sd 0.501
-rate e^z:     VI mean 0.593 | exact mean 0.594
-P(rate > 1):  VI 0.089 | exact 0.089
 ```
 
-The posterior here is one-dimensional and skewed (seven small counts, a log-rate parameter). The
-reparameterised Gaussian in log space gets the mean right to 0.003, but its sd is 6% too small
-(0.472 against 0.501). That is the reverse KL trimming the long left tail again. Moments of the
-rate itself and $P(\text{rate} > 1)$ still come out right, because they depend mostly on the
-centre. Try `counts = np.array([0, 0, 0])`: the posterior then piles up against very low rates,
-and the gap in the sd grows. Then try 50 counts near 4, where the posterior becomes almost Gaussian and VI is
-almost exact. That is Bernstein-von Mises (ch. 3) in action.
+Seven small counts give a skewed posterior for the log-rate. The reparameterised Gaussian gets the
+mean within 0.003, but its sd is 6% small (0.472 against 0.501): reverse KL trimming the long left
+tail. The rate's mean and $P(\text{rate} > 1)$ still match, because they depend mostly on the centre.
+Try `counts = np.array([0, 0, 0])` and watch the sd gap grow. Then try 50 counts near 4, where
+Bernstein-von Mises (ch. 3) makes the posterior nearly Gaussian and VI nearly exact.
 
 ## Exercise
 
-Bayesian linear regression with unknown noise has a conjugate Normal-Inverse-Gamma posterior, so you can
-grade a mean-field fit exactly. Use $y = Xw + \epsilon$ with
-$\epsilon \sim \mathcal{N}(0, \tau^{-1}I)$, $w \mid \tau \sim \mathcal{N}(0, (\alpha\tau)^{-1}I)$ and
-$\tau \sim \mathrm{Gamma}(a_0, b_0)$, with $n = 30$, $d = 4$ and two strongly correlated features.
+Bayesian linear regression with unknown noise has a conjugate posterior, so you can grade mean-field
+exactly. Take $y = Xw + \epsilon$, $\epsilon \sim \mathcal{N}(0, \tau^{-1}I)$,
+$w \mid \tau \sim \mathcal{N}(0, (\alpha\tau)^{-1}I)$, $\tau \sim \mathrm{Gamma}(a_0, b_0)$, with
+$n = 30$, $d = 4$ and two strongly correlated features.
 
-1. Derive the CAVI updates for $q(w)\,q(\tau)$ and implement them.
-2. Compare $\mathbb{E}[\tau]$, the posterior sds of $w$ and the correlation between $w_0$ and $w_1$ with the
-   exact posterior. Here the marginal of $w$ is multivariate t with $2a_n$ degrees of freedom and
-   scale $(b_n/a_n)P^{-1}$, where $P = X^\top X + \alpha I$.
-3. Mean-field broke the correlations in the logistic example. Explain why this factorisation does
-   not, and derive the sd ratio you observe.
+1. Derive and implement CAVI for $q(w)\,q(\tau)$.
+2. Compare $\mathbb{E}[\tau]$, the sds of $w$ and $\mathrm{corr}(w_0, w_1)$ with the exact posterior,
+   whose $w$-marginal is multivariate t with $2a_n$ degrees of freedom and scale $(b_n/a_n)P^{-1}$,
+   $P = X^\top X + \alpha I$.
+3. Mean-field broke the correlations in the logistic example. Explain why this factorisation keeps
+   them, and derive the sd ratio you observe.
 
 <details>
 <summary>Solution</summary>
@@ -829,45 +621,31 @@ $\tau \sim \mathrm{Gamma}(a_0, b_0)$, with $n = 30$, $d = 4$ and two strongly co
 ```python
 rr = np.random.default_rng(12)
 nr, dr, alpha, a0r, b0r = 30, 4, 1.0, 2.0, 2.0
-Xr = rr.normal(size=(nr, dr)); Xr[:, 1] = Xr[:, 0] + 0.3 * rr.normal(size=nr)    # two correlated features
+Xr = rr.normal(size=(nr, dr)); Xr[:, 1] = Xr[:, 0] + 0.3 * rr.normal(size=nr)    # two collinear features
 yr = Xr @ np.array([1.0, -0.5, 0.0, 2.0]) + rr.normal(0, 1.5, nr)
-
-P = Xr.T @ Xr + alpha * np.eye(dr)                 # w | tau ~ N(0, (alpha tau)^-1 I), tau ~ Gamma(a0, b0)
-Pinv = np.linalg.inv(P)
-m_w = Pinv @ Xr.T @ yr                             # same mean under exact and mean-field
-a_q, E_tau = a0r + (nr + dr) / 2, 1.0
+P = Xr.T @ Xr + alpha * np.eye(dr); Pinv = np.linalg.inv(P)
+m_w, a_q, E_tau = Pinv @ Xr.T @ yr, a0r + (nr + dr) / 2, 1.0
 for sweep in range(50):
-    S_w = Pinv / E_tau                                                         # q(w) = N(m_w, S_w)
-    E_quad = np.sum((yr - Xr @ m_w) ** 2) + alpha * m_w @ m_w + np.trace(P @ S_w)
-    b_q = b0r + 0.5 * E_quad                                                   # q(tau) = Gamma(a_q, b_q)
-    E_tau = a_q / b_q
-
-a_n = a0r + nr / 2                                 # exact: w is multivariate t with 2 a_n dof
-b_n = b0r + 0.5 * (yr @ yr - m_w @ P @ m_w)
-sd_exact = np.sqrt(np.diag(Pinv) * b_n / a_n * (2 * a_n) / (2 * a_n - 2))
+    S_w = Pinv / E_tau                                                        # q(w) = N(m_w, S_w)
+    b_q = b0r + 0.5 * (np.sum((yr - Xr @ m_w) ** 2) + alpha * m_w @ m_w + np.trace(P @ S_w))
+    E_tau = a_q / b_q                                                         # q(tau) = Gamma(a_q, b_q)
+a_n, b_n = a0r + nr / 2, b0r + 0.5 * (yr @ yr - m_w @ P @ m_w)                # exact NIG posterior
+sd_exact = np.sqrt(np.diag(Pinv) * b_n / (a_n - 1))                           # multivariate-t sds
+corr = lambda C: C[0, 1] / np.sqrt(C[0, 0] * C[1, 1])
 print(f"E[tau]: exact {a_n / b_n:.4f} | CAVI {E_tau:.4f}")
-print(f"sd(w) exact {np.array2string(sd_exact, precision=4)}")
-print(f"sd(w) CAVI  {np.array2string(np.sqrt(np.diag(S_w)), precision=4)}")
-print(f"ratio       {np.array2string(np.sqrt(np.diag(S_w)) / sd_exact, precision=4)}")
-print(f"corr(w0, w1): exact {Pinv[0, 1] / np.sqrt(Pinv[0, 0] * Pinv[1, 1]):+.4f} | CAVI {S_w[0, 1] / np.sqrt(S_w[0, 0] * S_w[1, 1]):+.4f}")
+print(f"sd(w) exact {np.array2string(sd_exact, precision=4)} | CAVI {np.array2string(np.sqrt(np.diag(S_w)), precision=4)}")
+print(f"ratio {np.array2string(np.sqrt(np.diag(S_w)) / sd_exact, precision=4)}, corr(w0, w1): exact {corr(Pinv):+.4f} | CAVI {corr(S_w):+.4f}")
 ```
 
 ```output
-E[tau]: exact 0.5436 | CAVI 0.5436
-sd(w) exact [0.6767 0.652  0.3391 0.235 ]
-sd(w) CAVI  [0.6565 0.6325 0.3289 0.228 ]
-ratio       [0.9701 0.9701 0.9701 0.9701]
-corr(w0, w1): exact -0.9110 | CAVI -0.9110
 ```
 
-Every coefficient's sd is too small by the same factor, 0.9701, while the correlation $-0.911$
-between the collinear features survives intact. The factorisation separates $w$ from $\tau$, but
-it keeps $w$ as one block, and the update $q(w) = \mathcal{N}(P^{-1}X^\top y,\; P^{-1}/\mathbb{E}[\tau])$ inherits the full
-shape of $P^{-1}$. The only thing lost is the coupling between scale and noise level. The exact
-marginal is a t whose covariance is $P^{-1}\,b_n/(a_n - 1)$. At the fixed point,
-$\mathbb{E}_q[\tau]$ equals the exact $a_n/b_n$: the extra $d/2$ in $a_q$ is cancelled by the
-$\mathrm{tr}(P S_w)/2 = d/(2\mathbb{E}[\tau])$ term in $b_q$. So CAVI's covariance is $P^{-1}\,b_n/a_n$, and the ratio of sds is
-$\sqrt{(a_n - 1)/a_n} = \sqrt{16/17} = 0.9701$: the Gaussian misses the t's heavier tails. The moral
-is to choose the factorisation along the weak dependencies of the posterior and keep the
-strongly coupled parameters in one block.
+Every sd is too small by the same factor, 0.9701, and the $-0.911$ correlation between the collinear
+features survives. The factorisation separates $w$ from $\tau$ but keeps $w$ as one block, so
+$q(w) = \mathcal{N}(P^{-1}X^\top y,\; P^{-1}/\mathbb{E}[\tau])$ inherits the full shape of $P^{-1}$.
+Only the scale-noise coupling is lost. At the fixed point $\mathbb{E}_q[\tau] = a_n/b_n$ exactly: the
+extra $d/2$ in $a_q$ cancels the $\mathrm{tr}(PS_w)/2 = d/(2\mathbb{E}[\tau])$ term in $b_q$. So CAVI's
+covariance is $P^{-1}b_n/a_n$, while the t's is $P^{-1}b_n/(a_n - 1)$, a ratio of
+$\sqrt{(a_n - 1)/a_n} = \sqrt{16/17} = 0.9701$. The lesson: factorise along the posterior's weak
+dependencies and keep strongly coupled parameters in one block.
 </details>
