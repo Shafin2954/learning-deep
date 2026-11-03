@@ -1,0 +1,1022 @@
+---
+course: bayesian-ml
+chapter: 05-gibbs-sampling
+title: "Gibbs Sampling and Data Augmentation"
+order: 5
+---
+
+## Gibbs is Metropolis–Hastings that never rejects
+
+Random-walk Metropolis (ch. 4) proposes blindly and pays for it with rejections. Gibbs sampling
+replaces the blind proposal with a perfect one, one coordinate (or block) at a time. Cycle through
+the variables and draw each one from its **full conditional**, its distribution given every other
+variable and the data:
+
+$$
+x_j^{(t+1)} \sim p\big(x_j \mid x_1^{(t+1)}, \dots, x_{j-1}^{(t+1)}, x_{j+1}^{(t)}, \dots, x_d^{(t)}, y\big)
+$$
+
+You never compute an acceptance probability and never tune a step size. The price is that you must be
+able to *sample* every full conditional, which is where conjugacy (ch. 2) comes back. Even when the
+joint posterior is intractable, each conditional is often a textbook distribution.
+
+### The acceptance ratio is exactly one
+
+Write the update of coordinate $j$ as an MH proposal. It draws $x_j'$ from the full conditional and
+leaves the other coordinates alone: $q(x' \mid x) = p(x_j' \mid x_{-j})$ with $x_{-j}' = x_{-j}$.
+Factor the target as $p(x) = p(x_j \mid x_{-j})\,p(x_{-j})$ and substitute into the Hastings ratio:
+
+$$
+r = \frac{p(x')\,q(x \mid x')}{p(x)\,q(x' \mid x)}
+= \frac{p(x_j' \mid x_{-j})\,p(x_{-j})\;p(x_j \mid x_{-j})}{p(x_j \mid x_{-j})\,p(x_{-j})\;p(x_j' \mid x_{-j})}
+= 1
+$$
+
+Every factor cancels because the proposal *is* the target restricted to one coordinate. Each update
+therefore leaves $p$ invariant (it satisfies detailed balance on its own), and so does any
+composition of updates. The code checks the cancellation on a bivariate Gaussian with correlation
+$\rho = 0.8$, where $x_0 \mid x_1 \sim \mathcal{N}(\rho x_1, 1 - \rho^2)$, and then runs the sampler.
+
+```python
+import numpy as np
+from scipy import stats, special, optimize
+
+def ess(x):
+    """ESS of one chain via FFT autocorrelation, truncated by Geyer's initial positive sequence (ch. 4)."""
+    n = len(x)
+    x = x - x.mean()
+    f = np.fft.rfft(x, 2 * n)
+    acov = np.fft.irfft(f * np.conj(f))[:n] / n
+    rho = acov / acov[0]
+    pairs = rho[:-1:2] + rho[1::2]
+    m = np.argmax(pairs < 0) if (pairs < 0).any() else len(pairs)
+    return n / (-1 + 2 * pairs[:m].sum())
+
+def lag1(x):
+    x = x - x.mean()
+    return np.dot(x[:-1], x[1:]) / np.dot(x, x)
+
+rng = np.random.default_rng(0)
+rho = 0.8
+log_p = lambda x: -0.5 * (x[0] ** 2 - 2 * rho * x[0] * x[1] + x[1] ** 2) / (1 - rho ** 2)
+log_q = lambda x0, x1: stats.norm.logpdf(x0, rho * x1, np.sqrt(1 - rho ** 2))   # p(x0 | x1)
+
+print("MH log acceptance ratio for Gibbs proposals on coordinate 0:")
+for _ in range(4):
+    x = rng.standard_normal(2) * 2
+    prop = np.array([rng.normal(rho * x[1], np.sqrt(1 - rho ** 2)), x[1]])
+    log_r = (log_p(prop) - log_p(x)) + (log_q(x[0], x[1]) - log_q(prop[0], x[1]))
+    print(f"  x = ({x[0]:+.2f}, {x[1]:+.2f}) -> x0' = {prop[0]:+.2f}   log r = {log_r:+.1e}")
+
+T = 20_000
+draws = np.empty((T, 2)); x = np.zeros(2)
+for t in range(T):                                    # systematic scan: x0 | x1, then x1 | x0
+    x[0] = rng.normal(rho * x[1], np.sqrt(1 - rho ** 2))
+    x[1] = rng.normal(rho * x[0], np.sqrt(1 - rho ** 2))
+    draws[t] = x
+print(f"\nGibbs, {T} sweeps: means {draws.mean(0).round(3)}, sds {draws.std(0).round(3)}, "
+      f"corr {np.corrcoef(draws.T)[0, 1]:.3f} (truth 0, 1, {rho})")
+```
+
+```output
+MH log acceptance ratio for Gibbs proposals on coordinate 0:
+  x = (+0.25, -0.26) -> x0' = +0.17   log r = +0.0e+00
+  x = (+0.21, -1.07) -> x0' = -0.64   log r = +6.7e-16
+  x = (+2.61, +1.89) -> x0' = +1.09   log r = +2.2e-16
+  x = (-2.53, -1.25) -> x0' = -0.97   log r = -1.8e-15
+
+Gibbs, 20000 sweeps: means [0.008 0.006], sds [1.003 0.996], corr 0.798 (truth 0, 1, 0.8)
+```
+
+The log ratio is zero to floating-point precision ($10^{-15}$) from every starting point, including
+ones far in the tails. Twenty thousand sweeps recover the means, unit variances and the 0.8
+correlation. Invariance is the easy half, though. As with any MCMC method, it says nothing about how
+*fast* the chain explores, and that question takes up the middle of this chapter.
+
+## Deriving full conditionals: keep the terms that involve the variable
+
+Take the latency model of ch. 1 with a **semi-conjugate** prior: $\mu \sim \mathcal{N}(m_0, s_0^2)$
+and precision $\tau = 1/\sigma^2 \sim \mathrm{Gamma}(a_0, b_0)$, *independent* of each other. This is
+not the Normal-Inverse-Gamma prior of ch. 2, where the prior variance of $\mu$ was $\sigma^2/\kappa_0$.
+With independent priors the joint posterior has no closed form, but each conditional does. The
+recipe is mechanical. Write the joint density
+$p(\mu, \tau, y) = \prod_i \mathcal{N}(y_i \mid \mu, \tau^{-1})\,p(\mu)\,p(\tau)$, keep only the
+factors that involve the variable you are updating, and recognise the kernel.
+
+### The conditional of the mean
+
+As a function of $\mu$, the likelihood and the prior on $\mu$ are the only factors that survive:
+
+$$
+p(\mu \mid \tau, y) \propto \exp\Big(-\frac{\tau}{2}\sum_i (y_i - \mu)^2\Big)\exp\Big(-\frac{(\mu - m_0)^2}{2 s_0^2}\Big)
+\propto \exp\Big(-\frac{1}{2}\big(s_0^{-2} + n\tau\big)\mu^2 + \big(s_0^{-2} m_0 + \tau \textstyle\sum_i y_i\big)\mu\Big)
+$$
+
+A quadratic in $\mu$ inside an exponential is a Gaussian kernel. Completing the square gives
+
+$$
+\mu \mid \tau, y \sim \mathcal{N}\left(\frac{s_0^{-2} m_0 + \tau \sum_i y_i}{s_0^{-2} + n\tau},\; \frac{1}{s_0^{-2} + n\tau}\right)
+$$
+
+Precisions add, and the mean is the precision-weighted average of prior mean and data. This is
+the known-variance update of ch. 2 with $\tau$ held at its current value.
+
+### The conditional of the precision
+
+As a function of $\tau$, the prior on $\mu$ drops out and the likelihood contributes $\tau^{n/2}$:
+
+$$
+p(\tau \mid \mu, y) \propto \tau^{n/2} \exp\Big(-\frac{\tau}{2}\sum_i (y_i - \mu)^2\Big)\,\tau^{a_0 - 1} e^{-b_0 \tau}
+\;\Rightarrow\;
+\tau \mid \mu, y \sim \mathrm{Gamma}\Big(a_0 + \frac{n}{2},\; b_0 + \frac{1}{2}\sum_i (y_i - \mu)^2\Big)
+$$
+
+The sampler alternates these two draws. The reference is a brute-force grid over $(\mu, \sigma)$.
+The Gamma prior on $\tau$ has to be moved to $\sigma$ with the Jacobian $|d\tau/d\sigma| = 2\sigma^{-3}$.
+
+```python
+rng = np.random.default_rng(1)
+y = np.round(rng.normal(212, 18, 15), 1)              # 15 latency measurements (ms)
+n, ybar = len(y), y.mean()
+m0, s0 = 200.0, 50.0                                  # mu  ~ N(200, 50^2)
+a0, b0 = 2.0, 800.0                                   # tau ~ Gamma(2, rate 800): prior sigma around 20
+
+def gibbs_normal(n_iter, rng, tau=1 / 400):
+    out = np.empty((n_iter, 2))
+    for t in range(n_iter):
+        prec = 1 / s0 ** 2 + n * tau
+        mu = rng.normal((m0 / s0 ** 2 + tau * y.sum()) / prec, 1 / np.sqrt(prec))
+        tau = rng.gamma(a0 + n / 2, 1 / (b0 + 0.5 * np.sum((y - mu) ** 2)))
+        out[t] = mu, 1 / np.sqrt(tau)
+    return out
+
+g = gibbs_normal(20_000, rng)[1000:]
+mu_g, sg_g = np.linspace(150, 270, 481), np.linspace(2, 80, 469)    # brute-force reference
+MU, SG = np.meshgrid(mu_g, sg_g, indexing="ij")
+lp = (stats.norm.logpdf(y[:, None, None], MU, SG).sum(0) + stats.norm.logpdf(MU, m0, s0)
+      + stats.gamma.logpdf(1 / SG ** 2, a0, scale=1 / b0) + np.log(2 / SG ** 3))  # Jacobian tau -> sigma
+P = np.exp(lp - lp.max()); P /= P.sum()
+print(f"data: n={n}, mean {ybar:.2f}, sd {y.std(ddof=1):.2f}")
+print(f"{'':16}{'Gibbs':>10}{'grid':>10}")
+for name, a, ref in (("E[mu]", g[:, 0].mean(), np.sum(MU * P)), ("sd[mu]", g[:, 0].std(), np.sqrt(np.sum(MU ** 2 * P) - np.sum(MU * P) ** 2)),
+                     ("E[sigma]", g[:, 1].mean(), np.sum(SG * P)), ("P(mu > 210)", np.mean(g[:, 0] > 210), P[MU > 210].sum())):
+    print(f"{name:16}{a:10.3f}{ref:10.3f}")
+print(f"lag-1 autocorr: mu {lag1(g[:, 0]):.3f}, sigma {lag1(g[:, 1]):.3f} | ESS of mu {ess(g[:, 0]):.0f} of {len(g)}")
+```
+
+```output
+data: n=15, mean 213.72, sd 11.22
+                     Gibbs      grid
+E[mu]              213.605   213.644
+sd[mu]               3.704     3.731
+E[sigma]            14.281    14.271
+P(mu > 210)          0.840     0.835
+lag-1 autocorr: mu -0.000, sigma 0.068 | ESS of mu 19016 of 19000
+```
+
+Gibbs and grid agree to within Monte Carlo error on every summary (213.61 against 213.64 for the
+mean, 0.840 against 0.835 for the tail probability). The chain is close to independent sampling:
+the lag-1 autocorrelation of $\mu$ is zero, and its ESS of 19,016 slightly exceeds the 19,000 draws
+(slightly negative higher-lag autocorrelations allow that). The reason is visible in the
+conditionals. With a weak prior, $\mathbb{E}[\mu \mid \tau, y] \approx \bar{y}$ whatever $\tau$ is,
+so $\mu$ and $\tau$ are nearly independent in the posterior. Gibbs is fast exactly when the
+coordinates it updates are close to independent. Hold on to that sentence, because the next three
+sections are about what happens when they are not.
+
+## Systematic scan versus random scan
+
+The **systematic scan** updates $x_1, x_2, \dots, x_d$ in a fixed order. The **random scan**
+picks a coordinate uniformly at random at each step. Each single-coordinate update is reversible,
+but a fixed-order composition of them is not. Composing $K_1 K_2$ gives a chain whose reverse is
+$K_2 K_1$. The systematic scan still has $p$ as its stationary distribution, because each factor
+preserves it. The random scan *is* reversible, which matters for some theory (spectral gaps, CLT
+proofs) and for a few algorithms that require reversibility. A third option, a fresh random permutation
+per sweep, is also reversible, because every order and its reverse are equally likely. The practical question is which one mixes faster
+per conditional draw.
+
+```python
+def gibbs_bvn(rho, n_upd, rng, scan="systematic"):
+    """Return the state after every single-coordinate update."""
+    s = np.sqrt(1 - rho ** 2)
+    noise = rng.standard_normal(n_upd) * s
+    coord = np.arange(n_upd) % 2 if scan == "systematic" else rng.integers(0, 2, n_upd)
+    x0, x1, out = 0.0, 0.0, np.empty((n_upd, 2))
+    for t in range(n_upd):
+        if coord[t] == 0:
+            x0 = rho * x1 + noise[t]
+        else:
+            x1 = rho * x0 + noise[t]
+        out[t] = x0, x1
+    return out
+
+rng = np.random.default_rng(2)
+print(f"{'rho':>5} {'systematic ESS/update':>22} {'random ESS/update':>18}")
+for r in (0.5, 0.9, 0.99):
+    res = []
+    for scan in ("systematic", "random"):
+        out = gibbs_bvn(r, 200_000, rng, scan)
+        res.append(ess(out[:, 0]) / len(out))
+    print(f"{r:>5} {res[0]:>22.4f} {res[1]:>18.4f}")
+```
+
+```output
+  rho  systematic ESS/update  random ESS/update
+  0.5                 0.2935             0.1768
+  0.9                 0.0556             0.0284
+ 0.99                 0.0050             0.0028
+```
+
+Per conditional draw, the systematic scan is roughly twice as efficient at every correlation
+(0.0556 against 0.0284 at $\rho = 0.9$). The random scan wastes moves. About half the time it
+updates the same coordinate twice in a row, and the second draw of $x_0$ given an unchanged $x_1$
+is a fresh conditional draw that tells you nothing new about the $x_1$ direction. Use the
+systematic scan by default and reach for random scan only when a proof or an algorithm needs
+reversibility. Neither scan fixes the collapse you can see in both columns as $\rho$ grows.
+
+## The correlated-Gaussian failure mode
+
+Gibbs moves only along coordinate axes. When the posterior is a narrow ridge at an angle to the
+axes, every conditional is narrow even though the ridge is long. The chain then moves along it in
+tiny staircase steps. This is the same geometry that hurts isotropic random-walk Metropolis (ch. 4),
+except that Gibbs has no step size you can tune to escape it.
+
+### Why the lag-1 autocorrelation is $\rho^2$
+
+For the standard bivariate Gaussian with correlation $\rho$, each conditional is
+$x_1 \mid x_2 \sim \mathcal{N}(\rho x_2, 1 - \rho^2)$, and symmetrically for $x_2 \mid x_1$. Follow
+$x_2$ through one systematic sweep, with independent noises $e_1, e_2 \sim \mathcal{N}(0, 1-\rho^2)$:
+
+$$
+x_1^{(t+1)} = \rho\, x_2^{(t)} + e_1, \qquad
+x_2^{(t+1)} = \rho\, x_1^{(t+1)} + e_2 = \rho^2 x_2^{(t)} + \rho e_1 + e_2
+$$
+
+The sweep-to-sweep chain is an AR(1) process with coefficient $\phi = \rho^2$, so its autocorrelation
+at lag $k$ is $\rho^{2k}$. Using the AR(1) result from ch. 4,
+
+$$
+\frac{\mathrm{ESS}}{n} = \frac{1 - \phi}{1 + \phi} = \frac{1 - \rho^2}{1 + \rho^2}
+\;\approx\; 1 - \rho \quad\text{as } \rho \to 1
+$$
+
+At $\rho = 0.99$ about 1 sweep in 100 counts. The integrated autocorrelation time
+$\tau_{\text{int}} = (1+\rho^2)/(1-\rho^2)$ grows like $1/(1-\rho)$, which is proportional to the
+squared ratio of the ridge's length to its width.
+
+```python
+rng = np.random.default_rng(3)
+print(f"{'rho':>6} {'lag-1 autocorr':>15} {'rho^2':>7} {'ESS/sweep':>10} {'(1-rho^2)/(1+rho^2)':>20}")
+for r in (0.0, 0.5, 0.9, 0.99, 0.999):
+    sw = gibbs_bvn(r, 400_000, rng)[1::2]                  # state after each full sweep
+    print(f"{r:>6} {lag1(sw[:, 0]):>15.4f} {r ** 2:>7.4f} {ess(sw[:, 0]) / len(sw):>10.4f} "
+          f"{(1 - r ** 2) / (1 + r ** 2):>20.4f}")
+```
+
+```output
+   rho  lag-1 autocorr   rho^2  ESS/sweep  (1-rho^2)/(1+rho^2)
+   0.0         -0.0022  0.0000     1.0044               1.0000
+   0.5          0.2482  0.2500     0.6057               0.6000
+   0.9          0.8121  0.8100     0.1025               0.1050
+  0.99          0.9797  0.9801     0.0104               0.0100
+ 0.999          0.9979  0.9980     0.0013               0.0010
+```
+
+The measured lag-1 autocorrelation tracks $\rho^2$ to three decimals, and ESS per sweep tracks
+$(1-\rho^2)/(1+\rho^2)$ down to 0.0013 at $\rho = 0.999$ (against a theoretical 0.0010, which is
+within the estimator's noise at that level of dependence). A posterior correlation of 0.999 is not
+exotic. Regression coefficients with uncentred predictors, the intercept and slope of a long time
+series, and a hierarchical mean and its group effects (ch. 10) all produce correlations like this.
+A Gibbs sampler on such a model needs a thousand sweeps per effective draw, and nothing in the
+trace will look broken. It will just look slow.
+
+## Blocking: update correlated variables together
+
+If two variables are strongly correlated, update them *together*: draw $(x_0, x_1)$ jointly from
+$p(x_0, x_1 \mid x_2)$. The conditional of any block of a Gaussian is Gaussian, and it is simplest
+in precision form. With $Q = \Sigma^{-1}$,
+
+$$
+x_A \mid x_B \sim \mathcal{N}\big(-Q_{AA}^{-1} Q_{AB}\, x_B,\; Q_{AA}^{-1}\big)
+$$
+
+Below, $x_0$ and $x_1$ have correlation 0.99 and each has correlation 0.5 with $x_2$. The
+single-site sampler updates three scalars per sweep. The blocked sampler draws the pair jointly,
+then $x_2$.
+
+```python
+Sigma = np.array([[1.0, 0.99, 0.5], [0.99, 1.0, 0.5], [0.5, 0.5, 1.0]])
+Q = np.linalg.inv(Sigma)                                   # precision: conditionals are easy in Q
+
+def cond_draw(x, A, rng):
+    """Draw x_A | x_rest for a zero-mean Gaussian with precision Q: N(-Q_AA^-1 Q_AB x_B, Q_AA^-1)."""
+    B = [j for j in range(3) if j not in A]
+    QAA_inv = np.linalg.inv(Q[np.ix_(A, A)])
+    mean = -QAA_inv @ Q[np.ix_(A, B)] @ x[B]
+    x[A] = mean + np.linalg.cholesky(QAA_inv) @ rng.standard_normal(len(A))
+
+rng = np.random.default_rng(4)
+for name, blocks in (("single-site {0},{1},{2}", [[0], [1], [2]]), ("blocked {0,1},{2}", [[0, 1], [2]])):
+    x, out = np.zeros(3), np.empty((20_000, 3))
+    for t in range(len(out)):
+        for A in blocks:
+            cond_draw(x, A, rng)
+        out[t] = x
+    print(f"{name:24} ESS/sweep " + "  ".join(f"x{j} {ess(out[:, j]) / len(out):.3f}" for j in range(3))
+          + f" | sd x0 {out[:, 0].std():.3f}")
+```
+
+```output
+single-site {0},{1},{2}  ESS/sweep x0 0.010  x1 0.010  x2 0.040 | sd x0 1.000
+blocked {0,1},{2}        ESS/sweep x0 0.613  x1 0.611  x2 0.607 | sd x0 0.997
+```
+
+Blocking the correlated pair raises ESS per sweep from 0.010 to 0.61, a 60-fold gain for one
+$2 \times 2$ Cholesky factor per sweep. It also fixes $x_2$, whose ESS went from 0.040 to 0.607 even
+though $x_2$ was never strongly correlated with anything. A slow coordinate drags everything that
+conditions on it. The general rule is to block what is correlated, provided the block's conditional
+is still something you can sample. The other two remedies are reparameterisation (centre the
+predictors, or rotate to decorrelate) and switching to a gradient-based sampler that moves along the
+ridge (ch. 6).
+
+## Data augmentation: a Gaussian mixture with latent assignments
+
+Many models become conditionally conjugate once you add variables that were never observed.
+That is **data augmentation** (Tanner and Wong, 1987). A Gaussian mixture,
+$p(y_i) = \sum_k \pi_k \mathcal{N}(y_i \mid \mu_k, \tau_k^{-1})$, has a likelihood that is a product of
+sums, and none of its parameters has a standard conditional. Introduce the component label
+$z_i \in \{1, \dots, K\}$ of each observation, with $p(z_i = k) = \pi_k$ and
+$y_i \mid z_i = k \sim \mathcal{N}(\mu_k, \tau_k^{-1})$. Summing $z_i$ out recovers the mixture, so
+sampling $(z, \pi, \mu, \tau)$ jointly and discarding $z$ gives exactly the right posterior. Given
+$z$, the mixture breaks into $K$ separate Normal models.
+
+### The four conditionals
+
+With priors $\pi \sim \mathrm{Dir}(\alpha, \dots, \alpha)$, $\mu_k \sim \mathcal{N}(0, s_\mu^2)$ and
+$\tau_k \sim \mathrm{Gamma}(a, b)$, write $n_k = \#\{i : z_i = k\}$ and $S_k = \sum_{i: z_i = k} y_i$.
+Applying "keep the terms that involve the variable" to each block in turn:
+
+$$
+\begin{aligned}
+p(z_i = k \mid \pi, \mu, \tau, y) &\propto \pi_k\, \mathcal{N}(y_i \mid \mu_k, \tau_k^{-1}) \\
+\pi \mid z &\sim \mathrm{Dir}(\alpha + n_1, \dots, \alpha + n_K) \\
+\mu_k \mid z, \tau, y &\sim \mathcal{N}\left(\frac{\tau_k S_k}{s_\mu^{-2} + n_k \tau_k},\; \frac{1}{s_\mu^{-2} + n_k \tau_k}\right) \\
+\tau_k \mid z, \mu, y &\sim \mathrm{Gamma}\Big(a + \frac{n_k}{2},\; b + \frac{1}{2}\sum_{i: z_i = k}(y_i - \mu_k)^2\Big)
+\end{aligned}
+$$
+
+The $z_i$ are conditionally independent given the parameters, so all $n$ labels are drawn in one
+vectorised step. The $\mu_k$ and $\tau_k$ updates are the semi-conjugate Normal updates from above,
+one per component, and the Dirichlet update is ch. 2's Dirichlet-Multinomial. The data are 500
+points from three components. Four chains start from different random initialisations.
+
+```python
+rng = np.random.default_rng(5)
+true_w, true_mu, true_sd = np.array([0.3, 0.5, 0.2]), np.array([-4.0, 0.5, 5.0]), np.array([1.0, 1.5, 0.8])
+N, K = 500, 3
+z_true = rng.choice(K, N, p=true_w)
+y_mix = rng.normal(true_mu[z_true], true_sd[z_true])
+alpha, mu_prior_sd, a_t, b_t = 1.0, 10.0, 2.0, 2.0         # pi ~ Dir(1), mu_k ~ N(0, 10^2), tau_k ~ Gamma(2, 2)
+
+def gmm_gibbs(y, K, n_iter, rng):
+    n = len(y)
+    mu = rng.choice(y, K, replace=False); tau = np.ones(K); w = np.ones(K) / K
+    out = {"mu": np.empty((n_iter, K)), "sd": np.empty((n_iter, K)), "w": np.empty((n_iter, K)), "nk": np.empty((n_iter, K))}
+    for t in range(n_iter):
+        logp = np.log(w) + 0.5 * np.log(tau) - 0.5 * tau * (y[:, None] - mu) ** 2      # n x K
+        p = np.exp(logp - logp.max(1, keepdims=True)); p /= p.sum(1, keepdims=True)
+        z = (rng.random(n)[:, None] > np.cumsum(p, 1)).sum(1)                         # z_i | rest
+        nk = np.bincount(z, minlength=K)
+        w = rng.dirichlet(alpha + nk)                                                 # pi | z
+        sk = np.bincount(z, weights=y, minlength=K)
+        prec = 1 / mu_prior_sd ** 2 + nk * tau
+        mu = rng.normal(tau * sk / prec, 1 / np.sqrt(prec))                           # mu_k | z, tau
+        ssk = np.bincount(z, weights=(y - mu[z]) ** 2, minlength=K)
+        tau = rng.gamma(a_t + nk / 2, 1 / (b_t + ssk / 2))                            # tau_k | z, mu
+        for key, v in (("mu", mu), ("sd", 1 / np.sqrt(tau)), ("w", w), ("nk", nk)):
+            out[key][t] = v
+    return out
+
+chains = [gmm_gibbs(y_mix, K, 2000, np.random.default_rng(100 + c)) for c in range(4)]
+for c, ch in enumerate(chains):
+    m = {k: v[500:].mean(0) for k, v in ch.items()}
+    print(f"chain {c}: mu {np.round(m['mu'], 2)}  sd {np.round(m['sd'], 2)}  w {np.round(m['w'], 3)}")
+print(f"truth  : mu {true_mu}  sd {true_sd}  w {true_w}")
+```
+
+```output
+chain 0: mu [ 0.48  5.18 -3.93]  sd [1.63 0.9  1.04]  w [0.497 0.189 0.315]
+chain 1: mu [-3.91  5.16  0.51]  sd [1.06 0.91 1.57]  w [0.321 0.191 0.488]
+chain 2: mu [ 5.17  0.49 -3.92]  sd [0.91 1.62 1.05]  w [0.189 0.494 0.317]
+chain 3: mu [ 0.49 -3.93  5.17]  sd [1.63 1.05 0.9 ]  w [0.497 0.314 0.188]
+truth  : mu [-4.   0.5  5. ]  sd [1.  1.5 0.8]  w [0.3 0.5 0.2]
+```
+
+Each chain recovers the truth, up to estimation error (means near $-3.9$, $0.5$ and $5.2$, weights
+near 0.32, 0.49 and 0.19). But each chain reports the components in a different order. Chain 0 calls
+the left component "3", chain 1 calls it "1". Nothing is wrong with the samplers. The likelihood and
+the exchangeable prior are invariant under permuting the labels, so the posterior has $K! = 6$
+identical modes. Each chain found one of them and, with these well-separated components, never left.
+
+## Label switching, shown and handled
+
+This is **label switching**. Any summary that is not permutation invariant is meaningless on raw
+draws: "the posterior mean of $\mu_1$" averages different components across chains. Permutation-
+invariant quantities, such as the predictive density, the number of occupied components, or
+whether $y_i$ and $y_j$ share a component, are fine as they are. For component-level summaries you
+must pick one labelling per draw. The simplest choice is an **ordering constraint**: relabel every
+draw so that $\mu_1 < \mu_2 < \mu_3$ and carry the weights and sds along with the means.
+
+```python
+mu_all = np.stack([ch["mu"][500:] for ch in chains])        # (chains, draws, K)
+sd_all = np.stack([ch["sd"][500:] for ch in chains])
+w_all = np.stack([ch["w"][500:] for ch in chains])
+
+def rhat(x):                                                # basic split-free R-hat over chains, per column
+    m, n = x.shape[:2]
+    B = n * x.mean(1).var(0, ddof=1); W = x.var(1, ddof=1).mean(0)
+    return np.sqrt(((n - 1) / n * W + B / n) / W)
+
+print("raw labels     : pooled mu", np.round(mu_all.mean((0, 1)), 2), "| R-hat", np.round(rhat(mu_all), 2))
+perm = np.argsort(mu_all, axis=2)                          # identifiability constraint mu_1 < mu_2 < mu_3
+take = lambda a: np.take_along_axis(a, perm, axis=2)
+mu_s, sd_s, w_s = take(mu_all), take(sd_all), take(w_all)
+print("ordered mu     : pooled mu", np.round(mu_s.mean((0, 1)), 2), "| R-hat", np.round(rhat(mu_s), 3))
+print("               : pooled sd", np.round(sd_s.mean((0, 1)), 2), "| pooled w", np.round(w_s.mean((0, 1)), 3))
+```
+
+```output
+raw labels     : pooled mu [ 0.56  1.72 -0.54] | R-hat [25.07 29.43 30.62]
+ordered mu     : pooled mu [-3.92  0.49  5.17] | R-hat [1.002 1.002 1.001]
+               : pooled sd [1.05 1.61 0.9 ] | pooled w [0.317 0.494 0.189]
+```
+
+The raw pooled means are mixtures of the three components, roughly $(0.56, 1.72, -0.54)$, and R-hat
+(ch. 7) is 25 to 31, which is about as alarming as a convergence diagnostic gets. After sorting by
+$\mu$, the pooled estimates recover the components and R-hat drops to 1.002. The chains had agreed
+all along about everything except the names.
+
+### Switching inside one chain
+
+With well-separated components the chain stays in one labelling, which hides the problem inside a
+single run. When components overlap, the sampler moves between the symmetric modes on its own.
+Here are two components with means $\pm 0.6$ and unit sd, 30 points each, which is barely
+distinguishable from one Gaussian.
+
+```python
+rng = np.random.default_rng(6)
+y_ov = np.r_[rng.normal(-0.6, 1, 30), rng.normal(0.6, 1, 30)]   # two heavily overlapping components
+ch_ov = gmm_gibbs(y_ov, 2, 20_000, rng)
+mu1 = ch_ov["mu"][:, 0]
+switches = np.sum(np.diff(np.sign(ch_ov["mu"][:, 0] - ch_ov["mu"][:, 1])) != 0)
+print(f"sign changes of mu_1 - mu_2 in one chain: {switches}")
+print(f"P(mu_1 < mu_2) within the chain: {np.mean(mu1 < ch_ov['mu'][:, 1]):.3f}")
+print(f"raw mu_1: mean {mu1.mean():+.3f}, quartiles {np.round(np.quantile(mu1, [.25, .5, .75]), 2)}")
+mu_o = np.sort(ch_ov["mu"], 1)
+print(f"ordered : mu_(1) mean {mu_o[:, 0].mean():+.3f} | mu_(2) mean {mu_o[:, 1].mean():+.3f}")
+```
+
+```output
+sign changes of mu_1 - mu_2 in one chain: 2405
+P(mu_1 < mu_2) within the chain: 0.498
+raw mu_1: mean -0.153, quartiles [-0.63  0.13  0.45]
+ordered : mu_(1) mean -1.152 | mu_(2) mean +0.852
+```
+
+The labels swapped 2,405 times in 20,000 iterations, and $P(\mu_1 < \mu_2) = 0.498$. That is a
+chain that mixes well *across* the symmetric modes, so the raw $\mu_1$ is a symmetric blend of both
+components with mean near zero. Ordering gives $-1.15$ and $+0.85$. The constraint is not innocent
+here, though. When the components overlap this much, sorting picks the order statistics of an
+exchangeable pair, and that pushes the two estimates apart, here further apart than the truth
+($\pm 0.6$). Ordering on $\mu$ is also wrong when components share a mean but differ in variance.
+The more robust fix is **relabeling by matching** (Stephens, 2000). Choose a reference labelling,
+then permute each draw to minimise its distance to the reference, for example with
+`scipy.optimize.linear_sum_assignment` on the component parameters, and iterate. In practice, when
+labels keep switching, ask whether $K$ is too large for the data before asking how to relabel.
+
+## Albert–Chib: probit regression by data augmentation
+
+Probit regression, $P(y_i = 1) = \Phi(x_i^\top \beta)$, has no conjugate prior. Albert and Chib
+(1993) noticed that it is a thresholded linear model. Introduce a latent utility
+$z_i = x_i^\top\beta + \varepsilon_i$ with $\varepsilon_i \sim \mathcal{N}(0, 1)$, and set
+$y_i = \mathbb{1}[z_i > 0]$. Then $P(y_i = 1 \mid \beta) = P(\varepsilon_i > -x_i^\top\beta) = \Phi(x_i^\top\beta)$,
+which is the probit likelihood. Given $z$, the problem is Bayesian linear regression with known noise
+variance 1 (ch. 2).
+
+### The conditionals
+
+With prior $\beta \sim \mathcal{N}(0, B_0)$, the joint is
+$p(\beta)\prod_i \mathcal{N}(z_i \mid x_i^\top\beta, 1)\,\mathbb{1}[y_i = \mathbb{1}(z_i > 0)]$.
+Keeping the terms that involve each block gives
+
+$$
+z_i \mid \beta, y_i \sim
+\begin{cases}
+\mathcal{N}(x_i^\top \beta, 1) \text{ truncated to } (0, \infty) & y_i = 1 \\
+\mathcal{N}(x_i^\top \beta, 1) \text{ truncated to } (-\infty, 0] & y_i = 0
+\end{cases}
+\qquad
+\beta \mid z \sim \mathcal{N}\big(V X^\top z,\; V\big), \quad V = (B_0^{-1} + X^\top X)^{-1}
+$$
+
+The $z_i$ are independent given $\beta$, so they are drawn as one vector. $V$ does not depend on $z$,
+so it is factored once outside the loop. The check uses two independent references. One is the
+posterior mode found by BFGS, and the other is a 100,000-step random-walk MH run preconditioned with
+the inverse Hessian (ch. 4).
+
+```python
+rng = np.random.default_rng(7)
+n_p = 400
+X = np.column_stack([np.ones(n_p), rng.standard_normal((n_p, 2))])
+beta_true = np.array([-0.3, 1.0, -0.7])
+y_p = (X @ beta_true + rng.standard_normal(n_p) > 0).astype(int)
+B0_inv = np.eye(3) / 10 ** 2                                # beta ~ N(0, 10^2 I)
+V = np.linalg.inv(B0_inv + X.T @ X); L_V = np.linalg.cholesky(V)    # fixed: compute once
+
+def albert_chib(X, y, n_iter, rng):
+    beta, out = np.zeros(X.shape[1]), np.empty((n_iter, X.shape[1]))
+    lo_inf, hi_inf = np.where(y == 1, 0.0, -np.inf), np.where(y == 1, np.inf, 0.0)
+    for t in range(n_iter):
+        eta = X @ beta
+        z = stats.truncnorm.rvs(lo_inf - eta, hi_inf - eta, loc=eta, random_state=rng)   # z_i | beta, y_i
+        beta = V @ (X.T @ z) + L_V @ rng.standard_normal(X.shape[1])                    # beta | z
+        out[t] = beta
+    return out
+
+ac = albert_chib(X, y_p, 6000, rng)[1000:]
+
+def log_post_probit(b):
+    eta = X @ b
+    return np.sum(np.where(y_p == 1, stats.norm.logcdf(eta), stats.norm.logcdf(-eta))) - 0.5 * b @ B0_inv @ b
+
+mle = optimize.minimize(lambda b: -log_post_probit(b), np.zeros(3), method="BFGS")
+Lc = np.linalg.cholesky(mle.hess_inv) * 2.38 / np.sqrt(3)
+b, lp, mh, acc = mle.x.copy(), -mle.fun, np.empty((100_000, 3)), 0
+for t in range(len(mh)):                                    # long reference random-walk MH (ch. 4)
+    prop = b + Lc @ rng.standard_normal(3)
+    lp_new = log_post_probit(prop)
+    if np.log(rng.random()) < lp_new - lp:
+        b, lp, acc = prop, lp_new, acc + 1
+    mh[t] = b
+mh = mh[5000:]
+print(f"{'':>6}{'truth':>8}{'MAP':>8}{'AC mean':>9}{'MH mean':>9}{'AC sd':>8}{'MH sd':>8}{'AC ESS/it':>10}{'MH ESS/it':>10}")
+for j in range(3):
+    print(f"beta{j:<2}{beta_true[j]:8.2f}{mle.x[j]:8.3f}{ac[:, j].mean():9.3f}{mh[:, j].mean():9.3f}"
+          f"{ac[:, j].std():8.3f}{mh[:, j].std():8.3f}{ess(ac[:, j]) / len(ac):10.3f}{ess(mh[:, j]) / len(mh):10.3f}")
+print(f"MH acceptance {acc / 100_000:.3f}")
+```
+
+```output
+         truth     MAP  AC mean  MH mean   AC sd   MH sd AC ESS/it MH ESS/it
+beta0    -0.30  -0.380   -0.385   -0.383   0.077   0.076     0.256     0.099
+beta1     1.00   0.849    0.858    0.855   0.095   0.096     0.171     0.101
+beta2    -0.70  -0.630   -0.638   -0.635   0.085   0.085     0.186     0.097
+MH acceptance 0.328
+```
+
+The Albert–Chib means match the long MH run to within 0.003 on every coefficient, and the sds agree
+to 0.001. The posterior means sit slightly beyond the MAP (for example $-0.385$ against $-0.380$),
+which is the small skew of the probit posterior and not an error. The Gibbs sampler also does
+better per iteration than a well-tuned random walk: ESS per iteration of 0.17 to 0.26 against about
+0.10, with no tuning at all. Each iteration costs one vector of truncated-normal draws and one
+$3 \times 3$ matrix-vector product. The same construction gives logistic regression through
+Pólya-Gamma latents (Polson, Scott and Windle, 2013) and Student-t errors through Gamma scale
+latents, which is this chapter's exercise. The section on when Gibbs is the wrong tool shows the
+case where Albert–Chib breaks down.
+
+## Rao-Blackwellization: average the conditional, not the draw
+
+A Gibbs sampler hands you more than draws. At every step it also has the full conditional, which
+is a known distribution with known moments. To estimate $\mathbb{E}[h(\mu) \mid y]$, you can
+average $\mathbb{E}[h(\mu) \mid \tau^{(t)}, y]$ instead of $h(\mu^{(t)})$. Both estimators converge
+to the same value, because $\mathbb{E}\big[\mathbb{E}[h(\mu) \mid \tau, y]\big] = \mathbb{E}[h(\mu) \mid y]$,
+but the second has the draw-level noise of $\mu$ integrated out analytically. This is
+**Rao-Blackwellization** (Gelfand and Smith, 1990).
+
+### Why it cannot be worse for independent draws
+
+For independent draws the law of total variance settles it:
+
+$$
+\mathrm{Var}\big(h(\mu)\big) = \underbrace{\mathrm{Var}\big(\mathbb{E}[h(\mu) \mid \tau]\big)}_{\text{RB estimator's per-draw variance}}
++ \underbrace{\mathbb{E}\big[\mathrm{Var}(h(\mu) \mid \tau)\big]}_{\ge 0}
+\;\ge\; \mathrm{Var}\big(\mathbb{E}[h(\mu) \mid \tau]\big)
+$$
+
+For a Markov chain the variance of an average also depends on autocorrelation, so the inequality
+needs more work. Liu, Wong and Kong (1994) prove it for the two-block Gibbs sampler, which is
+exactly the data-augmentation setting. To measure the effect, the code runs 2,000 independent short
+chains of the Normal model in parallel. Each estimand is computed both ways, and the code compares
+the spread of each estimator across chains.
+
+```python
+R, n_it = 2000, 400                                         # 2000 independent short chains, vectorised
+rng = np.random.default_rng(8)
+tau = rng.gamma(a0, 1 / b0, R)
+mu_draws, rb_mean, ind, rb_tail = (np.empty((n_it, R)) for _ in range(4))
+for t in range(n_it):
+    prec = 1 / s0 ** 2 + n * tau
+    m_c, s_c = (m0 / s0 ** 2 + tau * y.sum()) / prec, 1 / np.sqrt(prec)
+    mu = rng.normal(m_c, s_c)
+    tau = rng.gamma(a0 + n / 2, 1 / (b0 + 0.5 * np.sum((y[:, None] - mu) ** 2, 0)))
+    mu_draws[t], rb_mean[t] = mu, m_c                       # rb: E[mu | tau, y] before drawing mu
+    ind[t], rb_tail[t] = mu > 225, stats.norm.sf(225, m_c, s_c)
+burn = 100
+ref_tail = P[MU > 225].sum()
+print(f"{'estimand':14}{'grid':>9}{'plain mean':>12}{'RB mean':>10}{'plain sd':>10}{'RB sd':>9}{'var ratio':>10}")
+for name, a, b_, ref in (("E[mu]", mu_draws, rb_mean, np.sum(MU * P)), ("P(mu > 225)", ind, rb_tail, ref_tail)):
+    ea, eb = a[burn:].mean(0), b_[burn:].mean(0)
+    print(f"{name:14}{ref:9.4f}{ea.mean():12.4f}{eb.mean():10.4f}{ea.std():10.4f}{eb.std():9.4f}{ea.var() / eb.var():10.1f}")
+```
+
+```output
+estimand           grid  plain mean   RB mean  plain sd    RB sd var ratio
+E[mu]          213.6436    213.6421  213.6436    0.2163   0.0018   15197.2
+P(mu > 225)      0.0021      0.0023    0.0023    0.0028   0.0003     118.5
+```
+
+Both estimators are unbiased (213.642 and 213.644 against a grid value of 213.644). The spread
+across chains is very different. For $\mathbb{E}[\mu]$ the variance ratio is about 15,000. That
+number is extreme because with a weak prior the conditional mean barely moves with $\tau$, so the
+RB estimator is nearly a constant. The tail probability $P(\mu > 225)$ is the more typical case. The
+plain estimator counts the few draws beyond 225, while the RB estimator averages smooth normal tail
+areas, and the variance drops 118-fold. Rao-Blackwellization helps most for tail probabilities,
+densities and other rare-event summaries, and it costs nothing, since the conditional moments are
+computed anyway.
+
+## Collapsed Gibbs: integrate a parameter out before sampling
+
+Rao-Blackwellization integrates a variable out *after* sampling. **Collapsing** integrates it out
+*before*. You analytically marginalise a parameter and run Gibbs on what remains. In the mixture,
+$\pi$ can be integrated out against its Dirichlet prior. This is the move behind the classic collapsed
+sampler for LDA topic models and for Dirichlet-process mixtures.
+
+### The collapsed assignment conditional
+
+Integrating $\pi$ out of $\prod_i \pi_{z_i}\,\mathrm{Dir}(\pi \mid \alpha)$ gives the
+Dirichlet-Multinomial,
+$p(z) = \frac{\Gamma(K\alpha)}{\Gamma(n + K\alpha)}\prod_k \frac{\Gamma(n_k + \alpha)}{\Gamma(\alpha)}$.
+The ratio of this at $z_i = k$ to its sum over $k$, holding the other labels fixed, uses
+$\Gamma(m+1) = m\,\Gamma(m)$:
+
+$$
+p(z_i = k \mid z_{-i}, \mu, \tau, y) \propto \big(n_{-i,k} + \alpha\big)\, \mathcal{N}(y_i \mid \mu_k, \tau_k^{-1})
+$$
+
+where $n_{-i,k}$ counts the *other* observations in component $k$. The labels are no longer
+conditionally independent, because each one depends on the others' counts. They must be updated one
+at a time, which is a Python loop over observations here. Liu, Wong and Kong (1994) show that, in the
+schemes they analyse, collapsing cannot make the chain mix worse, but it can make each sweep
+slower. Whether it actually mixes *better* depends on whether the integrated variable was coupled to
+the slow direction. The code runs both samplers on the first 150 points of the mixture data and
+reports the RB estimate of the weights, $\mathbb{E}[\pi_k \mid z] = (\alpha + n_k)/(K\alpha + n)$,
+along with the ESS of the cluster sizes.
+
+```python
+def gmm_collapsed(y, K, n_sweeps, rng):
+    """pi integrated out; z updated one observation at a time. mu, tau as before."""
+    n = len(y)
+    z = rng.integers(0, K, n); mu = rng.choice(y, K, replace=False); tau = np.ones(K)
+    nk = np.bincount(z, minlength=K).astype(float)
+    out_nk, out_mu = np.empty((n_sweeps, K)), np.empty((n_sweeps, K))
+    for t in range(n_sweeps):
+        loglik = 0.5 * np.log(tau) - 0.5 * tau * (y[:, None] - mu) ** 2   # fixed during the z sweep
+        u = rng.random(n)
+        for i in range(n):
+            nk[z[i]] -= 1
+            p = (nk + alpha) * np.exp(loglik[i] - loglik[i].max())
+            z[i] = np.searchsorted(np.cumsum(p), u[i] * p.sum())
+            nk[z[i]] += 1
+        sk = np.bincount(z, weights=y, minlength=K)
+        prec = 1 / mu_prior_sd ** 2 + nk * tau
+        mu = rng.normal(tau * sk / prec, 1 / np.sqrt(prec))
+        tau = rng.gamma(a_t + nk / 2, 1 / (b_t + np.bincount(z, weights=(y - mu[z]) ** 2, minlength=K) / 2))
+        out_nk[t], out_mu[t] = nk, mu
+    return out_nk, out_mu
+
+rng = np.random.default_rng(9)
+y_small = y_mix[:150]
+col_nk, col_mu = gmm_collapsed(y_small, K, 1200, rng)
+unc = gmm_gibbs(y_small, K, 1200, rng)
+for name, nk_, mu_ in (("uncollapsed", unc["nk"], unc["mu"]), ("collapsed", col_nk, col_mu)):
+    o = np.argsort(mu_[200:], 1)
+    nk_s = np.take_along_axis(nk_[200:], o, 1)
+    w_rb = ((alpha + nk_s) / (K * alpha + len(y_small))).mean(0)       # E[pi_k | z], averaged over sweeps
+    print(f"{name:12} RB E[w] {np.round(w_rb, 3)} | ESS/sweep of n_k "
+          f"{np.round([ess(nk_s[:, k]) / len(nk_s) for k in range(K)], 3)}")
+```
+
+```output
+uncollapsed  RB E[w] [0.255 0.535 0.21 ] | ESS/sweep of n_k [0.038 0.027 0.034]
+collapsed    RB E[w] [0.283 0.485 0.231] | ESS/sweep of n_k [0.04  0.027 0.029]
+```
+
+The honest result is that collapsing $\pi$ buys nothing here. ESS per sweep of the cluster sizes is
+about 0.03 for both samplers. The two weight estimates differ by up to 0.05, which is within Monte
+Carlo error at an ESS of roughly 30 per component. The bottleneck is not $\pi$. It is the coupling
+between the labels of borderline points and the means of the two overlapping components ($-4$ and
+$0.5$ with sds 1 and 1.5). When a few points move from component 1 to 2, $\mu_1$ and $\mu_2$ shift,
+and that shift makes the move persist. Collapsing pays off when you integrate out the variable on
+the slow path. In LDA, that is the topic-word and document-topic proportions, whose dimension is
+enormous. Here the variables on the slow path are $\mu$ and $\tau$. Collapsing them requires a
+Normal-Gamma prior per component (ch. 2), and that is the version used in production
+Dirichlet-process samplers.
+
+## A change-point model: discrete and continuous unknowns together
+
+Gibbs does not care whether a variable is discrete or continuous. It needs only a conditional it
+can sample, and a discrete conditional on a finite set can always be sampled exactly by evaluating
+it everywhere and normalising. The classic example is the British coal-mining disaster series, with
+yearly counts from 1851 to 1962 whose rate appears to drop at some unknown year. The data here
+are synthetic with the same shape: 112 years, rate 3.1 for the first 40 years and 0.9 after.
+
+### Conditionals
+
+Let $k$ be the number of years in the first regime, with $y_t \sim \mathrm{Poisson}(\lambda_1)$
+for $t \le k$ and $\mathrm{Poisson}(\lambda_2)$ after. Use $\lambda_j \sim \mathrm{Gamma}(a, b)$ and
+$k$ uniform on $\{1, \dots, T-1\}$. Let $S_k = \sum_{t \le k} y_t$. Keeping the terms in each unknown
+gives
+
+$$
+\lambda_1 \mid k, y \sim \mathrm{Gamma}(a + S_k,\; b + k), \qquad
+\lambda_2 \mid k, y \sim \mathrm{Gamma}(a + S_T - S_k,\; b + T - k)
+$$
+
+$$
+\log p(k \mid \lambda_1, \lambda_2, y) = S_k \log\lambda_1 - k\lambda_1 + (S_T - S_k)\log\lambda_2 - (T - k)\lambda_2 + \text{const}
+$$
+
+With cumulative sums, the $k$ conditional costs $O(T)$ per iteration for all $T - 1$ values at once.
+Because the model is small, you can also collapse both rates out exactly with the Gamma-Poisson
+marginal of ch. 2,
+$p(k \mid y) \propto \frac{\Gamma(a + S_k)}{(b + k)^{a + S_k}}\cdot\frac{\Gamma(a + S_T - S_k)}{(b + T - k)^{a + S_T - S_k}}$,
+which gives an exact posterior over $k$ to check the sampler against.
+
+```python
+rng = np.random.default_rng(10)
+T_yr, k_true, lam_true = 112, 40, (3.1, 0.9)               # 112 years, rate drops after year 40
+years = 1851 + np.arange(T_yr)
+cnt = np.r_[rng.poisson(lam_true[0], k_true), rng.poisson(lam_true[1], T_yr - k_true)]
+a_l, b_l = 2.0, 1.0                                        # lambda ~ Gamma(2, rate 1), k ~ Uniform{1..T-1}
+S = np.r_[0, np.cumsum(cnt)]                               # S[k] = sum of the first k counts
+ks = np.arange(1, T_yr)
+
+def changepoint_gibbs(n_iter, rng):
+    k, out = T_yr // 2, np.empty((n_iter, 3))
+    for t in range(n_iter):
+        l1 = rng.gamma(a_l + S[k], 1 / (b_l + k))
+        l2 = rng.gamma(a_l + S[-1] - S[k], 1 / (b_l + T_yr - k))
+        logp = S[ks] * np.log(l1) - ks * l1 + (S[-1] - S[ks]) * np.log(l2) - (T_yr - ks) * l2
+        p = np.exp(logp - logp.max())
+        k = ks[np.searchsorted(np.cumsum(p), rng.random() * p.sum())]
+        out[t] = k, l1, l2
+    return out
+
+cp = changepoint_gibbs(20_000, rng)[1000:]
+# collapsed exact answer: integrate both rates out (Gamma-Poisson marginal, ch. 2)
+log_m = lambda s, m: special.gammaln(a_l + s) - (a_l + s) * np.log(b_l + m)
+lpk = log_m(S[ks], ks) + log_m(S[-1] - S[ks], T_yr - ks)
+pk = np.exp(lpk - lpk.max()); pk /= pk.sum()
+pk_gibbs = np.bincount(cp[:, 0].astype(int), minlength=T_yr)[1:] / len(cp)
+print(f"total counts: first {k_true} yrs {S[k_true]}, rest {S[-1] - S[k_true]}")
+print(f"change year: Gibbs mode {years[int(np.bincount(cp[:, 0].astype(int)).argmax()) - 1]} | "
+      f"exact mode {years[ks[pk.argmax()] - 1]} | truth {years[k_true - 1]}")
+print(f"P(k in [{k_true - 3}, {k_true + 3}]): Gibbs {pk_gibbs[k_true - 4:k_true + 3].sum():.3f} | exact {pk[k_true - 4:k_true + 3].sum():.3f}")
+print(f"TV(Gibbs, exact) over k: {0.5 * np.abs(pk_gibbs - pk).sum():.4f}")
+print(f"lambda1 {cp[:, 1].mean():.3f} [{np.quantile(cp[:, 1], .05):.2f}, {np.quantile(cp[:, 1], .95):.2f}] | "
+      f"lambda2 {cp[:, 2].mean():.3f} [{np.quantile(cp[:, 2], .05):.2f}, {np.quantile(cp[:, 2], .95):.2f}]")
+print(f"ESS/iter: k {ess(cp[:, 0]) / len(cp):.3f}, lambda1 {ess(cp[:, 1]) / len(cp):.3f}, lambda2 {ess(cp[:, 2]) / len(cp):.3f}")
+```
+
+```output
+total counts: first 40 yrs 120, rest 67
+change year: Gibbs mode 1885 | exact mode 1885 | truth 1890
+P(k in [37, 43]): Gibbs 0.330 | exact 0.329
+TV(Gibbs, exact) over k: 0.0040
+lambda1 3.124 [2.64, 3.65] | lambda2 0.968 [0.79, 1.16]
+ESS/iter: k 0.844, lambda1 0.826, lambda2 0.974
+```
+
+The sampler and the exact collapsed posterior over $k$ differ by a total variation distance of
+0.004, and both put the mode at 1885 (that is, $k = 35$). The true switch is at 1890. That is not a
+sampler error. This particular draw of the counts happens to look like an earlier switch, and only
+33% of the posterior mass lies within three years of the truth. A posterior over a change point is
+often wide and lumpy, which is why it is better to report the whole distribution than a single year.
+The rates are tight ($\lambda_1 \approx 3.12$, $\lambda_2 \approx 0.97$), and the chain mixes
+very well (ESS per iteration 0.83 to 0.97). Moving $k$ changes the rates and vice versa, but
+the posterior is concentrated enough that each conditional pins the other down quickly.
+
+In a model this small, the collapsed exact answer makes MCMC unnecessary. Gibbs earns its keep when
+you add structure, such as several change points, covariates on the rates, or a hierarchical prior
+across many series. Each extra piece adds one more conditional to the cycle.
+
+## Metropolis-within-Gibbs for a non-conjugate conditional
+
+Sometimes all conditionals but one are standard. You do not have to abandon Gibbs for that one.
+Replace its exact draw with *any* MH step that leaves that conditional invariant. The argument from
+the derivation at the top still holds: each update preserves $p$, so the cycle does too. A single
+MH step per sweep is enough, and you do not need to run that step to convergence.
+
+A common case is the half-Cauchy prior on a scale, $\sigma \sim \mathrm{HalfCauchy}(0, 25)$. It is
+widely recommended for scales (Gelman, 2006), but it is not conjugate to anything. With
+$\mu \sim \mathcal{N}(0, 100^2)$, the conditional of $\mu$ is still Normal. The conditional of $\sigma$
+is not, so the sampler takes one random-walk MH step on $\log\sigma$. The log scale removes the
+positivity constraint and requires the Jacobian term $+\log\sigma$ (ch. 4). There are six data
+points, so the prior on $\sigma$ really shapes the posterior.
+
+```python
+rng = np.random.default_rng(11)
+y_hc = np.array([28.0, 8.0, -3.0, 7.0, -1.0, 1.0])         # six measurements: the prior on sigma matters
+n_h = len(y_hc)
+
+def log_cond_logsigma(ls, mu):                             # log p(log sigma | mu, y), half-Cauchy(0, 25) on sigma
+    s = np.exp(ls)
+    return -n_h * ls - np.sum((y_hc - mu) ** 2) / (2 * s ** 2) + stats.halfcauchy.logpdf(s, scale=25) + ls  # + Jacobian
+
+mu, ls, out, acc, step = 0.0, np.log(10.0), np.empty((40_000, 2)), 0, 0.8
+for t in range(len(out)):
+    prec = 1 / 100 ** 2 + n_h / np.exp(2 * ls)             # mu ~ N(0, 100^2): conjugate Gibbs step
+    mu = rng.normal(y_hc.sum() / np.exp(2 * ls) / prec, 1 / np.sqrt(prec))
+    prop = ls + step * rng.standard_normal()               # one random-walk MH step on log sigma
+    if np.log(rng.random()) < log_cond_logsigma(prop, mu) - log_cond_logsigma(ls, mu):
+        ls, acc = prop, acc + 1
+    out[t] = mu, np.exp(ls)
+out = out[2000:]
+
+mu_g2, sg_g2 = np.linspace(-60, 70, 521), np.linspace(0.05, 120, 2400)
+M2, S2 = np.meshgrid(mu_g2, sg_g2, indexing="ij")
+lp2 = (stats.norm.logpdf(y_hc[:, None, None], M2, S2).sum(0) + stats.norm.logpdf(M2, 0, 100)
+       + stats.halfcauchy.logpdf(S2, scale=25))
+P2 = np.exp(lp2 - lp2.max()); P2 /= P2.sum()
+print(f"MH-within-Gibbs acceptance on log sigma: {acc / 40_000:.3f}")
+print(f"E[mu]    {out[:, 0].mean():7.3f} | grid {np.sum(M2 * P2):7.3f}")
+print(f"E[sigma] {out[:, 1].mean():7.3f} | grid {np.sum(S2 * P2):7.3f}")
+print(f"median sigma {np.median(out[:, 1]):.3f} | grid {sg_g2[np.searchsorted(np.cumsum(P2.sum(0)), 0.5)]:.3f}")
+print(f"ESS/iter: mu {ess(out[:, 0]) / len(out):.3f}, sigma {ess(out[:, 1]) / len(out):.3f}")
+```
+
+```output
+MH-within-Gibbs acceptance on log sigma: 0.411
+E[mu]      6.606 | grid   6.641
+E[sigma]  14.217 | grid  14.208
+median sigma 12.927 | grid 12.900
+ESS/iter: mu 0.997, sigma 0.153
+```
+
+The hybrid sampler matches the grid on the mean of $\mu$, and on the mean and median of $\sigma$, to
+within Monte Carlo error. The two coordinates now behave differently. The exact Gibbs step on $\mu$
+gives ESS per iteration of 0.997, and the single MH step on $\sigma$ gives 0.153 at 41% acceptance.
+The MH coordinate is the bottleneck. You can take several MH steps on $\log\sigma$ per sweep, since
+they are cheap and only touch one scalar. You can adapt the step during warmup (ch. 4). Or you can
+replace the step with a slice sampler (Neal, 2003), which has no step size to tune and is what
+BUGS and JAGS use for many non-conjugate nodes.
+
+## When Gibbs is the wrong tool
+
+Gibbs is the right tool when the conditionals are standard and the blocks are weakly dependent in
+the posterior. It is the wrong tool when either condition fails, and some data-augmentation schemes
+fail the second condition in ways that are easy to miss. The sharpest example is Albert–Chib with
+rare events. With few positives, most $z_i$ are truncated to $(-\infty, 0]$, and their conditional
+is driven almost entirely by $\beta$. The latents and the intercept then lock together, and each
+sweep moves the intercept only a little (Johndrow et al., 2019).
+
+```python
+rng = np.random.default_rng(12)
+n_r = 2000
+Xr = np.column_stack([np.ones(n_r), rng.standard_normal(n_r)])
+V_save, L_save = V, L_V
+print(f"{'intercept':>10} {'positives':>10} {'lag-1 b0':>9} {'ESS/it b0':>10} {'ESS/it b1':>10}")
+for b0_true in (0.0, -1.5, -2.5):
+    yr = (Xr @ np.array([b0_true, 0.5]) + rng.standard_normal(n_r) > 0).astype(int)
+    V = np.linalg.inv(B0_inv[:2, :2] + Xr.T @ Xr); L_V = np.linalg.cholesky(V)
+    ch = albert_chib(Xr, yr, 3000, rng)[500:]
+    print(f"{b0_true:>10} {yr.mean():>10.3f} {lag1(ch[:, 0]):>9.3f} {ess(ch[:, 0]) / len(ch):>10.3f} {ess(ch[:, 1]) / len(ch):>10.3f}")
+V, L_V = V_save, L_save
+```
+
+```output
+ intercept  positives  lag-1 b0  ESS/it b0  ESS/it b1
+       0.0      0.506     0.433      0.325      0.258
+      -1.5      0.104     0.715      0.107      0.104
+      -2.5      0.018     0.959      0.014      0.015
+```
+
+At 50% positives the intercept's ESS per iteration is 0.325. At 10% it is 0.107, and at 1.8% it
+drops to 0.014, with a lag-1 autocorrelation of 0.959. The slope degrades just as badly. Nothing
+about the data is pathological. The slowdown is a property of the augmentation scheme, not of
+the posterior, and Johndrow et al. show it keeps worsening as positives get rarer. More generally, prefer something other than plain Gibbs in these cases:
+
+- **Strong posterior correlation** between coordinates you cannot block. Use HMC/NUTS (ch. 6), which follows the ridge.
+- **Latents carrying most of the information** about a parameter (rare events, heavy missingness, hierarchical funnels). Augmentation slows to a crawl, so marginalise the latents or use gradients.
+- **Non-conjugate conditionals everywhere.** Metropolis-within-Gibbs on every coordinate is just a slow coordinatewise random walk.
+- **Multimodality.** Gibbs moves locally like every other local sampler. Use tempering, multiple chains with different starts, or reparameterise.
+- **Large $n$ with per-observation latents.** A sweep is $O(n)$ just to refresh latents that you will discard.
+
+Gibbs still has a permanent place. It is exact for discrete latent structure that gradients cannot
+touch (labels, change points, missing categories), it is easy to verify, and it combines with every
+other sampler as a block update. Modern PPLs (ch. 8) use HMC for the continuous parameters and keep
+Gibbs-style steps for discrete ones.
+
+## Try it Yourself
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+T, k_true, lam1, lam2 = 112, 40, 3.1, 0.9           # try k_true = 100, or lam2 = 2.5 (a subtle change)
+a, b = 2.0, 1.0                                     # Gamma(a, rate b) prior on both rates
+y = np.r_[rng.poisson(lam1, k_true), rng.poisson(lam2, T - k_true)]
+S = np.r_[0, np.cumsum(y)]
+ks = np.arange(1, T)
+
+k, draws = T // 2, []
+for t in range(10_000):
+    l1 = rng.gamma(a + S[k], 1 / (b + k))
+    l2 = rng.gamma(a + S[-1] - S[k], 1 / (b + T - k))
+    logp = S[ks] * np.log(l1) - ks * l1 + (S[-1] - S[ks]) * np.log(l2) - (T - ks) * l2
+    p = np.exp(logp - logp.max())
+    k = ks[np.searchsorted(np.cumsum(p), rng.random() * p.sum())]
+    draws.append((k, l1, l2))
+d = np.array(draws[1000:])
+pk = np.bincount(d[:, 0].astype(int), minlength=T) / len(d)
+top = np.argsort(pk)[::-1][:5]
+print("most probable change points:", ", ".join(f"k={j} ({pk[j]:.3f})" for j in top))
+print(f"lambda1 {d[:, 1].mean():.2f}, lambda2 {d[:, 2].mean():.2f} (truth {lam1}, {lam2})")
+print(f"90% interval for k: [{np.quantile(d[:, 0], .05):.0f}, {np.quantile(d[:, 0], .95):.0f}]")
+```
+
+```output
+most probable change points: k=41 (0.398), k=40 (0.362), k=45 (0.078), k=42 (0.054), k=46 (0.031)
+lambda1 3.10, lambda2 1.08 (truth 3.1, 0.9)
+90% interval for k: [40, 45]
+```
+
+Move `k_true` to 100, near the end of the series, and watch the interval for $k$ widen. There are few
+years after the change to learn $\lambda_2$ from. Set `lam2 = 2.5` and the posterior over $k$ becomes
+broad and multimodal. That is the honest answer for a subtle change, not a failure. Then add the
+exact collapsed $p(k \mid y)$ from the change-point section and compare.
+
+## Exercise
+
+Fit a linear regression with **Student-t errors** using a Gibbs sampler built on the scale-mixture
+representation. If $\lambda_i \sim \mathrm{Gamma}(\nu/2, \nu/2)$ and
+$\varepsilon_i \mid \lambda_i \sim \mathcal{N}(0, \sigma^2/\lambda_i)$, then marginally
+$\varepsilon_i \sim t_\nu(0, \sigma)$. (1) With $\beta \sim \mathcal{N}(0, 100 I)$,
+$\sigma^2 \sim \mathrm{InvGamma}(2, 1)$ and fixed $\nu = 4$, derive the three full conditionals for
+$\beta$, $\lambda$ and $\sigma^2$ by keeping the terms that involve each one. (2) Implement the
+sampler on 120 points from $y = 1 + 2x + \mathcal{N}(0, 0.5^2)$ with 8 gross outliers added. (3)
+Compare against OLS, and inspect $\mathbb{E}[\lambda_i \mid y]$ for the outliers against the rest.
+
+<details>
+<summary>Solution</summary>
+
+```python
+rng = np.random.default_rng(13)
+n_e, nu = 120, 4.0
+Xe = np.column_stack([np.ones(n_e), rng.uniform(-2, 2, n_e)])
+beta_e = np.array([1.0, 2.0])
+ye = Xe @ beta_e + 0.5 * rng.standard_normal(n_e)
+out_idx = rng.choice(n_e, 8, replace=False)
+ye[out_idx] += rng.choice([-1, 1], 8) * rng.uniform(6, 12, 8)       # 8 gross outliers
+
+def robust_gibbs(n_iter, rng, lam_prior_prec=1e-2, a_s=2.0, b_s=1.0):
+    beta, s2, lam = np.zeros(2), 1.0, np.ones(n_e)
+    out_b, out_lam = np.empty((n_iter, 2)), np.zeros(n_e)
+    for t in range(n_iter):
+        W = lam / s2                                                  # beta | lam, s2: weighted least squares
+        Vb = np.linalg.inv(lam_prior_prec * np.eye(2) + Xe.T @ (Xe * W[:, None]))
+        beta = Vb @ (Xe.T @ (W * ye)) + np.linalg.cholesky(Vb) @ rng.standard_normal(2)
+        r2 = (ye - Xe @ beta) ** 2
+        lam = rng.gamma((nu + 1) / 2, 1 / ((nu + r2 / s2) / 2))      # lam_i | beta, s2: Gamma
+        s2 = 1 / rng.gamma(a_s + n_e / 2, 1 / (b_s + 0.5 * np.sum(lam * r2)))   # s2 | beta, lam: Inv-Gamma
+        out_b[t] = beta
+        if t >= 1000:
+            out_lam += lam
+    return out_b[1000:], out_lam / (n_iter - 1000)
+
+rb, lam_bar = robust_gibbs(6000, rng)
+ols = np.linalg.lstsq(Xe, ye, rcond=None)[0]
+print(f"truth        {beta_e}")
+print(f"OLS          {ols.round(3)}")
+print(f"t-model mean {rb.mean(0).round(3)}  sd {rb.std(0).round(3)}  ESS/it {np.round([ess(rb[:, j]) / len(rb) for j in range(2)], 3)}")
+print(f"mean E[lam_i]: outliers {lam_bar[out_idx].mean():.3f} | others {np.delete(lam_bar, out_idx).mean():.3f}")
+```
+
+```output
+truth        [1. 2.]
+OLS          [0.878 2.035]
+t-model mean [1.042 2.01 ]  sd [0.068 0.058]  ESS/it [0.638 0.695]
+mean E[lam_i]: outliers 0.028 | others 1.072
+```
+
+The conditionals are $\beta \mid \lambda, \sigma^2 \sim \mathcal{N}(V X^\top W y, V)$ with
+$W = \mathrm{diag}(\lambda_i/\sigma^2)$ and $V = (10^{-2} I + X^\top W X)^{-1}$, then
+$\lambda_i \mid \beta, \sigma^2 \sim \mathrm{Gamma}\big(\frac{\nu+1}{2}, \frac{\nu + r_i^2/\sigma^2}{2}\big)$
+with $r_i = y_i - x_i^\top\beta$, then
+$\sigma^2 \mid \beta, \lambda \sim \mathrm{InvGamma}\big(2 + \frac{n}{2}, 1 + \frac{1}{2}\sum_i \lambda_i r_i^2\big)$.
+OLS lets the outliers pull the intercept to 0.878. The t-model recovers $(1.04, 2.01)$, because the
+outliers get $\mathbb{E}[\lambda_i] \approx 0.03$ against about 1.07 for clean points. Each outlier
+is down-weighted roughly 38-fold, and the data decide which points those are. This is iteratively
+reweighted least squares with uncertainty attached. The EM version of the same augmentation is
+the classic IRLS algorithm for t-regression. The chain also mixes well (ESS per iteration about
+0.65), because given the weights, $\beta$ is a linear-Gaussian draw.
+</details>

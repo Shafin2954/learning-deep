@@ -477,26 +477,22 @@ combinatorial action space to per-position quantities.
 **Exploration budget.** Exploration is spent on real users; cap it as a traffic percentage (the 5%
 above) or as a regret guardrail against the current policy (conservative bandits), and report it.
 **Delayed and batched feedback.** Conversions arrive days later and models refresh hourly; within one
-refresh a deterministic UCB serves the same arm to everyone, while Thompson keeps randomising.
+refresh a deterministic UCB serves the same arm to everyone, while Thompson keeps randomising, so
+prefer posterior sampling and model the delay explicitly (Chapelle, 2014) rather than counting
+not-yet-converted impressions as negatives.
 **Non-stationarity.** Items age and tastes drift. **Discounting** multiplies counts by $\gamma$ each
 step (memory $1/(1-\gamma)$); a **sliding window** keeps only the last $W$ events.
 
 ```python
 from collections import deque
 
-def bandit_run(algo, p_before, p_after=None, T=40_000, gamma=1.0, window=None, batch=1, seed=0):
+def drifting_ts(p_before, p_after, T=40_000, gamma=1.0, window=None, seed=0):
     r = np.random.default_rng(seed)
-    K_ = len(p_before)
-    n, s = np.zeros(K_), np.zeros(K_)
-    seen_n, seen_s = n.copy(), s.copy()                 # what the policy sees (stale if batched)
+    n, s = np.zeros(len(p_before)), np.zeros(len(p_before))
     hist, reg = deque(), np.zeros(T)
     for t in range(T):
-        p = p_before if p_after is None or t < T // 2 else p_after
-        if algo == "UCB1":
-            a = (int(np.argmin(seen_n)) if seen_n.min() == 0 else
-                 np.argmax(seen_s / seen_n + np.sqrt(2 * np.log(t + 1) / seen_n)))
-        else:
-            a = np.argmax(r.beta(seen_s + 1, seen_n - seen_s + 1))
+        p = p_before if t < T // 2 else p_after
+        a = np.argmax(r.beta(s + 1, n - s + 1))
         y = r.random() < p[a]
         n *= gamma                                      # discounting: forget old evidence
         s *= gamma
@@ -508,8 +504,6 @@ def bandit_run(algo, p_before, p_after=None, T=40_000, gamma=1.0, window=None, b
                 a_old, y_old = hist.popleft()
                 n[a_old] -= 1
                 s[a_old] -= y_old
-        if (t + 1) % batch == 0:                        # delayed feedback: refresh every `batch`
-            seen_n, seen_s = n.copy(), s.copy()
         reg[t] = p.max() - p[a]
     return reg
 
@@ -520,7 +514,7 @@ p1[0], p1[1] = 0.03, 0.12                               # at T/2 the winner fade
 rows = []
 for name, kw in (("Thompson", {}), ("Thompson, discount 0.999", {"gamma": 0.999}),
                  ("Thompson, window 2,000", {"window": 2_000})):
-    regs = np.array([bandit_run("TS", p0, p1, seed=sd, **kw) for sd in range(3)])
+    regs = np.array([drifting_ts(p0, p1, seed=sd, **kw) for sd in range(3)])
     rows.append({"policy": name, "regret first half": regs[:, :20_000].sum(1).mean(),
                  "regret second half": regs[:, 20_000:].sum(1).mean()})
 print("non-stationary: CTRs swap at t = 20,000 (mean of 3 seeds)")
@@ -547,8 +541,8 @@ items actually change, not from a default.
 import numpy as np
 
 rng = np.random.default_rng(0)
-n_seg, K = 20, 10                                       # user segments x items
-ctr = rng.beta(2, 30, (n_seg, K))
+n_seg, n_arms = 20, 10                                  # user segments x items
+ctr = rng.beta(2, 30, (n_seg, n_arms))
 target = np.argmax(ctr + rng.normal(0, 0.02, ctr.shape), axis=1)   # a decent but imperfect policy
 V = ctr[np.arange(n_seg), target].mean()
 
@@ -617,58 +611,40 @@ feat_all = np.r_[item_feat, np.c_[np.ones(K_new), rng.normal(0, 1, (K_new, d_i -
 theta_all = feat_all @ B.T                                  # same B: new items obey the same rule
 K_all = K + K_new
 
-def cross(x, F):                                            # z(x, a) = vec(x f_a^T), dim d_u * d_i
-    return (x[None, :, None] * F[:, None, :]).reshape(len(F), -1)
-
-def run_catalogue(algo, T=15_000, t_new=5_000, alpha=0.5, lam=1.0, seed=0):
+def run_catalogue(F, T=15_000, t_new=5_000, alpha=0.5, lam=1.0, seed=0):
+    """LinUCB on z(x, a) = vec(x f_a^T). F = item features -> shared; F = identity -> disjoint."""
     r = np.random.default_rng(seed)
     X = draw_users(T, r)
-    Pt = 1 / (1 + np.exp(-(X @ theta_all.T)))
-    U = r.random(T)
-    dz = d_u * d_i
-    Ad = np.tile(np.eye(d_u) / lam, (K_all, 1, 1))
-    bd = np.zeros((K_all, d_u))
-    As, bs = np.eye(dz) / lam, np.zeros(dz)
+    Pt, U = 1 / (1 + np.exp(-(X @ theta_all.T))), r.random(T)
+    dz = d_u * F.shape[1]
+    A_inv, b = np.eye(dz) / lam, np.zeros(dz)
     regret, new_pulls = np.zeros(T), 0
     for t in range(T):
         live = K_all if t >= t_new else K
-        x = X[t]
-        if algo == "disjoint":
-            mean = np.einsum("kij,kj->ki", Ad[:live], bd[:live]) @ x
-            width = np.sqrt(np.einsum("i,kij,j->k", x, Ad[:live], x))
-        else:
-            Z = cross(x, feat_all[:live])
-            mean = Z @ (As @ bs)
-            width = np.sqrt(np.einsum("ki,ij,kj->k", Z, As, Z))
-        a = int(np.argmax(mean + alpha * width))
+        Z = (X[t][None, :, None] * F[:live, None, :]).reshape(live, dz)
+        ZA = Z @ A_inv
+        a = int(np.argmax(ZA @ b + alpha * np.sqrt((ZA * Z).sum(1))))
         y = float(U[t] < Pt[t, a])
-        if algo == "disjoint":
-            Ax = Ad[a] @ x
-            Ad[a] -= np.outer(Ax, Ax) / (1 + x @ Ax)
-            bd[a] += y * x
-        else:
-            z = cross(x, feat_all[a:a + 1])[0]
-            Az = As @ z
-            As -= np.outer(Az, Az) / (1 + z @ Az)
-            bs += y * z
+        Az = A_inv @ Z[a]
+        A_inv -= np.outer(Az, Az) / (1 + Z[a] @ Az)
+        b += y * Z[a]
         regret[t] = Pt[t, :live].max() - Pt[t, a]
-        new_pulls += (a >= K) and t >= t_new
+        new_pulls += a >= K
     return regret, new_pulls
 
 rows = []
-for algo in ("disjoint", "shared"):
-    reg, new_pulls = run_catalogue(algo)
-    rows.append({"model": algo, "regret before launch": reg[:5_000].sum(),
-                 "regret 1k after launch": reg[5_000:6_000].sum(),
-                 "regret 10k after launch": reg[5_000:].sum(),
+for name, F in (("disjoint (one-hot items)", np.eye(K_all)), ("shared (item features)", feat_all)):
+    reg, new_pulls = run_catalogue(F)
+    rows.append({"model": name, "regret before launch": reg[:5_000].sum(),
+                 "regret 1k after": reg[5_000:6_000].sum(), "regret 10k after": reg[5_000:].sum(),
                  "pulls of new items": new_pulls})
 print(pd.DataFrame(rows).round(1).to_string(index=False))
 ```
 
 ```output
-   model  regret before launch  regret 1k after launch  regret 10k after launch  pulls of new items
-disjoint                 112.8                    73.5                    198.8                3671
-  shared                  77.6                     9.9                     60.8                2797
+                   model  regret before launch  regret 1k after  regret 10k after  pulls of new items
+disjoint (one-hot items)                 139.9             77.3             219.8                4577
+  shared (item features)                  77.6              9.9              60.8                2797
 ```
 
 The shared model is better at every stage. After the launch it loses 9.9 clicks in the first 1,000
