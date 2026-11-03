@@ -55,8 +55,8 @@ print(f"KL at (0,0): {kl_divergence_gaussian(torch.zeros(1,3), torch.zeros(1,3))
 ```output
 mu:      [[ 0.5 -0.3  1.2]]
 log_var: [[-0.4  0.1 -0.8]]
-KL:      1.0781
-KL at (0,0): 0.0000
+KL:      1.0524
+KL at (0,0): -0.0000
 ```
 
 ## The Reparameterization Trick
@@ -99,8 +99,8 @@ print(f"z has grad_fn: {z.grad_fn is not None}")   # gradients flow
 
 ```output
 z shape:       torch.Size([4, 16])
-mu range:      [-0.314, 0.298]
-sigma range:   [0.681, 1.382]
+mu range:      [-0.273, 0.300]
+sigma range:   [0.877, 1.183]
 z has grad_fn: True
 ```
 
@@ -149,7 +149,7 @@ print(f"Recon shape: {recon.shape}, mu shape: {mu.shape}")
 ```
 
 ```output
-ELBO loss: 552.34
+ELBO loss: 549.20
 Recon shape: torch.Size([32, 784]), mu shape: torch.Size([32, 16])
 ```
 
@@ -178,11 +178,11 @@ for epoch in range(1, 6):
 ```
 
 ```output
-Epoch 1  ELBO=561.4
-Epoch 2  ELBO=496.3
-Epoch 3  ELBO=471.8
-Epoch 4  ELBO=458.2
-Epoch 5  ELBO=449.7
+Epoch 1  ELBO=513.6
+Epoch 2  ELBO=386.7
+Epoch 3  ELBO=352.4
+Epoch 4  ELBO=346.7
+Epoch 5  ELBO=343.9
 ```
 
 ## Posterior Collapse and Beta-VAE
@@ -254,11 +254,11 @@ with torch.no_grad():
 
 ```output
 Samples from prior (5 x 8):
-[[0.51 0.48 0.47 0.52 0.49 0.53 0.47 0.51]
- [0.54 0.46 0.52 0.45 0.50 0.48 0.53 0.49]
- [0.49 0.50 0.51 0.48 0.52 0.47 0.50 0.53]
- [0.52 0.51 0.48 0.50 0.49 0.54 0.46 0.52]
- [0.50 0.47 0.53 0.51 0.48 0.52 0.49 0.47]]
+[[0.49 0.57 0.44 0.56 0.51 0.49 0.49 0.51]
+ [0.48 0.55 0.49 0.53 0.5  0.49 0.46 0.51]
+ [0.5  0.57 0.42 0.55 0.52 0.49 0.5  0.51]
+ [0.49 0.56 0.47 0.51 0.52 0.49 0.48 0.51]
+ [0.49 0.56 0.49 0.49 0.52 0.49 0.46 0.51]]
 ```
 
 ## Exercise
@@ -273,27 +273,40 @@ import torch
 import torch.nn.functional as F
 
 torch.manual_seed(0)
-X = torch.rand(1000, 64)
-vae = VAE(64, 128, 8)
-opt = torch.optim.Adam(vae.parameters(), lr=1e-3)
+X = torch.sigmoid(torch.randn(1000, 4) @ torch.randn(4, 64))   # low-rank synthetic data
 
-def count_collapsed(mu, threshold=0.1):
-    """Count dims where mean is near-zero across the batch (proxy for collapse)."""
-    return (mu.abs().mean(0) < threshold).sum().item()
+def count_collapsed(vae, X, threshold=0.05):
+    """Dims whose average per-dim KL to the prior is below threshold."""
+    with torch.no_grad():
+        _, mu, lv = vae(X)
+        kl_dim = (-0.5 * (1 + lv - mu.pow(2) - lv.exp())).mean(0)
+    return (kl_dim < threshold).sum().item()
 
-for epoch in range(1, 21):
-    beta = min(1.0, epoch / 10)    # anneal from 0 to 1 over 10 epochs
-    for i in range(0, len(X), 128):
-        x = X[i:i+128]
-        recon, mu, lv = vae(x)
-        kl  = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp()) / len(x)
-        rec = F.mse_loss(recon, x)
-        (rec + beta * kl).backward(); opt.step(); opt.zero_grad()
-    if epoch in (1, 10, 20):
-        with torch.no_grad():
-            _, mu, _ = vae(X)
-            print(f"Epoch {epoch:2d}  beta={beta:.1f}  collapsed_dims={count_collapsed(mu)}/8")
+def train(anneal):
+    torch.manual_seed(1)
+    vae = VAE(64, 128, 8)
+    opt = torch.optim.Adam(vae.parameters(), lr=1e-3)
+    for epoch in range(1, 21):
+        beta = min(1.0, epoch / 10) if anneal else 1.0
+        for i in range(0, len(X), 128):
+            x = X[i:i+128]
+            recon, mu, lv = vae(x)
+            kl  = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp()) / len(x)
+            rec = F.binary_cross_entropy(recon, x, reduction='sum') / len(x)
+            (rec + beta * kl).backward(); opt.step(); opt.zero_grad()
+        if epoch in (1, 20):
+            print(f"anneal={anneal!s:5}  epoch {epoch:2d}  beta={beta:.1f}  collapsed_dims={count_collapsed(vae, X)}/8")
+
+train(anneal=True)
+train(anneal=False)
 ```
 
-KL annealing lets the reconstruction loss establish useful representations before the KL term collapses unused dimensions. Without annealing, many dimensions collapse immediately in early training.
+```output
+anneal=True   epoch  1  beta=0.1  collapsed_dims=7/8
+anneal=True   epoch 20  beta=1.0  collapsed_dims=1/8
+anneal=False  epoch  1  beta=1.0  collapsed_dims=8/8
+anneal=False  epoch 20  beta=1.0  collapsed_dims=1/8
+```
+
+In this run both settings end with 1 of 8 dimensions collapsed (the data has only 4 hidden factors), and annealing's visible effect is at epoch 1, where $\beta$ is small and 7 of 8 dimensions are still collapsed versus all 8 with $\beta=1$. The benefit is small here; it depends on the data and decoder.
 </details>

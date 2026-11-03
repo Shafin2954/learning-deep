@@ -46,6 +46,7 @@ def distillation_loss(student_logits, teacher_logits, labels, alpha=0.5, tau=4.0
     return alpha * ce_loss + (1 - alpha) * kl_loss
 
 # Example: 4-class logits for a batch of 8
+torch.manual_seed(0)
 B, C = 8, 4
 student_logits  = torch.randn(B, C)
 teacher_logits  = torch.randn(B, C)
@@ -56,7 +57,7 @@ print(f"Distillation loss: {loss.item():.4f}")
 ```
 
 ```output
-Distillation loss: 1.5823
+Distillation loss: 1.2149
 ```
 
 ## The cross-architecture mismatch
@@ -125,37 +126,38 @@ def token_level_distill_loss(student_lm_logits, teacher_lm_logits, tau=3.0):
     """
     student_lm_logits: (B, T, V)
     teacher_lm_logits: (B, T, V)
-    Returns scalar KL loss.
+    Returns (raw per-token KL, tau^2-scaled KL).
     """
-    p_t = F.softmax(teacher_lm_logits / tau, dim=-1)
-    log_p_s = F.log_softmax(student_lm_logits / tau, dim=-1)
-    kl = F.kl_div(log_p_s, p_t, reduction='batchmean') * (tau ** 2)
-    return kl
+    V = student_lm_logits.shape[-1]
+    p_t = F.softmax(teacher_lm_logits / tau, dim=-1).reshape(-1, V)
+    log_p_s = F.log_softmax(student_lm_logits / tau, dim=-1).reshape(-1, V)
+    raw = F.kl_div(log_p_s, p_t, reduction='batchmean')  # mean KL per token
+    return raw, raw * (tau ** 2)
 
+torch.manual_seed(0)
 B, T, V = 4, 32, 1000
 student  = torch.randn(B, T, V)
 teacher  = torch.randn(B, T, V)
 
 for tau in [1.0, 2.0, 4.0, 8.0]:
-    loss = token_level_distill_loss(student, teacher, tau=tau)
-    print(f"tau={tau:.1f}  KL loss={loss.item():.4f}")
+    raw, scaled = token_level_distill_loss(student, teacher, tau=tau)
+    print(f"tau={tau:.1f}  raw KL={raw.item():.4f}  tau^2-scaled KL={scaled.item():.4f}")
 ```
 
 ```output
-tau=1.0  KL loss=6.9078
-tau=2.0  KL loss=1.8412
-tau=4.0  KL loss=0.4823
-tau=8.0  KL loss=0.1241
+tau=1.0  raw KL=0.9994  tau^2-scaled KL=0.9994
+tau=2.0  raw KL=0.2498  tau^2-scaled KL=0.9994
+tau=4.0  raw KL=0.0625  tau^2-scaled KL=0.9994
+tau=8.0  raw KL=0.0156  tau^2-scaled KL=0.9995
 ```
 
-Higher temperature → softer distributions → smaller raw KL, but scaled by $\tau^2$ in
-the full loss to keep gradient magnitudes comparable across temperatures.
+Higher temperature → softer distributions → a smaller raw KL (first column). The $\tau^2$ factor in the full loss compensates so that gradient magnitudes stay comparable across temperatures (second column).
 
 ## Exercise
 
 Implement progressive substitution: given a 4-layer toy Transformer, replace its layers
 one at a time with SSM proxies and measure the KL divergence between the original model's
-output and the increasingly substituted model's output. Plot KL vs number of substituted
+output and the increasingly substituted model's output. Print KL vs number of substituted
 layers.
 
 <details>
@@ -181,6 +183,7 @@ class SSMProxy(nn.Module):
     def forward(self, x):
         return torch.sigmoid(self.gate(x)) * self.val(x) + x
 
+torch.manual_seed(0)
 D, N_LAYERS = 32, 4
 teacher_layers = nn.ModuleList([ToyTransformerLayer(D) for _ in range(N_LAYERS)])
 
@@ -211,13 +214,12 @@ for n_sub in range(N_LAYERS + 1):
 
 ```output
 Substituted layers: 0/4  KL=0.0000
-Substituted layers: 1/4  KL=0.1832
-Substituted layers: 2/4  KL=0.3541
-Substituted layers: 3/4  KL=0.5203
-Substituted layers: 4/4  KL=0.6987
+Substituted layers: 1/4  KL=0.0012
+Substituted layers: 2/4  KL=0.0259
+Substituted layers: 3/4  KL=0.5875
+Substituted layers: 4/4  KL=11.6462
 ```
 
-KL grows roughly linearly with substituted layers, suggesting each layer contributes
-independently. In practice, fine-tuning after each substitution step keeps the KL low —
+KL grows much faster than linearly with the number of substituted layers: errors from untrained substitutes compound through the stack. In practice, fine-tuning after each substitution step keeps the KL low —
 progressive substitution with fine-tuning recovers quality that cold substitution loses.
 </details>

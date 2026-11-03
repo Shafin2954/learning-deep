@@ -7,7 +7,12 @@ order: 13
 
 ## Two kinds of not knowing
 
-S1
+A weather forecaster can be unsure for two reasons. Tomorrow may be genuinely chaotic (more data would not help), or
+the forecaster may never have seen this kind of sky before (more data would). The first is **aleatoric** uncertainty,
+noise in $y$ given $x$; the second is **epistemic** uncertainty, ignorance about the function itself, which a Bayesian
+writes as a posterior $p(\theta \mid \mathcal D)$ over the network weights $\theta$ given data $\mathcal D$. Two
+synthetic problems make the difference visible: 1-D regression of $f(x) = x\sin x$ with noise that grows with $|x|$ and
+**no training data for** $|x| < 1.5$, and 2-D two-moons classification with a ring of inputs far from both moons.
 
 ```python
 import copy
@@ -44,15 +49,26 @@ regression: 160 train points, |x| in [1.51, 3.99], gap test set x in [-1.5, 1.5]
 classification: 400 train points, class balance 0.50, OOD ring distance to nearest train point 0.63 .. 3.62
 ```
 
-S1b
+The gap is where $f$ dips from 1.5 to 0 and back, so a network that bridges it smoothly is wrong there and should say
+so. The OOD ring starts 0.63 from the nearest training point and reaches 3.6 away.
 
 ## A heteroscedastic head learns the noise, not the ignorance
 
-S2
+Make the network output two numbers per input, a mean $\mu(x)$ and a log-variance $\log\sigma^2(x)$, and it can say
+"the data here are noisy" by itself. That handles aleatoric noise. It cannot say "I have never been here", because
+$\sigma^2(x)$ is just another function the optimiser fits to the training points and extrapolates however it likes.
 
 ### Deriving the Gaussian negative log-likelihood
 
-S2d
+This derivation shows the loss the two-headed network minimises. Under $y_i \sim \mathcal N(\mu(x_i), \sigma^2(x_i))$
+the negative log-likelihood of point $i$ is
+
+$$
+-\log p(y_i \mid x_i) = \tfrac12\log 2\pi + \tfrac12\log\sigma^2(x_i) + \frac{(y_i-\mu(x_i))^2}{2\sigma^2(x_i)} .
+$$
+
+Setting its derivative in $\sigma^2$ to zero gives $\sigma^2(x_i) = (y_i - \mu(x_i))^2$: the variance head learns the local
+squared residual; the $\log\sigma^2$ term stops it claiming infinite noise everywhere.
 
 ```python
 def reg_net(p=0.0, h=50):                                 # 1 -> 50 tanh -> (mean, log-variance)
@@ -94,11 +110,15 @@ for x, m, s in zip(xs, mu, sd):
   3.50  -1.23  -1.28   0.05     0.32     0.35       0.2
 ```
 
-S2b
+On the data the variance head is right: predicted sd tracks the true 0.19 to 0.35 within a few hundredths. In the
+gap the mean misses by 0.44 to 0.49 while the network claims an sd of 0.15, so the error is three predicted standard
+deviations. The noise head reports what the noise *would* be by interpolation, which is not the same as being uncertain.
 
 ## A point network is overconfident off the data
 
-S3
+Classifiers fail the same way, and ReLU networks fail worst. A ReLU net is piecewise linear, so far from the data the
+logit grows linearly with distance and the sigmoid saturates (Hein et al. 2019 prove this happens for almost every
+direction). Walk straight out from the moons and watch the confidence.
 
 ```python
 cpoint = train(cls_net, Xc_tr, Yc_tr, bce, CLS_STEPS)
@@ -124,15 +144,35 @@ distance 12 from centre: logit    -28.4, confidence 1.0000
 distance 24 from centre: logit    -68.9, confidence 1.0000
 ```
 
-S3b
+93% of the OOD ring is classified with confidence above 0.99 and the median $|$logit$|$ is 128, against 0.98 mean
+confidence on real test points. At distance 24 the logit is $-69$. No amount of calibration on in-distribution data
+(Evaluation & Tuning, ch. 4) touches this: the calibration set contains no such inputs.
 
 ## The law of total variance splits what you see
 
-S4
+If you have several plausible networks, each with its own noise estimate, your total uncertainty is the average noise
+plus how much the networks disagree. That one identity is how every method below reports uncertainty, so it is worth
+having exactly. Throughout, a method is a **sampler**: it returns $S$ draws of the network output, from an ensemble, a
+dropout mask, or a weight posterior.
 
 ### Deriving the decomposition
 
-S4d
+This derivation shows the predictive variance splits into an aleatoric and an epistemic part. The predictive
+distribution averages the likelihood over the posterior, $p(y \mid x, \mathcal D) = \int p(y\mid x,\theta)\,p(\theta\mid
+\mathcal D)\,d\theta$, which with draws $\theta_s$ is a mixture of $S$ Gaussians. The law of total variance, conditioning
+on $\theta$, gives
+
+$$
+\mathrm{Var}(y \mid x) = \mathbb E\big[\mathrm{Var}(y\mid x,\theta)\big] + \mathrm{Var}\big(\mathbb E[y\mid x,\theta]\big)
+= \underbrace{\mathbb E_\theta\big[\sigma^2_\theta(x)\big]}_{\text{aleatoric}} + \underbrace{\mathrm{Var}_\theta\big[\mu_\theta(x)\big]}_{\text{epistemic}} .
+$$
+
+Proof: $\mathrm{Var}(y) = \mathbb E[y^2] - \mathbb E[y]^2 = \mathbb E_\theta\big[\sigma^2_\theta + \mu^2_\theta\big] -
+(\mathbb E_\theta \mu_\theta)^2$, and the last two terms are $\mathrm{Var}_\theta(\mu_\theta)$. The epistemic term
+vanishes for one network, and it is the term that should grow in the gap. For classification the analogue is total
+entropy $\mathrm H[\bar p]$ = expected entropy + mutual information; the helpers also score the variance of the logit
+across draws, the epistemic part measured before the sigmoid can saturate it. The predictive NLL is the exact mixture
+log-density, and the gap AUROC asks whether epistemic sd ranks gap inputs above in-data inputs.
 
 ```python
 RES, REG, CLS = {}, {}, {}                                # metrics, regression samplers, classifier samplers
@@ -180,46 +220,47 @@ point         test NLL  0.20 RMSE 0.281 | sd alea 0.252 epi 0.000 | gap NLL   2.
 point         NLL 0.215 acc 0.949 ECE 0.038 | OOD conf 0.986 | AUROC entropy 0.352 logit-var 0.500
 ```
 
-S4b
+A single network has zero epistemic variance by construction, so it cannot rank gap or OOD inputs (AUROC 0.500), and
+its gap NLL is 2.40 against 0.20 on test data. Entropy AUROC is 0.352, *below* chance: the in-distribution moons overlap,
+so boundary test points have high aleatoric entropy, while the OOD ring is saturated at confidence 1.
 
 ## Deep ensembles: train it five times
 
-S5
+The simplest posterior approximation is to train the same network five times from different random inits and treat the
+five as posterior draws (Lakshminarayanan, Pritzel and Blundell 2017). Where data pin the function down, all five agree;
+in the gap each init settles into a different bridge, and that disagreement is the epistemic term.
 
 ```python
 ens_r = [point] + [train(reg_net, Xtr, Ytr, gnll, REG_STEPS, seed=s) for s in range(1, 5)]
 ens_c = [cpoint] + [train(cls_net, Xc_tr, Yc_tr, bce, CLS_STEPS, seed=s) for s in range(1, 5)]
 reg_eval("ensemble", lambda X: torch.stack([m(X) for m in ens_r]))
 cls_eval("ensemble", lambda X: torch.stack([m(X) for m in ens_c]))
-with torch.no_grad():
-    mus = torch.stack([m(T(xs))[:, 0] for m in ens_r]).numpy()
-print("member means at x =", " ".join(f"{x:5.2f}" for x in xs))
-for k, row in enumerate(mus):
-    print(f"member {k}:              " + " ".join(f"{v:5.2f}" for v in row))
-print(f"truth f(x):            " + " ".join(f"{v:5.2f}" for v in f(xs)))
 ```
 
 ```output
 ensemble      test NLL  0.21 RMSE 0.283 | sd alea 0.252 epi 0.013 | gap NLL   0.92 epi 0.142 ( 11.1x) | AUROC 0.989
 ensemble      NLL 0.191 acc 0.948 ECE 0.034 | OOD conf 0.948 | AUROC entropy 0.312 logit-var 0.983
-member means at x = -3.50 -2.50 -1.50 -0.75  0.00  0.75  1.50  2.50  3.50
-member 0:              -1.24  1.37  1.34  0.02 -0.44  0.79  1.56  1.50 -1.28
-member 1:              -1.29  1.32  1.28  0.21  0.30  1.09  1.56  1.50 -1.26
-member 2:              -1.25  1.35  1.31  0.35  0.52  1.07  1.57  1.52 -1.26
-member 3:              -1.25  1.36  1.31  0.21  0.26  0.91  1.55  1.51 -1.26
-member 4:              -1.27  1.34  1.30  0.20  0.22  0.87  1.54  1.50 -1.26
-truth f(x):            -1.23  1.50  1.50  0.51  0.00  0.51  1.50  1.50 -1.23
 ```
 
-S5b
+On the data the members agree (epistemic sd 0.013); in the gap epistemic sd is 11 times larger, gap NLL drops from
+2.40 to 0.92 and the gap AUROC is 0.989, at no cost in test RMSE. On the OOD ring the logit-variance AUROC is 0.983.
+Ensembles are not Bayesian in the strict sense (no prior, no weighting), but each member sits in a different basin, and
+covering several modes is what the local methods below cannot do. That is why they are usually the strongest baseline.
 
 ## MC dropout: a free ensemble with a blind spot
 
-S6
+Dropout zeroes each hidden unit with probability $p$ during training. Gal and Ghahramani (2016) showed that leaving
+it on at test time and averaging $S$ stochastic passes is approximate Bayesian inference: each mask is one draw of a
+thinned network. It costs one network and $S$ forward passes.
 
 ### What dropout approximates
 
-S6d
+This section shows which posterior dropout corresponds to. Write each weight row as $W_j = z_j M_j$ with
+$z_j \sim \mathrm{Bernoulli}(1-p)$ and learnable $M_j$: that is a variational family $q(W)$, a spike at zero and a spike
+at $M_j$. Gal and Ghahramani show that dropout training with weight decay $\lambda$ minimises, up to constants, the
+negative ELBO (ch. 11) $-\mathbb E_q[\log p(\mathcal D\mid W)] + \mathrm{KL}(q \,\|\, p)$ with a Gaussian prior whose
+precision is tied to $\lambda$ and $p$. The catch is the family: the spread of $q$ is fixed by $p$, not learned from the
+data, so the uncertainty it produces has roughly the same size everywhere.
 
 ```python
 mcd_r = train(lambda: reg_net(p=0.1), Xtr, Ytr, gnll, 2 * REG_STEPS).train()      # train(): dropout stays on
@@ -233,15 +274,36 @@ MC dropout    test NLL  0.36 RMSE 0.295 | sd alea 0.398 epi 0.249 | gap NLL   2.
 MC dropout    NLL 0.190 acc 0.957 ECE 0.031 | OOD conf 0.981 | AUROC entropy 0.344 logit-var 0.920
 ```
 
-S6b
+The blind spot is visible in the ratio: epistemic sd is 0.249 on the data and 0.288 in the gap, only 1.2 times larger,
+and the gap NLL (2.80) is no better than the point network. Dropout noise inflates uncertainty *everywhere* (test NLL
+worsens from 0.20 to 0.36) instead of where data are missing, which is the in-between-uncertainty failure Foong et al.
+(2019) proved for dropout and mean-field Gaussians on exactly this kind of gap. On the ring, logit variance still
+detects OOD (0.920).
 
 ## Bayes by Backprop: a Gaussian over every weight
 
-S7
+Bayes by Backprop (Blundell et al. 2015) gives every weight its own Gaussian, $q(w_k) = \mathcal N(m_k, s_k^2)$, and
+learns all $2P$ numbers by gradient descent on the ELBO (ch. 11). Doubling the parameter count buys an explicit,
+learned uncertainty per weight.
 
 ### The ELBO for network weights
 
-S7d
+This derivation gives the loss that the code minimises. With prior $p(w) = \mathcal N(0, \sigma_p^2 I)$ and $N$ training
+points, the negative ELBO divided by $N$ is
+
+$$
+\mathcal L(m, \rho) = \frac{1}{N}\Big(-\mathbb E_{q}\big[\log p(\mathcal D \mid w)\big] + \mathrm{KL}(q\,\|\,p)\Big),
+\qquad w = m + \mathrm{softplus}(\rho)\odot\varepsilon,\ \ \varepsilon \sim \mathcal N(0, I).
+$$
+
+The reparameterisation moves the randomness into $\varepsilon$, so one draw gives an unbiased gradient of the expectation.
+For Gaussians the KL is closed form per weight, with $s = \mathrm{softplus}(\rho)$:
+
+$$
+\mathrm{KL}\big(\mathcal N(m, s^2)\,\|\,\mathcal N(0, \sigma_p^2)\big) = \log\frac{\sigma_p}{s} + \frac{s^2 + m^2}{2\sigma_p^2} - \frac12 .
+$$
+
+The KL charges every weight for moving away from the prior, and with 160 points the likelihood has little to pay with.
 
 ```python
 class BayesLinear(nn.Module):                             # q(w) = N(mu, softplus(rho)^2), mean-field
@@ -284,15 +346,33 @@ BBB           NLL 0.135 acc 0.958 ECE 0.037 | OOD conf 0.904 | AUROC entropy 0.4
 regression q: 202 weights, posterior sd median 0.169, share with sd > 0.5 (prior-like) 0.18, KL 280 nats
 ```
 
-S7b
+Classification is BBB's best result here: NLL 0.135, the lowest in the chapter, and logit-variance AUROC 1.000.
+Regression is its worst. The KL (280 nats against 160 data points) keeps 18% of the weights at prior-like sd above 0.5,
+the noise head absorbs the misfit (aleatoric sd 0.81 against the true 0.25) and test NLL is 0.81. Worse, epistemic sd
+is *smaller* in the gap than on the data (0.8x, AUROC 0.008): mean-field noise is largest where $|x|$ multiplies the
+first-layer weight noise, not where data are missing: the Foong et al. failure again.
 
 ## Last-layer Laplace: Gaussian around the trained head
 
-S8
+Train the network normally, then put a Gaussian only over the last layer, centred at the trained weights and shaped by
+the curvature of the loss there. This is the Laplace approximation from ch. 3, made cheap because the last layer of a
+50-unit net has 51 weights. Daxberger et al. (2021) found this post-hoc fix competitive with far costlier methods.
 
 ### The GGN and the evidence for the last layer
 
-S8d
+This section shows that for the last layer the Laplace posterior is available in closed form. Write the output as
+$z = w^\top\phi(x)$, with $\phi$ the frozen penultimate features plus a 1. The Hessian of the NLL in $w$ is
+$\sum_i \phi_i \phi_i^\top \,\partial^2_z \ell_i$, and the generalised Gauss-Newton (GGN) keeps exactly that form with the
+always-positive output curvature: $1/\sigma_i^2$ for the Gaussian mean, $p_i(1-p_i)$ for the logistic logit. With prior
+$\mathcal N(0, \lambda^{-1} I)$,
+
+$$
+q(w) = \mathcal N\big(w_\star,\ \Sigma\big), \qquad \Sigma^{-1} = \sum_i \phi_i\,\phi_i^\top\,\partial^2_z\ell_i + \lambda I,
+\qquad \mathrm{Var}[z(x)] = \phi(x)^\top \Sigma\, \phi(x).
+$$
+
+The Laplace evidence (ch. 3) chooses $\lambda$ without a validation set:
+$\log Z(\lambda) \approx \log p(\mathcal D\mid w_\star) + \frac P2\log\lambda - \frac\lambda2\|w_\star\|^2 - \frac12\log\det\Sigma^{-1}$.
 
 ```python
 def feats(net, X):                                        # penultimate activations plus a constant 1
@@ -330,45 +410,17 @@ LL-Laplace    test NLL  0.19 RMSE 0.281 | sd alea 0.252 epi 0.056 | gap NLL   0.
 LL-Laplace    NLL 0.146 acc 0.948 ECE 0.026 | OOD conf 0.938 | AUROC entropy 0.378 logit-var 0.938
 ```
 
-S8b
-
-## SWAG: read the posterior off the SGD trajectory
-
-S9
-
-```python
-def swag_diag(net, X, Y, loss, epochs=100, lr=3e-3, bs=32):
-    net = copy.deepcopy(net).train(); opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9)
-    torch.manual_seed(0); m1 = m2 = 0
-    for _ in range(epochs):                               # constant learning rate, minibatches: the noise is the point
-        for idx in torch.randperm(len(X)).split(bs):
-            opt.zero_grad(); loss(net(X[idx]), Y[idx]).backward(); opt.step()
-        v = nn.utils.parameters_to_vector(net.parameters()).detach()
-        m1, m2 = m1 + v / epochs, m2 + v ** 2 / epochs    # running first and second moments, once per epoch
-    return net, m1, (m2 - m1 ** 2).clamp_min(1e-10)
-def swag_sampler(net, mean, var, S=100):
-    def sample(X):
-        outs = []
-        for _ in range(S):
-            nn.utils.vector_to_parameters(mean + var.sqrt() * torch.randn_like(mean), net.parameters())
-            outs.append(net(X))
-        return torch.stack(outs)
-    return sample
-sw_r, sw_c = swag_diag(point, Xtr, Ytr, gnll), swag_diag(cpoint, Xc_tr, Yc_tr, bce)
-reg_eval("SWAG-diag", swag_sampler(*sw_r))
-cls_eval("SWAG-diag", swag_sampler(*sw_c))
-```
-
-```output
-SWAG-diag     test NLL  0.18 RMSE 0.286 | sd alea 0.312 epi 0.119 | gap NLL   1.21 epi 0.098 (  0.8x) | AUROC 0.161
-SWAG-diag     NLL 0.210 acc 0.949 ECE 0.034 | OOD conf 0.991 | AUROC entropy 0.356 logit-var 0.821
-```
-
-S9b
+For free (no retraining) the gap epistemic sd jumps to 0.380, 6.8 times its in-data value, gap NLL falls to 0.60, the
+best of any approximation, and gap AUROC is 0.996. Test NLL and RMSE are unchanged because $w_\star$ is unchanged. In
+classification it has the best ECE (0.026) of the approximations. The variance grows in the gap because
+$\phi(x)$ there points in directions the training features never spanned, so $\Sigma$ is still wide along them.
 
 ## HMC on the same network: the reference answer
 
-S10
+None of the approximations is the posterior, so which one is closest? For a 202-weight network you can simply run NUTS
+(ch. 6) with the same $\mathcal N(0, 1)$ prior and heteroscedastic likelihood. Weight-space convergence diagnostics
+(ch. 7) are meaningless here: swapping two hidden units or flipping a unit's sign gives the same function, so chains sit
+in different but equivalent modes. Check $\hat R$ on predictions instead.
 
 ```python
 import jax, jax.numpy as jnp, numpyro, numpyro.distributions as dist
@@ -412,11 +464,16 @@ SWAG-diag           0.128  0.136  0.129  0.105  0.092  0.088  0.088  0.100  0.11
 HMC (NUTS)          0.056  0.045  0.074  0.808  1.547  0.832  0.109  0.055  0.067
 ```
 
-S10b
+Weight-space $\hat R$ has median 1.20 and max 2.03, yet function-space $\hat R$ never exceeds 1.043: the four chains
+are in different symmetric copies of the same posterior over functions. The HMC row is the target. Its epistemic sd is
+0.06 on the data and climbs to 1.55 at $x = 0$, a 14-fold rise. Last-layer Laplace (0.48) and the ensemble (0.32) have
+the right shape at about a third and a fifth of the size; MC dropout and BBB are flat profiles of the wrong shape. The gold standard is "the posterior under this prior", not the truth: HMC's gap NLL (0.80) loses to Laplace
+(0.60) because a $\mathcal N(0,1)$ prior over 50 tanh units permits wilder bridges than $x\sin x$.
 
 ## Side by side
 
-S11
+All numbers from the sections above, in one place. Regression metrics use the in-data test set and the gap; the
+classification metrics use the moons test set and, for OOD detection, the ring.
 
 ```python
 print(f"{'regression':13} {'test NLL':>8} {'RMSE':>6} {'gap NLL':>8} {'epi test':>8} {'epi gap':>8} {'gap AUROC':>9}")
@@ -448,14 +505,27 @@ LL-Laplace       0.146  0.948    0.026    0.938    0.378     0.938
 SWAG-diag        0.210  0.949    0.034    0.991    0.356     0.821
 ```
 
-S11b
+Three readings. First, in-distribution accuracy and RMSE barely move: Bayesian deep learning is about the uncertainty,
+not the point prediction. Second, total predictive entropy is useless for this OOD task (every AUROC is below 0.5) while
+logit variance works for every method with an epistemic term; when the OOD question matters, score the epistemic part.
+Third, the ranking depends on the task: last-layer Laplace and ensembles are the only approximations whose uncertainty
+grows in the gap, while BBB wins classification and loses regression. Ensembles cost $M$ trainings, Laplace one
+training plus a $51\times 51$ inverse, MC dropout $S$ forward passes, BBB twice the parameters and slow convergence.
+**SWAG** (Maddox et al. 2019) sits between them: fit a Gaussian (diagonal plus low rank) to constant-learning-rate SGD
+iterates around one mode. Its diagonal-only version inherits the mean-field failure in the gap, the low-rank part is
+what captures the correlated directions that let uncertainty grow there.
 
 ## Priors in weight space and the cold posterior
 
-S12
+Weight-space priors are hard to choose: $\mathcal N(0,1)$ on every weight says nothing intuitive about functions,
+and its effect scales with width and depth. Wenzel et al. (2020) found that "cold" posteriors, $p(\theta\mid\mathcal
+D)^{1/T}$ with $T < 1$, predict better than the Bayes posterior $T = 1$, which suggests misspecified priors or
+likelihoods (data augmentation, curated labels). Izmailov et al. (2021) ran full-batch HMC on ResNets and found the
+effect largely vanishes without augmentation. Down-weighting the KL in BBB is the variational version of a cold
+posterior.
 
 ```python
-for t in (1.0, 0.3, 0.1):
+for t in (0.3, 0.1):
     net = train_bbb([1, 50, 2], torch.tanh, Xtr, Ytr, gnll, kl_weight=t)
     reg_eval(f"BBB KL x{t}", lambda X: torch.stack([net(X) for _ in range(200)]))
 ```
@@ -466,11 +536,15 @@ BBB KL x0.3   test NLL  0.20 RMSE 0.289 | sd alea 0.315 epi 0.126 | gap NLL   0.
 BBB KL x0.1   test NLL  0.18 RMSE 0.285 | sd alea 0.273 epi 0.070 | gap NLL   0.62 epi 0.080 (  1.1x) | AUROC 0.731
 ```
 
-S12b
+Shrinking the KL to 0.3 of its Bayesian weight fixes the underfit (test NLL 0.81 to 0.20, aleatoric sd 0.32) and gives
+the best gap NLL in the chapter (0.23), but the gap ratio stays at 1.1x: tempering changes how much the mean-field
+posterior spreads, not where. A good cold-posterior score is a symptom to investigate (prior, likelihood, the
+approximation itself), not a free hyperparameter.
 
 ## Try it Yourself
 
-TRY
+A self-contained ensemble on the gap problem with a homoscedastic MSE head. Widen `GAP`, drop `MEMBERS` to 2,
+or set `WIDTH` to 500 and watch the epistemic sd in the gap.
 
 ```python
 import numpy as np, torch, torch.nn as nn
@@ -507,11 +581,16 @@ x +3.0 (data): truth +0.42 | ensemble mean +0.43 | epistemic sd 0.005
 x +4.0 (data): truth -3.03 | ensemble mean -3.12 | epistemic sd 0.016
 ```
 
-TRYb
+The ensemble mean at $x = 0$ is 0.87 against a truth of 0, with sd 0.30: ensembles flag the gap but undercover it
+(about 3 sd off), consistent with the HMC comparison. Try `GAP = 2.5` and see whether the members disagree more.
 
 ## Exercise
 
-EX
+Sampling 200 last-layer draws is unnecessary for a single logit: $z(x)$ is Gaussian with mean $\mu = w_\star^\top\phi(x)$
+and variance $v = \phi^\top\Sigma\phi$, and the **probit approximation** $\mathbb E[\sigma(z)] \approx \sigma\big(\mu /
+\sqrt{1 + \pi v/8}\big)$ is accurate to about 0.02. Implement it for the classification Laplace from the chapter, compare
+NLL, ECE and both AUROCs with the Monte Carlo version, and walk out to distance 48 along the probe direction comparing its
+confidence with the point network's. Explain the limit as distance $\to\infty$.
 
 <details>
 <summary>Solution</summary>
@@ -545,9 +624,30 @@ distance 24: point confidence 1.0000 | Laplace-probit confidence 0.7084
 distance 48: point confidence 1.0000 | Laplace-probit confidence 0.7229
 ```
 
-EXb
+The probit version matches Monte Carlo (NLL 0.140 against 0.146, AUROC var 0.942 against 0.938) at the cost of one
+pass. Far away the point network hits confidence 1.0000, while Laplace levels off near 0.72. Along a ray $x = t\,u$ the
+ReLU features grow linearly, $\phi \approx t\,a$, so $\mu \approx t\,w_\star^\top a$ and $v \approx t^2 a^\top\Sigma a$:
+the ratio $\mu/\sqrt{1+\pi v/8}$ tends to a constant and confidence is bounded below 1. This is Kristiadi, Hein and
+Hennig (2020): being Bayesian even just in the last layer fixes asymptotic overconfidence of ReLU nets.
 </details>
 
 ## Under the Trench
 
-UT
+Rare and advanced topics you should at least know the name of. You won't need them daily, but you'll stop being
+surprised when you meet them.
+
+- **Empirical Bayes** — estimate prior hyperparameters from the data by maximising the marginal likelihood, as the Laplace $\lambda$ above did.
+- **Nonparametric Bayes (Dirichlet process)** — a prior over distributions whose number of clusters grows with the data.
+- **Bayesian optimization** — a GP surrogate (ch. 12) plus an acquisition function to minimise expensive black-box functions.
+- **PGMs (Bayes nets, MRFs, belief propagation)** — graphs encode conditional independence; message passing computes exact or loopy marginals.
+- **Expectation propagation** — fits each likelihood factor by moment matching instead of the reverse KL that VI uses.
+- **Stochastic VI & normalizing-flow posteriors** — minibatch natural-gradient VI for huge data, and invertible networks as flexible $q$.
+- **Causal Bayesian models & do-calculus** — distinguish $p(y\mid x)$ from $p(y\mid \mathrm{do}(x))$ and identify interventional effects.
+- **SMC / particle filters** — weighted, resampled particle populations for sequential posteriors and annealed static ones.
+- **Reversible-jump MCMC** — Metropolis-Hastings moves between parameter spaces of different dimension.
+- **Bayesian model averaging vs stacking** — BMA weights by evidence and collapses onto one model; stacking optimises predictive weights.
+- **Simulation-based inference (ABC, neural posterior estimation)** — inference when you can simulate data but cannot evaluate the likelihood.
+- **Stein variational gradient descent** — a set of particles pushed by a kernelised gradient flow toward the posterior.
+- **Riemannian HMC** — HMC with a position-dependent metric that adapts to funnels and curved geometry.
+- **Bayesian GP-LVM** — a GP mapping from latent inputs, marginalised variationally, for nonlinear dimensionality reduction.
+- **Conformal vs Bayesian intervals** — conformal gives distribution-free marginal coverage; Bayesian intervals are conditional and only as good as the model.
