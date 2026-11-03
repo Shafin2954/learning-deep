@@ -18,6 +18,8 @@ import time
 import traceback
 
 os.environ.setdefault("MPLBACKEND", "Agg")
+# OpenMP spin-waits make sklearn/numpy crawl when several runs share the CPU.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 FENCE = re.compile(r"^```(\w*)\s*$")
 
