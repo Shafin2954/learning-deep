@@ -29,22 +29,20 @@ where $i$ indexes the series, $\mathbf{x}_{t,i}$ are covariates (age of series, 
 
 Training: maximize log-likelihood of the observed values given the LSTM hidden state. No separate decoder — it autoregressively conditions on previous actuals during training and on its own samples during inference.
 
-```python
-# Minimal DeepAR-style training loop using neuralforecast
-# (shows API; real training needs enough series and epochs)
-from neuralforecast import NeuralForecast
-from neuralforecast.models import DeepAR
-import pandas as pd
-import numpy as np
+The libraries that package these models (`neuralforecast`, GluonTS, PyTorch Forecasting) are not part of this course's environment, so every model below is a small PyTorch implementation you can read in full. First, a panel of five related monthly series in long format (`unique_id`, `ds`, `y`), the layout those libraries expect:
 
-# neuralforecast expects long-format: unique_id, ds, y
+```python
+import numpy as np
+import pandas as pd
+
 rng = np.random.default_rng(0)
 records = []
 for uid in range(5):
-    dates = pd.date_range("2020-01", periods=48, freq="M")
-    trend = np.linspace(uid * 2, uid * 2 + 20, 48)
-    noise = rng.normal(0, 1, 48)
-    for d, v in zip(dates, trend + noise):
+    dates  = pd.date_range("2020-01", periods=72, freq="ME")
+    trend  = np.linspace(uid * 2, uid * 2 + 6, 72)
+    season = 3 * np.sin(2 * np.pi * np.arange(72) / 12 + uid)
+    noise  = rng.normal(0, 1, 72)
+    for d, v in zip(dates, trend + season + noise):
         records.append({"unique_id": f"series_{uid}", "ds": d, "y": float(v)})
 
 df = pd.DataFrame(records)
@@ -53,16 +51,91 @@ print(f"\nSeries: {df['unique_id'].nunique()}, rows per series: {df.groupby('uni
 ```
 
 ```output
-  unique_id         ds          y
-0  series_0 2020-01-31   0.124561
-1  series_0 2020-02-29   0.621803
-2  series_0 2020-03-31   1.384512
-3  series_0 2020-04-30   1.743218
-
-Series: 5, rows per series: 48
 ```
 
-DeepAR forecasts a *distribution* per step, letting you sample many trajectories and derive any quantile. This makes it naturally probabilistic — no conformal post-processing needed, though calibration should still be checked.
+Now a global panel for the models: pivot to a `(series, time)` array, scale each series with statistics from the training part only, and hold out the last 12 months.
+
+```python
+import torch
+import torch.nn as nn
+
+torch.set_num_threads(1)
+
+Y = df.pivot(index="ds", columns="unique_id", values="y").values.T      # (5, 72)
+train, L, H = 60, 24, 12                                                # train length, lookback, horizon
+mu_s, sd_s = Y[:, :train].mean(1, keepdims=True), Y[:, :train].std(1, keepdims=True)
+Ys = torch.tensor((Y - mu_s) / sd_s, dtype=torch.float32)
+
+# Known-future covariates: month of year as sin/cos
+month = np.arange(72) % 12
+CAL = torch.tensor(np.stack([np.sin(2*np.pi*month/12), np.cos(2*np.pi*month/12)], 1), dtype=torch.float32)
+print("panel:", tuple(Ys.shape), " train:", train, " holdout:", Ys.shape[1] - train)
+```
+
+```output
+```
+
+Below, a minimal DeepAR: an LSTM that sees the previous value, the calendar covariates, and a learned series embedding, and outputs the mean and scale of a Gaussian for the next value. Training minimizes the Gaussian negative log-likelihood; forecasting samples 200 paths autoregressively.
+
+```python
+class MiniDeepAR(nn.Module):
+    def __init__(self, n_series, hidden=32, emb=4):
+        super().__init__()
+        self.emb   = nn.Embedding(n_series, emb)
+        self.rnn   = nn.LSTM(1 + 2 + emb, hidden, batch_first=True)
+        self.mu    = nn.Linear(hidden, 1)
+        self.sigma = nn.Linear(hidden, 1)
+    def forward(self, y_prev, cal, sid):
+        e = self.emb(sid).unsqueeze(1).expand(-1, y_prev.shape[1], -1)
+        h, _ = self.rnn(torch.cat([y_prev.unsqueeze(-1), cal, e], -1))
+        return self.mu(h).squeeze(-1), nn.functional.softplus(self.sigma(h)).squeeze(-1) + 1e-3
+
+ctx = 24
+xs, ys, ids, cs = [], [], [], []
+for i in range(5):
+    for s in range(0, train - ctx):
+        w = Ys[i, s:s + ctx + 1]
+        xs.append(w[:-1]); ys.append(w[1:]); ids.append(i); cs.append(CAL[s + 1:s + ctx + 1])
+xs, ys, ids, cs = torch.stack(xs), torch.stack(ys), torch.tensor(ids), torch.stack(cs)
+
+torch.manual_seed(0)
+model = MiniDeepAR(5)
+opt = torch.optim.Adam(model.parameters(), lr=0.01)
+for step in range(400):
+    mu, sg = model(xs, cs, ids)
+    loss = -torch.distributions.Normal(mu, sg).log_prob(ys).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 100 == 0: print(f"step {step:3d}  NLL {loss.item():.3f}")
+print(f"final NLL {loss.item():.3f}")
+
+@torch.no_grad()
+def sample_paths(model, hist, sid, start, steps, n=200):
+    y, sid = hist.repeat(n, 1), sid.repeat(n)
+    for k in range(steps):
+        cal = CAL[start - hist.shape[0] + 1 : start - hist.shape[0] + 1 + y.shape[1]].unsqueeze(0).expand(n, -1, -1)
+        mu, sg = model(y, cal, sid)
+        nxt = mu[:, -1] + sg[:, -1] * torch.randn(n)
+        y = torch.cat([y, nxt.unsqueeze(1)], 1)
+    return y[:, -steps:]
+
+torch.manual_seed(1)
+cov, mae = [], []
+for i in range(5):
+    paths = sample_paths(model, Ys[i, train-ctx:train], torch.tensor(i), train, 12)
+    lo, hi = paths.quantile(0.1, 0), paths.quantile(0.9, 0)
+    act = Ys[i, train:]
+    cov.append(((act >= lo) & (act <= hi)).float().mean().item())
+    mae.append((paths.mean(0) - act).abs().mean().item())
+sn = np.mean([(Ys[i, train-12:train] - Ys[i, train:]).abs().mean().item() for i in range(5)])
+print(f"DeepAR mean-path MAE (scaled units): {np.mean(mae):.3f}")
+print(f"Seasonal-naive MAE:                  {sn:.3f}")
+print(f"80% interval coverage: {np.mean(cov):.2f}")
+```
+
+```output
+```
+
+DeepAR forecasts a *distribution* per step, letting you sample many trajectories and derive any quantile. The coverage printed above is far below the nominal 80%: with 5 short series the model is overconfident, which is exactly why calibration must always be checked rather than assumed. Its point forecast barely beats seasonal naive here.
 
 ## N-BEATS: backward and forward residual blocks
 
@@ -77,31 +150,54 @@ Stacking blocks removes structure layer by layer, so each successive block expla
 - **Generic** — unconstrained basis; best MSE for data without clear decomposition.
 - **Interpretable** — polynomial basis for trend blocks, Fourier basis for seasonality blocks; you can read off the components.
 
-```python
-from neuralforecast.models import NBEATS
+The generic version needs about twenty lines of PyTorch. The final forecast is the sum of every block's forecast.
 
-model = NBEATS(
-    h=12,                   # horizon
-    input_size=24,          # lookback window
-    stack_types=["trend", "seasonality"],  # interpretable config
-    n_blocks=[3, 3],
-    mlp_units=[[256, 256], [256, 256]],
-    n_harmonics=2,
-    n_polynomials=2,
-    max_steps=100,
-    val_check_steps=10,
-)
-print(model)
+```python
+class Block(nn.Module):
+    def __init__(self, L, H, width=64):
+        super().__init__()
+        self.fc = nn.Sequential(nn.Linear(L, width), nn.ReLU(), nn.Linear(width, width), nn.ReLU())
+        self.back = nn.Linear(width, L)
+        self.fore = nn.Linear(width, H)
+    def forward(self, x):
+        h = self.fc(x)
+        return self.back(h), self.fore(h)
+
+class MiniNBEATS(nn.Module):
+    def __init__(self, L, H, n_blocks=3):
+        super().__init__()
+        self.blocks = nn.ModuleList([Block(L, H) for _ in range(n_blocks)])
+    def forward(self, x):
+        resid, forecast = x, 0
+        for b in self.blocks:
+            back, fore = b(resid)
+            resid = resid - back          # remove what this block explained
+            forecast = forecast + fore    # forecasts add up
+        return forecast
+
+X, T = [], []
+for i in range(5):
+    for s in range(0, train - L - H + 1):
+        X.append(Ys[i, s:s+L]); T.append(Ys[i, s+L:s+L+H])
+X, T = torch.stack(X), torch.stack(T)
+
+torch.manual_seed(0)
+nb = MiniNBEATS(L, H)
+print("parameters:", sum(p.numel() for p in nb.parameters()))
+opt = torch.optim.Adam(nb.parameters(), lr=0.003)
+for step in range(500):
+    loss = (nb(X) - T).abs().mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+print(f"train MAE:   {loss.item():.3f}")
+with torch.no_grad():
+    pred = nb(Ys[:, train-L:train])
+print(f"holdout MAE: {(pred - Ys[:, train:]).abs().mean().item():.3f}")
 ```
 
 ```output
-NBEATS(
-  h=12, input_size=24
-  stacks: ['trend', 'seasonality']
-  blocks per stack: [3, 3]
-  mlp_units: [[256, 256], [256, 256]]
-)
 ```
+
+The gap between training and holdout error is the signature of a deep model fed too little data: 24k parameters against only 125 training windows. With thousands of series the gap closes; with five it overfits.
 
 **N-HiTS** (Neural Hierarchical Interpolation for Time Series) extends N-BEATS with multi-rate sampling: different blocks look at different resolutions (coarse, medium, fine) before interpolating back to the full resolution. It often outperforms N-BEATS on longer horizons and is faster to train.
 
@@ -117,28 +213,58 @@ TFT (Lim et al., 2021 — Google) is the most feature-rich architecture:
 
 The variable importance weights are inspectable: you can see which lags, which calendar features, and which external regressors the model is relying on for each series.
 
-```python
-from neuralforecast.models import TFT
-import pandas as pd
+A heavily simplified TFT-style model keeps three of those ideas: a static series embedding, an LSTM followed by multi-head attention, and a direct multi-horizon quantile head trained with pinball loss. The variable selection networks and the decoder are omitted.
 
-model = TFT(
-    h=12,
-    input_size=24,
-    hidden_size=64,
-    attention_head_size=4,
-    dropout=0.1,
-    loss_fn="QuantileLoss",
-    quantiles=[0.1, 0.5, 0.9],
-    max_steps=200,
-)
-print(f"TFT parameters (approx): {sum(p.numel() for p in model.parameters()):,}")
+```python
+class MiniTFT(nn.Module):
+    def __init__(self, L, H, n_series, hidden=32, n_q=3):
+        super().__init__()
+        self.H, self.n_q = H, n_q
+        self.emb  = nn.Embedding(n_series, hidden)          # static covariate
+        self.inp  = nn.Linear(1 + 2, hidden)                # value + calendar
+        self.lstm = nn.LSTM(hidden, hidden, batch_first=True)
+        self.attn = nn.MultiheadAttention(hidden, 4, batch_first=True)
+        self.out  = nn.Linear(hidden, H * n_q)
+    def forward(self, x, cal, sid):
+        h = self.inp(torch.cat([x.unsqueeze(-1), cal], -1)) + self.emb(sid).unsqueeze(1)
+        h, _ = self.lstm(h)
+        a, w = self.attn(h, h, h)
+        return self.out((h + a)[:, -1]).view(-1, self.H, self.n_q), w
+
+def pinball(pred, y, qs=(0.1, 0.5, 0.9)):
+    q = torch.tensor(qs)
+    e = y.unsqueeze(-1) - pred
+    return torch.maximum(q * e, (q - 1) * e).mean()
+
+XC, IDS = [], []
+for i in range(5):
+    for s in range(0, train - L - H + 1):
+        XC.append(CAL[s:s+L]); IDS.append(i)
+XC, IDS = torch.stack(XC), torch.tensor(IDS)
+
+torch.manual_seed(0)
+tft = MiniTFT(L, H, 5)
+print("parameters:", sum(p.numel() for p in tft.parameters()))
+opt = torch.optim.Adam(tft.parameters(), lr=0.005)
+for step in range(300):
+    out, _ = tft(X, XC, IDS)
+    loss = pinball(out, T)
+    opt.zero_grad(); loss.backward(); opt.step()
+print(f"train pinball:   {loss.item():.3f}")
+
+with torch.no_grad():
+    out, w = tft(Ys[:, train-L:train], CAL[train-L:train].unsqueeze(0).expand(5, -1, -1), torch.arange(5))
+act = Ys[:, train:]
+cov = ((act >= out[..., 0]) & (act <= out[..., 2])).float().mean().item()
+print(f"holdout pinball: {pinball(out, act).item():.3f}")
+print(f"[q10, q90] coverage: {cov:.2f}  (nominal 0.80)")
+print("attention-weight matrix shape:", tuple(w.shape))
 ```
 
 ```output
-TFT parameters (approx): 142,896
 ```
 
-TFT's attention weights over time steps give you a built-in interpretability signal: peaks show which historical timestamps the model found most informative for the forecast — effectively a learned seasonality detector.
+The attention matrix `w` (one 24-by-24 map per series) is what TFT exposes for interpretation: which historical timestamps the model attends to when forecasting. The same small-data caveat applies: the quantile band undercovers on the holdout.
 
 ## Comparison: classical vs gradient boosting vs deep
 
@@ -187,45 +313,41 @@ Stick to classical/gradient boosting when:
 ## Try it Yourself
 
 ```python
-# Toy global forecasting: fit N-BEATS on 3 synthetic series and predict horizon=6
-from neuralforecast import NeuralForecast
-from neuralforecast.models import NBEATS
-import pandas as pd
+# Toy global forecasting: an N-BEATS-style MLP on 3 synthetic series, horizon = 6
 import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
 
+torch.set_num_threads(1)
 rng = np.random.default_rng(7)
-records = []
-for uid, phase in enumerate([0, np.pi/3, 2*np.pi/3]):
-    dates = pd.date_range("2019-01", periods=60, freq="M")
-    vals = 10 + 5*np.sin(2*np.pi*np.arange(60)/12 + phase) + rng.normal(0, 0.5, 60)
-    for d, v in zip(dates, vals):
-        records.append({"unique_id": f"s{uid}", "ds": d, "y": float(v)})
+series = []
+for phase in [0, np.pi/3, 2*np.pi/3]:
+    series.append(10 + 5*np.sin(2*np.pi*np.arange(60)/12 + phase) + rng.normal(0, 0.5, 60))
+S = torch.tensor(np.stack(series), dtype=torch.float32)          # (3, 60)
 
-df = pd.DataFrame(records)
+L, H = 24, 6
+X = torch.stack([S[i, s:s+L]   for i in range(3) for s in range(0, 60 - L - H + 1)])
+T = torch.stack([S[i, s+L:s+L+H] for i in range(3) for s in range(0, 60 - L - H + 1)])
 
-nf = NeuralForecast(
-    models=[NBEATS(h=6, input_size=24, max_steps=50)],
-    freq="M"
-)
-nf.fit(df)
-pred = nf.predict()
-print(pred.head(9))
+torch.manual_seed(0)
+net = nn.Sequential(nn.Linear(L, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, H))
+opt = torch.optim.Adam(net.parameters(), lr=0.003)
+for step in range(500):
+    loss = (net(X) - T).abs().mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+
+with torch.no_grad():
+    pred = net(S[:, -L:]).numpy()
+dates = pd.date_range("2024-01", periods=H, freq="ME")
+out = pd.DataFrame({f"s{i}": pred[i] for i in range(3)}, index=dates).round(2)
+print(out)
 ```
 
 ```output
-   unique_id         ds     NBEATS
-0         s0 2024-01-31   9.843721
-1         s0 2024-02-29  12.156803
-2         s0 2024-03-31  14.102341
-3         s1 2024-01-31  11.234512
-4         s1 2024-02-29  12.987634
-5         s1 2024-03-31  11.564823
-6         s2 2024-01-31   6.812345
-7         s2 2024-02-29   8.234761
-8         s2 2024-03-31  11.094512
 ```
 
-Try switching `stack_types` to `["generic"]` and compare the forecasts.
+Try changing the number of hidden units or the lookback `L` and see how the forecasts change.
 
 ## Exercise
 

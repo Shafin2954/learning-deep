@@ -56,7 +56,7 @@ print(f"Trainable: {trainable:,}  /  Total: {total:,}")
 ```
 
 ```output
-Trainable: 10,245  /  Total: 25,548,285
+Trainable: 10,245  /  Total: 23,518,277
 ```
 
 Only the final linear head (2048×5 + bias) trains. The backbone stays fixed.
@@ -75,7 +75,7 @@ print(f"Trainable after unfreezing layer4: {trainable:,}")
 ```
 
 ```output
-Trainable after unfreezing layer4: 6,313,989
+Trainable after unfreezing layer4: 14,974,981
 ```
 
 ## Discriminative learning rates
@@ -127,8 +127,8 @@ def make_data(n):
     X = templates[y] + 2.0 * torch.randn(n, 3, 64, 64)
     return X, y
 
-model = models.resnet50(weights=None)
-model.fc = nn.Linear(2048, NUM_CLASSES)
+model = models.resnet18(weights=None)   # ResNet-18 keeps this demo fast on CPU
+model.fc = nn.Linear(512, NUM_CLASSES)
 for p in model.parameters(): p.requires_grad = False
 for p in model.fc.parameters(): p.requires_grad = True
 
@@ -153,6 +153,9 @@ for epoch in range(EPOCHS):
 ```
 
 ```output
+Epoch 1  loss=1.689  val_acc=0.31
+Epoch 2  loss=1.704  val_acc=0.19
+Epoch 3  loss=1.605  val_acc=0.16
 ```
 
 Chance is 0.20 for 5 classes. Read the numbers above against that baseline: with a random (not pretrained) backbone and only 3 epochs, the head sees whatever features the random network happens to produce. With real ImageNet weights the same loop would start far above chance, which is the whole point of transfer learning.
@@ -176,7 +179,7 @@ The simplest evaluation of pretrained features: extract feature vectors for ever
 from sklearn.linear_model import LogisticRegression
 import numpy as np
 
-# Extract 2048-d features from avgpool
+# Extract 512-d features from avgpool
 def extract_features(model, X):
     model.eval()
     features = []
@@ -192,17 +195,20 @@ def extract_features(model, X):
 
 X, y = make_data(100)
 feats = extract_features(model, X)
+mu, sd = feats.mean(0), feats.std(0) + 1e-6      # standardise features for the linear probe
 print("Feature shape:", feats.shape)
 
-clf = LogisticRegression(max_iter=200).fit(feats, y.numpy())
-print(f"Linear probe train acc: {clf.score(feats, y.numpy()):.2f}")
+clf = LogisticRegression(max_iter=1000).fit((feats - mu) / sd, y.numpy())
+print(f"Linear probe train acc: {clf.score((feats - mu) / sd, y.numpy()):.2f}")
 Xv, yv = make_data(50)
-print(f"Linear probe val acc:   {clf.score(extract_features(model, Xv), yv.numpy()):.2f}")
+fv = extract_features(model, Xv)
+print(f"Linear probe val acc:   {clf.score((fv - mu) / sd, yv.numpy()):.2f}")
 ```
 
 ```output
-Feature shape: (100, 2048)
-Linear probe train acc: 0.52
+Feature shape: (100, 512)
+Linear probe train acc: 1.00
+Linear probe val acc:   0.80
 ```
 
 ## Try it Yourself
@@ -233,8 +239,7 @@ print("Output:", model(x).shape)
 
 ```output
 MobileNetV3-Small total params: 2,542,856
-Trainable params: 10,250
-Linear probe train acc: 0.52
+Trainable params: 601,098
 Output: torch.Size([4, 10])
 ```
 
@@ -291,6 +296,11 @@ for name in ["resnet18", "efficientnet_b0"]:
     model, opt = fine_tune_setup(name, 5, 2)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"{name}: groups={len(opt.param_groups)}  trainable={trainable:,}  output={tuple(model(x).shape)}")
+```
+
+```output
+resnet18: groups=2  trainable=2,565  output=(2, 5)
+efficientnet_b0: groups=2  trainable=6,405  output=(2, 5)
 ```
 
 The function handles both `fc`-headed (ResNet) and `classifier`-headed (EfficientNet) torchvision models, freezes everything but the last `n` children, and returns an optimizer with proper learning rates.
