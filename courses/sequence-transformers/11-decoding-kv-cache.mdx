@@ -19,6 +19,8 @@ The simplest rule: at each step take the token with the highest logit.
 import torch
 import torch.nn.functional as F
 
+torch.set_num_threads(1)
+
 def greedy_decode(model, input_ids, max_new_tokens, eos_id=None):
     ids = input_ids.clone()
     for _ in range(max_new_tokens):
@@ -215,6 +217,7 @@ class CachedAttention(nn.Module):
         return self.out(out), new_cache
 
 # Simulate two forward passes: one with full seq, one cached
+torch.manual_seed(0)
 d_model, n_heads = 64, 4
 attn = CachedAttention(d_model, n_heads)
 attn.eval()
@@ -253,7 +256,7 @@ $$
 
 A 70B-parameter model with 80 layers, 8 KV heads, and head dim 128 at FP16:
 $2 \times 80 \times 8 \times T \times 128 \times 2 = 327{,}680 \times T$ bytes.
-At $T = 8{,}192$ tokens that is 2.56 GB per sequence — for a single batch element.
+At $T = 8{,}192$ tokens that is about 2.7 GB (2.5 GiB) per sequence — for a single batch element.
 
 This is why inference memory is dominated by the KV cache, not the model weights, at long
 context lengths. GQA/MQA reduce this by sharing K and V heads.
@@ -331,7 +334,7 @@ Try changing `temperature` to 5.0 to see random deviations from the greedy path.
 
 Implement a repetition penalty: before softmax, divide the logit of any token that already
 appears in `ids` by a penalty factor $\alpha > 1$. Show that with $\alpha = 10$ and the
-logit table above, the model avoids repeating 'a' even if forced to start with it twice.
+a logit table in which 'a' prefers to be followed by 'a' again, the penalty breaks the loop that plain greedy decoding falls into.
 
 <details>
 <summary>Solution</summary>
@@ -351,10 +354,26 @@ def decode_with_rep_penalty(logit_fn, input_ids, max_new_tokens, alpha=2.0, eos_
             break
     return ids
 
-# Force 'a' at start then let penalty steer
-forced = torch.tensor([[0, 1]])  # <bos>, a
-result = decode_with_rep_penalty(logit_fn, forced, max_new_tokens=5, alpha=10.0, eos_id=4)
-print(" ".join(vocab[i.item()] for i in result[0]))
+# A table where 'a' loops on itself: after 'a' the top choice is 'a' again (5.0), 'b' is close (4.0)
+loop_table = torch.tensor([
+    [0., 5., 1., 1., 0.],   # after <bos>: 'a'
+    [0., 5., 4., 0., 0.],   # after 'a':   'a' again, or 'b'
+    [0., 0., 0., 5., 0.],   # after 'b':   'c'
+    [0., 0., 0., 0., 5.],   # after 'c':   <eos>
+    [0., 0., 0., 0., 0.],
+])
+loop_fn = lambda ids: loop_table[ids[0, -1].item()].unsqueeze(0).unsqueeze(0)
+
+start = torch.tensor([[0, 1]])  # <bos>, a
+plain = decode_with_rep_penalty(loop_fn, start, max_new_tokens=5, alpha=1.0, eos_id=4)
+pen   = decode_with_rep_penalty(loop_fn, start, max_new_tokens=5, alpha=10.0, eos_id=4)
+print("No penalty:  ", " ".join(vocab[i.item()] for i in plain[0]))
+print("alpha = 10:  ", " ".join(vocab[i.item()] for i in pen[0]))
+```
+
+```output
+No penalty:   <bos> a a a a a a
+alpha = 10:   <bos> a b c <eos>
 ```
 
 The penalty divides positive logits for seen tokens, pushing the model toward tokens it has

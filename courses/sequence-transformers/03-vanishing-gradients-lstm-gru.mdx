@@ -28,7 +28,7 @@ def grad_norm_through_tanh(T, W_scale=0.9, H=8, seed=0):
     h = np.ones(H)  # arbitrary starting gradient
     norms = [np.linalg.norm(h)]
     for _ in range(T):
-        dtanh = 1 - np.tanh(h)**2  # ≤ 1 element-wise
+        dtanh = 1 - np.tanh(h)**2  # at most 1 element-wise
         h = Whh.T @ (dtanh * h)
         norms.append(np.linalg.norm(h))
     return norms
@@ -42,9 +42,9 @@ print(f"Gradient norm after   1 steps: {norms_20[1]:.4f}")
 ```
 
 ```output
-Gradient norm after  20 steps: 3.21e-07
-Gradient norm after 100 steps: 4.18e-35
-Gradient norm after   1 steps: 0.4823
+Gradient norm after  20 steps: 2.95e-02
+Gradient norm after 100 steps: 1.11e-05
+Gradient norm after   1 steps: 0.8509
 ```
 
 After 100 steps the gradient is effectively zero — the model is blind to events 100+ tokens ago.
@@ -107,7 +107,7 @@ class LSTMCell:
         return 1 / (1 + np.exp(-np.clip(x, -30, 30)))
 
 cell = LSTMCell(input_size=4, hidden_size=8)
-x   = np.random.randn(4)
+x   = np.random.default_rng(0).standard_normal(4)
 h   = np.zeros(8)
 c   = np.zeros(8)
 
@@ -121,8 +121,8 @@ print("c norm:", np.linalg.norm(c).round(5))
 
 ```output
 h shape: (8,)   c shape: (8,)
-h norm: 0.01132
-c norm: 0.05261
+h norm: 0.00886
+c norm: 0.01773
 ```
 
 ## GRU: simpler alternative
@@ -171,13 +171,14 @@ class GRUCell:
 
 gru = GRUCell(input_size=4, hidden_size=8)
 h   = np.zeros(8)
+rng = np.random.default_rng(0)
 for _ in range(10):
-    h = gru.forward(np.random.randn(4), h)
+    h = gru.forward(rng.standard_normal(4), h)
 print("GRU h norm after 10 steps:", np.linalg.norm(h).round(5))
 ```
 
 ```output
-GRU h norm after 10 steps: 0.04317
+GRU h norm after 10 steps: 0.00825
 ```
 
 ## LSTM vs GRU: when to choose
@@ -232,18 +233,18 @@ for _ in range(T):
     h, c = cell.forward(np.zeros(4), h, c)
 # Approximate: gradient through c via forget gates
 f_approx = cell._sigmoid(cell.b[:8])
-c_grad_after = c_grad * np.prod(f_approx) ** T
+c_grad_after = c_grad * f_approx ** T      # each unit's gradient shrinks by its own f per step
 print(f"LSTM cell gradient approx after {T} steps (f≈{f_approx.mean():.2f}): {np.linalg.norm(c_grad_after):.4f}")
 ```
 
 ```output
-Vanilla RNN gradient norm after 50 steps: 3.47e-18
-LSTM cell gradient approx after 50 steps (f≈0.88): 0.0012
+Vanilla RNN gradient norm after 50 steps: 6.89e-32
+LSTM cell gradient approx after 50 steps (f≈0.88): 0.0050
 ```
 
 ## Exercise
 
-Implement a GRU cell where the update gate is initialized to favor **remembering** (set $b_z$ to $-2$ so $z_t \approx \sigma(-2) \approx 0.12$, meaning the state barely changes each step). Then run 50 steps with a constant input and observe that $h$ changes slowly.
+Implement a GRU cell where the update gate is initialized to favor **remembering** (set $b_z$ to $-2$ so $z_t \approx \sigma(-2) \approx 0.12$, meaning the state barely changes each step). Then run 50 steps with a constant input and watch how $h$ evolves: with $z \approx 0.12$ the state moves only about 12% of the way toward the candidate each step.
 
 <details>
 <summary>Solution</summary>
@@ -278,12 +279,18 @@ class GRUCell:
 gru = GRUCell(4, 8)
 h = np.ones(8) * 0.5
 x = np.ones(4)
-for step in [0, 10, 25, 49]:
-    for _ in range(1 if step == 0 else (step - prev_step if step > 0 else 0)):
-        h, z_mean = gru.forward(x, h)
-    prev_step = step
-    print(f"Step {step:2d}: h_norm={np.linalg.norm(h):.4f}, z_mean={z_mean:.4f}")
+for step in range(50):
+    h, z_mean = gru.forward(x, h)
+    if step in (0, 10, 25, 49):
+        print(f"Step {step:2d}: h_norm={np.linalg.norm(h):.4f}, z_mean={z_mean:.4f}")
 ```
 
-With $b_z = -2$, the update gate $z \approx 0.12$, so $h$ barely moves each step — it "remembers" the initial state.
+```output
+Step  0: h_norm=1.2416, z_mean=0.1191
+Step 10: h_norm=0.3294, z_mean=0.1195
+Step 25: h_norm=0.0503, z_mean=0.1197
+Step 49: h_norm=0.0484, z_mean=0.1197
+```
+
+With $b_z = -2$, the update gate $z \approx 0.12$, so each step keeps about 88% of the previous state. With these tiny random weights the candidate is near zero, so $h$ decays gradually (about $1.41 \to 0.05$ over 50 steps, flattening at a small fixed point set by the constant input) rather than being overwritten in one step; the larger $z$ is, the faster the initial state is forgotten.
 </details>

@@ -27,7 +27,7 @@ def transformer_schedule(step, d_model=64, warmup=4000):
 def cosine_with_warmup(step, max_lr=1e-3, warmup=200, total=2000):
     if step < warmup:
         return max_lr * step / warmup
-    t = (step - warmup) / (total - warmup)
+    t = min((step - warmup) / (total - warmup), 1.0)   # stay at the floor after `total` steps
     return max_lr * 0.5 * (1 + np.cos(np.pi * t))
 
 steps = [1, 100, 500, 1000, 2000, 4000, 8000]
@@ -40,13 +40,13 @@ for s in steps:
 
 ```output
   step     vaswani      cosine
-     1    0.000195    0.000005
-   100    0.001953    0.000500
-   500    0.001043    0.001000
-  1000    0.000347    0.000985
-  2000    0.000245    0.000500
-  4000    0.000174    0.000003
-  8000    0.000123    0.000003
+     1    0.000016    0.000005
+   100    0.001563    0.000500
+   500    0.005590    0.000933
+  1000    0.003953    0.000587
+  2000    0.002795    0.000000
+  4000    0.001976    0.000000
+  8000    0.001398    0.000000
 ```
 
 ## Label smoothing
@@ -64,6 +64,9 @@ Typical $\varepsilon = 0.1$: 90% probability on the true class, 10% distributed 
 ```python
 import torch
 import torch.nn.functional as F
+
+torch.manual_seed(0)
+torch.set_num_threads(1)
 
 def label_smoothed_nll(logits, targets, eps=0.1):
     V = logits.shape[-1]
@@ -84,9 +87,8 @@ print(f"Label-smoothed loss:      {smooth_loss.item():.4f}")
 ```
 
 ```output
-Standard CE loss:         4.5423
-Standard CE loss:         4.5423
-Label-smoothed loss:      4.5193
+Standard CE loss:         4.7171
+Label-smoothed loss:      4.7597
 ```
 
 ## Causal attention mask
@@ -111,7 +113,7 @@ tensor([[0, 1, 1, 1, 1],
         [0, 0, 1, 1, 1],
         [0, 0, 0, 1, 1],
         [0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 0]])
+        [0, 0, 0, 0, 0]], dtype=torch.int32)
 ```
 
 ## Padding mask
@@ -134,7 +136,7 @@ print(pmask.int())
 Padding mask (True=padded):
 tensor([[0, 0, 0, 0, 0, 1, 1, 1],
         [0, 0, 0, 1, 1, 1, 1, 1],
-        [0, 0, 0, 0, 0, 0, 0, 1]])
+        [0, 0, 0, 0, 0, 0, 0, 1]], dtype=torch.int32)
 ```
 
 For cross-attention in translation, the decoder should not attend to padding positions in the source. Expand the padding mask to `(B, 1, 1, T_src)` to broadcast over decoder positions and heads.
@@ -145,6 +147,7 @@ For cross-attention in translation, the decoder should not attend to padding pos
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 text = ("the quick brown fox jumps over the lazy dog " * 30).strip()
 chars = sorted(set(text))
@@ -159,12 +162,6 @@ class TinyGPT(nn.Module):
         super().__init__()
         self.tok_emb = nn.Embedding(V, d)
         self.pos_emb = nn.Embedding(block_size, d)
-        layers = []
-        for _ in range(N):
-            layers += [
-                nn.LayerNorm(d),
-                # Inline MHA for brevity
-            ]
         # Use nn.TransformerEncoderLayer for compactness
         enc_layer = nn.TransformerEncoderLayer(d, h, dim_feedforward=4*d,
                                                 dropout=0.0, batch_first=True,
@@ -199,19 +196,19 @@ for step in range(400):
     opt.zero_grad(); loss.backward(); opt.step()
     losses.append(loss.item())
 
-perplexity = lambda l: 2 ** l
+perplexity = lambda l: float(np.exp(l))   # loss is in nats
 print(f"Step   0: loss={losses[0]:.3f}  ppl={perplexity(losses[0]):.1f}")
 print(f"Step 100: loss={losses[99]:.3f}  ppl={perplexity(losses[99]):.1f}")
 print(f"Step 399: loss={losses[399]:.3f}  ppl={perplexity(losses[399]):.1f}")
 ```
 
 ```output
-Step   0: loss=3.178  ppl=9.0
-Step 100: loss=2.012  ppl=4.0
-Step 399: loss=1.241  ppl=2.4
+Step   0: loss=3.459  ppl=31.8
+Step 100: loss=0.147  ppl=1.2
+Step 399: loss=0.023  ppl=1.0
 ```
 
-Perplexity drops from 9 (near-random for a ~9-char alphabet) toward ~2.4 — the model starts capturing the common English letter patterns.
+The alphabet has 27 symbols, so a uniform random guesser has perplexity 27 (loss $\ln 27 \approx 3.3$); the untrained model starts close to that (about 32). The training text is one sentence repeated 30 times, so within 100 steps the model effectively memorises it and perplexity falls to about 1.2 and then 1.0. On real text it would plateau far higher.
 
 ## Gradient clipping
 
@@ -219,8 +216,13 @@ Large gradients — common in early training and on long sequences — cause des
 
 ```python
 # In your training loop, after loss.backward():
-nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 opt.step()
+print(f"gradient norm before clipping: {grad_norm:.4f}")
+```
+
+```output
+gradient norm before clipping: 0.1031
 ```
 
 A max norm of 1.0 is standard; 0.5 is more conservative for large models.
@@ -266,13 +268,13 @@ for step in range(300):
     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
     if step % 100 == 0:
-        print(f"Step {step:3d}  loss={loss.item():.3f}  ppl={2**loss.item():.2f}")
+        print(f"Step {step:3d}  loss={loss.item():.3f}  ppl={np.exp(loss.item()):.2f}")
 ```
 
 ```output
-Step   0  loss=2.089  ppl=4.26
-Step 100  loss=0.631  ppl=1.55
-Step 200  loss=0.189  ppl=1.14
+Step   0  loss=2.108  ppl=8.23
+Step 100  loss=0.000  ppl=1.00
+Step 200  loss=0.000  ppl=1.00
 ```
 
 ## Exercise
@@ -302,6 +304,15 @@ for step in range(300):
     if step in [1, 25, 50, 100, 200, 299]:
         lr = scheduler.get_last_lr()[0]
         print(f"Step {step:3d}  lr={lr:.6f}  loss={loss.item():.3f}")
+```
+
+```output
+Step   1  lr=0.001414  loss=0.000
+Step  25  lr=0.018385  loss=0.000
+Step  50  lr=0.035007  loss=0.000
+Step 100  lr=0.024876  loss=0.000
+Step 200  lr=0.017634  loss=0.000
+Step 299  lr=0.014434  loss=0.000
 ```
 
 The LR ramps from near-0 to peak at step 50 then decays. Training with this schedule requires no manual LR tuning for the architecture's scale.

@@ -35,6 +35,9 @@ When $d_k$ is large, the dot products $q \cdot k$ grow in magnitude (variance $\
 import torch
 import torch.nn.functional as F
 
+torch.manual_seed(0)
+torch.set_num_threads(1)
+
 def scaled_dot_product_attention(Q, K, V, mask=None):
     """
     Q, K, V: (batch, heads, seq, d_k)
@@ -90,14 +93,14 @@ Causal mask:
         [0, 0, 1, 1, 1],
         [0, 0, 0, 1, 1],
         [0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 0]])
+        [0, 0, 0, 0, 0]], dtype=torch.int32)
 
 Weights (should be lower-triangular):
-tensor([[1.000, 0.000, 0.000, 0.000, 0.000],
-        [0.534, 0.466, 0.000, 0.000, 0.000],
-        [0.282, 0.355, 0.363, 0.000, 0.000],
-        [0.201, 0.292, 0.268, 0.239, 0.000],
-        [0.166, 0.228, 0.218, 0.213, 0.175]])
+tensor([[1.0000, 0.0000, 0.0000, 0.0000, 0.0000],
+        [0.1430, 0.8570, 0.0000, 0.0000, 0.0000],
+        [0.0500, 0.0280, 0.9210, 0.0000, 0.0000],
+        [0.0030, 0.0080, 0.0050, 0.9840, 0.0000],
+        [0.0850, 0.0670, 0.0660, 0.0150, 0.7670]])
 ```
 
 ## Multi-head attention
@@ -145,12 +148,12 @@ print("Total params:", sum(p.numel() for p in mha.parameters()))
 
 ```output
 MHA output shape: torch.Size([3, 10, 64])
-Total params: 16,384
+Total params: 16384
 ```
 
 ## Complexity: $O(n^2)$ in sequence length
 
-The attention score matrix is $n \times n$ — for a sequence of length 1000, that's $10^6$ elements per head. For 8 heads with d=64, the full matrix takes ~0.5 MB per batch. At $n = 100{,}000$ (long documents), this becomes intractable. This is the key limitation that motivated FlashAttention and linear attention variants (covered in ch. 12 Under the Trench).
+The attention score matrix is $n \times n$ — for a sequence of length 1000, that's $10^6$ elements per head. For 8 heads in float32, the score matrices alone take $8 \times 10^6 \times 4$ bytes $\approx 32$ MB per sequence per layer. At $n = 100{,}000$ (long documents), this becomes intractable. This is the key limitation that motivated FlashAttention and linear attention variants (covered in ch. 12 Under the Trench).
 
 ## Try it Yourself
 
@@ -193,15 +196,19 @@ def causal_mask(T):
 enc_out = mha(x)                                 # all positions see all
 dec_out = mha(x, causal_mask(T).unsqueeze(0).unsqueeze(0))  # causal
 
-print("Encoder out  (same for all seqs):", enc_out.shape)
-print("Decoder out  (causal):            ", dec_out.shape)
-print("Position 0 same?", torch.allclose(enc_out[:, 0], dec_out[:, 0]))  # should be True
+print("Encoder out (no mask):", enc_out.shape)
+print("Decoder out (causal): ", dec_out.shape)
+# Position 0 sees only itself under the causal mask but sees everything without it -> differs
+print("Position 0 same?", torch.allclose(enc_out[:, 0], dec_out[:, 0]))
+# The last position may attend to every position under both -> identical
+print("Last position same?", torch.allclose(enc_out[:, -1], dec_out[:, -1], atol=1e-6))
 ```
 
 ```output
-Encoder out  (same for all seqs): torch.Size([2, 8, 32])
-Decoder out  (causal):             torch.Size([2, 8, 32])
-Position 0 same?: True
+Encoder out (no mask): torch.Size([2, 8, 32])
+Decoder out (causal):  torch.Size([2, 8, 32])
+Position 0 same? False
+Last position same? True
 ```
 
 ## Exercise
@@ -240,6 +247,10 @@ dec  = torch.randn(2, 5, 32)   # decoder: 5 tokens
 enc  = torch.randn(2, 10, 32)  # encoder: 10 tokens
 cross_out = mha(dec, enc)
 print("Cross-attention output:", cross_out.shape)  # (2, 5, 32)
+```
+
+```output
+Cross-attention output: torch.Size([2, 5, 32])
 ```
 
 Cross-attention output has the same length as the query (decoder), attending to the full encoder.

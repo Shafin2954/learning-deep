@@ -17,28 +17,77 @@ Understanding which family to reach for is more important than memorizing hyperp
 BERT stacks $N$ encoder blocks. Each block has bidirectional self-attention — every position
 attends to every other position — followed by a feed-forward sublayer. There is no causal mask.
 
+You'll build all three families as tiny, randomly initialised PyTorch models on a toy corpus, so everything
+runs offline in seconds. The architecture is identical to the real thing; only the size and the weights differ.
+
 ```python
-from transformers import AutoTokenizer, AutoModel
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModel.from_pretrained("bert-base-uncased")
-model.eval()
+torch.manual_seed(0)
+torch.set_num_threads(1)
 
-text = "The bank can guarantee deposits."
-inputs = tokenizer(text, return_tensors="pt")
+corpus = [
+    "the bank can guarantee deposits",
+    "i deposited money at the bank",
+    "i sat by the river bank",
+    "this movie is fantastic",
+    "this movie is terrible",
+    "the plot was dull and boring",
+    "a wonderful and moving film",
+    "the acting was awful",
+    "the cat sat on the mat near the window",
+    "a thrilling match ended in a draw",
+]
+specials = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+vocab = specials + sorted({w for s in corpus for w in s.split()})
+w2i = {w: i for i, w in enumerate(vocab)}
+V = len(vocab)
+
+def encode(text):
+    return [w2i["[CLS]"]] + [w2i[w] for w in text.split()] + [w2i["[SEP]"]]
+
+class TinyBERT(nn.Module):
+    """Encoder-only: bidirectional self-attention, no causal mask."""
+    def __init__(self, V, d=32, h=4, n=2, max_len=32):
+        super().__init__()
+        self.tok = nn.Embedding(V, d, padding_idx=0)
+        self.pos = nn.Embedding(max_len, d)
+        layer = nn.TransformerEncoderLayer(d, h, 4 * d, dropout=0.0,
+                                           batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, n, enable_nested_tensor=False)
+        self.ln = nn.LayerNorm(d)
+        self.pooler = nn.Linear(d, d)
+
+    def forward(self, ids):
+        x = self.tok(ids) + self.pos(torch.arange(ids.shape[1]))
+        h = self.ln(self.enc(x, src_key_padding_mask=(ids == 0)))
+        return h, torch.tanh(self.pooler(h[:, 0]))   # pooled = transformed [CLS] state
+
+bert = TinyBERT(V)
+bert.eval()
+
+ids = torch.tensor([encode("the bank can guarantee deposits")])
 with torch.no_grad():
-    outputs = model(**inputs)
+    hidden, pooled = bert(ids)
 
-print("Input IDs shape:        ", inputs["input_ids"].shape)
-print("Last hidden state shape:", outputs.last_hidden_state.shape)
-print("Pooler output shape:    ", outputs.pooler_output.shape)
+print("Input IDs shape:        ", ids.shape)
+print("Last hidden state shape:", hidden.shape)
+print("Pooler output shape:    ", pooled.shape)
+
+# Bidirectional: changing the LAST word changes the hidden state of the FIRST word
+ids2 = ids.clone(); ids2[0, -2] = w2i["money"]
+with torch.no_grad():
+    hidden2, _ = bert(ids2)
+print("Position 1 changed when a later word changed:", not torch.allclose(hidden[0, 1], hidden2[0, 1]))
 ```
 
 ```output
-Input IDs shape:         torch.Size([1, 9])
-Last hidden state shape: torch.Size([1, 9, 768])
-Pooler output shape:     torch.Size([1, 768])
+Input IDs shape:         torch.Size([1, 7])
+Last hidden state shape: torch.Size([1, 7, 32])
+Pooler output shape:     torch.Size([1, 32])
+Position 1 changed when a later word changed: True
 ```
 
 ### Pretraining objectives
@@ -58,26 +107,42 @@ is a pooled representation of the whole sequence. Fine-tuning for classification
 layer on top of `[CLS]` and trains on labeled examples.
 
 ```python
-from transformers import AutoModelForSequenceClassification
-import torch
+# Fine-tune the tiny encoder for sentiment: a linear layer on the [CLS] state
+train = [("this movie is fantastic", 1), ("a wonderful and moving film", 1),
+         ("a thrilling match ended in a draw", 1), ("this movie is terrible", 0),
+         ("the plot was dull and boring", 0), ("the acting was awful", 0)]
 
-# BERT fine-tuned on SST-2 (sentiment)
-clf = AutoModelForSequenceClassification.from_pretrained(
-    "textattack/bert-base-uncased-SST-2"
-)
-clf.eval()
-inputs = tokenizer("This movie is fantastic!", return_tensors="pt")
+def pad_batch(seqs):
+    L = max(len(s) for s in seqs)
+    return torch.tensor([s + [0] * (L - len(s)) for s in seqs])
+
+X = pad_batch([encode(t) for t, _ in train])
+y = torch.tensor([lab for _, lab in train])
+
+clf_head = nn.Linear(32, 2)
+params = list(bert.parameters()) + list(clf_head.parameters())
+opt = torch.optim.AdamW(params, lr=3e-3)
+bert.train()
+for step in range(60):
+    _, pooled = bert(X)
+    loss = F.cross_entropy(clf_head(pooled), y)
+    opt.zero_grad(); loss.backward(); opt.step()
+bert.eval()
+
+labels = {0: "NEGATIVE", 1: "POSITIVE"}
 with torch.no_grad():
-    logits = clf(**inputs).logits
-label = logits.argmax().item()
-print("Predicted label:", clf.config.id2label[label])
-print("Logits:", logits.round(decimals=2))
+    for text in ["this movie is fantastic", "the acting was awful"]:
+        _, pooled = bert(torch.tensor([encode(text)]))
+        logits = clf_head(pooled)
+        print(f"{text!r}: {labels[logits.argmax().item()]}  logits={[round(v, 2) for v in logits[0].tolist()]}")
 ```
 
 ```output
-Predicted label: POSITIVE
-Logits: tensor([[-3.82,  3.91]])
+'this movie is fantastic': POSITIVE  logits=[-3.65, 3.27]
+'the acting was awful': NEGATIVE  logits=[3.45, -3.28]
 ```
+
+Only a handful of training sentences are used, so this shows the mechanics (pool `[CLS]`, add a head, fine-tune everything), not generalisation.
 
 ### BERT family
 
@@ -95,27 +160,44 @@ can only attend to positions $\leq i$. There is no cross-attention because there
 separate encoder.
 
 ```python
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+class TinyGPT(nn.Module):
+    """Decoder-only: self-attention with a causal mask, no cross-attention."""
+    def __init__(self, V, d=32, h=4, n=2, max_len=32):
+        super().__init__()
+        self.tok = nn.Embedding(V, d, padding_idx=0)
+        self.pos = nn.Embedding(max_len, d)
+        layer = nn.TransformerEncoderLayer(d, h, 4 * d, dropout=0.0,
+                                           batch_first=True, norm_first=True)
+        self.blocks = nn.TransformerEncoder(layer, n, enable_nested_tensor=False)
+        self.ln = nn.LayerNorm(d)
+        self.head = nn.Linear(d, V, bias=False)
 
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-model = AutoModelForCausalLM.from_pretrained("gpt2")
-model.eval()
+    def forward(self, ids):
+        T = ids.shape[1]
+        x = self.tok(ids) + self.pos(torch.arange(T))
+        mask = nn.Transformer.generate_square_subsequent_mask(T)
+        return self.head(self.ln(self.blocks(x, mask=mask, is_causal=True)))
 
-prompt = "The transformer architecture was introduced in"
-inputs = tokenizer(prompt, return_tensors="pt")
+gpt = TinyGPT(V)
+gpt.eval()
 
+prompt = torch.tensor([encode("the cat sat on the mat")[:-1]])   # [CLS] + words, no [SEP]
 with torch.no_grad():
-    # Just the logits, no sampling
-    out = model(**inputs)
-    print("Logits shape:", out.logits.shape)  # (batch, seq_len, vocab_size)
-    next_token_id = out.logits[0, -1].argmax()
-    print("Next token:  ", repr(tokenizer.decode([next_token_id.item()])))
+    logits = gpt(prompt)
+print("Logits shape:", logits.shape)  # (batch, seq_len, vocab_size)
+
+# Causal: changing the LAST token cannot change logits at earlier positions
+prompt2 = prompt.clone(); prompt2[0, -1] = w2i["draw"]
+with torch.no_grad():
+    logits2 = gpt(prompt2)
+print("Earlier positions unchanged:", torch.allclose(logits[0, :-1], logits2[0, :-1], atol=1e-6))
+print("Last position changed:      ", not torch.allclose(logits[0, -1], logits2[0, -1], atol=1e-6))
 ```
 
 ```output
-Logits shape: torch.Size([1, 9, 50257])
-Next token:   ' 2017'
+Logits shape: torch.Size([1, 7, 42])
+Earlier positions unchanged: True
+Last position changed:       True
 ```
 
 ### Pretraining objective
@@ -126,22 +208,43 @@ This is simple and scales: the entire sequence is a valid training signal.
 
 ### Generating with sampling
 
+Train the tiny GPT on the toy corpus for a few hundred steps (next-token cross-entropy, `[CLS]` as the start token and `[SEP]` as the end), then sample with temperature and top-$p$:
+
 ```python
-inputs = tokenizer("Once upon a time", return_tensors="pt")
-with torch.no_grad():
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=20,
-        do_sample=True,
-        temperature=0.8,
-        top_p=0.9,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+seqs = pad_batch([encode(t) for t in corpus])
+opt = torch.optim.AdamW(gpt.parameters(), lr=3e-3)
+gpt.train()
+for step in range(300):
+    logits = gpt(seqs[:, :-1])
+    loss = F.cross_entropy(logits.reshape(-1, V), seqs[:, 1:].reshape(-1), ignore_index=0)
+    opt.zero_grad(); loss.backward(); opt.step()
+gpt.eval()
+print(f"final training loss: {loss.item():.3f}")
+
+def generate(prompt_words, max_new_tokens=8, temperature=0.8, top_p=0.9):
+    ids = torch.tensor([[w2i["[CLS]"]] + [w2i[w] for w in prompt_words.split()]])
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            logits = gpt(ids)[0, -1] / temperature
+        probs = F.softmax(logits, dim=-1)
+        sp, si = probs.sort(descending=True)
+        keep = sp.cumsum(0) - sp < top_p            # smallest set with mass >= top_p
+        sp = sp * keep
+        nxt = si[torch.multinomial(sp / sp.sum(), 1)]
+        ids = torch.cat([ids, nxt.view(1, 1)], dim=1)
+        if nxt.item() == w2i["[SEP]"]:
+            break
+    return " ".join(vocab[i] for i in ids[0, 1:].tolist() if vocab[i] != "[SEP]")
+
+torch.manual_seed(1)
+print(generate("the"))
+print(generate("this movie"))
 ```
 
 ```output
-Once upon a time there was a small village nestled between two mountains where people lived in peace for centuries.
+final training loss: 0.353
+the cat sat on the mat near the window
+this movie is fantastic
 ```
 
 The GPT family (GPT-2, GPT-3, GPT-4, LLaMA, Mistral, Phi) all share this decoder-only
@@ -154,25 +257,75 @@ decoder generates the output with causal self-attention plus **cross-attention**
 hidden states (just like the original Transformer in ch. 9).
 
 ```python
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+# A tiny text-to-text model with the nn.Transformer encoder-decoder.
+# One model, two tasks, selected by a prefix token (like T5's "summarize:" / "translate:").
+letters = list("abcdefgh")
+t_vocab = ["[PAD]", "[BOS]", "[EOS]", "copy:", "reverse:"] + letters
+t2i = {w: i for i, w in enumerate(t_vocab)}
+TV = len(t_vocab)
 
-t5_tok = T5Tokenizer.from_pretrained("t5-small")
-t5 = T5ForConditionalGeneration.from_pretrained("t5-small")
+def make_example(task, seq):
+    out = seq if task == "copy:" else seq[::-1]
+    src = [t2i[task]] + [t2i[c] for c in seq]
+    tgt = [t2i["[BOS]"]] + [t2i[c] for c in out] + [t2i["[EOS]"]]
+    return src, tgt
+
+class TinyT5(nn.Module):
+    def __init__(self, V, d=32, h=4, n=2):
+        super().__init__()
+        self.emb = nn.Embedding(V, d, padding_idx=0)
+        self.pos = nn.Embedding(32, d)
+        self.tf = nn.Transformer(d, h, n, n, 4 * d, dropout=0.0, batch_first=True, norm_first=True)
+        self.head = nn.Linear(d, V, bias=False)
+
+    def embed(self, ids):
+        return self.emb(ids) + self.pos(torch.arange(ids.shape[1]))
+
+    def encode(self, src):
+        return self.tf.encoder(self.embed(src))
+
+    def decode(self, tgt, memory):
+        T = tgt.shape[1]
+        mask = nn.Transformer.generate_square_subsequent_mask(T)
+        return self.head(self.tf.decoder(self.embed(tgt), memory, tgt_mask=mask, tgt_is_causal=True))
+
+t5 = TinyT5(TV)
+opt = torch.optim.AdamW(t5.parameters(), lr=3e-3)
+for step in range(400):
+    batch = [make_example(["copy:", "reverse:"][i % 2], [letters[j] for j in torch.randint(0, 8, (4,)).tolist()])
+             for i in range(64)]
+    src = torch.tensor([b[0] for b in batch]); tgt = torch.tensor([b[1] for b in batch])
+    logits = t5.decode(tgt[:, :-1], t5.encode(src))
+    loss = F.cross_entropy(logits.reshape(-1, TV), tgt[:, 1:].reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
 t5.eval()
+print(f"final training loss: {loss.item():.3f}")
 
-# T5 frames everything as text-to-text with task prefix
-input_text = "summarize: The cat sat on the mat near the window."
-inputs = t5_tok(input_text, return_tensors="pt")
-with torch.no_grad():
-    out = t5.generate(**inputs, max_new_tokens=12)
-print(t5_tok.decode(out[0], skip_special_tokens=True))
+def t5_generate(task, seq, max_new_tokens=8):
+    src = torch.tensor([make_example(task, list(seq))[0]])
+    with torch.no_grad():
+        memory = t5.encode(src)
+        out = torch.tensor([[t2i["[BOS]"]]])
+        for _ in range(max_new_tokens):
+            nxt = t5.decode(out, memory)[0, -1].argmax()
+            if nxt.item() == t2i["[EOS]"]:
+                break
+            out = torch.cat([out, nxt.view(1, 1)], dim=1)
+    return "".join(t_vocab[i] for i in out[0, 1:].tolist())
+
+print("copy:    abcd ->", t5_generate("copy:", "abcd"))
+print("reverse: abcd ->", t5_generate("reverse:", "abcd"))
+print("reverse: hgfe ->", t5_generate("reverse:", "hgfe"))
 ```
 
 ```output
-The cat sat on the mat near the window.
+final training loss: 0.001
+copy:    abcd -> abcd
+reverse: abcd -> dcba
+reverse: hgfe -> efgh
 ```
 
-T5's text-to-text framing means every task — translation, summarization, classification,
+The same idea scales up in T5: its text-to-text framing means every task — translation, summarization, classification,
 question answering — uses the same interface: a string in, a string out. The task is specified
 in the input prefix (`translate English to French:`, `summarize:`, `sst2 sentence:`).
 
@@ -210,11 +363,11 @@ for row in zip(*comparison.values()):
 ```
 
 ```output
-Sentence classification              BERT (encoder-only)       Bidirectional context → richer CLS
-Token labeling (NER)                 BERT (encoder-only)       Bidirectional context over full span
-Text generation                      GPT (decoder-only)        Causal LM scales best; RLHF-friendly
-Translation / summarization          T5 (encoder-decoder)      Enc-dec: dedicated read/write phases
-Open QA / chat                       GPT (decoder-only)        Instruction-tuned GPT; KV cache efficient
+Sentence classification             BERT (encoder-only)       Bidirectional context → richer CLS
+Token labeling (NER)                BERT (encoder-only)       Bidirectional context over full span
+Text generation                     GPT (decoder-only)        Causal LM scales best; RLHF-friendly
+Translation / summarization         T5 (encoder-decoder)      Enc-dec: dedicated read/write phases
+Open QA / chat                      GPT (decoder-only)        Instruction-tuned GPT; KV cache efficient
 ```
 
 The modern trend is toward decoder-only models even for tasks that look like understanding
@@ -224,77 +377,72 @@ prompts well, and the unified architecture is simpler to serve at scale.
 ## Try it Yourself
 
 ```python
-from transformers import pipeline
+# Three families, same toy vocabulary: parameters, output shape, and attention pattern
+bert_m, gpt_m, t5_m = TinyBERT(V), TinyGPT(V), TinyT5(V)
+x = torch.tensor([encode("the cat sat on the mat")])
+with torch.no_grad():
+    h, _ = bert_m(x)
+    lg = gpt_m(x)
+    mem = t5_m.encode(x)
+    dec = t5_m.decode(x[:, :4], mem)
 
-# Three families, same task
-classifier = pipeline("text-classification",
-                      model="distilbert-base-uncased-finetuned-sst-2-english")
-generator  = pipeline("text-generation", model="gpt2",
-                      max_new_tokens=20, do_sample=False)
-summarizer = pipeline("summarization", model="t5-small",
-                      max_length=30, min_length=5)
-
-text = "Despite the rain, the match was played and ended in a thrilling draw."
-
-print("BERT family sentiment:", classifier(text)[0])
-print("GPT2 completion:      ", generator(text)[0]["generated_text"])
-print("T5 summary:           ", summarizer(text)[0]["summary_text"])
+count = lambda m: sum(p.numel() for p in m.parameters())
+print(f"encoder-only  params={count(bert_m):>6,}  output={tuple(h.shape)}      attention: full bidirectional")
+print(f"decoder-only  params={count(gpt_m):>6,}  output={tuple(lg.shape)}  attention: causal")
+print(f"enc-dec       params={count(t5_m):>6,}  output={tuple(dec.shape)}  attention: encoder full, decoder causal + cross")
 ```
 
 ```output
-BERT family sentiment: {'label': 'POSITIVE', 'score': 0.9987}
-GPT2 completion:       Despite the rain, the match was played and ended in a thrilling draw. The result was
-T5 summary:            the match was played and ended in a thrilling draw.
+encoder-only  params=28,896  output=(1, 8, 32)      attention: full bidirectional
+decoder-only  params=29,184  output=(1, 8, 42)  attention: causal
+enc-dec       params=63,232  output=(1, 4, 42)  attention: encoder full, decoder causal + cross
 ```
+
+Change the number of layers or `d` and watch the parameter counts move; swap the decoder prefix `x[:, :4]` for a different length to see the cross-attention keep reading all 8 source tokens.
 
 ## Exercise
 
-Load `bert-base-uncased` and encode the word "bank" in two contexts:
-"I deposited money at the bank" and "I sat by the river bank." Extract the hidden state for
-the "bank" token from each sentence and compute their cosine similarity. Then do the same with
-a static GloVe or Word2Vec embedding (use `gensim` or a lookup table). Show that BERT's
-contextual embeddings are more different than the static embeddings.
+Take a fresh `TinyBERT` and encode the word "bank" in two contexts:
+"i deposited money at the bank" and "i sat by the river bank". Extract the hidden state for
+the "bank" token from each sentence and compute their cosine similarity. Then compute the same
+similarity for the static input embedding of "bank" (the token embedding table, before any
+attention). Show that the contextual vectors differ while the static ones are identical.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-from transformers import AutoTokenizer, AutoModel
-import torch
-import torch.nn.functional as F
+torch.manual_seed(0)
+enc_model = TinyBERT(V)
+enc_model.eval()
 
-tok = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModel.from_pretrained("bert-base-uncased")
-model.eval()
-
-sentences = [
-    "I deposited money at the bank .",
-    "I sat by the river bank .",
-]
-
+sentences = ["i deposited money at the bank", "i sat by the river bank"]
 bank_vecs = []
 for sent in sentences:
-    inputs = tok(sent, return_tensors="pt")
-    token_ids = inputs["input_ids"][0].tolist()
-    words = tok.convert_ids_to_tokens(token_ids)
-    bank_pos = words.index("bank")
+    ids = torch.tensor([encode(sent)])
+    bank_pos = ids[0].tolist().index(w2i["bank"])
     with torch.no_grad():
-        h = model(**inputs).last_hidden_state[0]  # (seq_len, 768)
-    bank_vecs.append(h[bank_pos])
+        h, _ = enc_model(ids)
+    bank_vecs.append(h[0, bank_pos])
 
-cos_bert = F.cosine_similarity(bank_vecs[0].unsqueeze(0),
-                                bank_vecs[1].unsqueeze(0)).item()
-print(f"BERT cosine similarity for 'bank': {cos_bert:.4f}")
+cos_ctx = F.cosine_similarity(bank_vecs[0].unsqueeze(0), bank_vecs[1].unsqueeze(0)).item()
+print(f"Contextual cosine similarity for 'bank': {cos_ctx:.4f}")
 
-# Static embedding: same vector both times → similarity = 1.0
-static = torch.randn(768)  # placeholder for a real GloVe vector
+# Static embedding: the same lookup-table row regardless of context -> similarity = 1.0
+static = enc_model.tok.weight[w2i["bank"]].detach()
 cos_static = F.cosine_similarity(static.unsqueeze(0), static.unsqueeze(0)).item()
-print(f"Static cosine similarity for 'bank': {cos_static:.4f}")
+print(f"Static cosine similarity for 'bank':     {cos_static:.4f}")
 ```
 
-BERT produces similarity around 0.6–0.75 for these two senses; a static embedding gives 1.0
-because it is context-independent. The gap demonstrates why contextual representations matter
-for disambiguation and downstream tasks.
+```output
+Contextual cosine similarity for 'bank': 0.9913
+Static cosine similarity for 'bank':     1.0000
+```
+
+The static embedding is one row of a lookup table, so both occurrences are the same vector and the
+similarity is exactly 1. The contextual vectors differ because attention mixes in the surrounding
+words. This model is untrained, so the difference only shows that context enters the representation;
+a pretrained BERT additionally learns to separate the money and river senses.
 
 </details>
 

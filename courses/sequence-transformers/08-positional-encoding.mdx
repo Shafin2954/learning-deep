@@ -41,16 +41,16 @@ def sinusoidal_pe(max_len, d_model):
 
 pe = sinusoidal_pe(max_len=50, d_model=16)
 print("PE shape:", pe.shape)
-print("PE[0, :4]:", pe[0, :4].round(decimals=4).tolist())
-print("PE[1, :4]:", pe[1, :4].round(decimals=4).tolist())
-print("PE[49,:4]:", pe[49,:4].round(decimals=4).tolist())
+print("PE[0, :4]:", [round(v, 4) for v in pe[0, :4].tolist()])
+print("PE[1, :4]:", [round(v, 4) for v in pe[1, :4].tolist()])
+print("PE[49,:4]:", [round(v, 4) for v in pe[49,:4].tolist()])
 ```
 
 ```output
 PE shape: torch.Size([50, 16])
 PE[0, :4]: [0.0, 1.0, 0.0, 1.0]
-PE[1, :4]: [0.8415, 0.5403, 0.0999, 0.995]
-PE[49,:4]: [-0.9258, -0.3780, -0.9999, 0.0108]
+PE[1, :4]: [0.8415, 0.5403, 0.311, 0.9504]
+PE[49,:4]: [-0.9538, 0.3006, 0.2112, -0.9774]
 ```
 
 Position 0 starts at 0 and 1 alternating (sin(0)=0, cos(0)=1). At higher dimensions the wavelengths are much longer.
@@ -62,12 +62,12 @@ import numpy as np
 
 pe = sinusoidal_pe(32, 32).numpy()
 print("Heatmap (rows=positions, cols=dimensions):")
-print(f"{'':>5}", end="")
+print(f"{'':>4}", end="")
 for d in range(0, 32, 4):
-    print(f"  d{d:>2}", end="")
+    print(f"{'d' + str(d):>7}", end="")
 print()
 for pos in range(0, 32, 4):
-    print(f"p{pos:>3} ", end="")
+    print(f"p{pos:>2} ", end="")
     for d in range(0, 32, 4):
         v = pe[pos, d]
         print(f"  {v:>5.2f}", end="")
@@ -76,15 +76,15 @@ for pos in range(0, 32, 4):
 
 ```output
 Heatmap (rows=positions, cols=dimensions):
-       d 0   d 4   d 8  d12  d16  d20  d24  d28
-p  0   0.00  0.00  0.00  0.00  0.00  0.00  0.00  0.00
-p  4   0.76  0.98  0.39  0.04  0.00  0.00  0.00  0.00
-p  8  -0.99  0.91  0.72  0.08  0.01  0.00  0.00  0.00
-p 12  -0.54  0.66  0.93  0.12  0.01  0.00  0.00  0.00
-p 16   0.29  0.28  0.98  0.16  0.02  0.00  0.00  0.00
-p 20   0.91 -0.16  0.89  0.20  0.02  0.00  0.00  0.00
-p 24   0.99 -0.58  0.67  0.24  0.02  0.00  0.00  0.00
-p 28   0.27 -0.88  0.34  0.27  0.03  0.00  0.00  0.00
+         d0     d4     d8    d12    d16    d20    d24    d28
+p 0    0.00   0.00   0.00   0.00   0.00   0.00   0.00   0.00
+p 4   -0.76   0.95   0.39   0.13   0.04   0.01   0.00   0.00
+p 8    0.99   0.57   0.72   0.25   0.08   0.03   0.01   0.00
+p12   -0.54  -0.61   0.93   0.37   0.12   0.04   0.01   0.00
+p16   -0.29  -0.94   1.00   0.48   0.16   0.05   0.02   0.01
+p20    0.91   0.04   0.91   0.59   0.20   0.06   0.02   0.01
+p24   -0.91   0.97   0.68   0.69   0.24   0.08   0.02   0.01
+p28    0.27   0.54   0.33   0.77   0.28   0.09   0.03   0.01
 ```
 
 Low dimensions oscillate fast (complete period over ~6 positions); high dimensions barely move at this scale — they encode coarse position.
@@ -143,7 +143,7 @@ def alibi_bias(seq_len, n_heads):
 
 bias = alibi_bias(seq_len=6, n_heads=4)
 print("ALiBi bias shape:", bias.shape)
-print("Head 0 bias row 3:", bias[0, 3].round(decimals=3).tolist())
+print("Head 0 bias row 3:", (bias[0, 3] + 0.0).round(decimals=3).tolist())  # + 0.0 turns -0.0 into 0.0
 ```
 
 ```output
@@ -169,24 +169,34 @@ def apply_rope(x, base=10000):
     theta = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) * 2 / dk))
     pos   = torch.arange(T, dtype=torch.float32)
     freqs = torch.outer(pos, theta)             # (T, half)
-    cos   = freqs.cos()[None, None]             # (1, 1, T, half)
-    sin   = freqs.sin()[None, None]
+    cos   = torch.cat([freqs.cos(), freqs.cos()], dim=-1)[None, None]  # (1, 1, T, d_k)
+    sin   = torch.cat([freqs.sin(), freqs.sin()], dim=-1)[None, None]
 
     x1, x2 = x[..., :half], x[..., half:]
-    x_rot = torch.cat([-x2, x1], dim=-1)       # 90° rotation trick
+    x_rot = torch.cat([-x2, x1], dim=-1)       # rotate each (x1, x2) pair by 90 degrees
     return x * cos + x_rot * sin
 
-Q = torch.randn(2, 4, 8, 16)  # (batch, heads, seq, d_k)
-Q_rope = apply_rope(Q)
+torch.manual_seed(0)
+torch.set_num_threads(1)
+
+# Put the SAME q and k vector at every position, then rotate by position
+q = torch.randn(16); k = torch.randn(16)
+Q = q.expand(1, 1, 8, 16).contiguous()
+K = k.expand(1, 1, 8, 16).contiguous()
+Q_rope, K_rope = apply_rope(Q), apply_rope(K)
 print("RoPE Q shape:", Q_rope.shape)
-# Verify: dot product between position 0 and position 2 is position-relative
-q0 = Q_rope[0, 0, 0]; q2 = Q_rope[0, 0, 2]
-print("dot(pos0, pos2):", (q0 @ q2).item():.4f})
+
+# The score depends only on the relative offset m - n, not on absolute positions
+print(f"q at pos 2 . k at pos 0: {(Q_rope[0,0,2] @ K_rope[0,0,0]).item():.4f}")
+print(f"q at pos 5 . k at pos 3: {(Q_rope[0,0,5] @ K_rope[0,0,3]).item():.4f}   (same offset 2)")
+print(f"q at pos 6 . k at pos 3: {(Q_rope[0,0,6] @ K_rope[0,0,3]).item():.4f}   (offset 3)")
 ```
 
 ```output
-RoPE Q shape: torch.Size([2, 4, 8, 16])
-dot(pos0, pos2): -1.2847
+RoPE Q shape: torch.Size([1, 1, 8, 16])
+q at pos 2 . k at pos 0: -1.2793
+q at pos 5 . k at pos 3: -1.2793   (same offset 2)
+q at pos 6 . k at pos 3: -2.9044   (offset 3)
 ```
 
 ## Try it Yourself
@@ -216,8 +226,8 @@ print(f"dot(PE[5], PE[15]) = {dot_far:.2f}  (distance 10)")
 
 ```output
 dot(PE[5], PE[5])  = 32.00  (same position)
-dot(PE[5], PE[6])  = 30.91  (distance 1)
-dot(PE[5], PE[15]) = 16.83  (distance 10)
+dot(PE[5], PE[6])  = 30.92  (distance 1)
+dot(PE[5], PE[15]) = 21.05  (distance 10)
 ```
 
 ## Exercise
@@ -257,9 +267,14 @@ out = pe_mod(x)
 # out[0, i] - out[0, j] should equal PE[i] - PE[j]
 diff_out = out[0, 2] - out[0, 4]
 diff_pe  = pe_mod.pe[2] - pe_mod.pe[4]
-print("Difference matches PE delta:", torch.allclose(diff_out, diff_pe))
-print("Max error:", (diff_out - diff_pe).abs().max().item())
+print("Difference matches PE delta:", torch.allclose(diff_out, diff_pe, atol=1e-6))
+print("Max error < 1e-6:", (diff_out - diff_pe).abs().max().item() < 1e-6)
 ```
 
-Since `x` is constant, `out[0,i] - out[0,j] = (x + PE[i]) - (x + PE[j]) = PE[i] - PE[j]` exactly.
+```output
+Difference matches PE delta: True
+Max error < 1e-6: True
+```
+
+Since `x` is constant, `out[0,i] - out[0,j] = (x + PE[i]) - (x + PE[j]) = PE[i] - PE[j]`, up to float32 rounding error (hence the tolerance).
 </details>
