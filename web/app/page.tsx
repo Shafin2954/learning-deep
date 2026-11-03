@@ -100,6 +100,11 @@ const HOME_COURSES: Record<string, { tagline: string; chapters: number; badge: s
     chapters: 12,
     badge: 'Ch 1 – 12',
   },
+  'bayesian-ml': {
+    tagline: '13 chapters: conjugate models, Laplace and importance sampling, Metropolis–Hastings, Gibbs, HMC and NUTS from scratch, R-hat/ESS diagnostics, PyMC and NumPyro, PSIS-LOO, hierarchical models, variational inference, Gaussian processes, and Bayesian deep learning.',
+    chapters: 14,
+    badge: 'Ch 1 – 14',
+  },
   'eval-tuning': {
     tagline: '12 chapters: metrics that answer your question, cost-optimal thresholds, calibration, CV pitfalls, Optuna, permutation importance and SHAP, PDP/ICE/ALE, error analysis, and honest model comparison.',
     chapters: 13,
