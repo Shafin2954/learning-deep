@@ -473,22 +473,7 @@ print(f"{len(FEATS)} features: {', '.join(FEATS)}")
 ```output
 train (features <= t1, labels in (t1, t2]): 198,390 rows | 2,395 users | positive rate 0.0425
 test  (features <= t2, labels > t2): 199,522 rows | 2,381 users | positive rate 0.0408
-                   mean    std    min     max
-als               0.388  0.212 -0.229   1.251
-icf               6.237  4.668  0.045  38.795
-als_recent        0.198  0.137 -0.131   0.912
-icf_recent        1.134  0.962  0.000   7.677
-als_rank          3.699  1.189  0.000   6.801
-icf_rank          3.611  1.072  0.000   6.337
-log_pop           5.959  0.482  3.434   7.188
-log_trend         3.380  0.460  0.803   4.416
-trend_ratio      -2.579  0.134 -3.375  -1.952
-log_item_age      0.240  0.440  0.000   2.708
-user_log_n        3.468  0.840  0.693   5.617
-genre_aff         0.268  0.229  0.000   1.000
-genre_aff_recent  0.269  0.298  0.000   1.000
-n_sources         2.387  1.133  1.000   4.000
-label             0.041  0.198  0.000   1.000
+14 features: als, icf, als_recent, icf_recent, als_rank, icf_rank, log_pop, log_trend, trend_ratio, log_item_age, user_log_n, genre_aff, genre_aff_recent, n_sources
 ```
 
 About 200,000 rows per table and roughly 4% positives: each user has about 84 candidates of which
@@ -862,12 +847,24 @@ for name, pol in policies:
 
 ```output
             policy  NDCG@10  genres in top-10  intra-list sim
-      ranker order   0.1076              2.73           0.668
-    MMR lambda=0.9   0.1080              2.86           0.659
-    MMR lambda=0.7   0.1085              3.22           0.632
-    MMR lambda=0.5   0.1044              3.88           0.580
-   cap 3 per genre   0.0986              4.41           0.551
+      ranker order   0.1187              3.01           0.658
+    MMR lambda=0.9   0.1189              3.26           0.643
+    MMR lambda=0.7   0.1162              3.86           0.599
+    MMR lambda=0.5   0.1071              4.61           0.532
+   cap 3 per genre   0.1087              4.57           0.560
 ```
+
+The re-ranker now runs on the LambdaRank MLP's scores (0.1187 in ranker order). A light touch of
+MMR ($\lambda = 0.9$) is free: 3.26 genres instead of 3.01, lower intra-list similarity, and NDCG
+unchanged at 0.1189. Push harder and you pay — $\lambda = 0.5$ reaches 4.61 genres but loses
+0.0116 NDCG. The blunt business rule is interesting: "at most 3 per genre" gets almost the same
+diversity as MMR at 0.5 (4.57 genres) for less NDCG cost (0.1087 against 0.1071), because it only
+intervenes when a genre actually floods the list.
+
+Offline NDCG cannot settle how much diversity to buy. It rewards predicting the next click, and
+the next click is concentrated in the user's habitual genres; the value of diversity — discovery,
+long-term retention, not boring the user — shows up only online, in experiments and bandit-style exploration (ch. 11). The job of
+this table is to price each policy so the online test compares sensible options.
 
 ## Try it Yourself
 
@@ -933,9 +930,24 @@ for kind in ("pointwise (regress grade)", "ranknet", "lambdarank", "listwise"):
 ```
 
 ```output
+339 lists kept | random order: NDCG@10 0.1871
+ pointwise (regress grade): NDCG@10 0.8334
+                   ranknet: NDCG@10 0.8272
+                lambdarank: NDCG@10 0.8362
+                  listwise: NDCG@10 0.8405
 ```
 
-TRYIT PROSE
+All four losses land between 0.827 and 0.841, far above random (0.1871) and close to each
+other. With a linear scorer the model is just a direction $\mathbf{w}$, and the unobserved per-list
+offset is independent of the features, so it adds noise to the pointwise regression without
+biasing the direction — every loss finds roughly the same $\mathbf{w}$. That is why the losses
+diverged on the real table only once the user-level feature and an MLP with capacity to fit it
+were present.
+
+Try breaking the independence: make the offset correlated with a feature
+(`offset = 2.0 * X[..., 3].mean(1, keepdims=True)`), so a pointwise model can "explain" the
+offset with feature 3 and mis-weight it within lists. Then replace the linear scorer with a small
+MLP, or score NDCG@3 instead of @10, and see whether LambdaRank's top-heavy weights start to pay.
 
 ## Exercise
 
@@ -982,7 +994,26 @@ print("user_log_n weight in the pairwise model:", round(float(w[FEATS.index("use
 ```
 
 ```output
+158,938 difference rows from 198,390 candidate rows
+                          iALS order: NDCG@10 0.1136
+          pointwise GBDT (31 leaves): NDCG@10 0.1075
+  pointwise GBDT (8 leaves, min 200): NDCG@10 0.1150
+                  pointwise logistic: NDCG@10 0.1143
+   pairwise logistic (RankSVM-style): NDCG@10 0.1159
+                      LambdaRank MLP: NDCG@10 0.1187
+user_log_n weight in the pairwise model: 0.0
 ```
 
-SOLUTION PROSE
+Most of the GBDT's deficit was overfitting: 8-leaf trees with at least 200 rows per leaf go from
+0.1075 to 0.1150, past iALS order. The pairwise linear model (0.1159) then beats its pointwise
+twin, the logistic at 0.1143, using the very same features and model class — the only change is
+the training rows. The printed weight for `user_log_n` is exactly 0: its difference between two
+candidates of one user is always zero, so a pairwise model *cannot* use a between-user feature,
+which is the whole argument for pairwise losses in one number.
+
+The LambdaRank MLP (0.1187) still leads, because it combines a within-list loss with nonlinear
+capacity. The production version of the same idea is LambdaMART — `lightgbm.LGBMRanker` with
+`objective="lambdarank"` and a `group` array giving each user's list length — which fits the
+lambda gradient directly with boosted trees and is usually the strongest ranker you can
+build in an afternoon.
 </details>
