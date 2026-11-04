@@ -7,6 +7,8 @@ order: 10
 
 ## Zero-Shot vs Few-Shot
 
+This chapter is about the text you send to a model and the structure you demand back. We make no API calls here: wherever a model response is needed, the code uses a **simulated response** (a hard-coded string, clearly marked) so that every parsing, voting and validation step still runs for real.
+
 In zero-shot prompting you describe the task and let the model figure it out. In few-shot
 prompting you show examples first. Few-shot works better when the format or reasoning style
 is non-obvious.
@@ -27,16 +29,16 @@ Sentiment: NEGATIVE
 Text: The product broke after two days.
 Sentiment:"""
 
-print("Zero-shot prompt tokens:", len(zero_shot_prompt.split()))
-print("Few-shot prompt tokens:", len(few_shot_prompt.split()))
+print("Zero-shot prompt words:", len(zero_shot_prompt.split()))
+print("Few-shot prompt words:", len(few_shot_prompt.split()))
 ```
 
 ```output
-Zero-shot prompt tokens: 12
-Few-shot prompt tokens: 38
+Zero-shot prompt words: 15
+Few-shot prompt words: 24
 ```
 
-The few-shot version costs more tokens but anchors the output format precisely.
+The few-shot version costs more tokens (word counts here, a rough proxy) but anchors the output format precisely.
 
 ## Chain-of-Thought (CoT)
 
@@ -57,10 +59,12 @@ Q: A car travels 40 mph for 1.5 hours, then 70 mph for 0.5 hours. What is the to
 
 A: Let's think step by step."""
 # Expected completion: 40*1.5=60 miles + 70*0.5=35 miles = 95 miles.
-print(cot_prompt[-60:])
+print(cot_prompt[-95:])
 ```
 
 ```output
+1.5 hours, then 70 mph for 0.5 hours. What is the total distance?
+
 A: Let's think step by step.
 ```
 
@@ -141,34 +145,49 @@ print(json.dumps(parsed, indent=2))
 
 ## Constrained Decoding with `outlines`
 
-`outlines` enforces output structure at the token level — the model can only emit tokens
+Libraries such as `outlines` enforce output structure at the token level — the model can only emit tokens
 consistent with your schema or regex. No post-processing or retrying needed.
 
-```python
-# Requires: pip install outlines
-# import outlines
-# model = outlines.models.transformers("HuggingFaceTB/SmolLM2-360M-Instruct")
-# 
-# from pydantic import BaseModel
-# class Person(BaseModel):
-#     name: str
-#     age: int
-#     email: str
-#
-# generator = outlines.generate.json(model, Person)
-# result = generator("Extract: Alice Wong, 28, alice@example.com")
-# print(result)  # Person(name='Alice Wong', age=28, email='alice@example.com')
+The mechanism is simple: at each step, compute which tokens keep the output a valid prefix of the target pattern, and set every other logit to $-\infty$ before choosing. `outlines` does this for arbitrary regexes and JSON schemas using finite-state machines over a real tokenizer's vocabulary. Below is the idea for the pattern `\d{4}-\d{2}-\d{2}` with a character-level vocabulary and a stand-in "model" whose logits are random but fixed (it has no idea what a date is):
 
-# Regex-constrained generation (e.g., force a date format):
-# generator = outlines.generate.regex(model, r"\d{4}-\d{2}-\d{2}")
-# result = generator("Today's date is")
-# print(result)  # e.g., "2024-06-15"
-print("outlines constrains decoding to valid schema tokens at generation time.")
+```python
+import numpy as np, string
+
+rng = np.random.default_rng(0)
+VOCAB = list(string.digits + "-/ abc")             # tiny character vocabulary
+PATTERN = "dddd-dd-dd"                             # d = digit, anything else is a literal
+
+def fake_model_logits(prefix):                     # stand-in for an LLM: arbitrary but deterministic
+    return np.random.default_rng(len(prefix) + 7).normal(size=len(VOCAB))
+
+def allowed(prefix):
+    """Tokens that keep the text a valid prefix of PATTERN."""
+    slot = PATTERN[len(prefix)]
+    return [c for c in VOCAB if (c.isdigit() if slot == "d" else c == slot)]
+
+def decode(constrained):
+    out = ""
+    for _ in range(len(PATTERN)):
+        logits = fake_model_logits(out)
+        if constrained:
+            ok = set(allowed(out))
+            logits = np.array([l if c in ok else -np.inf for c, l in zip(VOCAB, logits)])
+        out += VOCAB[int(np.argmax(logits))]
+    return out
+
+import re
+for constrained in (False, True):
+    text = decode(constrained)
+    valid = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", text))
+    print(f"constrained={constrained!s:5s} -> {text!r}  valid date format: {valid}")
 ```
 
 ```output
-outlines constrains decoding to valid schema tokens at generation time.
+constrained=False -> '7aa7-c6a94'  valid date format: False
+constrained=True  -> '7947-46-94'  valid date format: True
 ```
+
+The unconstrained stand-in emits whatever its logits favour; the constrained one is valid by construction, with no retries. In real use you would write `outlines.generate.json(model, Person)` or `outlines.generate.regex(model, r"\d{4}-\d{2}-\d{2}")` and pass in a Pydantic model or regex.
 
 ## Function Calling
 
@@ -223,7 +242,7 @@ Tool: get_weather  Args: {'city': 'Dhaka', 'unit': 'celsius'}
 Parse and validate structured LLM output with Pydantic to catch missing fields or wrong types:
 
 ```python
-from pydantic import BaseModel, EmailStr, ValidationError
+from pydantic import BaseModel, ValidationError
 from typing import Optional
 
 class ExtractedPerson(BaseModel):
@@ -261,7 +280,7 @@ If no person is found, return {{"error": "no person"}}.
 Text: {text}
 JSON:"""
 
-# Simulate outputs (replace with real model calls)
+# Simulated model outputs (replace with real model calls)
 simulated_outputs = [
     '{"name": "Ahmed Hassan", "age": 45}',
     '{"name": "Sara Chen", "age": 31}',
@@ -278,7 +297,7 @@ for (text, expected), output in zip(examples, simulated_outputs):
 ```
 
 ```output
-PASS: Ahmed Hassan, 45, CTO of Tech
+PASS: Ahmed Hassan, 45, CTO of TechB
 PASS: Sara Chen, 31, data scientist.
 PASS: 12345, not a person at all
 ```
@@ -309,6 +328,11 @@ print(dates)
 assert len(dates) == 3
 assert all(len(d) == 10 and d[4] == '-' for d in dates)
 print("All dates correctly normalised to ISO format.")
+```
+
+```output
+['2024-06-15', '2024-09-30', '2024-12-01']
+All dates correctly normalised to ISO format.
 ```
 
 The key insight: specifying the exact output format (ISO dates in a JSON array) in the prompt

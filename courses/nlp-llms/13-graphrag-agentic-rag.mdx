@@ -36,7 +36,7 @@ Documents
 ```
 
 ```python
-# Simulate a small knowledge graph
+# A small hand-written knowledge graph (in a real system an LLM extracts these triples)
 from collections import defaultdict
 
 # Triples extracted from documents
@@ -78,9 +78,14 @@ for s, p, o in facts:
 Facts about Yann LeCun (2-hop):
   (Yann LeCun) --[invented]--> (ConvNets)
   (Yann LeCun) --[works_at]--> (Meta AI)
+  (ConvNets) --[inv_invented]--> (Yann LeCun)
   (ConvNets) --[used_in]--> (Computer Vision)
+  (Meta AI) --[inv_works_at]--> (Yann LeCun)
+  (Computer Vision) --[inv_used_in]--> (ConvNets)
   (Computer Vision) --[applied_to]--> (Image Classification)
 ```
+
+Because `graph[o]` also stores each triple in reverse (`inv_` predicates), the traversal can walk against an edge's direction: the output above includes the inverse edges back to "Yann LeCun", which is how you answer "who works at Meta AI?" from the same structure. The `visited` set stops it from looping.
 
 ### Community Summaries
 
@@ -142,36 +147,37 @@ def agentic_rag(query, retrieve_fn, generate_fn, max_steps=3):
 
     return generate_fn(f"Answer '{query}' using: {context}")
 
-# Simulate retrieval and generation
+# Simulated retrieval and generation (a stand-in for a real retriever and LLM)
 docs_db = {
     "what is backpropagation": ["Backpropagation computes gradients via chain rule.", "It is used to train neural networks."],
     "who invented backpropagation": ["Geoffrey Hinton popularised backpropagation in the 1980s.", "Paul Werbos derived it in 1974."],
 }
 
 def mock_retrieve(q, k=2):
-    for key, docs in docs_db.items():
-        if any(w in q.lower() for w in key.split()):
-            return docs[:k]
-    return []
+    overlap = lambda key: len(set(key.split()) & set(q.lower().split()))
+    key = max(docs_db, key=overlap)                     # best word-overlap key
+    return docs_db[key][:k] if overlap(key) else []
 
 def mock_generate(prompt):
     if "missing" in prompt.lower():
         return "who invented backpropagation"
     if "fully answer" in prompt.lower():
-        return "YES"
+        return "YES" if ("Werbos" in prompt or "Hinton" in prompt) else "NO"
     return "Backpropagation was invented by Paul Werbos (1974) and popularised by Geoffrey Hinton."
 
-answer = agentic_rag("Who invented backpropagation and how does it work?", mock_retrieve, mock_generate)
+answer = agentic_rag("Explain backpropagation and credit its inventor", mock_retrieve, mock_generate)
 print(f"\nFinal answer: {answer}")
 ```
 
 ```output
-  Step 1: retrieved 2 new doc(s) for query 'Who invented backpropagation and how does it work?'
+  Step 1: retrieved 2 new doc(s) for query 'Explain backpropagation and credit its i'
   Step 2: retrieved 2 new doc(s) for query 'who invented backpropagation'
   Step 2: agent is confident, generating answer.
 
 Final answer: Backpropagation was invented by Paul Werbos (1974) and popularised by Geoffrey Hinton.
 ```
+
+The mocks make the control flow visible: step 1 retrieves the "what is" documents, the confidence check says NO (nobody is named as the inventor), so the reflection step asks for "who invented backpropagation", and only then does the agent answer. With a real LLM, each of these decisions is a model call.
 
 ### Self-RAG
 
@@ -279,11 +285,19 @@ def mock_decompose(prompt):
     return "YES"
 
 answer = agentic_rag_decomposed(
-    "Who invented backpropagation and how does it work?",
+    "Explain backpropagation and credit its inventor",
     mock_retrieve,
     lambda p: mock_decompose(p) if "Break" in p else mock_generate(p),
 )
 print(f"Answer: {answer}")
+```
+
+```output
+Sub-questions: ['What is backpropagation?', 'Who invented backpropagation?']
+  Step 1: answered 'What is backpropagation?'
+  Step 2: answered 'Who invented backpropagation?'
+All sub-questions answered.
+Answer: Backpropagation was invented by Paul Werbos (1974) and popularised by Geoffrey Hinton.
 ```
 
 Decomposing upfront ensures the agent terminates cleanly once each specific aspect of the

@@ -22,38 +22,112 @@ There are three stages of modern LLM alignment:
 SFT trains the base model on curated (instruction, response) pairs using standard cross-entropy
 loss. The model learns to produce helpful, formatted outputs for the instruction style you show it.
 
+We cannot download chat models here, so this chapter runs the whole alignment pipeline on a **toy language model we train ourselves**. The world is tiny: a prompt is one of four question tokens `q0`-`q3`; a "good" response repeats the matching answer token (`a0 a0 <eos>` for `q0`); a "bad" response is random rambling tokens (`b2 b0 <eos>`). The model is a 2-layer causal transformer, the same architecture as ch. 5's GPT-style model. The mechanics (masked SFT loss, Bradley-Terry reward model, DPO, SimPO) are exactly the real ones; the scale is not.
+
 ```python
-# Pseudocode — not runnable without an actual dataset and model checkpoint
-training_example = {
-    "instruction": "Summarise the following in one sentence.",
-    "input": "The Eiffel Tower was built in 1889...",
-    "output": "The Eiffel Tower, built in 1889, is Paris's iconic iron lattice tower.",
-}
-# Formatted with a chat template at training time:
-# <|system|>You are a helpful assistant.<|user|>{instruction}\n{input}<|assistant|>{output}
+import random, copy, torch, torch.nn as nn, torch.nn.functional as F
+torch.set_num_threads(1)
+torch.manual_seed(0)
+rng = random.Random(0)
+
+itos = ["<bos>", "<sep>", "<eos>"] + [f"q{i}" for i in range(4)] + [f"a{i}" for i in range(4)] + [f"b{i}" for i in range(4)]
+stoi = {w: i for i, w in enumerate(itos)}
+good = lambda q: [f"a{q}", f"a{q}", "<eos>"]
+bad = lambda: [f"b{rng.randrange(4)}", f"b{rng.randrange(4)}", "<eos>"]
+chat = lambda q, resp: [stoi[w] for w in ["<bos>", f"q{q}", "<sep>"] + resp]   # tiny chat template
+
+print("template :", " ".join(["<bos>", "q0", "<sep>"] + good(0)))
+print("token ids:", chat(0, good(0)))
+
+class LM(nn.Module):
+    def __init__(self, V, d=32):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(V, d), nn.Embedding(8, d)
+        layer = nn.TransformerEncoderLayer(d, 4, 4 * d, dropout=0.0, batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, 2, enable_nested_tensor=False)
+        self.head = nn.Linear(d, V)
+    def forward(self, ids):
+        T = ids.shape[1]
+        causal = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
+        return self.head(self.enc(self.tok(ids) + self.pos(torch.arange(T)), mask=causal))
+
+def resp_logp(model, ids, prompt_len=3):
+    """Sum of log-probs of the RESPONSE tokens only (prompt tokens are masked out)."""
+    lp = model(ids[:, :-1]).log_softmax(-1).gather(-1, ids[:, 1:, None])[..., 0]
+    return lp[:, prompt_len - 1:].sum(-1)
+
+def fit(model, batch_fn, loss_fn, steps, lr=3e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(steps):
+        loss = loss_fn(model, batch_fn())
+        opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+def p_correct(model):
+    """Average probability the model assigns to the exact good response."""
+    with torch.no_grad():
+        ids = torch.tensor([chat(q, good(q)) for q in range(4)])
+        return resp_logp(model, ids).exp().mean().item()
+
+sft_loss = lambda model, ids: -resp_logp(model, ids).mean()      # cross-entropy on response tokens only
+
+# "Pretraining": raw behaviour mixture, half good and half rambling
+pretrain_batch = lambda: torch.tensor([chat(q, good(q) if rng.random() < 0.5 else bad())
+                                       for q in [rng.randrange(4) for _ in range(32)]])
+base = LM(len(itos))
+fit(base, pretrain_batch, sft_loss, 300)
+print(f"base model: P(good response) = {p_correct(base):.3f}")
 ```
 
 ```output
-# SFT loss = cross-entropy on the output tokens only (mask out prompt tokens)
+template : <bos> q0 <sep> a0 a0 <eos>
+token ids: [0, 3, 1, 7, 7, 2]
+base model: P(good response) = 0.511
 ```
 
-Popular SFT datasets: Alpaca, FLAN, OpenHermes, ShareGPT.
+The base model reproduces its training mixture: it answers correctly about half the time, like a pretrained LM that continues text however the web did.
+
+SFT trains the base model on curated (instruction, response) pairs using standard cross-entropy
+loss **on the response tokens only** (`resp_logp` above masks the prompt). The model learns to produce helpful, formatted outputs for the instruction style you show it. Real data looks like:
+
+```
+{"instruction": "Summarise the following in one sentence.", "input": "The Eiffel Tower was built in 1889...",
+ "output": "The Eiffel Tower, built in 1889, is Paris's iconic iron lattice tower."}
+# formatted at training time: <|system|>You are a helpful assistant.<|user|>{instruction}\n{input}<|assistant|>{output}
+```
+
+Popular SFT datasets: Alpaca, FLAN, OpenHermes, ShareGPT. Our toy demonstrations come from annotators who are right 75% of the time:
+
+```python
+sft_batch = lambda: torch.tensor([chat(q, good(q) if rng.random() < 0.75 else bad())
+                                  for q in [rng.randrange(4) for _ in range(32)]])
+sft = copy.deepcopy(base)
+fit(sft, sft_batch, sft_loss, 200, lr=1e-3)
+print(f"after SFT: P(good response) = {p_correct(sft):.3f}")
+```
+
+```output
+after SFT: P(good response) = 0.775
+```
+
+SFT moves the model towards its demonstrations, including their flaws: it cannot become better than 75% because that is how often the demonstrators were right.
 
 ### Chat Templates
 
-Different model families expect different prompt formats. You must match the template the model
-was trained with:
+Different model families expect different prompt formats (ChatML, Llama, Zephyr style, ...). You must match the template the model was trained with. A template is just string assembly, and the model has learned to expect exactly its special tokens:
 
 ```python
-from transformers import AutoTokenizer
+def apply_chat_template(messages, add_generation_prompt=True):
+    out = ""
+    for m in messages:
+        out += f"<|{m['role']}|>\n{m['content']}</s>\n"
+    return out + ("<|assistant|>\n" if add_generation_prompt else "")
 
-tokenizer = AutoTokenizer.from_pretrained("HuggingFaceH4/zephyr-7b-beta")
 messages = [
     {"role": "system", "content": "You are a concise assistant."},
     {"role": "user", "content": "What is backpropagation?"},
 ]
-prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-print(prompt)
+print(apply_chat_template(messages))
 ```
 
 ```output
@@ -63,6 +137,8 @@ You are a concise assistant.</s>
 What is backpropagation?</s>
 <|assistant|>
 ```
+
+This is Zephyr-style formatting, written by hand; with the real `transformers` library you would call `tokenizer.apply_chat_template(...)` on the model's own tokenizer.
 
 ## RLHF
 
@@ -77,6 +153,43 @@ RLHF (Reinforcement Learning from Human Feedback) adds a preference signal on to
 $$\mathcal{L}_{RLHF} = \mathbb{E}[r_\phi(x, y)] - \beta \cdot \text{KL}(\pi_\theta(y|x) \| \pi_{ref}(y|x))$$
 
 The KL term stops the model from producing high-reward gibberish that drifts from coherent text.
+
+Step 2 in code: the reward model is a transformer with a scalar head, trained so that $r(x, y_w) > r(x, y_l)$ via the Bradley-Terry loss $-\log\sigma(r_w - r_l)$. We draw preference pairs (good response preferred over rambling) and check pairwise accuracy on fresh pairs:
+
+```python
+def pref_batch():
+    qs = [rng.randrange(4) for _ in range(32)]
+    return (torch.tensor([chat(q, good(q)) for q in qs]),
+            torch.tensor([chat(q, bad()) for q in qs]))
+
+class RewardModel(nn.Module):
+    def __init__(self, V, d=32):
+        super().__init__()
+        self.lm, self.score = LM(V, d), nn.Linear(d, 1)
+    def forward(self, ids):
+        T = ids.shape[1]
+        causal = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
+        h = self.lm.enc(self.lm.tok(ids) + self.lm.pos(torch.arange(T)), mask=causal)
+        return self.score(h[:, -1])[:, 0]          # reward read off the last token
+
+rm = RewardModel(len(itos))
+opt = torch.optim.Adam(rm.parameters(), lr=3e-3)
+for _ in range(150):
+    w, l = pref_batch()
+    loss = -F.logsigmoid(rm(w) - rm(l)).mean()     # Bradley-Terry pairwise loss
+    opt.zero_grad(); loss.backward(); opt.step()
+w, l = pref_batch()
+with torch.no_grad():
+    print(f"held-out pairwise accuracy: {(rm(w) > rm(l)).float().mean().item():.3f}")
+    print(f"mean reward  preferred: {rm(w).mean().item():.2f}   rejected: {rm(l).mean().item():.2f}")
+```
+
+```output
+held-out pairwise accuracy: 1.000
+mean reward  preferred: 17.63   rejected: -14.32
+```
+
+PPO would then optimise the policy against this reward with the KL penalty; it is the unstable, expensive part that DPO removes.
 
 ### Reward Hacking
 
@@ -97,10 +210,9 @@ $$\mathcal{L}_{DPO}(\pi_\theta) = -\mathbb{E}\left[\log \sigma\!\left(\beta \lef
 Intuitively: increase the log-likelihood ratio of preferred over reference, decrease it for
 rejected. A frozen reference model $\pi_{ref}$ (usually the SFT model) prevents collapse.
 
-```python
-import torch
-import torch.nn.functional as F
+We start with the loss as a function of sequence log-probabilities, evaluated on a small synthetic batch:
 
+```python
 def dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta=0.1):
     """
     policy_logps_w: log p_theta(y_w | x)  — shape (B,)
@@ -109,11 +221,9 @@ def dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta=0.1)
     """
     log_ratio_w = policy_logps_w - ref_logps_w
     log_ratio_l = policy_logps_l - ref_logps_l
-    loss = -F.logsigmoid(beta * (log_ratio_w - log_ratio_l))
-    return loss.mean()
+    return -F.logsigmoid(beta * (log_ratio_w - log_ratio_l)).mean()
 
 # Synthetic example
-B = 4
 policy_logps_w = torch.tensor([-1.2, -0.8, -1.5, -1.0])
 policy_logps_l = torch.tensor([-2.1, -2.5, -1.8, -3.0])
 ref_logps_w    = torch.tensor([-1.3, -0.9, -1.4, -1.1])
@@ -124,8 +234,43 @@ print(f"DPO loss: {loss.item():.4f}")
 ```
 
 ```output
-DPO loss: 0.5813
+DPO loss: 0.6870
 ```
+
+At initialisation the policy equals the reference, so all log-ratios are 0 and the loss is $-\log\sigma(0) = \log 2 \approx 0.693$; training pushes it below that. Now the real thing: the policy starts as a copy of the SFT model, the reference is a frozen copy, and we optimise on preference pairs.
+
+```python
+def run_dpo(beta, steps=100, lr=3e-4):
+    pol, ref = copy.deepcopy(sft), copy.deepcopy(sft).eval()
+    for p in ref.parameters():
+        p.requires_grad = False
+    opt = torch.optim.Adam(pol.parameters(), lr=lr)
+    for _ in range(steps):
+        w, l = pref_batch()
+        with torch.no_grad():
+            rw, rl = resp_logp(ref, w), resp_logp(ref, l)
+        loss = dpo_loss(resp_logp(pol, w), resp_logp(pol, l), rw, rl, beta)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return pol, loss.item()
+
+def chosen_log_ratio(pol):
+    """How far the policy moved from the SFT reference on the good responses (nats, averaged)."""
+    ids = torch.tensor([chat(q, good(q)) for q in range(4)])
+    with torch.no_grad():
+        return (resp_logp(pol, ids) - resp_logp(sft, ids)).mean().item()
+
+dpo_policy, final_loss = run_dpo(beta=0.1)
+print(f"SFT : P(good) = {p_correct(sft):.3f}")
+print(f"DPO : P(good) = {p_correct(dpo_policy):.3f}  (final loss {final_loss:.4f}, "
+      f"log-ratio of good response {chosen_log_ratio(dpo_policy):+.2f} nats)")
+```
+
+```output
+SFT : P(good) = 0.775
+DPO : P(good) = 1.000  (final loss 0.0802, log-ratio of good response +0.26 nats)
+```
+
+Preference data lets the policy go beyond the flawed demonstrations, with no reward model and no PPO.
 
 ## SimPO
 
@@ -135,7 +280,26 @@ by sequence length and adds a reward margin $\gamma$:
 $$\mathcal{L}_{SimPO} = -\log \sigma\!\left(\frac{\beta}{|y_w|}\log\pi_\theta(y_w|x) - \frac{\beta}{|y_l|}\log\pi_\theta(y_l|x) - \gamma\right)$$
 
 No reference model means lower memory and simpler training. Works well when the SFT model is
-already strong.
+already strong. In code it is one line different from DPO, and there is no reference model to keep in memory:
+
+```python
+def run_simpo(beta=2.0, gamma=0.5, steps=100, lr=3e-4, length=3):
+    pol = copy.deepcopy(sft)
+    opt = torch.optim.Adam(pol.parameters(), lr=lr)
+    for _ in range(steps):
+        w, l = pref_batch()
+        margin = beta / length * resp_logp(pol, w) - beta / length * resp_logp(pol, l) - gamma
+        loss = -F.logsigmoid(margin).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return pol, loss.item()
+
+simpo_policy, simpo_loss = run_simpo()
+print(f"SimPO: P(good) = {p_correct(simpo_policy):.3f}  (final loss {simpo_loss:.5f})")
+```
+
+```output
+SimPO: P(good) = 1.000  (final loss 0.00073)
+```
 
 ## When to Use Each
 
@@ -151,41 +315,29 @@ stability over RLHF. Use RLHF for frontier-scale alignment where reward modellin
 
 ## Try it Yourself
 
+Sweep $\beta$ on the real DPO training run:
+
 ```python
-import torch
-import torch.nn.functional as F
-
-def dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta):
-    log_ratio_w = policy_logps_w - ref_logps_w
-    log_ratio_l = policy_logps_l - ref_logps_l
-    return -F.logsigmoid(beta * (log_ratio_w - log_ratio_l)).mean()
-
-# Sweep beta values and see how loss changes
-policy_logps_w = torch.tensor([-1.0, -1.1, -0.9, -1.2])
-policy_logps_l = torch.tensor([-2.0, -1.8, -2.2, -2.1])
-ref_logps_w    = torch.tensor([-1.05, -1.05, -1.05, -1.05])
-ref_logps_l    = torch.tensor([-1.95, -1.95, -1.95, -1.95])
-
 for beta in [0.01, 0.1, 0.5, 1.0]:
-    loss = dpo_loss(policy_logps_w, policy_logps_l, ref_logps_w, ref_logps_l, beta)
-    print(f"beta={beta:.2f}  loss={loss.item():.4f}")
+    pol, final = run_dpo(beta)
+    print(f"beta={beta:.2f}  final loss={final:.5f}  P(good)={p_correct(pol):.3f}  "
+          f"log-ratio of good response={chosen_log_ratio(pol):+.2f}")
 ```
 
 ```output
-beta=0.01  loss=0.6885
-beta=0.10  loss=0.6273
-beta=0.50  loss=0.4121
-beta=1.00  loss=0.2653
+beta=0.01  final loss=0.51668  P(good)=0.999  log-ratio of good response=+0.26
+beta=0.10  final loss=0.07137  P(good)=1.000  log-ratio of good response=+0.26
+beta=0.50  final loss=0.00644  P(good)=1.000  log-ratio of good response=+0.26
+beta=1.00  final loss=0.00199  P(good)=0.999  log-ratio of good response=+0.26
 ```
 
-Higher beta makes the loss more sensitive to log-ratio differences — a larger margin between
-preferred and rejected probabilities is rewarded more strongly.
+$\beta$ scales the log-ratios inside the sigmoid. In this run every $\beta$ ends with `P(good)` near 1, and the "+0.26 nats" in the last column is just the ceiling: moving from $P=0.775$ to $P=1$ is $\ln(1/0.775) \approx 0.26$. What differs is the final loss: with $\beta=0.01$ the loss stays near $\log 2$ (0.52) because the scaled margin is still small, while $\beta=1$ drives it to 0.002. Equivalently, a large $\beta$ saturates the sigmoid after a small move away from the reference, whereas a small $\beta$ keeps asking for a large margin and, with longer training or a higher learning rate, lets the policy drift far from the reference (the same sweep at `lr=1e-3` pushed `P(good)` *down* for small $\beta$, a known DPO failure mode where both chosen and rejected likelihoods fall). Try `lr=1e-3` yourself.
 
 ## Exercise
 
-Given a preference dataset where the preferred response always has a lower perplexity (higher
-log-probability) than the rejected response, show mathematically that the DPO loss will be
-lower than 0.5 in expectation. Then verify numerically with a toy dataset where
+Given a preference dataset where the preferred response always has a higher
+log-probability than the rejected response, show mathematically that the DPO loss is
+lower than the initial value $\log 2 \approx 0.693$ when the reference model assigns equal log-probability to both. Then verify numerically with a toy dataset where
 `policy_logps_w > policy_logps_l` and `ref_logps_w == ref_logps_l`.
 
 <details>
@@ -199,18 +351,15 @@ If `policy_logps_w > policy_logps_l`, the argument of $\sigma$ is positive, so $
 meaning $-\log\sigma(\cdot) < \log 2 \approx 0.693$. The loss is below the random-baseline value.
 
 ```python
-import torch
-import torch.nn.functional as F
-
 pw = torch.tensor([-0.5, -0.6, -0.4, -0.7])   # higher log-prob = preferred
 pl = torch.tensor([-1.5, -1.8, -1.2, -2.0])
 ref = torch.zeros(4)   # same for both — cancels out
 
-loss = -F.logsigmoid(0.1 * (pw - pl - (ref - ref))).mean()
-print(f"loss={loss.item():.4f}")   # should be < 0.693
+loss = dpo_loss(pw, pl, ref, ref, beta=0.1)
+print(f"loss={loss.item():.4f}   (log 2 = {torch.log(torch.tensor(2.0)).item():.4f})")
 ```
 
 ```output
-loss=0.5892
+loss=0.6409   (log 2 = 0.6931)
 ```
 </details>

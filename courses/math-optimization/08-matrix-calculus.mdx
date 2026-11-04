@@ -1,0 +1,683 @@
+---
+course: math-optimization
+chapter: 08-matrix-calculus
+title: "Matrix Calculus: Gradients, Jacobians, Hessians"
+order: 8
+---
+
+## The derivative is the best linear approximation
+
+Zoom far enough into any smooth surface and it looks like a flat plane. The derivative *is* that plane: the one linear
+map that predicts how $f$ changes for a small step, with an error that vanishes faster than the step itself. For
+$f : \mathbb{R}^n \to \mathbb{R}$, the **gradient** $\nabla f(x) \in \mathbb{R}^n$ is the vector that makes
+
+$$
+f(x + h) = f(x) + \nabla f(x)^\top h + O(\|h\|^2),
+$$
+
+where $h$ is a small step and $O(\|h\|^2)$ means "at most a constant times $\|h\|^2$". The test of a correct gradient
+is therefore numeric before it is symbolic: halve the step, and the leftover error must drop by 4. A wrong gradient
+leaves an error proportional to $\|h\|$, which only halves.
+
+```python
+import numpy as np
+import torch
+torch.set_num_threads(1)
+np.set_printoptions(precision=4, suppress=True)
+
+f = lambda x: np.sin(x[0]) * x[1] ** 2 + np.exp(0.5 * x[0] * x[1])
+grad = lambda x: np.array([np.cos(x[0]) * x[1] ** 2 + 0.5 * x[1] * np.exp(0.5 * x[0] * x[1]),
+                           2 * np.sin(x[0]) * x[1] + 0.5 * x[0] * np.exp(0.5 * x[0] * x[1])])
+x0 = np.array([0.7, -1.3]); u = np.array([0.6, 0.8])           # base point and a unit direction
+wrong = grad(x0) * np.array([1.0, 1.1])                         # a 10% bug in one component
+print(f"{'t':>8} {'err (true grad)':>16} {'ratio':>6} {'err (buggy grad)':>17} {'ratio':>6}")
+prev = None
+for t in [10.0 ** -k for k in range(1, 6)]:
+    h = t * u
+    e1 = abs(f(x0 + h) - f(x0) - grad(x0) @ h); e2 = abs(f(x0 + h) - f(x0) - wrong @ h)
+    r1, r2 = ("", "") if prev is None else (f"{prev[0] / e1:.0f}", f"{prev[1] / e2:.0f}")
+    print(f"{t:>8.0e} {e1:>16.2e} {r1:>6} {e2:>17.2e} {r2:>6}")
+    prev = (e1, e2)
+```
+
+```output
+       t  err (true grad)  ratio  err (buggy grad)  ratio
+   1e-01         5.35e-03                 6.27e-03
+   1e-02         5.77e-05     93          1.10e-03      6
+   1e-03         5.82e-07     99          1.16e-04     10
+   1e-04         5.82e-09    100          1.16e-05     10
+   1e-05         5.82e-11    100          1.16e-06     10
+```
+
+Each tenfold shrink of the step cuts the true-gradient error by 100 (quadratic), while the buggy gradient's error
+only falls by 10 and stalls at a fixed fraction of the step: no amount of shrinking makes a wrong plane tangent. Every
+gradient check in this chapter is a disguised version of this table.
+
+## The gradient points uphill fastest, and across the contours
+
+Standing on a hillside, there is one compass direction that climbs most steeply, and walking at right angles to it
+keeps you at the same altitude. The gradient gives both. The rate of change of $f$ along a unit direction $u$ is the
+**directional derivative** $D_u f = \nabla f^\top u$ (the linear approximation with $h = tu$, divided by $t$).
+
+### Steepest ascent from Cauchy–Schwarz
+
+This shows the gradient direction wins among all unit directions. By Cauchy–Schwarz (ch. 1),
+
+$$
+D_u f = \nabla f^\top u \le \|\nabla f\|_2\, \|u\|_2 = \|\nabla f\|_2,
+$$
+
+with equality exactly when $u = \nabla f / \|\nabla f\|_2$. So the steepest slope is $\|\nabla f\|_2$, reached along the
+gradient, and $-\nabla f$ descends fastest (ch. 10). If $u$ is tangent to the level set $\{x : f(x) = c\}$, moving along
+it keeps $f$ constant to first order, so $\nabla f^\top u = 0$: the gradient is **normal to the level sets**.
+
+```python
+g0 = grad(x0)
+angles = np.linspace(0, 2 * np.pi, 3600, endpoint=False)
+U = np.stack([np.cos(angles), np.sin(angles)], 1)               # 3600 unit directions
+slopes = U @ g0
+best = U[np.argmax(slopes)]
+print("best direction  :", best, "| g/||g|| :", g0 / np.linalg.norm(g0))
+print(f"max slope       : {slopes.max():.4f} | ||g|| : {np.linalg.norm(g0):.4f}")
+tang = np.array([-g0[1], g0[0]]) / np.linalg.norm(g0)          # perpendicular to the gradient
+for t in (1e-2, 1e-3):
+    print(f"step {t:.0e} along the tangent changes f by {f(x0 + t * tang) - f(x0):+.2e} "
+          f"(along the gradient: {f(x0 + t * g0 / np.linalg.norm(g0)) - f(x0):+.2e})")
+```
+
+```output
+best direction  : [ 0.518  -0.8554] | g/||g|| : [ 0.5181 -0.8553]
+max slope       : 1.6987 | ||g|| : 1.6987
+step 1e-02 along the tangent changes f by -9.18e-05 (along the gradient: +1.71e-02)
+step 1e-03 along the tangent changes f by -9.21e-07 (along the gradient: +1.70e-03)
+```
+
+The best of 3600 directions matches $\nabla f / \|\nabla f\|$ to the grid resolution, and its slope equals
+$\|\nabla f\|$. Along the tangent, $f$ changes by $O(t^2)$ (a hundredfold drop per tenfold step); along the gradient
+it changes by $O(t)$. That second-order residue along the tangent is the level set's curvature, the Hessian's business.
+
+## One layout convention, and the shape check
+
+The same derivative can be written as a row or as a column, and textbooks disagree (the Matrix Cookbook and Parr and
+Howard state theirs explicitly). Mixing conventions is the most common source of stray transposes. This chapter uses one rule
+throughout:
+
+- The **gradient** of a scalar with respect to anything has the **same shape as that thing**: $\nabla_x f \in \mathbb{R}^n$
+  for $x \in \mathbb{R}^n$, $\nabla_X f \in \mathbb{R}^{m \times n}$ for $X \in \mathbb{R}^{m \times n}$. This is what
+  PyTorch's `.grad` stores, and what you subtract in gradient descent.
+- The **Jacobian** of $y = g(x)$, $y \in \mathbb{R}^m$, $x \in \mathbb{R}^n$, is $m \times n$: row $i$ holds the
+  partial derivatives of $y_i$ (numerator layout). For a scalar, $J = \nabla f^\top$.
+
+The shape check catches most mistakes before any arithmetic. For $f(x) = \|Ax - b\|^2$ with $A \in \mathbb{R}^{m \times n}$,
+the candidates $2(Ax - b)^\top A$ ($1 \times n$, a row: Jacobian, not gradient), $2A(Ax - b)$ (does not multiply:
+$n \ne m$ in general), and $2A^\top(Ax - b)$ ($n \times 1$) leave one survivor. Use non-square test matrices, because a
+square one lets the wrong transpose run silently.
+
+## The differential method: read the gradient off df
+
+Instead of computing $n$ partial derivatives and reassembling them, perturb the input by a small matrix $dX$, expand,
+keep first-order terms, and massage the result into the form
+
+$$
+df = \operatorname{tr}\!\left(G^\top dX\right) = \sum_{ij} G_{ij}\, dX_{ij} \quad\Longrightarrow\quad \nabla_X f = G .
+$$
+
+The trace form is just the matrix dot product (ch. 1), so $G$ is the gradient by the definition of the first section.
+The tool kit is small: $d(AXB) = A\,dX\,B$ for constants $A, B$; the product rule $d(XY) = dX\,Y + X\,dY$;
+$\operatorname{tr}(ABC) = \operatorname{tr}(CAB)$ (cyclic); $\operatorname{tr}(M^\top) = \operatorname{tr}(M)$; and a scalar equals its own trace.
+
+### Six gradients you will reuse
+
+This derives the workhorse identities in a line or two each ($a, b$ vectors; $A$ a constant matrix; $X$ square and,
+where needed, invertible):
+
+$$
+\begin{aligned}
+f = a^\top x: &\quad df = a^\top dx &&\Rightarrow \nabla f = a \\
+f = x^\top A x: &\quad df = dx^\top A x + x^\top A\, dx = x^\top (A + A^\top)\, dx &&\Rightarrow \nabla f = (A + A^\top)x \\
+f = \|Ax - b\|^2,\ r = Ax - b: &\quad df = 2 r^\top dr = 2 r^\top A\, dx &&\Rightarrow \nabla f = 2A^\top(Ax - b) \\
+f = \operatorname{tr}(AX): &\quad df = \operatorname{tr}(A\, dX) = \operatorname{tr}\big((A^\top)^\top dX\big) &&\Rightarrow \nabla f = A^\top \\
+f = \log\det X: &\quad df = \operatorname{tr}(X^{-1} dX) &&\Rightarrow \nabla f = X^{-\top} \\
+f = \operatorname{tr}(B X^{-1}): &\quad df = -\operatorname{tr}(B X^{-1} dX\, X^{-1}) = -\operatorname{tr}(X^{-1} B X^{-1} dX) &&\Rightarrow \nabla f = -X^{-\top} B^\top X^{-\top}
+\end{aligned}
+$$
+
+For symmetric $A$ the quadratic gives $2Ax$; setting the least-squares gradient to zero gives the normal equations
+(ch. 3). Two facts need a short proof. Differentiating $X X^{-1} = I$ gives $dX\, X^{-1} + X\, d(X^{-1}) = 0$, so
+$d(X^{-1}) = -X^{-1}\, dX\, X^{-1}$. For the log-determinant, $\det(X + dX) = \det X \det(I + X^{-1} dX)$ and
+$\det(I + E) = 1 + \operatorname{tr} E + O(\|E\|^2)$ (the product of eigenvalues $1 + \lambda_i(E)$), so
+$d \log\det X = \operatorname{tr}(X^{-1} dX)$. The checker below perturbs every entry and compares.
+
+```python
+def num_grad(f, X, h=1e-6):
+    """Central-difference gradient of scalar f at array X (same shape as X)."""
+    G = np.zeros_like(X, dtype=float)
+    for idx in np.ndindex(X.shape):
+        E = np.zeros_like(X, dtype=float); E[idx] = h
+        G[idx] = (f(X + E) - f(X - E)) / (2 * h)
+    return G
+rel = lambda a, b: np.linalg.norm(a - b) / max(np.linalg.norm(a), np.linalg.norm(b))
+
+rng = np.random.default_rng(0)
+m, n = 5, 3                                                       # non-square on purpose
+a, x, b = rng.standard_normal(n), rng.standard_normal(n), rng.standard_normal(m)
+A_mn, A_nn, B_nn = rng.standard_normal((m, n)), rng.standard_normal((n, n)), rng.standard_normal((n, n))
+X = rng.standard_normal((n, n)) + 3 * np.eye(n)                   # invertible, det > 0
+cases = [
+    ("a^T x",        lambda v: a @ v,                         x, a),
+    ("x^T A x",      lambda v: v @ A_nn @ v,                  x, (A_nn + A_nn.T) @ x),
+    ("||Ax - b||^2", lambda v: np.sum((A_mn @ v - b) ** 2),   x, 2 * A_mn.T @ (A_mn @ x - b)),
+    ("tr(AX)",       lambda M: np.trace(A_nn @ M),            X, A_nn.T),
+    ("log det X",    lambda M: np.linalg.slogdet(M)[1],       X, np.linalg.inv(X).T),
+    ("tr(B X^-1)",   lambda M: np.trace(B_nn @ np.linalg.inv(M)), X,
+                     -np.linalg.inv(X).T @ B_nn.T @ np.linalg.inv(X).T),
+]
+for name, fn, at, G in cases:
+    print(f"{name:14} shape {str(G.shape):7} rel err {rel(G, num_grad(fn, at)):.1e}")
+print("wrong transpose for x^T A x, i.e. 2Ax with non-symmetric A:",
+      f"rel err {rel(2 * A_nn @ x, num_grad(cases[1][1], x)):.2f}")
+```
+
+```output
+a^T x          shape (3,)    rel err 5.0e-11
+x^T A x        shape (3,)    rel err 3.4e-11
+||Ax - b||^2   shape (3,)    rel err 5.9e-11
+tr(AX)         shape (3, 3)  rel err 7.6e-10
+log det X      shape (3, 3)  rel err 9.1e-10
+tr(B X^-1)     shape (3, 3)  rel err 4.2e-10
+wrong transpose for x^T A x, i.e. 2Ax with non-symmetric A: rel err 0.54
+```
+
+All six closed forms agree with brute force to about $10^{-10}$, the floor of central differences (section on gradient
+checking below). The last line is the classic slip: $2Ax$ is only right for symmetric $A$, and on a general matrix it
+is off by order one, which no rounding could explain.
+
+## Softmax cross-entropy: why the gradient is p minus y
+
+Every classifier and every language model ends with this loss, and its gradient is the cleanest in ML: "what you
+predicted minus what was true". With logits $z \in \mathbb{R}^K$ (unnormalized scores for $K$ classes), probabilities
+$p = \operatorname{softmax}(z)$, $p_k = e^{z_k} / \sum_j e^{z_j}$, and a one-hot target $y$, the loss is
+$L = -\sum_k y_k \log p_k$.
+
+### The cancellation
+
+This shows the messy softmax Jacobian disappears. Write $L = -y^\top z + \log\sum_j e^{z_j}$ (using $\sum_k y_k = 1$). Then
+
+$$
+dL = -y^\top dz + \frac{\sum_j e^{z_j} dz_j}{\sum_j e^{z_j}} = (p - y)^\top dz \quad\Longrightarrow\quad \nabla_z L = p - y .
+$$
+
+Going through softmax's Jacobian $\partial p / \partial z = \operatorname{diag}(p) - pp^\top$ gives the same answer the
+long way. For logistic regression ($K = 2$ written with one logit), $L(w) = \frac1N\sum_i [\log(1 + e^{x_i^\top w}) - y_i x_i^\top w]$
+with labels $y_i \in \{0, 1\}$ and sigmoid $\sigma(t) = 1/(1 + e^{-t})$; the same steps give
+$\nabla_w L = \frac1N X^\top(\sigma(Xw) - y)$, where $X \in \mathbb{R}^{N \times d}$ stacks the inputs $x_i^\top$ as rows.
+A batch of softmax rows is $\nabla_W L = \frac1N X^\top(P - Y)$ for weights $W \in \mathbb{R}^{d \times K}$.
+
+```python
+def softmax(Z):
+    Z = Z - Z.max(axis=-1, keepdims=True); E = np.exp(Z); return E / E.sum(axis=-1, keepdims=True)
+N, d, K = 40, 6, 4
+Xc = rng.standard_normal((N, d)); labels = rng.integers(0, K, N); Y = np.eye(K)[labels]
+W0 = 0.5 * rng.standard_normal((d, K))
+ce = lambda W: -np.mean(np.log(softmax(Xc @ W)[np.arange(N), labels]))
+G_ce = Xc.T @ (softmax(Xc @ W0) - Y) / N
+print(f"softmax CE  : grad shape {G_ce.shape}, rel err vs finite diff {rel(G_ce, num_grad(ce, W0)):.1e}")
+sig = lambda t: 1 / (1 + np.exp(-t))
+yb = (Xc @ rng.standard_normal(d) + 0.5 * rng.standard_normal(N) > 0).astype(float)
+logloss = lambda w: np.mean(np.logaddexp(0, Xc @ w) - yb * (Xc @ w))
+w0 = 0.3 * rng.standard_normal(d)
+g_log = Xc.T @ (sig(Xc @ w0) - yb) / N
+print(f"logistic    : grad shape {g_log.shape}, rel err vs finite diff {rel(g_log, num_grad(logloss, w0)):.1e}")
+```
+
+```output
+softmax CE  : grad shape (6, 4), rel err vs finite diff 1.2e-09
+logistic    : grad shape (6,), rel err vs finite diff 1.4e-10
+```
+
+Both closed forms match brute force at the central-difference floor. The practical consequence: frameworks fuse softmax and log into one `cross_entropy` op so the
+backward pass computes $p - y$ directly, never dividing by a tiny $p$ (ch. 14).
+
+## Jacobians compose, and the multiplication order sets the cost
+
+A network is a pipeline $x \to h_1 \to h_2 \to \dots \to L$. The chain rule says the sensitivity of the end to the start
+is the product of the stage-by-stage sensitivities, like exchange rates: dollars to euros to yen multiply. For
+$y = g(x)$ and $z = f(y)$, $dz = J_f\, dy = J_f J_g\, dx$, so $J_{f \circ g}(x) = J_f(g(x))\, J_g(x)$, an
+$(m_f \times m_g)(m_g \times n)$ product with the last stage on the left. A linear layer $y = Wx + b$ has $J = W$; an
+elementwise map $y = \phi(x)$ has $J = \operatorname{diag}(\phi'(x))$.
+
+The chain can be multiplied from either end, with the same answer but not the same cost. For a scalar
+loss of $n$ parameters, $\nabla L^\top = J_k \cdots J_2 J_1$ with $J_k$ a single row. Starting from the right
+(**forward mode**) pushes one input direction $v$ through: $J_k(\cdots(J_1 v))$, a **Jacobian–vector product (JVP)** that
+yields one directional derivative, so the full gradient needs $n$ passes. Starting from the left (**reverse mode**,
+backpropagation) pulls the row vector back: $((u^\top J_k) J_{k-1})\cdots J_1$, a **vector–Jacobian product (VJP)**
+that yields *all* $n$ partial derivatives in one pass.
+
+### The cost of a chain
+
+This counts multiplications for a depth-$k$ chain of width-$n$ layers ending in a scalar. Each VJP or JVP through an
+$n \times n$ Jacobian costs $n^2$ multiplications, so
+
+$$
+\text{reverse: } \underbrace{k n^2}_{\text{one backward pass}} \qquad \text{forward: } \underbrace{n \cdot k n^2}_{n \text{ JVPs}} ,
+$$
+
+a factor $n$ apart. In general, with $n$ inputs and $p$ outputs, the full Jacobian takes $p$ reverse passes or $n$
+forward passes: reverse wins for losses ($p = 1$), forward for a few inputs and many outputs (the sensitivity of a
+simulation to two physical constants). Reverse mode pays in memory: it must store every intermediate $h_i$ for the backward sweep.
+
+```python
+def chain_cost(dims, order):
+    """Multiplications to multiply J_k ... J_1, J_i of shape (dims[i+1], dims[i]), from the given end."""
+    mults = 0
+    if order == "reverse":                       # (1 x d_k) row times each Jacobian, left to right
+        rows = dims[-1]
+        for i in range(len(dims) - 2, -1, -1): mults += rows * dims[i + 1] * dims[i]
+    else:                                        # (d_0 x d_0) identity of input directions, right to left
+        cols = dims[0]
+        for i in range(len(dims) - 1): mults += dims[i + 1] * dims[i] * cols
+    return mults
+def num_jac(g, x, h=1e-6):
+    return np.stack([(g(x + h * e) - g(x - h * e)) / (2 * h) for e in np.eye(len(x))], axis=1)
+W1, b1, W2, xv = rng.standard_normal((5, 3)), rng.standard_normal(5), rng.standard_normal((2, 5)), rng.standard_normal(3)
+J1, J2 = np.diag(1 - np.tanh(W1 @ xv + b1) ** 2) @ W1, W2       # tanh layer (5, 3), then linear (2, 5)
+print(f"J2 @ J1 {(J2 @ J1).shape} vs numerical Jacobian of the composition: rel err "
+      f"{rel(J2 @ J1, num_jac(lambda v: W2 @ np.tanh(W1 @ v + b1), xv)):.1e}")
+print(f"{'network (input ... output)':34} {'reverse (VJP)':>14} {'forward (JVPs)':>15} {'fwd/rev':>8}")
+for dims in ([1000, 1000, 1000, 1000, 1], [784, 256, 256, 10, 1], [2, 100, 100, 100, 5000]):
+    r, fw = chain_cost(dims, "reverse"), chain_cost(dims, "forward")
+    print(f"{str(dims):34} {r:>14,} {fw:>15,} {fw / r:>8.4g}")
+```
+
+```output
+J2 @ J1 (2, 3) vs numerical Jacobian of the composition: rel err 1.7e-09
+network (input ... output)          reverse (VJP)  forward (JVPs)  fwd/rev
+[1000, 1000, 1000, 1000, 1]             3,001,000   3,001,000,000     1000
+[784, 256, 256, 10, 1]                    268,810     210,747,040      784
+[2, 100, 100, 100, 5000]            2,601,000,000       1,040,400   0.0004
+```
+
+The product of Jacobians matches the numerical Jacobian of the two-layer map. For a scalar loss of 1000 inputs, reverse mode is about 1000 times cheaper, the MNIST-shaped MLP about 784 times. The last
+row flips the verdict: with 2 inputs and 5000 outputs, forward mode is 2500 times cheaper. This asymmetry, more than any
+clever trick, is why deep learning runs on backpropagation.
+
+## A reverse-mode autodiff in 40 lines
+
+Backpropagation is bookkeeping: record each operation as it runs, then walk the record backwards, handing each node
+its share of the gradient. Every operation needs only its *local* derivative; the chain rule glues them. Below, a
+scalar `Value` stores its data, its gradient (initially 0), its parents, and a closure that applies the VJP of the
+operation that made it. A node used twice receives two contributions, which is why gradients are *accumulated* with `+=`.
+
+```python
+import math
+class Value:
+    def __init__(self, data, parents=()):
+        self.data, self.grad, self._parents, self._back = float(data), 0.0, parents, lambda: None
+    def _wrap(o): return o if isinstance(o, Value) else Value(o)
+    def __add__(s, o):
+        o = Value._wrap(o); out = Value(s.data + o.data, (s, o))
+        def back(): s.grad += out.grad; o.grad += out.grad
+        out._back = back; return out
+    def __mul__(s, o):
+        o = Value._wrap(o); out = Value(s.data * o.data, (s, o))
+        def back(): s.grad += o.data * out.grad; o.grad += s.data * out.grad
+        out._back = back; return out
+    def __pow__(s, k): return s._unary(s.data ** k, k * s.data ** (k - 1))
+    def _unary(s, val, local):                     # y = phi(s): VJP multiplies by phi'(s)
+        out = Value(val, (s,)); out._back = lambda: setattr(s, "grad", s.grad + local * out.grad); return out
+    def exp(s):  e = math.exp(s.data); return s._unary(e, e)
+    def log(s):  return s._unary(math.log(s.data), 1 / s.data)
+    def tanh(s): t = math.tanh(s.data); return s._unary(t, 1 - t * t)
+    __radd__, __rmul__ = __add__, __mul__
+    def __truediv__(s, o): return s * Value._wrap(o) ** -1
+    def backward(self):
+        order, seen = [], set()
+        def topo(v):                               # parents before children
+            if id(v) not in seen:
+                seen.add(id(v)); [topo(p) for p in v._parents]; order.append(v)
+        topo(self); self.grad = 1.0
+        for v in reversed(order): v._back()
+
+def fn(x1, x2, x3):                                # duck-typed: Value, Dual or torch tensor
+    hdn = (x1 * x2 + x3).tanh()
+    return (hdn * x1).exp() / (1 + x2 ** 2) + (x3 * x3 + 1).log()
+
+xs = [Value(0.5), Value(-1.2), Value(0.8)]
+out = fn(*xs); out.backward()
+g_mine = np.array([v.grad for v in xs])
+pt = np.array([0.5, -1.2, 0.8])
+xt = torch.tensor(pt, requires_grad=True)
+yt = fn(*xt); yt.backward()                         # the same fn runs on torch tensors
+g_fd = num_grad(lambda v: fn(*[Value(t) for t in v]).data, pt)
+print(f"f = {out.data:.10f} (torch {yt.item():.10f})")
+print("mine :", g_mine, "\ntorch:", xt.grad.numpy(), "\nfd   :", g_fd)
+print(f"rel err vs torch {rel(g_mine, xt.grad.numpy()):.1e} | vs finite diff {rel(g_mine, g_fd):.1e}")
+```
+
+```output
+f = 0.9470411228 (torch 0.9470411228)
+mine : [-0.1716  0.5536  1.193 ]
+torch: [-0.1716  0.5536  1.193 ]
+fd   : [-0.1716  0.5536  1.193 ]
+rel err vs torch 0.0e+00 | vs finite diff 1.8e-11
+```
+
+One backward pass gave all three partials, matching `torch.autograd` to machine precision and finite differences to
+$10^{-10}$. Note that `x1` and `x3` are each used twice in `fn`; the `+=` accumulation is what makes that work. PyTorch
+does exactly this, with tensors instead of scalars and a VJP per op (for `W @ x` the VJPs are $\bar y x^\top$ and $W^\top \bar y$,
+where $\bar y$ is the incoming gradient).
+
+### Forward mode with dual numbers
+
+This shows forward mode needs no graph at all. Carry pairs $(a, \dot a)$, a value and its derivative along a chosen
+direction, and define arithmetic on them by the chain rule: $(a, \dot a)(b, \dot b) = (ab, \dot a b + a \dot b)$,
+$\exp(a, \dot a) = (e^a, e^a \dot a)$. Algebraically this is computing with $a + \dot a\,\epsilon$ where $\epsilon^2 = 0$,
+so the $\epsilon$ coefficient of $f(x + v\epsilon)$ is exactly the JVP $\nabla f^\top v$. Seeding $v = e_i$ gives one
+partial per pass.
+
+```python
+class Dual:
+    def __init__(s, a, da=0.0): s.a, s.da = float(a), float(da)
+    def _w(o): return o if isinstance(o, Dual) else Dual(o)
+    def __add__(s, o): o = Dual._w(o); return Dual(s.a + o.a, s.da + o.da)
+    def __mul__(s, o): o = Dual._w(o); return Dual(s.a * o.a, s.da * o.a + s.a * o.da)
+    def __pow__(s, k): return Dual(s.a ** k, k * s.a ** (k - 1) * s.da)
+    __radd__, __rmul__ = __add__, __mul__
+    def __truediv__(s, o): return s * Dual._w(o) ** -1
+    def exp(s):  e = math.exp(s.a); return Dual(e, e * s.da)
+    def log(s):  return Dual(math.log(s.a), s.da / s.a)
+    def tanh(s): t = math.tanh(s.a); return Dual(t, (1 - t * t) * s.da)
+g_dual = np.array([fn(*[Dual(p, float(i == j)) for j, p in enumerate(pt)]).da for i in range(3)])
+v = np.array([1.0, -2.0, 0.5])
+jvp = fn(*[Dual(p, vi) for p, vi in zip(pt, v)]).da
+print("dual-number gradient (3 forward passes):", g_dual, f"| rel err vs reverse {rel(g_dual, g_mine):.1e}")
+print(f"one JVP along v: {jvp:.10f} | grad @ v: {g_mine @ v:.10f}")
+```
+
+```output
+dual-number gradient (3 forward passes): [-0.1716  0.5536  1.193 ] | rel err vs reverse 0.0e+00
+one JVP along v: -0.6822866310 | grad @ v: -0.6822866310
+```
+
+Three forward passes rebuild the gradient that one reverse pass gave, and a single pass with an arbitrary seed gives the
+directional derivative $\nabla f^\top v$ directly. That one-pass JVP returns below as the engine of Hessian–vector products.
+
+## Gradient checking done right
+
+A finite-difference check is how you trust a hand-written gradient, and it is easy to do badly. Two errors compete. The
+**truncation error** comes from the Taylor terms you dropped: forward differences $(f(x + h) - f(x))/h$ are off by
+$O(h)$, central differences $(f(x + h) - f(x - h))/(2h)$ by $O(h^2)$ because the even terms cancel. The **rounding
+error** comes from subtracting two nearly equal floats: each $f$ value carries relative error
+$\varepsilon \approx 1.1 \times 10^{-16}$, and dividing by $h$ amplifies it to $\varepsilon |f| / h$.
+
+### The optimal step
+
+This balances the two errors. For central differences the total is about $C_3 h^2 + \varepsilon |f| / h$, where
+$C_3$ scales with $|f'''|$; setting the derivative in $h$ to zero gives
+
+$$
+h^\star \sim \varepsilon^{1/3} \approx 5 \times 10^{-6}, \qquad \text{error}(h^\star) \sim \varepsilon^{2/3} \approx 10^{-11},
+$$
+
+against $h^\star \sim \varepsilon^{1/2} \approx 10^{-8}$ and error $\sim 10^{-8}$ for forward differences (scale $h$ by
+$|x|$ when $x$ is large). Too small a step is as wrong as too large: the plot of error against $h$ is a U.
+
+```python
+d_true = 2.0 * np.cos(2.0) * np.exp(np.sin(2.0))                 # f(t) = exp(sin 2t), exact f'(1)
+fx = lambda t: np.exp(np.sin(2 * t))
+print(f"{'h':>8} {'forward err':>12} {'central err':>12}")
+for k in (1, 2, 4, 6, 8, 9, 10, 12):
+    h = 10.0 ** -k
+    fe = abs((fx(1 + h) - fx(1)) / h - d_true); ce_ = abs((fx(1 + h) - fx(1 - h)) / (2 * h) - d_true)
+    print(f"{h:>8.0e} {fe:>12.1e} {ce_:>12.1e}")
+print(f"eps^(1/2) = {np.finfo(float).eps ** 0.5:.1e}, eps^(1/3) = {np.finfo(float).eps ** (1 / 3):.1e}")
+```
+
+```output
+       h  forward err  central err
+   1e-01      3.1e-01      4.8e-02
+   1e-02      3.6e-02      4.9e-04
+   1e-04      3.7e-04      4.9e-08
+   1e-06      3.7e-06      1.0e-10
+   1e-08      2.6e-08      3.7e-09
+   1e-09      1.1e-07      1.1e-07
+   1e-10      2.1e-06      1.1e-07
+   1e-12      3.3e-04      1.1e-04
+eps^(1/2) = 1.5e-08, eps^(1/3) = 6.1e-06
+```
+
+Read the two columns as U-curves. Forward differences bottom out near $h = 10^{-8}$ at about $10^{-8}$ error; central
+differences bottom out near $10^{-5}$ to $10^{-6}$ at about $10^{-11}$, and both get *worse* as $h$ shrinks further,
+until at $10^{-12}$ the central estimate is wrong in the fourth digit. The textbook advice "use the smallest $h$ you
+can" is backwards.
+
+### Relative error is the right metric
+
+An absolute difference of $10^{-6}$ means nothing without the size of the gradient, so compare
+$\|g_{\text{analytic}} - g_{\text{numeric}}\| / \max(\|g_{\text{analytic}}\|, \|g_{\text{numeric}}\|)$ (the `rel`
+helper above). In float64 with central differences, below $10^{-7}$ is correct, $10^{-4}$ or above is a bug. Check
+in float64 (float32 has $\varepsilon \approx 6 \times 10^{-8}$, which drags the floor to about $10^{-5}$), on a few
+random coordinates if the model is large, away from kinks like ReLU at 0, and with dropout and other randomness frozen.
+
+```python
+grad_good = lambda W: Xc.T @ (softmax(Xc @ W) - Y) / N
+grad_bug = lambda W: Xc.T @ (softmax(Xc @ W) - Y)                 # forgot the 1/N
+grad_bug2 = lambda W: Xc.T @ (softmax(Xc @ W) - Y) / N + 1e-3 * W  # stray weight decay
+for name, gfun in [("correct", grad_good), ("missing 1/N", grad_bug), ("stray 1e-3 W", grad_bug2)]:
+    G_a, G_n = gfun(W0), num_grad(ce, W0, h=1e-5)
+    print(f"{name:14} max abs diff {np.abs(G_a - G_n).max():.1e} | relative error {rel(G_a, G_n):.1e}")
+```
+
+```output
+correct        max abs diff 2.6e-11 | relative error 1.3e-10
+missing 1/N    max abs diff 7.3e+00 | relative error 9.7e-01
+stray 1e-3 W   max abs diff 7.5e-04 | relative error 3.8e-03
+```
+
+The correct gradient sits at $10^{-11}$, the missing $1/N$ is glaring, and the small stray term shows up at a level far
+above the floor even though its absolute difference looks tiny. That gap of five or more orders is what makes a
+correct implementation unambiguous.
+
+## Hessians: the curvature matrix
+
+The gradient tells you which way is downhill; the **Hessian** $H = \nabla^2 f$, the $n \times n$ matrix of second
+partials $H_{ij} = \partial^2 f / \partial x_i \partial x_j$, tells you how fast that answer changes as you move. It is
+the Jacobian of the gradient, and it is symmetric for twice continuously differentiable $f$. It enters the second-order
+expansion $f(x + h) \approx f(x) + \nabla f^\top h + \tfrac12 h^\top H h$, whose quadratic form is the subject of ch. 7.
+
+### Two Hessians in closed form
+
+This differentiates the gradient once more. For the quadratic $f = \tfrac12 x^\top A x - b^\top x$ with symmetric $A$,
+$d(\nabla f) = d(Ax - b) = A\, dx$, so $H = A$, the same everywhere. For logistic regression,
+$\nabla L = \frac1N X^\top(\sigma(Xw) - y)$ and $\sigma'(t) = \sigma(t)(1 - \sigma(t))$, so
+
+$$
+d(\nabla L) = \tfrac1N X^\top \operatorname{diag}\big(\sigma'(Xw)\big) X\, dw \quad\Longrightarrow\quad
+H = \tfrac1N X^\top S X, \quad S = \operatorname{diag}\big(\sigma_i(1 - \sigma_i)\big) .
+$$
+
+Each $\sigma_i(1 - \sigma_i) \in (0, \tfrac14]$, so $h^\top H h = \frac1N\sum_i s_i (x_i^\top h)^2 \ge 0$: $H$ is
+positive semidefinite (ch. 7) and the loss is convex (ch. 9). It is also how Newton's method for logistic regression,
+IRLS, gets its weights.
+
+```python
+def logistic_H(w):
+    s = sig(Xc @ w); return Xc.T @ (Xc * (s * (1 - s))[:, None]) / N
+H_closed = logistic_H(w0)
+H_fd = num_jac(lambda w: Xc.T @ (sig(Xc @ w) - yb) / N, w0)      # Jacobian of the analytic gradient
+ev = np.linalg.eigvalsh(H_closed)
+print(f"rel err X^T S X / N vs FD Jacobian of gradient: {rel(H_closed, H_fd):.1e} | symmetric: {np.allclose(H_closed, H_closed.T)}")
+print("eigenvalues:", ev, "| all >= 0:", bool(ev.min() >= 0))
+print(f"condition number {ev.max() / ev.min():.1f}; with w scaled by 10: {np.linalg.cond(logistic_H(10 * w0)):.1f}")
+```
+
+```output
+rel err X^T S X / N vs FD Jacobian of gradient: 1.9e-10 | symmetric: True
+eigenvalues: [0.1319 0.177  0.2207 0.2466 0.3404 0.3772] | all >= 0: True
+condition number 2.9; with w scaled by 10: 22.7
+```
+
+The closed form matches, and every eigenvalue is positive. Scaling the weights up pushes the $\sigma_i$ toward 0 and 1,
+shrinks the weights $s_i$ unevenly, and worsens the conditioning: near-separable data make logistic regression's curvature
+collapse in some directions, which is why it needs regularization (ch. 7, ch. 10).
+
+## Hessian–vector products without the Hessian
+
+A network with $10^6$ parameters has a Hessian with $10^{12}$ entries; you will never form it. But most second-order
+algorithms (conjugate gradient, Lanczos for the top eigenvalue, Newton–CG in ch. 12) only ever need $Hv$ for a given
+vector $v$, and that costs about as much as two gradients. The trick (Pearlmutter, 1994): $Hv$ is the directional
+derivative of the gradient,
+
+$$
+Hv = \frac{d}{dt}\nabla f(x + tv)\Big|_{t=0} = \nabla_x\big(\nabla f(x)^\top v\big),
+$$
+
+so differentiate the scalar $\nabla f^\top v$ once more. In PyTorch that is a `backward` through a graph built with
+`create_graph=True` (reverse over reverse); JAX prefers forward over reverse, a dual-number JVP of the gradient.
+
+```python
+torch.manual_seed(0)
+Xt = torch.randn(200, 10, dtype=torch.float64); yt_ = torch.sin(Xt[:, 0]) + 0.1 * torch.randn(200, dtype=torch.float64)
+shapes = [(10, 8), (8,), (8, 1), (1,)]                         # tiny tanh MLP, parameters in one flat vector
+n_par = sum(math.prod(s) for s in shapes)
+def resid(theta):                                               # scaled so that loss = 0.5 ||resid||^2
+    ps, i = [], 0
+    for s in shapes: ps.append(theta[i:i + math.prod(s)].view(s)); i += math.prod(s)
+    return ((torch.tanh(Xt @ ps[0] + ps[1]) @ ps[2] + ps[3]).squeeze(1) - yt_) / math.sqrt(len(yt_))
+mlp_loss = lambda theta: 0.5 * (resid(theta) ** 2).sum()
+theta = 0.3 * torch.randn(n_par, dtype=torch.float64, requires_grad=True)
+vt = torch.randn(n_par, dtype=torch.float64)
+g, = torch.autograd.grad(mlp_loss(theta), theta, create_graph=True)
+Hv, = torch.autograd.grad(g @ vt, theta)                        # Pearlmutter: grad of (grad . v)
+H_full = torch.autograd.functional.hessian(mlp_loss, theta.detach())
+eps_ = 1e-5
+grad_at = lambda th: torch.autograd.grad(mlp_loss(th), th)[0]
+Hv_fd = (grad_at((theta + eps_ * vt).detach().requires_grad_()) - grad_at((theta - eps_ * vt).detach().requires_grad_())) / (2 * eps_)
+print(f"parameters {n_par} | Hessian entries {n_par ** 2:,}")
+print(f"rel err HVP vs full H @ v: {rel(Hv.numpy(), (H_full @ vt).numpy()):.1e} | vs central diff of gradients: {rel(Hv.numpy(), Hv_fd.numpy()):.1e}")
+print(f"cost: HVP = 1 gradient + 1 extra backward; full Hessian via autograd = {n_par} HVPs")
+```
+
+```output
+parameters 97 | Hessian entries 9,409
+rel err HVP vs full H @ v: 4.4e-16 | vs central diff of gradients: 1.5e-09
+cost: HVP = 1 gradient + 1 extra backward; full Hessian via autograd = 97 HVPs
+```
+
+The Pearlmutter product equals the explicit Hessian times $v$ to machine precision without ever storing the
+$385 \times 385$ matrix; the finite-difference-of-gradients version agrees to about $10^{-10}$, the same central-difference
+floor as before. Forming $H$ needed one HVP per parameter; algorithms that use only $Hv$ scale to any model size.
+
+## Gauss–Newton: curvature you can always trust
+
+For a least-squares loss the Hessian splits into a part built from first derivatives and a part that needs second
+derivatives, and the first part alone is often good enough. With residuals $r(\theta) \in \mathbb{R}^N$ (prediction
+minus target, one per data point), loss $f = \tfrac12\|r\|^2$, and residual Jacobian $J = \partial r / \partial\theta$
+($N \times n$):
+
+$$
+\nabla f = J^\top r, \qquad H = J^\top J + \sum_{i=1}^N r_i\, \nabla^2 r_i \;\approx\; J^\top J = G_{\mathrm{GN}} .
+$$
+
+The **Gauss–Newton matrix** $G_{\mathrm{GN}}$ is always PSD (it is a Gram matrix, ch. 7) and needs no second
+derivatives; the dropped term is small when residuals are small or the model is nearly linear in $\theta$. The full $H$ of a
+network can have negative eigenvalues and send Newton uphill; $J^\top J$ cannot. For cross-entropy losses the analogue
+is the generalized Gauss–Newton matrix, equal to the Fisher information. Levenberg–Marquardt and K-FAC are built on it
+(ch. 12).
+
+```python
+def compare_gn(theta_np):
+    th = torch.tensor(theta_np)
+    J = torch.autograd.functional.jacobian(resid, th)            # residual Jacobian, (200, n_par)
+    G, H = (J.T @ J).numpy(), torch.autograd.functional.hessian(mlp_loss, th).numpy()
+    eh, eg = np.linalg.eigvalsh(H), np.linalg.eigvalsh(G)
+    return mlp_loss(th).item(), rel(G, H), eh.min(), eh.max(), eg.min()
+th_fit = theta.detach().clone().requires_grad_()
+opt = torch.optim.LBFGS([th_fit], max_iter=500, line_search_fn="strong_wolfe")
+def closure():
+    opt.zero_grad(); l = mlp_loss(th_fit); l.backward(); return l
+opt.step(closure)
+print(f"{'point':10} {'loss':>8} {'||G-H||/||H||':>14} {'min eig H':>10} {'max eig H':>10} {'min eig G':>10}")
+for name, th_ in [("random", theta.detach().numpy()), ("fitted", th_fit.detach().numpy())]:
+    l, r_, mn, mx, mg = compare_gn(th_)
+    print(f"{name:10} {l:>8.4f} {r_:>14.3f} {mn:>10.2e} {mx:>10.2e} {mg:>10.2e}")
+```
+
+```output
+point          loss  ||G-H||/||H||  min eig H  max eig H  min eig G
+random       0.2803          0.578  -5.70e-01   1.60e+00   7.21e-07
+fitted       0.0017          0.001  -1.22e-04   1.06e+02   3.48e-08
+```
+
+At the random start the residuals are large, the dropped term matters, and the true Hessian has clearly negative
+eigenvalues: a pure Newton step there could head uphill. After fitting, the residuals are small, $G_{\mathrm{GN}}$ is
+close to $H$, and the negative curvature has nearly vanished, while $G_{\mathrm{GN}}$'s smallest eigenvalue never
+goes below 0 (to rounding). Ch. 12 turns this into Gauss–Newton and Levenberg–Marquardt steps.
+
+## Try it Yourself
+
+```python
+import numpy as np, torch
+torch.set_num_threads(1)
+rng = np.random.default_rng(7)
+N, d, H, K = 32, 5, 8, 3                       # batch, inputs, hidden units, classes
+X = rng.standard_normal((N, d)); y = rng.integers(0, K, N); Y = np.eye(K)[y]
+W1, W2 = 0.5 * rng.standard_normal((d, H)), 0.5 * rng.standard_normal((H, K))
+# forward: A = tanh(X W1), Z = A W2, P = softmax(Z), L = mean CE
+A = np.tanh(X @ W1); Z = A @ W2
+P = np.exp(Z - Z.max(1, keepdims=True)); P /= P.sum(1, keepdims=True)
+# backward by the rules of this chapter (each gradient has the shape of its variable)
+dZ = (P - Y) / N                               # softmax + CE: p - y
+dW2 = A.T @ dZ                                 # Z = A W2  ->  dW2 = A^T dZ
+dA = dZ @ W2.T                                 #           ->  dA  = dZ W2^T
+dW1 = X.T @ (dA * (1 - A ** 2))                # elementwise tanh: multiply by its derivative
+t1, t2 = (torch.tensor(W, requires_grad=True) for W in (W1, W2))
+loss = torch.nn.functional.cross_entropy(torch.tanh(torch.tensor(X) @ t1) @ t2, torch.tensor(y))
+loss.backward()
+rel = lambda a, b: np.linalg.norm(a - b) / max(np.linalg.norm(a), np.linalg.norm(b))
+print(f"loss {loss.item():.6f} | rel err dW1 {rel(dW1, t1.grad.numpy()):.1e} | dW2 {rel(dW2, t2.grad.numpy()):.1e}")
+```
+
+```output
+loss 1.066069 | rel err dW1 1.9e-16 | dW2 1.5e-16
+```
+
+Both hand-derived gradients match autograd to machine precision. Swap `tanh` for a ReLU (derivative `(A > 0)`), add a
+bias row, or break a transpose on purpose and watch the relative error jump from $10^{-16}$ to order one.
+
+## Exercise
+
+The negative log-likelihood of $N$ zero-mean Gaussian samples $x_i \in \mathbb{R}^p$ with covariance $\Sigma$ is, up to a
+constant, $L(\Sigma) = \tfrac{N}{2}\left[\log\det\Sigma + \operatorname{tr}(S\Sigma^{-1})\right]$, where
+$S = \frac1N\sum_i x_i x_i^\top$ is the sample covariance. Use the differential method and two of the six rules to find
+$\nabla_\Sigma L$, verify it with central differences at a random symmetric positive definite $\Sigma$, and show that it
+vanishes at $\Sigma = S$ (the maximum-likelihood estimate) but not at the true covariance.
+
+<details>
+<summary>Solution</summary>
+
+```python
+rng = np.random.default_rng(11)
+p, Ns = 4, 500
+C = rng.standard_normal((p, p)); Sigma_true = C @ C.T + np.eye(p)
+S = (lambda Xs: Xs.T @ Xs / Ns)(rng.multivariate_normal(np.zeros(p), Sigma_true, Ns))
+nll = lambda Sg: 0.5 * Ns * (np.linalg.slogdet(Sg)[1] + np.trace(S @ np.linalg.inv(Sg)))
+def nll_grad(Sg):
+    Si = np.linalg.inv(Sg); return 0.5 * Ns * (Si - Si @ S @ Si)
+Sg0 = np.cov(rng.standard_normal((p, 50))) + np.eye(p)             # a random symmetric PD point
+print(f"rel err gradient vs central differences: {rel(nll_grad(Sg0), num_grad(nll, Sg0)):.1e}")
+print(f"||grad|| at Sigma = S: {np.linalg.norm(nll_grad(S)):.1e} | at Sigma_true: {np.linalg.norm(nll_grad(Sigma_true)):.1f}")
+```
+
+```output
+rel err gradient vs central differences: 1.4e-09
+||grad|| at Sigma = S: 6.5e-14 | at Sigma_true: 12.4
+```
+
+The log-det rule gives $\operatorname{tr}(\Sigma^{-1}d\Sigma)$ and the inverse rule (with $B = S$) gives
+$-\operatorname{tr}(\Sigma^{-1}S\Sigma^{-1}d\Sigma)$, so $\nabla_\Sigma L = \tfrac N2(\Sigma^{-1} - \Sigma^{-1}S\Sigma^{-1})$,
+already symmetric. Multiplying by $\Sigma$ on both sides shows it vanishes exactly when $\Sigma = S$; at the true
+covariance it does not, because $S$ is the best fit to *this* sample. Differentiating once more, the curvature along a
+symmetric direction $V$ is $\tfrac N2\operatorname{tr}\big(\Sigma^{-1}V\Sigma^{-1}(2S - \Sigma)\Sigma^{-1}V\big)$: positive
+at $\Sigma = S$, but able to turn negative when $\Sigma \gg S$, so this NLL is not convex in $\Sigma$ (it is in $\Sigma^{-1}$).
+</details>

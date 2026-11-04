@@ -40,23 +40,61 @@ print(f"Chunks: {len(chunks)}, sizes: {[len(c.split()) for c in chunks]}")
 ```
 
 ```output
-Chunks: 4, sizes: [200, 200, 200, 100]
+Chunks: 4, sizes: [200, 200, 200, 50]
 ```
 
-**Sentence-aware chunking** respects sentence boundaries using spaCy or NLTK.
+**Sentence-aware chunking** respects sentence boundaries (spaCy or NLTK in practice; a regex splitter is enough to see the idea):
+
+```python
+import re
+
+def sentence_chunks(text, max_words=12):
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks, cur = [], []
+    for sent in sents:
+        if cur and len(" ".join(cur + [sent]).split()) > max_words:
+            chunks.append(" ".join(cur)); cur = []
+        cur.append(sent)
+    if cur:
+        chunks.append(" ".join(cur))
+    return chunks
+
+text = ("RAG retrieves documents. It then passes them to the model. Chunk size matters a lot. "
+        "Small chunks are precise. Large chunks keep context. Overlap hides boundary effects.")
+for c in sentence_chunks(text):
+    print(len(c.split()), "words |", c)
+```
+
+```output
+10 words | RAG retrieves documents. It then passes them to the model.
+9 words | Chunk size matters a lot. Small chunks are precise.
+8 words | Large chunks keep context. Overlap hides boundary effects.
+```
+
+Chunks never cut a sentence in half, at the cost of uneven sizes.
 **Semantic chunking** splits when the embedding similarity between consecutive sentences drops.
 **Parent-child chunking** stores large parent chunks in a document store and small child chunks
 in the retrieval index; retrieval returns the parent for full context.
 
 ## Dense Retrieval
 
-Embed both documents and the query with a sentence encoder, then find nearest neighbours:
+Embed both documents and the query into a vector space, then find nearest neighbours. Pretrained sentence encoders and FAISS are not available here, so we use **latent semantic analysis (LSA)** as a stand-in dense encoder: TF-IDF followed by a truncated SVD, fitted on a synthetic background corpus of topical documents. LSA vectors are low-dimensional and capture word co-occurrence, which is the property that makes dense retrieval work (a neural encoder from ch. 7 would be better). Exact search over normalised vectors is a matrix product, which is what `faiss.IndexFlatIP` computes.
 
 ```python
-from sentence_transformers import SentenceTransformer
-import numpy as np, faiss
+import numpy as np, random
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+rng = random.Random(0)
+TOPICS = {
+ "ml": "neural networks learn gradient descent backpropagation chain rule loss weights adam optimiser momentum rate training model parameters layers computational graphs".split(),
+ "france": "france paris capital eiffel tower french cuisine baguettes croissants wine cheese cities famous".split(),
+ "python": ("python numpy pandas dataframes matplotlib plots scikit-learn library arrays data analysis code programming "
+            "high-level interpreted language fast array operations scientific computing store tabular labelled columns "
+            "creates visualisations provides algorithms consistent api").split(),
+}
+FILL = "the a of and is for by in with how what are".split()
+topic_doc = lambda t, n=10: " ".join(rng.sample(TOPICS[t], n) + rng.sample(FILL, 4))
 
 docs = [
     "Gradient descent minimises a loss function by iterating in the negative gradient direction.",
@@ -65,25 +103,30 @@ docs = [
     "French cuisine is famous for baguettes, croissants, and coq au vin.",
     "Adam optimiser combines momentum and RMSProp for adaptive learning rates.",
 ]
-doc_embs = model.encode(docs, normalize_embeddings=True).astype(np.float32)
+background = [topic_doc(t) for t in TOPICS for _ in range(100)]
+vec = TfidfVectorizer(sublinear_tf=True).fit(background + docs)
+svd = TruncatedSVD(8, random_state=0).fit(vec.transform(background + docs))
 
-index = faiss.IndexFlatIP(doc_embs.shape[1])
-index.add(doc_embs)
+def embed(texts):
+    E = svd.transform(vec.transform(texts))
+    return (E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)).astype(np.float32)
 
+doc_embs = embed(docs)
 query = "how do neural networks learn?"
-q_emb = model.encode([query], normalize_embeddings=True).astype(np.float32)
-scores, idxs = index.search(q_emb, k=3)
+q_emb = embed([query])
+sims = (q_emb @ doc_embs.T)[0]                      # exact inner-product search
+idxs = np.argsort(-sims)[:3]
 
 print("Dense retrieval top-3:")
-for s, i in zip(scores[0], idxs[0]):
-    print(f"  [{s:.4f}] {docs[i]}")
+for i in idxs:
+    print(f"  [{sims[i]:.4f}] {docs[i]}")
 ```
 
 ```output
 Dense retrieval top-3:
-  [0.7214] Gradient descent minimises a loss function by iterating in the negative gradient direction.
-  [0.6893] Backpropagation computes gradients by applying the chain rule through computational graphs.
-  [0.6541] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+  [0.5348] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [0.5191] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [0.3931] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
 ```
 
 ## BM25 (Sparse Retrieval)
@@ -136,10 +179,12 @@ for i, s in ranked[:3]:
 
 ```output
 BM25 top-3:
-  [1.8832] Gradient descent minimises a loss function by iterating in the negative gradient direction.
-  [1.4201] Backpropagation computes gradients by applying the chain rule through computational graphs.
-  [0.9312] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+  [1.8831] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [0.0000] The capital of France is Paris, known for the Eiffel Tower.
+  [0.0000] Backpropagation computes gradients by applying the chain rule through computational graphs.
 ```
+
+Only the first document contains the exact query word "gradient"; "gradients" in the backpropagation document is a different token for BM25, and "neural", "networks" and "learn" appear in no document at all. Every other document scores exactly 0 and their order is arbitrary (ties). This is the **vocabulary mismatch** problem that dense retrieval (above) softens and that stemming (ch. 3) partly fixes.
 
 ## Hybrid Search with RRF
 
@@ -159,9 +204,9 @@ def rrf(ranked_lists, k=60):
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 # Dense ranking
-dense_ranked = list(idxs[0])                            # [0, 2, 4]
+dense_ranked = [int(i) for i in np.argsort(-sims)]       # all docs, best first
 # BM25 ranking
-bm_ranked = [i for i, _ in ranked]                      # e.g. [0, 2, 4, 1, 3]
+bm_ranked = [i for i, _ in ranked]
 
 hybrid = rrf([dense_ranked, bm_ranked])
 print("Hybrid RRF top-3:")
@@ -171,29 +216,46 @@ for doc_id, score in hybrid[:3]:
 
 ```output
 Hybrid RRF top-3:
-  [0.0323] Gradient descent minimises a loss function by iterating in the negative gradient direction.
-  [0.0313] Backpropagation computes gradients by applying the chain rule through computational graphs.
-  [0.0303] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+  [0.0325] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [0.0323] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [0.0318] The capital of France is Paris, known for the Eiffel Tower.
 ```
 
 Hybrid search catches documents that score well in either vocabulary match (BM25) or semantic
-similarity (dense), reducing misses from either system alone.
+similarity (dense), reducing misses from either system alone. Here the two lists nearly tie at the top (0.0325 vs 0.0323), and the third place (the Paris document) comes only from BM25's arbitrary tie-breaking at score 0 plus a low dense rank: fusion is only as good as its inputs.
 
 ## Cross-Encoder Reranking
 
-A cross-encoder reads (query, document) jointly — no embedding step — and outputs a relevance
+A cross-encoder reads (query, document) jointly — no separate embedding step — and outputs a relevance
 score. Much more accurate than bi-encoders, but $O(N)$ forward passes per query (run only on
 the top-k retrieved documents, not the full corpus).
 
-```python
-from sentence_transformers import CrossEncoder
+`cross-encoder/ms-marco-MiniLM` cannot be downloaded here. As a stand-in we train a small **learned reranker on joint query-document features** (BM25 score, dense similarity, fraction of query words found in the document) with logistic regression on synthetic relevance labels. It shares the pointwise `score(query, doc)` interface and the "run only on the top-k" usage of a cross-encoder, but it is much weaker than a transformer that reads the text.
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+```python
+from sklearn.linear_model import LogisticRegression
+
+def features(query, candidates):
+    bm = BM25(candidates).score(query)
+    de = (embed([query]) @ embed(candidates).T)[0]
+    qw = set(query.lower().split())
+    ov = [len(qw & set(c.lower().split())) / len(qw) for c in candidates]
+    return np.array([bm, de, ov]).T
+
+# synthetic training data: queries/docs from the same topic are relevant
+X, y = [], []
+names = list(TOPICS)
+for _ in range(200):
+    t = rng.choice(names)
+    q = " ".join(rng.sample(TOPICS[t], 3))
+    cands = [topic_doc(t, 8)] + [topic_doc(rng.choice([n for n in names if n != t]), 8) for _ in range(3)]
+    X.append(features(q, cands)); y += [1, 0, 0, 0]
+reranker = LogisticRegression(max_iter=1000).fit(np.vstack(X), y)
+print("learned feature weights [bm25, dense, overlap]:", reranker.coef_[0].round(2))
 
 query = "how do neural networks learn?"
 candidates = [docs[i] for i, _ in hybrid[:3]]
-
-rerank_scores = reranker.predict([(query, d) for d in candidates])
+rerank_scores = reranker.decision_function(features(query, candidates))
 reranked = sorted(zip(rerank_scores, candidates), reverse=True)
 
 print("After reranking:")
@@ -202,23 +264,18 @@ for score, doc in reranked:
 ```
 
 ```output
+learned feature weights [bm25, dense, overlap]: [2.41 6.68 0.67]
 After reranking:
-  [8.4312] Backpropagation computes gradients by applying the chain rule through computational graphs.
-  [7.9821] Gradient descent minimises a loss function by iterating in the negative gradient direction.
-  [6.1034] Adam optimiser combines momentum and RMSProp for adaptive learning rates.
+  [-0.4426] Backpropagation computes gradients by applying the chain rule through computational graphs.
+  [-0.5471] Gradient descent minimises a loss function by iterating in the negative gradient direction.
+  [-2.9503] The capital of France is Paris, known for the Eiffel Tower.
 ```
 
-The reranker flips the top-2 — backpropagation is a better match for "how neural networks
-learn" than gradient descent alone.
+Compare the order with the hybrid list above: the reranker sees all signals for each (query, document) pair at once, moves the backpropagation document ahead of gradient descent (agreeing with the dense retriever, not BM25) and gives the off-topic Paris document a clearly lower score.
 
 ## Try it Yourself
 
 ```python
-from sentence_transformers import SentenceTransformer
-import numpy as np
-
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
 new_docs = [
     "Python is a high-level interpreted programming language.",
     "NumPy provides fast array operations for scientific computing.",
@@ -226,77 +283,62 @@ new_docs = [
     "Matplotlib creates 2D plots and visualisations.",
     "scikit-learn provides ML algorithms with a consistent API.",
 ]
-embs = model.encode(new_docs, normalize_embeddings=True)
+embs = embed(new_docs)
 
 # Try different queries and rank the docs
 for query in ["data analysis tools", "machine learning library", "array math"]:
-    q = model.encode([query], normalize_embeddings=True)
+    q = embed([query])
     scores = (q @ embs.T)[0]
     top = np.argmax(scores)
-    print(f"Query: '{query}'  → top doc: '{new_docs[top][:50]}'")
+    print(f"Query: '{query}'  -> top doc: '{new_docs[top][:50]}'")
 ```
 
 ```output
-Query: 'data analysis tools'  → top doc: 'pandas DataFrames store tabular data with labelled '
-Query: 'machine learning library'  → top doc: 'scikit-learn provides ML algorithms with a consi'
-Query: 'array math'  → top doc: 'NumPy provides fast array operations for scientific'
+Query: 'data analysis tools'  -> top doc: 'pandas DataFrames store tabular data with labelled'
+Query: 'machine learning library'  -> top doc: 'NumPy provides fast array operations for scientifi'
+Query: 'array math'  -> top doc: 'NumPy provides fast array operations for scientifi'
 ```
+
+Try your own queries and check where LSA fails: words absent from the background corpus ("machine", "math") carry no signal at all, the out-of-vocabulary problem that neural encoders soften with subwords (ch. 2).
 
 ## Exercise
 
 Implement a minimal two-stage retrieval pipeline: BM25 retrieval of top-10, followed by a
-cross-encoder reranker returning top-3. Test on a corpus of 20 sentences and one query.
+reranker (the learned reranker above stands in for a cross-encoder) returning top-3. Test on a corpus of 20 sentences and one query.
 Measure whether the reranked top-3 differs from the raw BM25 top-3.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-import math
-from collections import Counter
-from sentence_transformers import CrossEncoder
-
 corpus = [f"Document {i}: topic about subject area {i % 5}." for i in range(20)]
 corpus[3] = "Neural networks learn by backpropagating gradients."
 corpus[7] = "Gradient descent updates weights to minimise the loss."
 corpus[12] = "Optimisers like Adam adjust the learning rate adaptively."
 
-class SimpleBM25:
-    def __init__(self, docs, k1=1.5, b=0.75):
-        self.docs = [d.lower().split() for d in docs]
-        self.k1, self.b = k1, b
-        self.avgdl = sum(len(d) for d in self.docs) / len(self.docs)
-        N = len(self.docs)
-        self.idf = {}
-        for t in set(t for d in self.docs for t in d):
-            df = sum(1 for d in self.docs if t in d)
-            self.idf[t] = math.log((N - df + 0.5) / (df + 0.5) + 1)
-
-    def score(self, query):
-        qtokens = query.lower().split()
-        out = []
-        for doc in self.docs:
-            dl = len(doc); tf = Counter(doc)
-            s = sum(self.idf.get(t, 0) * ((self.k1+1)*tf[t] /
-                    (tf[t]+self.k1*(1-self.b+self.b*dl/self.avgdl))) for t in qtokens)
-            out.append(s)
-        return out
-
 query = "how do neural networks optimise weights"
-bm25 = SimpleBM25(corpus)
-bm_scores = bm25.score(query)
-top10_idxs = sorted(range(len(bm_scores)), key=lambda i: bm_scores[i], reverse=True)[:10]
-top10_docs = [corpus[i] for i in top10_idxs]
+bm_scores = BM25(corpus).score(query)
+top10 = sorted(range(len(corpus)), key=lambda i: bm_scores[i], reverse=True)[:10]
+bm_top3 = top10[:3]
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-rr_scores = reranker.predict([(query, d) for d in top10_docs])
-reranked = sorted(zip(rr_scores, top10_docs), reverse=True)[:3]
+rr_scores = reranker.decision_function(features(query, [corpus[i] for i in top10]))
+rr_top3 = [top10[j] for j in np.argsort(-rr_scores)[:3]]
 
-print("Reranked top-3:")
-for s, d in reranked:
-    print(f"  [{s:.2f}] {d}")
+print("BM25 top-3 ids:    ", bm_top3)
+print("Reranked top-3 ids:", rr_top3)
+print("differs:", bm_top3 != rr_top3)
+for i in rr_top3:
+    print(f"  {corpus[i]}")
 ```
 
-The reranker typically surfaces docs 3, 7, 12 (the semantically relevant ones) even if BM25
-ranked some topic-keyword documents higher.
+```output
+BM25 top-3 ids:     [3, 7, 0]
+Reranked top-3 ids: [3, 7, 0]
+differs: False
+  Neural networks learn by backpropagating gradients.
+  Gradient descent updates weights to minimise the loss.
+  Document 0: topic about subject area 0.
+```
+
+The point of the exercise is the pipeline shape: a cheap first stage narrows 20 (in practice millions of) documents to 10, and a more expensive scorer reorders only those. Whether the order changes depends on how different the two scorers' signals are: here the reranked top-3 is the same as BM25's, because the query shares exact words with documents 3 and 7 and the dense and overlap features agree with BM25. A reranker earns its cost on queries where lexical match misleads.
 </details>
