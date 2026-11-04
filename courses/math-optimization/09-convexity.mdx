@@ -1,0 +1,716 @@
+---
+course: math-optimization
+chapter: 09-convexity
+title: "Convex Sets and Functions: Why Convexity Matters"
+order: 9
+---
+
+## Convex means every valley is the same valley
+
+Picture a loss surface as a landscape and gradient descent as a ball rolling downhill. On a bumpy landscape where the
+ball stops depends on where you dropped it. On a bowl-shaped landscape there is only one place to stop. Convexity is
+the precise version of "bowl-shaped", and its payoff fits in a sentence: **for a convex function every local minimum is
+a global minimum**, so any method that reaches a point with no downhill direction has solved the problem. Below,
+twenty random starts of gradient descent run on a convex loss (logistic regression) and on a non-convex one (a
+three-unit tanh network fitting $\sin 2x$).
+
+```python
+import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+rng = np.random.default_rng(0)
+
+n = 200                                                    # logistic regression: 2 features + bias
+Xl = np.c_[rng.standard_normal((n, 2)), np.ones(n)]
+yl = (Xl @ np.array([1.5, -1.0, 0.3]) + 0.8 * rng.standard_normal(n) > 0).astype(float)
+logloss = lambda w: np.mean(np.logaddexp(0, Xl @ w) - yl * (Xl @ w))
+logloss_grad = lambda w: Xl.T @ (1 / (1 + np.exp(-Xl @ w)) - yl) / n
+
+xs = np.linspace(-3, 3, 60); ys = np.sin(2 * xs)           # tiny net: 3 tanh units, 9 parameters
+def net_loss_grad(th):
+    a, b, c = th[:3], th[3:6], th[6:]                      # input weights, biases, output weights
+    H = np.tanh(np.outer(xs, a) + b); r = H @ c - ys
+    dZ = np.outer(r, c) * (1 - H ** 2) / len(xs)
+    return 0.5 * np.mean(r ** 2), np.r_[xs @ dZ, dZ.sum(0), H.T @ r / len(xs)]
+
+final_conv, final_net, net_sols = [], [], []
+for s in range(20):
+    w = rng.uniform(-5, 5, 3)
+    for _ in range(3000):
+        w -= 2.0 * logloss_grad(w)
+    final_conv.append(logloss(w))
+    th = rng.uniform(-2, 2, 9)
+    for _ in range(6000):
+        th -= 0.3 * net_loss_grad(th)[1]
+    final_net.append(net_loss_grad(th)[0]); net_sols.append(th.copy())
+print("convex loss, sorted finals:", np.sort(final_conv)[[0, 5, 10, 15, 19]],
+      "| distinct (to 1e-4):", len(np.unique(np.round(final_conv, 4))))
+print("tanh net,    sorted finals:", np.sort(final_net)[[0, 5, 10, 15, 19]],
+      "| distinct (to 1e-4):", len(np.unique(np.round(final_net, 4))))
+```
+
+```output
+convex loss, sorted finals: [0.2778 0.2778 0.2778 0.2778 0.2778] | distinct (to 1e-4): 1
+tanh net,    sorted finals: [0.0085 0.0097 0.0099 0.011  0.0497] | distinct (to 1e-4): 15
+```
+
+Every logistic start lands on the same loss value; the network's twenty runs end at many different values, some far
+worse than the best. Nothing about the optimizer changed. The difference is entirely in the shape of the function, and
+the rest of this chapter is about recognizing that shape: in sets, in functions, and in the losses you actually train.
+
+## Convex sets: the segment never leaves
+
+A set is convex if you can walk in a straight line between any two of its members without stepping outside. A disc
+passes, a ring fails (the straight line between opposite sides crosses the hole). Formally $C \subseteq \mathbb{R}^d$ is
+convex when for all $x, y \in C$ and every mixing weight $\theta \in [0, 1]$,
+
+$$
+\theta x + (1 - \theta) y \in C .
+$$
+
+The standard examples: a **halfspace** $\{x : a^\top x \le b\}$ (one side of a hyperplane, with normal vector $a$ and
+offset $b$); a **norm ball** $\{x : \|x - c\| \le r\}$ for any norm (ch. 1), by the triangle inequality; a
+**polyhedron** $\{x : Ax \le b\}$, an intersection of halfspaces; and the **PSD cone** of symmetric matrices with
+nonnegative eigenvalues (ch. 7), because $v^\top(\theta A + (1 - \theta)B)v = \theta v^\top A v + (1 - \theta)
+v^\top B v \ge 0$. The key closure rule is that **any intersection of convex sets is convex** (a segment inside each set
+is inside all of them). Non-examples include the ring, a union of two disjoint balls, and the set of vectors with at most
+$k$ nonzeros, which is why exact sparsity constraints are hard and the $L_1$ ball is the convex substitute.
+
+```python
+def segment_test(member, sampler=None, trials=5000):
+    """Fraction of random segments (x, y in C, random theta) whose mixed point leaves C."""
+    def draw():                                            # default: rejection-sample C inside [-3, 3]^2
+        while not member(x := rng.uniform(-3, 3, 2)): pass
+        return x
+    sampler = sampler or draw
+    return np.mean([not member(t * sampler() + (1 - t) * sampler()) for t in rng.uniform(size=trials)])
+
+a, Ap, bp = np.array([1.0, 2.0]), rng.standard_normal((5, 2)), np.ones(5)
+sets = {
+    "halfspace a.x <= 1":       lambda x: a @ x <= 1,
+    "L1 ball radius 2":          lambda x: np.abs(x).sum() <= 2,
+    "polyhedron Ax <= 1":        lambda x: np.all(Ap @ x <= bp),
+    "ball AND halfspace":        lambda x: (x @ x <= 4) and (a @ x <= 1),
+    "ring 1 <= |x| <= 2":        lambda x: 1 <= np.linalg.norm(x) <= 2,
+    "union of two unit balls":   lambda x: min(np.linalg.norm(x - [1.5, 0]), np.linalg.norm(x + [1.5, 0])) <= 1,
+}
+for name, m in sets.items():
+    print(f"{name:26s} segments leaving the set: {segment_test(m):.3f}")
+sparse = segment_test(lambda x: np.count_nonzero(x) <= 1, lambda: np.eye(3)[rng.integers(3)] * rng.standard_normal())
+print(f"{'at most 1 nonzero (R^3)':26s} segments leaving the set: {sparse:.3f}")
+psd_draw = lambda rank=4: (G := rng.standard_normal((4, rank))) @ G.T
+mins = [np.linalg.eigvalsh(t * psd_draw() + (1 - t) * psd_draw()).min() for t in rng.uniform(size=2000)]
+print(f"PSD cone: min eigenvalue over 2000 mixtures {min(mins):.4f} (>= 0) | "
+      f"rank of the midpoint of two rank-1 matrices = {np.linalg.matrix_rank(0.5 * psd_draw(1) + 0.5 * psd_draw(1))}")
+```
+
+```output
+halfspace a.x <= 1         segments leaving the set: 0.000
+L1 ball radius 2           segments leaving the set: 0.000
+polyhedron Ax <= 1         segments leaving the set: 0.000
+ball AND halfspace         segments leaving the set: 0.000
+ring 1 <= |x| <= 2         segments leaving the set: 0.263
+union of two unit balls    segments leaving the set: 0.207
+at most 1 nonzero (R^3)    segments leaving the set: 0.675
+PSD cone: min eigenvalue over 2000 mixtures 0.0034 (>= 0)
+rank-1 matrices: rank of the midpoint of two = 2
+```
+
+The four convex sets never let a segment escape. The ring and the two balls leak often, and the sparse set leaks
+almost always: mixing two different 1-sparse vectors gives a 2-sparse one. Mixtures of PSD matrices stay PSD, while the
+set of rank-1 matrices is not convex (the midpoint has rank 2), which is the geometric reason low-rank constraints in
+matrix completion are hard and the nuclear norm (ch. 5) is used as their convex relaxation.
+
+## Convex functions: the chord lies above the graph
+
+A function is convex if, whenever you pick two points on its graph and stretch a string between them, the string never
+dips below the graph. Equivalently, averaging inputs never does worse than averaging outputs. For $f : \mathbb{R}^d \to
+\mathbb{R}$ (on a convex domain) the definition, also called **Jensen's inequality**, is
+
+$$
+f(\theta x + (1 - \theta) y) \le \theta f(x) + (1 - \theta) f(y) \qquad \text{for all } x, y,\ \theta \in [0, 1].
+$$
+
+$f$ is **concave** if $-f$ is convex. A convex function is exactly one whose **epigraph** $\{(x, t) : f(x) \le t\}$,
+the region on or above the graph, is a convex set, so the set and function notions are one idea. Taking expectations
+over many points gives the probabilistic form $f(\mathbb{E}[X]) \le \mathbb{E}[f(X)]$, the inequality behind the ELBO
+and every "log of an average beats the average of logs" argument.
+
+```python
+def jensen_test(f, d, trials=20000, scale=3.0, draw=None):
+    """Largest violation f(mix) - chord over random triples; <= 0 (up to rounding) means no counterexample found."""
+    draw = draw or (lambda: scale * rng.standard_normal((trials, d)))
+    X, Y, t = draw(), draw(), rng.uniform(size=(trials, 1))
+    return np.max(f(t * X + (1 - t) * Y) - (t[:, 0] * f(X) + (1 - t[:, 0]) * f(Y)))
+
+M = rng.standard_normal((3, 3)); Spsd = M @ M.T; Sind = np.diag([2.0, 1.0, -0.5])
+funcs = {
+    "||x||_2":            lambda X: np.linalg.norm(X, axis=1),
+    "||x||_1":            lambda X: np.abs(X).sum(1),
+    "max_i x_i":          lambda X: X.max(1),
+    "log-sum-exp":        lambda X: np.log(np.exp(X).sum(1)),
+    "x^T S x, S PSD":     lambda X: np.einsum("ij,jk,ik->i", X, Spsd, X),
+    "x^T S x, indefinite": lambda X: np.einsum("ij,jk,ik->i", X, Sind, X),
+    "sqrt(||x||_2)":      lambda X: np.sqrt(np.linalg.norm(X, axis=1)),
+    "sum sin(x_i)":       lambda X: np.sin(X).sum(1),
+}
+for name, f in funcs.items():
+    v = jensen_test(f, 3)
+    print(f"{name:20s} worst violation {v:+.2e} -> {'convex (no counterexample)' if v <= 1e-9 else 'NOT convex'}")
+Z = rng.lognormal(0.0, 1.0, 100000)
+print(f"Jensen for concave log: log E[Z] = {np.log(Z.mean()):.4f} >= E[log Z] = {np.log(Z).mean():.4f}")
+```
+
+```output
+||x||_2              worst violation -2.65e-06 -> convex (no counterexample)
+||x||_1              worst violation +3.55e-15 -> convex (no counterexample)
+max_i x_i            worst violation +0.00e+00 -> convex (no counterexample)
+log-sum-exp          worst violation -2.77e-07 -> convex (no counterexample)
+x^T S x, S PSD       worst violation -3.84e-03 -> convex (no counterexample)
+x^T S x, indefinite  worst violation +3.77e+01 -> NOT convex
+sqrt(||x||_2)        worst violation +5.58e-01 -> NOT convex
+sum sin(x_i)         worst violation +4.81e+00 -> NOT convex
+Jensen for concave log: log E[Z] = 0.5007 >= E[log Z] = 0.0027
+```
+
+Norms, the max, log-sum-exp and the PSD quadratic never produce a counterexample; the indefinite quadratic, the square
+root of a norm, and the sine do. A random search can only refute convexity, never prove it, so the next three sections
+give tests you can actually prove things with. The last line is Jensen for a concave function: for a lognormal with
+$\mu = 0, \sigma = 1$, $\log \mathbb{E}[Z] = 1/2$ while $\mathbb{E}[\log Z] = 0$.
+
+## First-order condition: every tangent is a global underestimator
+
+For a smooth convex function, the tangent line (or tangent plane) at any point sits entirely below the graph, not just
+near the point. That single fact is what turns "the gradient is zero here" into "nothing anywhere is lower".
+
+### From the chord to the tangent
+
+This shows Jensen implies the tangent bound for differentiable $f$. Rearranging the definition with $\theta \in (0, 1]$
+as the weight on $y$,
+
+$$
+f(x + \theta(y - x)) \le f(x) + \theta\,(f(y) - f(x))
+\;\Longrightarrow\;
+\frac{f(x + \theta(y - x)) - f(x)}{\theta} \le f(y) - f(x).
+$$
+
+Letting $\theta \to 0$ the left side becomes the directional derivative $\nabla f(x)^\top (y - x)$ (ch. 8), so
+
+$$
+\boxed{\,f(y) \ge f(x) + \nabla f(x)^\top (y - x) \quad \text{for all } x, y\,}
+$$
+
+and the converse also holds (apply the bound at the mixed point toward $x$ and toward $y$ and average). If
+$\nabla f(x^\star) = 0$ the bound reads $f(y) \ge f(x^\star)$ for every $y$: a stationary point is a global minimum.
+
+```python
+def tangent_gap(f, grad, sampler, trials=5000):
+    return min(f(y) - f(x) - grad(x) @ (y - x) for x, y in ((sampler(), sampler()) for _ in range(trials)))
+
+print(f"logistic loss: min tangent gap {tangent_gap(logloss, logloss_grad, lambda: rng.uniform(-5, 5, 3)):+.3e}")
+net_f = lambda th: net_loss_grad(th)[0]; net_g = lambda th: net_loss_grad(th)[1]
+print(f"tanh net:      min tangent gap {tangent_gap(net_f, net_g, lambda: rng.uniform(-2, 2, 9)):+.3e}")
+w_star = np.zeros(3)
+for _ in range(20000):
+    w_star -= 2.0 * logloss_grad(w_star)
+print(f"logistic w* = {w_star}, ||grad|| = {np.linalg.norm(logloss_grad(w_star)):.1e}, f(w*) = {logloss(w_star):.6f}"
+      f" | best of 5000 random w: {min(logloss(rng.uniform(-5, 5, 3)) for _ in range(5000)):.6f}")
+```
+
+```output
+logistic loss: min tangent gap +1.575e-03
+tanh net:      min tangent gap -7.561e+00
+logistic w* = [ 3.6438 -2.2054  0.6281], ||grad|| = 1.5e-16, f(w*) = 0.277802, min f over 5000 random w = 0.279171
+```
+
+The logistic gap never goes negative, so every tangent plane of the loss lies below it everywhere. The network's
+gap does go negative: some tangent planes cut through the surface, which is the same thing as having more than one
+valley. At the logistic stationary point the bound certifies optimality, and indeed no random point does better.
+
+## Second-order condition: the Hessian is PSD everywhere
+
+Convexity in one dimension means the slope never decreases, so the second derivative is never negative. In many
+dimensions, the curvature in every direction must be nonnegative: the Hessian $\nabla^2 f(x)$ (the matrix of second
+partial derivatives, ch. 8) must be positive semidefinite at every point (ch. 7). This is the test you will use most,
+because Hessians of ML losses usually have a clean closed form.
+
+### Reducing to one dimension
+
+This shows the PSD condition is the 1D test applied along every line. $f$ is convex iff its restriction $g(t) = f(x +
+t v)$ to every line is convex, and $g$ is convex iff $g''(t) \ge 0$. By the chain rule,
+
+$$
+g''(t) = v^\top \nabla^2 f(x + t v)\, v \ge 0 \;\; \text{for all } x, v
+\iff
+\nabla^2 f(x) \succeq 0 \;\; \text{for all } x .
+$$
+
+If $\nabla^2 f \succ 0$ everywhere the function is **strictly convex** and its minimizer, when one exists, is unique.
+
+```python
+def hess_fd(grad, x, h=1e-5):
+    """Hessian by central differences of the gradient, symmetrized."""
+    E = np.eye(len(x)) * h
+    H = np.array([(grad(x + e) - grad(x - e)) / (2 * h) for e in E])
+    return (H + H.T) / 2
+
+def logistic_hessian(w):
+    p = 1 / (1 + np.exp(-Xl @ w)); return (Xl * (p * (1 - p))[:, None]).T @ Xl / n
+
+lo_log, lo_net = [], []
+for _ in range(300):
+    w = rng.uniform(-5, 5, 3); H = logistic_hessian(w)
+    assert np.allclose(H, hess_fd(logloss_grad, w), atol=1e-6)
+    lo_log.append(np.linalg.eigvalsh(H).min())
+    lo_net.append(np.linalg.eigvalsh(hess_fd(net_g, rng.uniform(-2, 2, 9))).min())
+print(f"logistic: smallest Hessian eigenvalue over 300 points {min(lo_log):.2e} (closed form = finite diff)")
+print(f"tanh net: smallest Hessian eigenvalue over 300 points {min(lo_net):.3f}; "
+      f"negative at {np.mean(np.array(lo_net) < -1e-6):.0%} of points")
+```
+
+```output
+logistic: smallest Hessian eigenvalue over 300 points 2.00e-03 (closed form = finite diff)
+tanh net: smallest Hessian eigenvalue over 300 points -8.594; negative at 100% of points
+```
+
+The logistic Hessian $X^\top S X / n$ with $S = \mathrm{diag}(p_i(1 - p_i))$ is PSD at every point by construction (a
+weighted Gram matrix, ch. 7). Its smallest eigenvalue gets tiny far from the data's decision boundary, where every
+$p_i$ saturates; that is a warning about conditioning, not about convexity. The network's Hessian has negative
+curvature almost everywhere you sample.
+
+## Operations that preserve convexity
+
+Checking Hessians by hand gets tedious, so in practice you build convex functions out of convex pieces, the way you
+prove a function continuous by composing continuous ones. The rules (Boyd and Vandenberghe ch. 3.2):
+
+- **Nonnegative weighted sums**: $\sum_i w_i f_i$ with $w_i \ge 0$. A data-averaged loss plus a penalty is convex if
+  each term is.
+- **Affine composition**: $f(Ax + b)$ is convex if $f$ is. Every loss of a linear model, $\ell(y_i, x_i^\top w)$, is
+  convex in $w$ whenever $\ell$ is convex in its second argument.
+- **Pointwise maximum (or supremum)**: $\max_i f_i(x)$, even over infinitely many $f_i$. The epigraph of a max is the
+  intersection of the epigraphs.
+- **Composition**: $h(g(x))$ is convex if $h$ is convex and nondecreasing and $g$ is convex (e.g. $e^{g(x)}$). Without
+  the monotonicity it fails: $(x^2 - 1)^2$ composes convex pieces and has two minima.
+- **Perspective**: $t\,f(x/t)$ for $t > 0$ is jointly convex in $(x, t)$, e.g. $\|x\|^2 / t$.
+- **Partial minimization**: $\inf_y f(x, y)$ over a convex set, with $f$ jointly convex, is convex in $x$.
+
+```python
+A50, b50 = rng.standard_normal((50, 3)), rng.standard_normal(50)
+checks = {
+    "max of 50 affine":          (lambda X: (X @ A50.T + b50).max(1), 3),
+    "(x^2 - 1)^2 (bad compose)": (lambda X: (X[:, 0] ** 2 - 1) ** 2, 1),
+    "exp(||x||^2) (good compose)": (lambda X: np.exp(0.1 * (X ** 2).sum(1)), 2),
+}
+for name, (f, d) in checks.items():
+    print(f"{name:28s} worst Jensen violation {jensen_test(f, d, scale=1.5):+.2e}")
+xt_draw = lambda: np.c_[rng.standard_normal((20000, 2)), rng.uniform(0.05, 3, 20000)]   # points (x, t), t > 0
+viol = jensen_test(lambda Z: (Z[:, :2] ** 2).sum(1) / Z[:, 2], 3, draw=xt_draw)
+print(f"{'perspective ||x||^2 / t':28s} worst Jensen violation {viol:+.2e}")
+```
+
+```output
+max of 50 affine             worst Jensen violation +3.55e-15
+(x^2 - 1)^2 (bad compose)    worst Jensen violation +9.97e-01
+exp(||x||^2) (good compose)  worst Jensen violation -1.53e-06
+perspective ||x||^2 / t      worst Jensen violation -1.63e-07
+```
+
+The max of affine functions (a piecewise-linear bowl), the composition of $\exp$ with a convex quadratic, and the
+perspective all pass; the non-monotone composition fails. The perspective matters more than it looks: $\|x\|^2/t$ is
+the quadratic-over-linear function of second-order cone programs, and the perspective of $-\log$ is the relative
+entropy $x \log(x/t)$, whose joint convexity makes the KL divergence convex in both arguments.
+
+## Proving the standard ML losses convex
+
+With the rules and the Hessian test you can certify almost every classical loss in a line or two. Write the model as
+$z_i = x_i^\top w$ (linear in the weights $w$), so by affine composition it is enough to show the scalar loss is convex
+in $z$:
+
+- **Least squares** $\|Xw - y\|^2$: Hessian $2X^\top X \succeq 0$; strictly convex iff $X$ has full column rank.
+- **Logistic loss** $\log(1 + e^{z}) - y z$: the softplus $\log(1 + e^z)$ has second derivative $\sigma(z)(1 -
+  \sigma(z)) > 0$, and $-yz$ is linear.
+- **Hinge loss** $\max(0, 1 - y z)$: a max of two affine functions. Convex but not differentiable at the kink.
+- **Penalties** $\lambda\|w\|_1$ and $\lambda\|w\|_2^2$: norms are convex (triangle inequality), and squaring a
+  nonnegative convex function keeps convexity (nondecreasing composition).
+- **Softmax cross-entropy** $\mathrm{LSE}(Wx) - (Wx)_y$: log-sum-exp of an affine map, minus a linear term.
+
+### Log-sum-exp has a covariance for a Hessian
+
+This shows the Hessian of $\mathrm{LSE}(z) = \log \sum_k e^{z_k}$ is a covariance matrix, hence PSD. With $p =
+\mathrm{softmax}(z)$, the gradient is $\partial \mathrm{LSE}/\partial z_k = p_k$, and differentiating $p_k = e^{z_k}/\sum_j
+e^{z_j}$ again gives $\partial p_k/\partial z_l = p_k \delta_{kl} - p_k p_l$. So for any direction $v$,
+
+$$
+\nabla^2 \mathrm{LSE}(z) = \mathrm{diag}(p) - p p^\top,
+\qquad
+v^\top \nabla^2 \mathrm{LSE}\, v = \sum_k p_k v_k^2 - \Big(\sum_k p_k v_k\Big)^2 = \mathrm{Var}_{k \sim p}(v_k) \ge 0 .
+$$
+
+The same argument covers every **exponential family**. A density $p(x \mid \eta) = h(x)\exp(\eta^\top T(x) - A(\eta))$
+with natural parameter $\eta$, sufficient statistic $T$ and log-partition $A$ has negative log-likelihood $A(\eta) -
+\eta^\top T(x) + \text{const}$, and $\nabla^2 A(\eta) = \mathrm{Cov}_\eta[T(x)] \succeq 0$. So Gaussian, Bernoulli
+(logistic), categorical (softmax), Poisson and gamma GLMs with canonical links all have convex NLLs in their weights.
+The categorical case is exactly the LSE identity, with $T(x)$ the one-hot vector of the class.
+
+```python
+z = rng.standard_normal(5); p = np.exp(z - z.max()); p /= p.sum()
+H_lse = np.diag(p) - np.outer(p, p)
+onehots = np.eye(5)[rng.choice(5, size=200000, p=p)]
+print("LSE Hessian eigenvalues:", np.linalg.eigvalsh(H_lse))
+print(f"max |diag(p) - pp^T - sample covariance of one-hot draws| = {np.abs(H_lse - np.cov(onehots.T)).max():.1e}")
+
+Xp = rng.standard_normal((300, 4)) * 0.5                    # Poisson regression, canonical log link
+yp = rng.poisson(np.exp(Xp @ np.array([0.5, -0.3, 0.2, 0.1])))
+pois_grad = lambda w: Xp.T @ (np.exp(Xp @ w) - yp) / len(yp)
+pois_hess = lambda w: (Xp * np.exp(Xp @ w)[:, None]).T @ Xp / len(yp)
+lows = [np.linalg.eigvalsh(pois_hess(w)).min() for w in rng.uniform(-3, 3, (300, 4))]
+w0 = rng.uniform(-3, 3, 4)
+print(f"Poisson NLL: closed-form Hessian matches finite differences {np.allclose(pois_hess(w0), hess_fd(pois_grad, w0), atol=1e-5)}"
+      f" | smallest eigenvalue over 300 points {min(lows):.3e}")
+hinge = lambda Z: np.maximum(0, 1 - Z[:, 0])
+print(f"hinge: worst Jensen violation {jensen_test(hinge, 1):+.2e} | softplus'' min on [-20, 20]: "
+      f"{(lambda s: (s * (1 - s)).min())(1 / (1 + np.exp(-np.linspace(-20, 20, 2001)))):.2e}")
+```
+
+```output
+LSE Hessian eigenvalues: [-0.      0.0123  0.0453  0.0846  0.4483]
+max |diag(p) - pp^T - sample covariance of one-hot draws| = 4.7e-04
+Poisson NLL: closed-form Hessian matches finite differences True | smallest eigenvalue over 300 points 2.311e-01
+hinge: worst Jensen violation +1.78e-15 | softplus'' min on [-20, 20]: 2.06e-09
+```
+
+The LSE Hessian has one zero eigenvalue (along the all-ones direction, since adding a constant to every logit changes
+nothing) and the rest positive, and it matches the sample covariance of one-hot draws to Monte Carlo error. The Poisson
+Hessian $X^\top \mathrm{diag}(e^{Xw}) X / n$ is PD wherever you sample. The softplus curvature is positive but tiny far
+from zero: convex, yet nearly flat, which again is a statement about how fast you can optimize, not whether.
+
+## Where convexity breaks in ML
+
+The models that dominate modern ML are not convex in their parameters, and the cause is usually a symmetry: if two
+different parameter settings give the same function, and the loss between them is higher, the chord condition fails.
+A hidden layer of $m$ units can be permuted in $m!$ ways, and with tanh each unit's sign can be flipped, so every
+minimum of the three-unit net from the first section comes with $3! \cdot 2^3 = 48$ copies.
+
+```python
+best = net_sols[int(np.argmin(final_net))]
+perm = np.r_[best[[1, 2, 0]], best[[4, 5, 3]], best[[7, 8, 6]]]          # relabel the hidden units
+flip = best.copy(); flip[[0, 3, 6]] *= -1                                  # tanh(-u) = -tanh(u)
+for name, th in (("best solution", best), ("units permuted", perm), ("unit 0 sign-flipped", flip),
+                 ("midpoint best/permuted", 0.5 * (best + perm))):
+    print(f"{name:24s} loss {net_f(th):.5f}")
+
+f_mf = lambda u, v: (u * v - 1.0) ** 2                                   # rank-1 factorization of the number 1
+print(f"matrix factorization (uv - 1)^2: f(1,1) = {f_mf(1, 1)}, f(-1,-1) = {f_mf(-1, -1)}, midpoint f(0,0) = {f_mf(0, 0)}")
+
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+Xb, _ = make_blobs(n_samples=600, centers=8, cluster_std=1.0, random_state=3)
+inertias = [KMeans(n_clusters=8, n_init=1, init="random", random_state=s).fit(Xb).inertia_ for s in range(20)]
+print(f"k-means, 20 random inits: {len(np.unique(np.round(inertias, 2)))} distinct final inertias, "
+      f"best {min(inertias):.1f}, worst {max(inertias):.1f}")
+```
+
+```output
+best solution            loss 0.00854
+units permuted           loss 0.00854
+unit 0 sign-flipped      loss 0.00854
+midpoint best/permuted   loss 7.10310
+matrix factorization (uv - 1)^2: f(1,1) = 0.0, f(-1,-1) = 0.0, midpoint f(0,0) = 1.0
+k-means, 20 random inits: 20 distinct final inertias, best 1079.8, worst 4034.9
+```
+
+Permuting or sign-flipping hidden units leaves the loss unchanged to the last digit, while averaging two equivalent
+solutions produces a much worse network: a direct violation of convexity. Matrix factorization has the same structure,
+since $UV^\top = (UR)(VR^{-\top})^\top$ for any invertible $R$ (Recommender Systems ch. 4 fits these models with ALS,
+which exploits the fact that the loss is convex in $U$ for fixed $V$ and vice versa). k-means is non-convex because
+cluster labels are discrete; different initializations converge to different local optima, which is why `n_init` and
+k-means++ exist. None of this makes these models unusable, but it changes what a guarantee can say.
+
+## Strong convexity and smoothness: the bowl's floor and ceiling
+
+Convexity says the curvature is never negative; it says nothing about how much. A nearly flat bowl and a steep narrow
+one are both convex, yet gradient descent behaves very differently on them. Two numbers bound the curvature from
+below and above. $f$ is **$\mu$-strongly convex** if it curves up at least as fast as a quadratic of curvature $\mu >
+0$, and **$L$-smooth** if its gradient changes at most $L$ times as fast as its input:
+
+$$
+f(y) \ge f(x) + \nabla f(x)^\top (y - x) + \frac{\mu}{2}\|y - x\|^2,
+\qquad
+\|\nabla f(x) - \nabla f(y)\| \le L \|x - y\| .
+$$
+
+For twice-differentiable $f$ these are eigenvalue bounds on the Hessian: $\mu I \preceq \nabla^2 f(x) \preceq L I$ at
+every $x$. The ratio $\kappa = L/\mu$ is the **condition number** (ch. 4, ch. 7). Smoothness gives a quadratic upper
+bound $f(y) \le f(x) + \nabla f(x)^\top(y - x) + \tfrac L2 \|y - x\|^2$, so a step of $1/L$ always decreases $f$; strong
+convexity guarantees each such step removes a fixed fraction of the remaining gap. Together they give the linear rate
+$f(x_k) - f^\star \le (1 - 1/\kappa)^k (f(x_0) - f^\star)$ that ch. 10 proves: about $\kappa \ln(1/\varepsilon)$ steps.
+
+```python
+print(f"{'kappa':>6} {'GD steps to 1e-8 gap':>21} {'kappa * ln(1e8) / 2':>20}")
+for kappa in (10, 100, 1000):
+    lam_q = np.linspace(1.0, kappa, 20)                    # Hessian eigenvalues: mu = 1, L = kappa
+    x = np.ones(20); f0 = 0.5 * (lam_q * x ** 2).sum(); k = 0
+    while 0.5 * (lam_q * x ** 2).sum() > 1e-8 * f0:
+        x -= (1 / kappa) * lam_q * x; k += 1
+    print(f"{kappa:>6} {k:>21} {kappa * np.log(1e8) / 2:>20.0f}")
+
+lam_r = 0.1                                                # ridge-regularized logistic regression
+L_bound = np.linalg.eigvalsh(Xl.T @ Xl / n).max() / 4 + lam_r
+eigs_r = np.array([np.linalg.eigvalsh(logistic_hessian(w) + lam_r * np.eye(3)) for w in rng.uniform(-5, 5, (500, 3))])
+print(f"ridge logistic: Hessian eigenvalues in [{eigs_r.min():.4f}, {eigs_r.max():.4f}] "
+      f"within [mu, L] = [{lam_r}, {L_bound:.4f}] -> kappa <= {L_bound / lam_r:.1f}")
+```
+
+```output
+ kappa  GD steps to 1e-8 gap  kappa * ln(1e8) / 2
+    10                    66                   92
+   100                   573                  921
+  1000                  4603                 9210
+ridge logistic: Hessian eigenvalues in [0.1021, 0.3560] within [mu, L] = [0.1, 0.3717] -> kappa <= 3.7
+```
+
+The step counts track $\kappa \ln(10^8)/2$ (the gap is quadratic in the error, so it shrinks by $(1 - 1/\kappa)^2$ per
+step): ten times worse conditioning costs ten times more iterations. For logistic regression $\sigma' \le 1/4$ gives
+$L = \lambda_{\max}(X^\top X/n)/4$, but $\mu = 0$ without a penalty (on separable data the loss has no minimizer at
+all). A ridge term $\tfrac\lambda2\|w\|^2$ adds $\lambda$ to every eigenvalue, so it buys strong convexity and a bounded
+$\kappa$; this is the optimization half of why regularization helps. Ch. 11 and ch. 12 attack large $\kappa$ directly.
+
+## Subgradients: tangents for functions with kinks
+
+$|x|$, the hinge loss and the $L_1$ penalty are convex but have corners where no gradient exists. At a corner, many
+lines touch the graph from below without crossing it; any of their slopes is a **subgradient**. At $x = 0$, every line
+$y = gx$ with $g \in [-1, 1]$ stays under $|x|$. Formally $g$ is a subgradient of convex $f$ at $x$ if
+
+$$
+f(y) \ge f(x) + g^\top (y - x) \quad \text{for all } y,
+$$
+
+and the set of all of them is the **subdifferential** $\partial f(x)$. Where $f$ is differentiable, $\partial f(x) =
+\{\nabla f(x)\}$. Examples: $\partial |x| = \{\mathrm{sign}(x)\}$ for $x \neq 0$ and $[-1, 1]$ at 0; $\partial
+\|w\|_1$ is the product of these per coordinate; the hinge $\max(0, 1 - z)$ has $\partial = \{-1\}$ for $z < 1$,
+$\{0\}$ for $z > 1$ and $[-1, 0]$ at $z = 1$. The first-order optimality condition becomes $0 \in \partial f(x^\star)$:
+a point is a global minimum iff a horizontal supporting line exists there.
+
+### Soft-thresholding from the subgradient condition
+
+This shows the $L_1$ proximal step that ch. 1 stated comes straight from $0 \in \partial f$. Minimize $f(x) =
+\tfrac12 (x - z)^2 + \lambda |x|$ with $\lambda > 0$. Its subdifferential is $x - z + \lambda\,\partial|x|$. If
+$x^\star > 0$: $x^\star - z + \lambda = 0$, so $x^\star = z - \lambda$, consistent only when $z > \lambda$. Symmetrically
+$x^\star = z + \lambda$ when $z < -\lambda$. If $x^\star = 0$: we need $0 \in -z + \lambda[-1, 1]$, i.e. $|z| \le
+\lambda$. Together,
+
+$$
+x^\star = S_\lambda(z) = \mathrm{sign}(z)\max(|z| - \lambda, 0).
+$$
+
+```python
+for g in (-1.0, 0.4, 1.0, 1.2):
+    ok = all(abs(y) >= g * y for y in np.linspace(-5, 5, 1001))
+    print(f"is g = {g:+.1f} a subgradient of |x| at 0? {ok}")
+soft = lambda z, lam: np.sign(z) * np.maximum(np.abs(z) - lam, 0.0)
+grid, lam_s = np.linspace(-4, 4, 800001), 1.0
+for z0 in (-2.5, -0.7, 0.0, 0.9, 3.0):
+    x_grid = grid[np.argmin(0.5 * (grid - z0) ** 2 + lam_s * np.abs(grid))]
+    print(f"z = {z0:+.1f}: soft-threshold {soft(z0, lam_s) + 0.0:+.4f} | brute-force argmin {x_grid + 0.0:+.4f}")
+```
+
+```output
+is g = -1.0 a subgradient of |x| at 0? True
+is g = +0.4 a subgradient of |x| at 0? True
+is g = +1.0 a subgradient of |x| at 0? True
+is g = +1.2 a subgradient of |x| at 0? False
+z = -2.5: soft-threshold -1.5000 | brute-force argmin -1.5000
+z = -0.7: soft-threshold +0.0000 | brute-force argmin +0.0000
+z = +0.0: soft-threshold +0.0000 | brute-force argmin +0.0000
+z = +0.9: soft-threshold +0.0000 | brute-force argmin +0.0000
+z = +3.0: soft-threshold +2.0000 | brute-force argmin +2.0000
+```
+
+Slopes inside $[-1, 1]$ pass the supporting-line test at the kink and 1.2 fails. The closed-form soft-threshold
+matches a brute-force grid minimization for every $z$, including the dead zone $|z| \le 1$ that maps exactly to zero;
+that dead zone is where lasso sparsity comes from. Iterating this step on a full objective gives coordinate descent and
+proximal gradient (ISTA) for the lasso, which the exercise builds.
+
+## Convex conjugates: a function described by its tangents
+
+A convex function is fully determined by its supporting lines: for each slope $y$, record how far down you must shift
+the line $y^\top x$ to make it touch the graph. That shift, as a function of the slope, is the **convex conjugate**
+(Fenchel conjugate),
+
+$$
+f^*(y) = \sup_x \big( y^\top x - f(x) \big).
+$$
+
+It is a supremum of affine functions of $y$, so it is convex even when $f$ is not. Two facts carry it into duality
+(ch. 13): the **Fenchel–Young inequality** $f(x) + f^*(y) \ge x^\top y$, with equality iff $y \in \partial f(x)$; and
+$f^{**} = f$ for closed convex $f$. Examples: $\tfrac12\|x\|^2$ is its own conjugate; the conjugate of a norm is the
+indicator of the dual-norm unit ball. The ML example: the conjugate of log-sum-exp is **negative entropy** restricted
+to the probability simplex, $\mathrm{LSE}^*(y) = \sum_k y_k \log y_k$ if $y \ge 0$, $\sum_k y_k = 1$, and $+\infty$
+otherwise, which is why softmax shows up whenever you maximize a linear score plus an entropy bonus.
+
+```python
+from scipy.optimize import minimize
+lse = lambda x: np.log(np.exp(x - x.max()).sum()) + x.max()
+def conj_lse(y):
+    res = minimize(lambda x: lse(x) - y @ x, np.zeros(len(y)), method="BFGS", options={"gtol": 1e-10})
+    return -res.fun
+for y in (np.array([0.2, 0.3, 0.5]), np.array([0.7, 0.2, 0.1]), np.array([1 / 3] * 3)):
+    print(f"y = {y.round(3)}: numeric LSE*(y) = {conj_lse(y):+.6f} | sum y log y = {(y * np.log(y)).sum():+.6f}")
+y_off = np.array([0.4, 0.4, 0.4])                            # sums to 1.2: off the simplex
+print("y off the simplex: y.x - LSE(x) at x = t * 1 for t = 1, 10, 100:",
+      [round(float(y_off @ (t * np.ones(3)) - lse(t * np.ones(3))), 2) for t in (1, 10, 100)])
+x0 = rng.standard_normal(3); y0 = np.exp(x0) / np.exp(x0).sum()
+print(f"Fenchel-Young at y = softmax(x): LSE(x) + LSE*(y) - x.y = {lse(x0) + (y0 * np.log(y0)).sum() - x0 @ y0:+.1e}")
+```
+
+```output
+y = [0.2 0.3 0.5]: numeric LSE*(y) = -1.029653 | sum y log y = -1.029653
+y = [0.7 0.2 0.1]: numeric LSE*(y) = -0.801819 | sum y log y = -0.801819
+y = [0.333 0.333 0.333]: numeric LSE*(y) = -1.098612 | sum y log y = -1.098612
+y off the simplex: y.x - LSE(x) at x = t * 1 for t = 1, 10, 100: [-0.9, 0.9, 18.9]
+Fenchel-Young at y = softmax(x): LSE(x) + LSE*(y) - x.y = +2.2e-16
+```
+
+The numerical supremum agrees with $\sum_k y_k \log y_k$ to six digits on the simplex. Off the simplex the objective
+grows without bound along the all-ones direction, so the conjugate is $+\infty$ there, exactly the constraint that
+turns into "probabilities sum to one". Fenchel–Young is tight at $y = \mathrm{softmax}(x)$, because softmax is the
+gradient of LSE. Ch. 13 uses this pairing to derive dual problems, and maximum-entropy models are this identity read
+backwards.
+
+## Non-convex is not hopeless: quasiconvexity and the PL condition
+
+Convexity is sufficient for easy optimization, not necessary. Two weaker properties keep some guarantees. A function is
+**quasiconvex** if every sublevel set $\{x : f(x) \le t\}$ is convex; $\sqrt{|x|}$ fails Jensen but each sublevel set is
+an interval, so bisection on the level still finds the minimum (the 0-1 loss of a threshold in 1D and generalized
+linear-fractional problems live here). For gradient methods the more useful one is the **Polyak–Łojasiewicz (PL)
+condition**: there is $\mu > 0$ with
+
+$$
+\tfrac12 \|\nabla f(x)\|^2 \ge \mu\,\big(f(x) - f^\star\big) \quad \text{for all } x,
+$$
+
+so a small gradient forces a small gap and every stationary point is global. With $L$-smoothness it gives the same
+linear rate as strong convexity (ch. 10), without convexity. Underdetermined least squares and very wide networks near
+initialization satisfy PL-type inequalities, one current explanation of why heavily over-parameterized nets train
+reliably. The classic example (Karimi, Nutini and Schmidt, 2016) is $f(x) = x^2 + 3\sin^2 x$.
+
+```python
+fp = lambda x: x ** 2 + 3 * np.sin(x) ** 2
+dfp = lambda x: 2 * x + 3 * np.sin(2 * x)
+xg = np.linspace(-10, 10, 200001); xg = xg[np.abs(xg) > 1e-6]
+print(f"f'' = 2 + 6 cos 2x: min {np.min(2 + 6 * np.cos(2 * xg)):.1f} (negative -> not convex)")
+print(f"PL ratio 0.5 f'^2 / (f - f*) over the grid: min {np.min(0.5 * dfp(xg) ** 2 / fp(xg)):.4f} (> 0 -> PL holds)")
+ends = []
+for x in rng.uniform(-10, 10, 10):
+    for _ in range(300):
+        x -= dfp(x) / 8.0                                   # step 1/L with L = max f'' = 8
+    ends.append(x)
+print("GD from 10 random starts ends at |x| <=", f"{np.max(np.abs(ends)):.1e}")
+print(f"sqrt|x|: worst Jensen violation {jensen_test(lambda X: np.sqrt(np.abs(X[:, 0])), 1):+.2e} "
+      "(quasiconvex: sublevel sets are intervals)")
+```
+
+```output
+f'' = 2 + 6 cos 2x: min -4.0 (negative -> not convex)
+PL ratio 0.5 f'^2 / (f - f*) over the grid: min 0.1755 (> 0 -> PL holds)
+GD from 10 random starts ends at |x| <= 0.0e+00
+sqrt|x|: worst Jensen violation +5.82e-01 (quasiconvex: sublevel sets are intervals)
+```
+
+The second derivative dips to $-4$, so $f$ is not convex, yet the PL ratio stays positive and every start descends to
+the global minimum at 0. The lesson is to ask which property your proof actually needs: "no spurious stationary
+points" and "gradients are large when the gap is large" are what gradient descent uses, and convexity is one
+convenient way to get them.
+
+## Try it Yourself
+
+```python
+import numpy as np
+rng = np.random.default_rng(1)
+
+def convexity_report(f, d, box=3.0, trials=20000, h=1e-4):
+    """Refute convexity by Jensen sampling and by the smallest finite-difference Hessian eigenvalue."""
+    X, Y = rng.uniform(-box, box, (trials, d)), rng.uniform(-box, box, (trials, d))
+    t = rng.uniform(size=trials)
+    jensen = max(f(t[i] * X[i] + (1 - t[i]) * Y[i]) - t[i] * f(X[i]) - (1 - t[i]) * f(Y[i]) for i in range(trials))
+    E, lo = np.eye(d) * h, np.inf
+    for x in X[:200]:
+        H = np.array([[(f(x + E[i] + E[j]) - f(x + E[i] - E[j]) - f(x - E[i] + E[j]) + f(x - E[i] - E[j])) / (4 * h * h)
+                       for j in range(d)] for i in range(d)])
+        lo = min(lo, np.linalg.eigvalsh((H + H.T) / 2).min())
+    return jensen, lo
+
+huber = lambda x, c=1.0: np.sum(np.where(np.abs(x) <= c, 0.5 * x ** 2, c * (np.abs(x) - 0.5 * c)))
+candidates = {"huber": huber,
+              "softplus sum": lambda x: np.sum(np.logaddexp(0, x)),
+              "x1 * x2": lambda x: x[0] * x[1],
+              "||x||^2 + 2 sin(x1)": lambda x: x @ x + 2 * np.sin(x[0])}   # edit the 2: when does it break?
+for name, f in candidates.items():
+    j, lo = convexity_report(f, 2)
+    print(f"{name:22s} worst Jensen gap {j:+.2e} | min Hessian eig {lo:+.3f}")
+```
+
+```output
+huber                  worst Jensen gap +1.33e-15 | min Hessian eig -0.000
+softplus sum           worst Jensen gap -1.88e-08 | min Hessian eig +0.046
+x1 * x2                worst Jensen gap +7.54e+00 | min Hessian eig -1.000
+||x||^2 + 2 sin(x1)    worst Jensen gap -2.28e-06 | min Hessian eig +0.001
+```
+
+Change the coefficient on $\sin x_1$: the Hessian is $2I - c\sin(x_1) e_1 e_1^\top$, so convexity survives exactly up to
+$c = 2$. Add your own losses (pinball loss for quantiles, $\log(1 + x^2)$ for the Cauchy loss) and predict the verdict
+before running.
+
+## Exercise
+
+Solve the lasso $\min_w \tfrac{1}{2n}\|Xw - y\|^2 + \lambda\|w\|_1$ by cyclic coordinate descent: each update minimizes
+over one $w_j$ with the others fixed, which is a one-dimensional problem of exactly the soft-thresholding form above.
+Use $n = 100$, $d = 20$, five nonzero true weights, and $\lambda = 0.1$.
+
+1. Derive the coordinate update, run it to convergence, and compare with `sklearn.linear_model.Lasso(alpha=0.1)`.
+2. Verify the subgradient optimality condition $0 \in \partial f(w^\star)$ coordinate by coordinate: with $g =
+   X^\top(y - Xw^\star)/n$, show $g_j = \lambda\,\mathrm{sign}(w_j^\star)$ for nonzero coordinates and $|g_j| \le \lambda$
+   for zero ones.
+
+<details>
+<summary>Solution</summary>
+
+```python
+from sklearn.linear_model import Lasso
+rng_e = np.random.default_rng(5)
+ne, de, lam_e = 100, 20, 0.1
+Xe = rng_e.standard_normal((ne, de)); w_true_e = np.zeros(de); w_true_e[:5] = [2.0, -1.5, 1.0, 0.8, -0.5]
+ye = Xe @ w_true_e + 0.3 * rng_e.standard_normal(ne)
+col_sq = (Xe ** 2).sum(0) / ne
+w_cd = np.zeros(de); r = ye.copy()                          # r = y - X w, kept up to date
+for sweep in range(500):
+    w_old = w_cd.copy()
+    for j in range(de):
+        rho = Xe[:, j] @ r / ne + col_sq[j] * w_cd[j]       # partial residual correlation
+        w_new = np.sign(rho) * max(abs(rho) - lam_e, 0.0) / col_sq[j]
+        r += Xe[:, j] * (w_cd[j] - w_new); w_cd[j] = w_new
+    if np.abs(w_cd - w_old).max() < 1e-12:
+        break
+w_sk = Lasso(alpha=lam_e, fit_intercept=False, tol=1e-12, max_iter=100000).fit(Xe, ye).coef_
+print(f"converged after {sweep + 1} sweeps | nonzeros {np.count_nonzero(w_cd)} | max |w_cd - w_sklearn| = {np.abs(w_cd - w_sk).max():.1e}")
+print("w (first 8):", w_cd[:8].round(4))
+g = Xe.T @ (ye - Xe @ w_cd) / ne
+nz = w_cd != 0
+print(f"nonzero coords: max |g_j - lam sign(w_j)| = {np.abs(g[nz] - lam_e * np.sign(w_cd[nz])).max():.1e}")
+print(f"zero coords:    max |g_j| = {np.abs(g[~nz]).max():.4f} <= lam = {lam_e}")
+```
+
+```output
+converged after 14 sweeps | nonzeros 5 | max |w_cd - w_sklearn| = 2.2e-16
+w (first 8): [ 1.8621 -1.3343  0.8464  0.7051 -0.2799  0.      0.      0.    ]
+nonzero coords: max |g_j - lam sign(w_j)| = 2.7e-14
+zero coords:    max |g_j| = 0.0695 <= lam = 0.1
+```
+
+Fixing all coordinates but $j$, the objective is $\tfrac{a_j}{2} w_j^2 - \rho_j w_j + \lambda|w_j| + \text{const}$
+with $a_j = \|X_{:,j}\|^2/n$ and $\rho_j = X_{:,j}^\top r_{-j}/n$ (the residual without feature $j$), so the same
+subgradient argument gives $w_j = S_\lambda(\rho_j)/a_j$. Because the objective is convex and each coordinate step is an
+exact minimization, the sweeps converge to the global lasso solution, matching sklearn (which runs this same
+algorithm). The certificate in part 2 is the whole point of convexity: for a non-zero coefficient the correlation of its
+feature with the residual is pinned at exactly $\pm\lambda$; for every zeroed feature it lies inside $[-\lambda,
+\lambda]$, which proves no feature could enter and lower the objective. Ch. 13 reads the same conditions as KKT.
+</details>
