@@ -27,6 +27,11 @@ Dyna-Q is the simplest model-based algorithm. At each real step, it:
 
 ```python
 import numpy as np
+np.random.seed(0)
+
+def greedy(q):
+    """argmax with random tie-breaking (an all-zero Q table must not always pick action 0)."""
+    return int(np.random.choice(np.flatnonzero(q == q.max())))
 
 # Simple 5x5 maze: start=(0,0), goal=(4,4)
 # Random walls: state (2,1) and (2,2) are walls
@@ -61,7 +66,7 @@ def run_dyna(n_planning=5, n_episodes=100):
         steps = 0
         while s != GOAL and steps < 500:
             si = state_id(s)
-            a = np.random.randint(N_ACTIONS) if np.random.random() < epsilon else np.argmax(Q[si])
+            a = np.random.randint(N_ACTIONS) if np.random.random() < epsilon else greedy(Q[si])
             ns, r, done = step_maze(s, a)
             nsi = state_id(ns)
             # Direct update
@@ -86,13 +91,16 @@ for k in [0, 5, 20]:
 ```
 
 ```output
-k= 0 planning steps  |  avg steps (first 20 eps): 387  |  avg steps (last 20 eps):  112
-k= 5 planning steps  |  avg steps (first 20 eps): 203  |  avg steps (last 20 eps):   14
-k=20 planning steps  |  avg steps (first 20 eps):  89  |  avg steps (last 20 eps):    8
+k= 0 planning steps  |  avg steps (first 20 eps): 33  |  avg steps (last 20 eps):  10
+k= 5 planning steps  |  avg steps (first 20 eps): 13  |  avg steps (last 20 eps):  10
+k=20 planning steps  |  avg steps (first 20 eps): 14  |  avg steps (last 20 eps):  9
 ```
 
-With 20 planning steps per real step, Dyna-Q needs ~4× fewer episodes to converge than pure
-Q-learning (k=0). Each real transition is "replayed" 20 times in simulation.
+Planning helps most early: in the first 20 episodes plain Q-learning ($k=0$) averages 33 steps per
+episode while $k=5$ averages 13, because each real transition is "replayed" $k$ extra times in
+simulation. All three settings end near the 8-step optimum (9 to 10 steps with $\varepsilon=0.1$
+exploration), and $k=20$ is no better than $k=5$ here: this maze is tiny, so five replays already
+propagate the goal reward quickly.
 
 ### Dyna-Q+ and Exploration
 
@@ -190,10 +198,10 @@ print(f"Path: {' → '.join(str(p) for p in path[:8])} ...")
 
 ```output
 MCTS path length: 9 steps
-Path: (0,0) → (1,0) → (2,0) → (3,0) → (4,0) → (4,1) → (4,2) → (4,3) ...
+Path: (0, 0) → (0, 0) → (1, 0) → (2, 0) → (3, 0) → (3, 1) → (3, 2) → (3, 3) ...
 ```
 
-MCTS navigates the maze in 9 steps (near optimal) using 500 simulations per move — no
+MCTS navigates the maze in 9 steps (the optimum is 8; the first move bumped into the boundary and wasted a step) using 500 simulations per move — no
 learning required, just planning from the known model.
 
 ### AlphaZero: MCTS + Neural Value/Policy
@@ -225,59 +233,68 @@ sample efficiency on continuous control benchmarks.
 ## Try it Yourself
 
 ```python
-import numpy as np
-
-# Dyna-Q on a changing maze: at episode 50, open a shortcut (remove wall at (2,2))
-# Compare Dyna-Q (k=5) with and without the Dyna-Q+ exploration bonus (kappa=0.001)
-
-HEIGHT, WIDTH = 5, 5
-START, GOAL = (0,0), (4,4)
-WALLS = {(2,1), (2,2)}
+# Dyna-Q on a changing maze. Start bottom-right (4,4), goal top-right (0,4).
+# A wall across row 2 leaves a single gap at column 0, so the path is 12 steps long.
+# At episode 50 the wall at (2,4) is removed: a 4-step shortcut appears.
+# Compare plain Dyna-Q (kappa=0) with Dyna-Q+ (planning bonus kappa*sqrt(tau)).
+T_START, T_GOAL = (4, 4), (0, 4)
+WALLS_BEFORE = {(2, 1), (2, 2), (2, 3), (2, 4)}
+WALLS_AFTER = {(2, 1), (2, 2), (2, 3)}
 
 def step_changing(s, a, walls):
     r, c = s
     dr, dc = [(-1,0),(1,0),(0,-1),(0,1)][a]
-    nr, nc = max(0,min(4,r+dr)), max(0,min(4,c+dc))
-    ns = (nr,nc)
-    if ns in walls: ns = s
-    return ns, 1.0 if ns==GOAL else 0.0, ns==GOAL
+    ns = (max(0, min(4, r + dr)), max(0, min(4, c + dc)))
+    if ns in walls:
+        ns = s
+    return ns, 1.0 if ns == T_GOAL else 0.0
 
-Q = np.zeros((25, 4))
-model = {}
-tau = np.zeros((25, 4))   # steps since last tried (for Dyna-Q+)
-total_steps = 0
-step_counts = []
-kappa = 0.001
+def run_changing(kappa, n_planning=10, n_episodes=150, change_at=50, seed=0):
+    rng = np.random.default_rng(seed)
+    Q = np.zeros((25, 4))
+    model = {}
+    tau = np.zeros((25, 4))            # steps since (s,a) was last tried in the real environment
+    counts = []
+    for ep in range(n_episodes):
+        walls = WALLS_BEFORE if ep < change_at else WALLS_AFTER
+        s, steps = T_START, 0
+        while s != T_GOAL and steps < 300:
+            si = s[0] * 5 + s[1]
+            if rng.random() < 0.1:
+                a = int(rng.integers(4))
+            else:
+                a = int(rng.choice(np.flatnonzero(Q[si] == Q[si].max())))
+            ns, r = step_changing(s, a, walls)
+            nsi = ns[0] * 5 + ns[1]
+            Q[si, a] += 0.5 * (r + 0.95 * Q[nsi].max() - Q[si, a])
+            tau += 1; tau[si, a] = 0
+            model[(si, a)] = (r, nsi)
+            keys = list(model)
+            for _ in range(n_planning):
+                sp, ap = keys[rng.integers(len(keys))]
+                rp, nsp = model[(sp, ap)]
+                bonus = kappa * np.sqrt(tau[sp, ap])
+                Q[sp, ap] += 0.5 * (rp + bonus + 0.95 * Q[nsp].max() - Q[sp, ap])
+            s, steps = ns, steps + 1
+        counts.append(steps)
+    return np.array(counts)
 
-for ep in range(100):
-    walls = WALLS if ep < 50 else {(2,1)}  # shortcut opens at ep 50
-    s = START; steps = 0
-    while s != GOAL and steps < 500:
-        si = s[0]*WIDTH+s[1]
-        a = np.random.randint(4) if np.random.random()<0.1 else np.argmax(Q[si]+kappa*np.sqrt(tau[si]))
-        ns, r, done = step_changing(s, a, walls)
-        nsi = ns[0]*WIDTH+ns[1]
-        Q[si,a] += 0.5*(r+0.95*np.max(Q[nsi])-Q[si,a])
-        model[(si,a)] = (r,nsi); tau[si,a] = 0; tau += 1; total_steps += 1; steps += 1
-        for _ in range(5):
-            si_p,a_p = list(model)[np.random.randint(len(model))]
-            r_p,nsi_p = model[(si_p,a_p)]
-            r_bonus = kappa*np.sqrt(tau[si_p,a_p])
-            Q[si_p,a_p] += 0.5*((r_p+r_bonus)+0.95*np.max(Q[nsi_p])-Q[si_p,a_p])
-        s = ns
-    step_counts.append(steps)
-    if ep in [45,50,55,60,75,99]:
-        print(f"Episode {ep:3d}: {steps:4d} steps (shortcut {'open' if ep>=50 else 'closed'})")
+for kappa in (0.0, 0.001):
+    c = run_changing(kappa)
+    print(f"kappa={kappa:<5}: steps/episode  before change (eps 40-49): {c[40:50].mean():5.1f}"
+          f"  | just after (50-69): {c[50:70].mean():5.1f}  | late (130-149): {c[130:].mean():5.1f}")
 ```
 
 ```output
-Episode  45:  12 steps (shortcut closed)
-Episode  50:  11 steps (shortcut closed)
-Episode  55:  18 steps (shortcut open)
-Episode  60:   9 steps (shortcut open)
-Episode  75:   7 steps (shortcut open)
-Episode  99:   7 steps (shortcut open)
+kappa=0.0  : steps/episode  before change (eps 40-49):  13.9  | just after (50-69):  14.2  | late (130-149):  13.5
+kappa=0.001: steps/episode  before change (eps 40-49):  14.2  | just after (50-69):  13.3  | late (130-149):   4.2
 ```
+
+Both agents take about 14 steps before the change (the 12-step detour plus exploration). After the wall
+at $(2,4)$ opens, plain Dyna-Q never notices the 4-step shortcut: its model says that cell is blocked, and
+greedy behaviour never retests it, so it stays at about 13.5 steps. Dyna-Q+ builds up a bonus on
+long-untried transitions, retests the blocked cell, and by episodes 130 to 149 averages about 4 steps.
+Try `kappa=0.01` and watch the bonus become so large that the agent keeps wandering.
 
 ## Exercise
 
@@ -285,66 +302,63 @@ Implement a **prioritised Dyna-Q** variant: instead of sampling $(s,a)$ pairs un
 from the model, prioritise pairs with the highest expected TD error. After a real update,
 recompute the predecessor states' expected errors and add them to the priority queue.
 This is called **Prioritised Sweeping** (Moore & Atkeson 1993).
-Compare convergence speed vs standard Dyna-Q (k=5) on the 5×5 maze over 50 episodes.
+Compare it with standard Dyna-Q ($k=5$) on the $5\times 5$ maze from the first example over 50 episodes,
+measuring the total number of real steps taken.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-import numpy as np
 import heapq
 
-HEIGHT, WIDTH = 5, 5
-WALLS = {(2,1),(2,2)}
-START, GOAL = (0,0),(4,4)
 gamma, alpha, theta = 0.95, 0.5, 0.01
 
-def step_maze(s, a):
-    r,c = s; dr,dc=[(-1,0),(1,0),(0,-1),(0,1)][a]
-    nr,nc=max(0,min(4,r+dr)),max(0,min(4,c+dc))
-    ns=(nr,nc)
-    if ns in WALLS: ns=s
-    return ns,1.0 if ns==GOAL else 0.0,ns==GOAL
+def run_ps(n_planning=5, n_episodes=50, seed=0):
+    rng = np.random.default_rng(seed)
+    Q = np.zeros((25, 4))
+    model, predecessors, pq = {}, {}, []   # predecessors: ns -> set of (s, a)
+    counts = []
+    for ep in range(n_episodes):
+        s, steps = START, 0
+        while s != GOAL and steps < 500:
+            si = state_id(s)
+            if rng.random() < 0.1:
+                a = int(rng.integers(4))
+            else:
+                a = int(rng.choice(np.flatnonzero(Q[si] == Q[si].max())))
+            ns, r, done = step_maze(s, a)
+            nsi = state_id(ns)
+            model[(si, a)] = (r, nsi)
+            predecessors.setdefault(nsi, set()).add((si, a))
+            err = abs(r + gamma * Q[nsi].max() - Q[si, a])
+            if err > theta:
+                heapq.heappush(pq, (-err, si, a))
+            for _ in range(n_planning):
+                if not pq:
+                    break
+                _, sp, ap = heapq.heappop(pq)
+                rp, nsp = model[(sp, ap)]
+                Q[sp, ap] += alpha * (rp + gamma * Q[nsp].max() - Q[sp, ap])
+                for sb, ab in predecessors.get(sp, ()):
+                    rb, _ = model[(sb, ab)]
+                    e = abs(rb + gamma * Q[sp].max() - Q[sb, ab])
+                    if e > theta:
+                        heapq.heappush(pq, (-e, sb, ab))
+            s, steps = ns, steps + 1
+        counts.append(steps)
+    return np.array(counts)
 
-Q = np.zeros((25,4))
-model = {}
-predecessors = {}  # ns -> set of (si, a)
-pq = []  # max-heap (negate priority)
-counts = []
-
-for ep in range(50):
-    s = START; steps = 0
-    while s!=GOAL and steps<500:
-        si=s[0]*WIDTH+s[1]
-        a=np.random.randint(4) if np.random.random()<0.1 else np.argmax(Q[si])
-        ns,r,done=step_maze(s,a); nsi=ns[0]*WIDTH+ns[1]
-        model[(si,a)]=(r,nsi)
-        predecessors.setdefault(nsi,set()).add((si,a))
-        td_err = abs(r+gamma*np.max(Q[nsi])-Q[si,a])
-        if td_err > theta:
-            heapq.heappush(pq, (-td_err, si, a))
-        for _ in range(5):
-            if not pq: break
-            _,si_p,a_p=heapq.heappop(pq)
-            if (si_p,a_p) not in model: continue
-            r_p,nsi_p=model[(si_p,a_p)]
-            Q[si_p,a_p]+=alpha*(r_p+gamma*np.max(Q[nsi_p])-Q[si_p,a_p])
-            for s_bar,a_bar in predecessors.get(si_p,set()):
-                if (s_bar,a_bar) in model:
-                    r_bar,_=model[(s_bar,a_bar)]
-                    e=abs(r_bar+gamma*np.max(Q[si_p])-Q[s_bar,a_bar])
-                    if e>theta: heapq.heappush(pq,(-e,s_bar,a_bar))
-        s=ns; steps+=1
-    counts.append(steps)
-
-print(f"Prioritised Sweeping avg (last 10): {np.mean(counts[-10:]):.0f} steps")
+np.random.seed(0)
+dyna = np.array(run_dyna(n_planning=5, n_episodes=50))
+ps = run_ps(n_planning=5, n_episodes=50)
+print(f"Dyna-Q (k=5):          total real steps = {dyna.sum():4d}, avg last 10 eps = {dyna[-10:].mean():.1f}")
+print(f"Prioritised sweeping:  total real steps = {ps.sum():4d}, avg last 10 eps = {ps[-10:].mean():.1f}")
 ```
 
-Prioritised sweeping focuses planning on high-error regions of the Q-function, propagating
-value estimates backward through predecessor states. It typically needs 30–50% fewer planning
-steps than uniform Dyna-Q to reach the same policy quality, especially after an environment
-change.
-</details>
+```output
+Dyna-Q (k=5):          total real steps =  643, avg last 10 eps = 9.0
+Prioritised sweeping:  total real steps =  492, avg last 10 eps = 8.8
+```
 
 ## Under the Trench
 
@@ -353,9 +367,9 @@ but you'll stop being surprised when you meet them.
 
 - **Offline / batch RL (CQL, BCQ)** — learn from logged data without interacting with the environment; critical for healthcare and robotics where online exploration is costly.
 - **Inverse RL & imitation learning (behavioral cloning, GAIL)** — recover a reward function from expert demonstrations; BC is simple but suffers covariate shift.
-- **Distributional RL (C51, QR-DQN)** — model the full return distribution Z(s,a), not just its expectation; leads to more robust value estimates.
+- **Distributional RL (C51, QR-DQN)** — model the full return distribution $Z(s,a)$, not just its expectation; leads to more robust value estimates.
 - **Multi-agent RL (MARL)** — cooperative/competitive settings; CTDE (centralized training, decentralized execution) with QMIX or MADDPG.
-- **Exploration beyond ε-greedy (RND, ICM)** — random network distillation or intrinsic curiosity for sparse-reward environments.
+- **Exploration beyond $\varepsilon$-greedy (RND, ICM)** — random network distillation or intrinsic curiosity for sparse-reward environments.
 - **Hierarchical RL & options** — the options framework (initiation set, policy, termination); goal-conditioned RL with HER.
 - **RLHF as RL** — reward model from human preference pairs → PPO with KL constraint; the backbone of chat model alignment.
 - **Bandits in production** — contextual bandits (LinUCB, Thompson sampling) for recommendation and ad serving without full RL.

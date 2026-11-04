@@ -26,61 +26,129 @@ Target: "sat"
 
 **Next Sentence Prediction (NSP):** given sentence A and B, predict if B follows A in the original text. (Later work showed NSP adds little; RoBERTa drops it.)
 
+Pretrained BERT weights cannot be downloaded in this course environment, so every model in this chapter is a **tiny transformer we train ourselves** (a few seconds on CPU) on a toy corpus. The architecture is the real thing (token + position embeddings, pre-norm encoder layers with multi-head self-attention, an output head); only the size (32-dimensional, 2 layers, about 50 word types) and the data differ. We use a word-level vocabulary with BERT's special tokens `[CLS]`, `[SEP]`, `[MASK]`, `[PAD]`. The corpus deliberately contains "bank" in two senses.
+
 ```python
-from transformers import BertTokenizer, BertModel
-import torch
+import random, torch, torch.nn as nn, torch.nn.functional as F
+torch.set_num_threads(1)
+torch.manual_seed(0)
+rng = random.Random(0)
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertModel.from_pretrained('bert-base-uncased')
-model.eval()
+money = ["deposit money at the bank", "open an account at the bank", "approved the loan from the bank",
+         "paid a fee to the bank for the account", "saved money in the bank"]
+river = ["swam near the river bank", "walked along the river bank", "stood on the muddy bank of the river",
+         "rested on the grassy bank of the river", "sat on the bank and watched the water"]
+other = ["the surgeon performed the operation", "the musician performed at the concert",
+         "the cat sat on the mat", "the dog chased the cat", "the team won the match"]
+subj = ["she", "he", "we", "they", "the man", "the woman"]
 
-sentence = "I went to the bank to deposit money."
-inputs = tokenizer(sentence, return_tensors='pt')
-print("Token IDs:", inputs['input_ids'])
-print("Tokens:", tokenizer.convert_ids_to_tokens(inputs['input_ids'][0].tolist()))
+def sample(templates):
+    if templates is other:
+        return rng.choice(templates).split()
+    return (rng.choice(subj) + " " + rng.choice(templates)).split()
+
+sents = [sample(k) for _ in range(300) for k in (money, river, other)]
+PAD, CLS, SEP, MASK = 0, 1, 2, 3
+itos = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"] + sorted({w for s in sents for w in s})
+stoi = {w: i for i, w in enumerate(itos)}
+encode = lambda words: [CLS] + [stoi[w] for w in words] + [SEP]
+batchify = lambda seqs: torch.tensor([s + [PAD] * (max(map(len, seqs)) - len(s)) for s in seqs])
+
+class MiniEncoder(nn.Module):
+    """BERT-style stack; causal=True turns it into a GPT-style decoder (same code, one extra mask)."""
+    def __init__(self, V, d=32, heads=4, layers=2, causal=False, maxlen=24):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(V, d), nn.Embedding(maxlen, d)
+        layer = nn.TransformerEncoderLayer(d, heads, 4 * d, dropout=0.0, batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+        self.head, self.causal = nn.Linear(d, V), causal
+    def hidden(self, ids):
+        T = ids.shape[1]
+        x = self.tok(ids) + self.pos(torch.arange(T))
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool), 1) if self.causal else None
+        return self.enc(x, mask=mask, src_key_padding_mask=(ids == PAD))
+    def forward(self, ids):
+        return self.head(self.hidden(ids))
+
+print("vocab size:", len(itos), "| example:", encode("she saved money in the bank".split()))
+print("tokens:", [itos[i] for i in encode("she saved money in the bank".split())])
 ```
 
 ```output
-Token IDs: tensor([[ 101, 1045, 2253, 2000, 1996, 2924, 2000, 8065, 2769,  102]])
-Tokens: ['[CLS]', 'i', 'went', 'to', 'the', 'bank', 'to', 'deposit', 'money', '[SEP]']
+vocab size: 55 | example: [1, 41, 40, 27, 22, 46, 11, 2]
+tokens: ['[CLS]', 'she', 'saved', 'money', 'in', 'the', 'bank', '[SEP]']
 ```
+
+### Masked language modelling in practice
+
+Training loop for MLM: hide 25% of the real tokens (a higher rate than BERT's 15%, because our corpus is tiny) and minimise cross-entropy on the hidden positions only.
+
+```python
+bert = MiniEncoder(len(itos))
+opt = torch.optim.Adam(bert.parameters(), lr=3e-3)
+data = [encode(s) for s in sents]
+for step in range(800):
+    ids = batchify(rng.sample(data, 32))
+    m = (torch.rand(ids.shape) < 0.25) & (ids > SEP)      # never mask special tokens
+    inp = ids.clone(); inp[m] = MASK
+    loss = F.cross_entropy(bert(inp)[m], ids[m])
+    opt.zero_grad(); loss.backward(); opt.step()
+    if (step + 1) % 200 == 0:
+        print(f"step {step+1}: MLM loss {loss.item():.3f}")
+bert.eval()
+
+def fill(sentence, k=3):
+    ids = torch.tensor([encode(sentence.split())])
+    pos = ids[0].tolist().index(MASK)
+    with torch.no_grad():
+        p = bert(ids)[0, pos].softmax(-1)
+    top = p.topk(k)
+    return [(itos[i], round(float(v), 3)) for v, i in zip(top.values, top.indices)]
+
+print(fill("the surgeon performed the [MASK]"))
+print(fill("the musician performed at the [MASK]"))
+```
+
+```output
+step 200: MLM loss 0.501
+step 400: MLM loss 0.174
+step 600: MLM loss 0.157
+step 800: MLM loss 0.083
+[('operation', 1.0), ('at', 0.0), ('cat', 0.0)]
+[('concert', 1.0), ('bank', 0.0), ('river', 0.0)]
+```
+
+The same masked position gets different predictions because the surrounding words differ.
 
 ### Extracting contextual embeddings
 
 ```python
-with torch.no_grad():
-    outputs = model(**inputs)
+def bank_vec(sentence):
+    ids = torch.tensor([encode(sentence.split())])
+    with torch.no_grad():
+        h = bert.hidden(ids)[0]                       # (seq_len, 32)
+    return h[ids[0].tolist().index(stoi["bank"])]
 
-last_hidden = outputs.last_hidden_state  # (1, seq_len, 768)
-print("Shape:", last_hidden.shape)
+v_money1 = bank_vec("she saved money in the bank")
+v_money2 = bank_vec("he deposit money at the bank")
+v_river1 = bank_vec("they walked along the river bank")
+v_river2 = bank_vec("we swam near the river bank")
 
-# Get embedding for "bank" (token index 5)
-bank_deposit_vec = last_hidden[0, 5, :]
-
-# Now try "bank" in a river context
-sentence2 = "She swam across the river bank at dusk."
-inputs2 = tokenizer(sentence2, return_tensors='pt')
-toks2 = tokenizer.convert_ids_to_tokens(inputs2['input_ids'][0].tolist())
-print("Tokens:", toks2)
-bank_idx = toks2.index('bank')
-
-with torch.no_grad():
-    out2 = model(**inputs2)
-bank_river_vec = out2.last_hidden_state[0, bank_idx, :]
-
-cos = torch.nn.CosineSimilarity(dim=0)
-sim = cos(bank_deposit_vec, bank_river_vec)
-print(f"\nCosine similarity between 'bank' (deposit) and 'bank' (river): {sim:.4f}")
+cos = lambda a, b: F.cosine_similarity(a, b, dim=0).item()
+print(f"money vs money: {cos(v_money1, v_money2):.3f}")
+print(f"river vs river: {cos(v_river1, v_river2):.3f}")
+print(f"money vs river: {cos(v_money1, v_river1):.3f}")
+print(f"money vs river: {cos(v_money2, v_river2):.3f}")
 ```
 
 ```output
-Shape: torch.Size([1, 10, 768])
-Tokens: ['[CLS]', 'she', 'swam', 'across', 'the', 'river', 'bank', 'at', 'dusk', '.', '[SEP]']
-
-Cosine similarity between 'bank' (deposit) and 'bank' (river): 0.7231
+money vs money: 0.987
+river vs river: 0.955
+money vs river: 0.812
+money vs river: 0.860
 ```
 
-The same word "bank" has a cosine similarity of ~0.72 — meaningfully different representations driven by context. A static embedding would give exactly 1.0.
+The same word "bank" gets nearly identical vectors within a sense (about 0.96-0.99) and noticeably lower similarity across senses (about 0.81-0.86). A static embedding would give exactly 1.0 for every pair. The separation is modest because the model is tiny and the final-layer vector also encodes position and neighbouring words.
 
 ## GPT: unidirectional decoder
 
@@ -92,26 +160,53 @@ Predict the next token from all previous tokens:
 
 $$P(x_1, x_2, \ldots, x_T) = \prod_{t=1}^{T} P(x_t \mid x_1, \ldots, x_{t-1})$$
 
+The only code change from the encoder above is `causal=True` (the upper-triangular mask) and the loss, which shifts targets by one position:
+
 ```python
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
-import torch
+gpt = MiniEncoder(len(itos), causal=True)
+opt = torch.optim.Adam(gpt.parameters(), lr=3e-3)
+for step in range(600):
+    ids = batchify(rng.sample(data, 32))
+    logits = gpt(ids[:, :-1])
+    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1), ignore_index=PAD)
+    opt.zero_grad(); loss.backward(); opt.step()
+gpt.eval()
 
-tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-model = GPT2LMHeadModel.from_pretrained('gpt2')
-model.eval()
+def generate(prompt, max_new=10):
+    ids = [CLS] + [stoi[w] for w in prompt.split()]
+    for _ in range(max_new):
+        with torch.no_grad():
+            nxt = gpt(torch.tensor([ids]))[0, -1].argmax().item()      # greedy decoding
+        if nxt == SEP:
+            break
+        ids.append(nxt)
+    return " ".join(itos[i] for i in ids[1:])
 
-prompt = "Machine learning is"
-inputs = tokenizer(prompt, return_tensors='pt')
-with torch.no_grad():
-    outputs = model.generate(**inputs, max_new_tokens=10, do_sample=False)
-print(tokenizer.decode(outputs[0]))
+print(generate("the surgeon"))
+print(generate("they walked along the"))
 ```
 
 ```output
-Machine learning is a branch of artificial intelligence that allows computers
+the surgeon performed the operation
+they walked along the river bank
 ```
 
-GPT generates left-to-right. It can't look ahead during generation — which is by design.
+GPT generates left-to-right. It can't look ahead during generation — which is by design. We can verify the causal mask directly: changing the last token must not change the hidden states of earlier positions in the GPT-style model, while the BERT-style model lets information flow backwards.
+
+```python
+a = torch.tensor([[CLS, stoi['she'], stoi['saved'], stoi['money']]])
+b = a.clone(); b[0, 3] = stoi['river']                  # change only the last token
+with torch.no_grad():
+    same_gpt = torch.allclose(gpt.hidden(a)[0, :3], gpt.hidden(b)[0, :3], atol=1e-6)
+    same_bert = torch.allclose(bert.hidden(a)[0, :3], bert.hidden(b)[0, :3], atol=1e-6)
+print("GPT earlier positions unchanged: ", same_gpt)
+print("BERT earlier positions unchanged:", same_bert)
+```
+
+```output
+GPT earlier positions unchanged:  True
+BERT earlier positions unchanged: False
+```
 
 ## The BERT family
 
@@ -123,51 +218,95 @@ GPT generates left-to-right. It can't look ahead during generation — which is 
 | ALBERT | 12M | Parameter sharing across layers, SOP instead of NSP |
 | DeBERTa | 184M | Disentangled attention (position + content separate), better on GLUE |
 
-```python
-from transformers import AutoTokenizer, AutoModel
-import torch
+We cannot load these checkpoints here, but their sizes follow from the architecture. A BERT-style encoder has embeddings ($V d$ token, $P d$ position, segment and LayerNorm terms) plus $L$ identical layers of attention ($4d^2$) and feed-forward ($8d^2$) weights:
 
-# All BERT-family models share the same API
-for model_name in ['bert-base-uncased', 'distilbert-base-uncased', 'roberta-base']:
-    tok = AutoTokenizer.from_pretrained(model_name)
-    mdl = AutoModel.from_pretrained(model_name)
-    n_params = sum(p.numel() for p in mdl.parameters()) / 1e6
-    inputs = tok("hello world", return_tensors='pt')
-    with torch.no_grad():
-        out = mdl(**inputs)
-    print(f"{model_name:30s}: {n_params:.0f}M params, output shape {out.last_hidden_state.shape}")
+```python
+def encoder_params(L, d, V, P, types=2):
+    emb = V * d + P * d + types * d + 2 * d
+    layer = 4 * (d * d + d) + 2 * d * (4 * d) + 4 * d + d + 4 * d   # attn + FFN + biases + 2 LayerNorms
+    return emb + L * layer
+
+configs = {"bert-base": (12, 768, 30522, 512, 2),
+           "distilbert (6 layers, no segments)": (6, 768, 30522, 512, 0),
+           "roberta-base (50k BPE vocab)": (12, 768, 50265, 514, 1),
+           "our MiniEncoder (32-d, 2 layers)": (2, 32, len(itos), 24, 0)}
+for name, cfg in configs.items():
+    print(f"{name:36s}: {encoder_params(*cfg)/1e6:7.3f}M params")
 ```
 
 ```output
-bert-base-uncased             : 110M params, output shape torch.Size([1, 4, 768])
-distilbert-base-uncased       : 67M params, output shape torch.Size([1, 4, 768])
-roberta-base                  : 125M params, output shape torch.Size([1, 4, 768])
+bert-base                           : 108.892M params
+distilbert (6 layers, no segments)  :  66.363M params
+roberta-base (50k BPE vocab)        : 124.055M params
+our MiniEncoder (32-d, 2 layers)    :   0.028M params
 ```
+
+The first three land close to the published 110M / 66M / 125M (the official counts also include a small pooler head). Roughly 23M of BERT-base's parameters are the token embedding table alone, which is why vocabulary size matters (ch. 2).
 
 ## T5: encoder-decoder
 
 T5 (Raffel, 2019) uses the full encoder-decoder architecture and frames every task as text-to-text:
 
-- Classification: `"classify: The movie was great."` → `"positive"`
-- Translation: `"translate English to French: Hello"` → `"Bonjour"`
-- Summarization: `"summarize: Long article..."` → `"Short summary"`
+- Classification: `"classify: The movie was great."` -> `"positive"`
+- Translation: `"translate English to French: Hello"` -> `"Bonjour"`
+- Summarization: `"summarize: Long article..."` -> `"Short summary"`
+
+The decoder attends causally to its own prefix and, through cross-attention, to the encoder output. Here is a miniature encoder-decoder (`nn.Transformer`) trained on a toy "translation" task, a word-by-word English-to-French lexicon. It is a stand-in for T5's setup, not a real translator:
 
 ```python
-from transformers import T5ForConditionalGeneration, T5Tokenizer
+en = "hello how are you today friend thank very much good morning".split()
+fr = "bonjour comment allez vous aujourdhui ami merci tres beaucoup bon matin".split()
+src_v = ["<pad>"] + en
+tgt_v = ["<pad>", "<bos>", "<eos>"] + fr
+lex = dict(zip(en, fr))
 
-tokenizer = T5Tokenizer.from_pretrained('t5-small')
-model = T5ForConditionalGeneration.from_pretrained('t5-small')
-model.eval()
+def pair():
+    n = rng.randint(2, 5)
+    w = [rng.choice(en) for _ in range(n)]
+    return [src_v.index(x) for x in w], [1] + [tgt_v.index(lex[x]) for x in w] + [2]
 
-input_text = "translate English to French: Hello, how are you?"
-inputs = tokenizer(input_text, return_tensors='pt')
-with torch.no_grad():
-    out = model.generate(**inputs, max_new_tokens=20)
-print(tokenizer.decode(out[0], skip_special_tokens=True))
+class Seq2Seq(nn.Module):
+    def __init__(self, d=32):
+        super().__init__()
+        self.se, self.te, self.pe = nn.Embedding(len(src_v), d), nn.Embedding(len(tgt_v), d), nn.Embedding(16, d)
+        self.tr = nn.Transformer(d, 4, 2, 2, 4 * d, dropout=0.0, batch_first=True, norm_first=True)
+        self.out = nn.Linear(d, len(tgt_v))
+    def forward(self, src, tgt):
+        T = tgt.shape[1]
+        causal = nn.Transformer.generate_square_subsequent_mask(T)
+        x = self.se(src) + self.pe(torch.arange(src.shape[1]))
+        y = self.te(tgt) + self.pe(torch.arange(T))
+        h = self.tr(x, y, tgt_mask=causal, src_key_padding_mask=(src == 0), memory_key_padding_mask=(src == 0))
+        return self.out(h)
+
+s2s = Seq2Seq()
+opt = torch.optim.Adam(s2s.parameters(), lr=3e-3)
+for step in range(500):
+    b = [pair() for _ in range(32)]
+    src, tgt = batchify([x for x, _ in b]), batchify([y for _, y in b])
+    logits = s2s(src, tgt[:, :-1])
+    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt[:, 1:].reshape(-1), ignore_index=0)
+    opt.zero_grad(); loss.backward(); opt.step()
+s2s.eval()
+
+def translate(text):
+    src = torch.tensor([[src_v.index(w) for w in text.split()]])
+    out = [1]
+    for _ in range(10):
+        with torch.no_grad():
+            nxt = s2s(src, torch.tensor([out]))[0, -1].argmax().item()
+        if nxt == 2:
+            break
+        out.append(nxt)
+    return " ".join(tgt_v[i] for i in out[1:])
+
+for sentence in ["hello how are you", "thank you very much"]:
+    print(f"{sentence!r} -> {translate(sentence)!r}")
 ```
 
 ```output
-Bonjour, comment allez-vous?
+'hello how are you' -> 'bonjour comment allez vous'
+'thank you very much' -> 'merci vous tres beaucoup'
 ```
 
 ## Choosing an architecture
@@ -176,68 +315,63 @@ Bonjour, comment allez-vous?
 |------|------------|-----|
 | Classification, NER, QA | BERT (encoder-only) | Sees full context |
 | Text generation | GPT (decoder-only) | Autoregressive by design |
-| Seq2seq (translation, summarization) | T5 (enc-dec) | Flexible input→output |
+| Seq2seq (translation, summarization) | T5 (enc-dec) | Flexible input to output |
 | Feature extraction for retrieval | BERT/RoBERTa | Rich bidirectional representations |
 
 ## Try it Yourself
 
+Use the BERT-style model trained above to compare "bank" across three contexts, including one it never saw as a full sentence:
+
 ```python
-from transformers import BertTokenizer, BertModel
-import torch
-
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-model = BertModel.from_pretrained('bert-base-uncased')
-model.eval()
-
 sentences = [
-    "The model bank stores trained weights.",
-    "She walked along the river bank.",
-    "He opened a bank account for savings.",
+    "she saved money in the bank",
+    "they walked along the river bank",
+    "he paid a fee to the bank for the account",
 ]
-
-vecs = []
-for s in sentences:
-    inputs = tokenizer(s, return_tensors='pt')
-    with torch.no_grad():
-        out = model(**inputs)
-    toks = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0].tolist())
-    bank_idx = toks.index('bank')
-    vecs.append(out.last_hidden_state[0, bank_idx, :])
-
-cos = torch.nn.CosineSimilarity(dim=0)
+vecs = [bank_vec(s) for s in sentences]
 for i in range(len(sentences)):
-    for j in range(i+1, len(sentences)):
-        print(f"S{i+1}↔S{j+1}: {cos(vecs[i], vecs[j]):.4f}")
+    for j in range(i + 1, len(sentences)):
+        print(f"S{i+1} vs S{j+1}: {cos(vecs[i], vecs[j]):.4f}")
 ```
 
 ```output
-S1↔S2: 0.7412
-S1↔S3: 0.8934
-S2↔S3: 0.7188
+S1 vs S2: 0.8123
+S1 vs S3: 0.6671
+S2 vs S3: 0.7086
 ```
 
-Try with static Word2Vec: all similarities would be 1.0. Which pair is most/least similar? Does it match your intuition?
+With a static embedding, every pair would score exactly 1.0. Which pair is most similar? Here S1 vs S2 (a money sentence and a river sentence) comes out highest and the two money sentences are not the closest pair, so this tiny model is a noisy sense detector: a 32-dimensional model trained for seconds encodes sentence position and neighbouring words, not just sense. Does it match your intuition? Try a new sentence mixing both contexts ("she saved money near the river bank") and see where its vector lands.
 
 ## Exercise
 
-Use `BertForMaskedLM` to predict the masked token in two sentences and compare the top predictions: (1) "The surgeon performed the [MASK] procedure" and (2) "The musician performed at the [MASK]".
+Use the MLM head of the BERT-style model to predict the masked token in two sentences and compare the top predictions: (1) "the surgeon performed the [MASK]" and (2) "the musician performed at the [MASK]". Also ask for the top 3 for "she saved money in the [MASK]".
 
 <details>
 <summary>Solution</summary>
 
 ```python
-from transformers import pipeline
-
-fill = pipeline('fill-mask', model='bert-base-uncased')
-for sent in [
-    "The surgeon performed the [MASK] procedure.",
-    "The musician performed at the [MASK].",
-]:
-    print(f"\nSentence: {sent}")
-    results = fill(sent)
-    for r in results[:3]:
-        print(f"  {r['token_str']:15s} score={r['score']:.3f}")
+for sent in ["the surgeon performed the [MASK]",
+             "the musician performed at the [MASK]",
+             "she saved money in the [MASK]"]:
+    print(f"Sentence: {sent}")
+    for tok, score in fill(sent):
+        print(f"  {tok:15s} score={score:.3f}")
 ```
 
-The model returns "operation"/"surgical" for the first sentence and "concert"/"festival"/"venue" for the second — the same [MASK] position gets completely different top predictions because the surrounding context changes the probability distribution. This is contextualization in action.
+```output
+Sentence: the surgeon performed the [MASK]
+  operation       score=1.000
+  at              score=0.000
+  cat             score=0.000
+Sentence: the musician performed at the [MASK]
+  concert         score=1.000
+  bank            score=0.000
+  river           score=0.000
+Sentence: she saved money in the [MASK]
+  bank            score=1.000
+  the             score=0.000
+  concert         score=0.000
+```
+
+The first two sentences share the verb "performed" but get completely different top predictions: the surrounding context changes the probability distribution. This is contextualization in action; a real BERT does the same with a 30K-word vocabulary and 110M parameters.
 </details>

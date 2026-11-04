@@ -7,27 +7,190 @@ order: 6
 
 ## The pipeline abstraction
 
-The `transformers` library wraps the full tokenize → model → decode flow into a single callable.
-You get a model, a tokenizer, and post-processing in one object — enough to run NER, QA, or
-generation in three lines.
+The Hugging Face `transformers` library wraps the full tokenize -> model -> post-process flow into a single callable: you get a model, a tokenizer, and decoding logic in one object, enough to run NER, QA, or generation in three lines. In this course environment we cannot download pretrained checkpoints from the Hub, so we build the same abstraction ourselves around **tiny transformers trained in seconds on templated data**. The API shape (inputs in, task-specific dicts out) is identical; the models are toys and their accuracy is not meaningful beyond the demos.
+
+First, the shared pieces: a word-level tokenizer that returns `input_ids`, `attention_mask` and character offsets (like a fast tokenizer's `return_offsets_mapping`), a small encoder, a training helper, and a `Pipeline` class that chains tokenizer, model and post-processing.
 
 ```python
-from transformers import pipeline
+import re, random, torch, torch.nn as nn, torch.nn.functional as F
+torch.set_num_threads(1)
+torch.manual_seed(0)
+rng = random.Random(0)
 
-ner = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
-results = ner("Elon Musk founded SpaceX in Hawthorne, California.")
-for r in results:
+class Tok:
+    """Word-level stand-in for a Hugging Face tokenizer: ids, attention_mask, char offsets."""
+    SPECIAL = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    def __init__(self, corpus):
+        words = sorted({m.group().lower() for t in corpus for m in re.finditer(r"\w+|[^\w\s]", t)})
+        self.itos = self.SPECIAL + words
+        self.stoi = {w: i for i, w in enumerate(self.itos)}
+    def pieces(self, text):
+        return [(m.group(), m.start(), m.end()) for m in re.finditer(r"\[MASK\]|\w+|[^\w\s]", text)]
+    def __call__(self, texts, pair=None, padding=True):
+        rows, offs = [], []
+        for k, text in enumerate(texts):
+            ids, off = [2], [(0, 0)]
+            for w, s, e in self.pieces(text):
+                ids.append(4 if w == "[MASK]" else self.stoi.get(w.lower(), 1)); off.append((s, e))
+            ids.append(3); off.append((0, 0))
+            if pair is not None:                     # second segment (e.g. QA context)
+                for w, s, e in self.pieces(pair[k]):
+                    ids.append(self.stoi.get(w.lower(), 1)); off.append((s, e))
+                ids.append(3); off.append((0, 0))
+            rows.append(ids); offs.append(off)
+        L = max(map(len, rows))
+        input_ids = torch.tensor([r + [0] * (L - len(r)) for r in rows])
+        return {"input_ids": input_ids, "attention_mask": (input_ids != 0).long(), "offsets": offs}
+
+class Encoder(nn.Module):
+    def __init__(self, V, d=48, heads=4, layers=2, maxlen=64):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(V, d), nn.Embedding(maxlen, d)
+        layer = nn.TransformerEncoderLayer(d, heads, 4 * d, dropout=0.0, batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+    def forward(self, input_ids, attention_mask):
+        x = self.tok(input_ids) + self.pos(torch.arange(input_ids.shape[1]))
+        return self.enc(x, src_key_padding_mask=(attention_mask == 0))
+
+def train(model, loss_fn, make_batch, steps, lr=3e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for step in range(steps):
+        loss = loss_fn(model, *make_batch())
+        opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+def train(model, loss_fn, make_batch, steps, lr=3e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(steps):
+        loss = loss_fn(model, *make_batch())
+        opt.zero_grad(); loss.backward(); opt.step()
+    model.eval()
+    return loss.item()
+
+class Pipeline:
+    """tokenizer -> model -> post-process, with batching."""
+    def __init__(self, task, model, tok, postprocess, batch_size=8):
+        self.task, self.model, self.tok, self.post, self.batch_size = task, model, tok, postprocess, batch_size
+        self.n_forward = 0
+    def __call__(self, texts, **kw):
+        single = isinstance(texts, str)
+        texts = [texts] if single else texts
+        out = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
+            enc = self.tok(batch, **{k: v for k, v in kw.items() if k == "pair"})
+            with torch.no_grad():
+                raw = self.model(enc["input_ids"], enc["attention_mask"])
+            self.n_forward += 1
+            out.extend(self.post(enc, raw, batch, **{k: v for k, v in kw.items() if k != "pair"}))
+        return out[0] if single else out
+
+print("tokenizer and pipeline classes defined")
+```
+
+```output
+tokenizer and pipeline classes defined
+```
+
+## Named entity recognition as a pipeline
+
+NER is token classification: one label per token in BIO format (`B-PER` begins a person, `I-PER` continues it, `O` is outside). We train a tiny tagger on templated sentences that combine names, organisations and places. The held-out test sentence below recombines known words in a new arrangement, so the model is largely doing lexicon lookup plus sentence position, unlike a real pretrained NER model that generalises to unseen names.
+
+```python
+per = ["elon musk", "ada lovelace", "grace hopper", "alan turing", "sundar pichai", "satya nadella"]
+org = ["spacex", "tesla", "google", "microsoft", "openai", "nasa"]
+loc = ["hawthorne", "california", "paris", "london", "texas", "seattle", "boston"]
+TAGS = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
+
+def build(parts):                      # join parts into text; remember entity character spans
+    text, spans = "", []
+    for s, typ in parts:
+        if s not in {".", ","} and text:
+            text += " "
+        if typ:
+            spans.append((len(text), len(text) + len(s), typ))
+        text += s
+    return text, spans
+
+def ner_example():
+    p, o, l, l2 = rng.choice(per), rng.choice(org), rng.choice(loc), rng.choice(loc)
+    parts = rng.choice([
+        [(p, "PER"), ("founded", None), (o, "ORG"), ("in", None), (l, "LOC"), (",", None), (l2, "LOC"), (".", None)],
+        [(p, "PER"), ("joined", None), (o, "ORG"), ("in", None), (l, "LOC"), (".", None)],
+        [(o, "ORG"), ("hired", None), (p, "PER"), ("near", None), (l, "LOC"), (".", None)]])
+    return build(parts)
+
+def ner_labels(tok, text, spans):
+    out, seen = [], set()
+    for w, s, e in tok.pieces(text):
+        lab = "O"
+        for a, b, typ in spans:
+            if a <= s < b:
+                lab = ("I-" if (a, b) in seen else "B-") + typ
+                seen.add((a, b))
+        out.append(TAGS.index(lab))
+    return [0] + out + [0]            # [CLS] and [SEP] are tagged O
+
+ner_data = [ner_example() for _ in range(800)]
+test_ner = "Elon Musk founded SpaceX in Hawthorne, California."
+tok = Tok([t for t, _ in ner_data] + [test_ner])
+
+class TokCls(nn.Module):
+    def __init__(self, V, n):
+        super().__init__()
+        self.enc, self.head = Encoder(V), nn.Linear(48, n)
+    def forward(self, input_ids, attention_mask):
+        return self.head(self.enc(input_ids, attention_mask))
+
+exs = [(t, ner_labels(tok, t, sp)) for t, sp in ner_data]
+def ner_batch():
+    b = rng.sample(exs, 32)
+    x = tok([t for t, _ in b])
+    L = x["input_ids"].shape[1]
+    return x, torch.tensor([l + [0] * (L - len(l)) for _, l in b])
+def ner_loss(m, x, y):
+    lg = m(x["input_ids"], x["attention_mask"])
+    return F.cross_entropy(lg.reshape(-1, lg.shape[-1]), y.reshape(-1))
+
+ner_model = TokCls(len(tok.itos), len(TAGS))
+print("final training loss:", round(train(ner_model, ner_loss, ner_batch, 300), 4))
+
+def ner_post(enc, logits, texts, aggregation_strategy="simple"):
+    results = []
+    for k, text in enumerate(texts):
+        tags = logits[k].softmax(-1)
+        spans, cur = [], None
+        for i, (s, e) in enumerate(enc["offsets"][k]):
+            if (s, e) == (0, 0):
+                continue                                   # skip [CLS]/[SEP]
+            score, t = tags[i].max(-1)
+            tag = TAGS[t]
+            if tag == "O":
+                cur = None
+            elif tag.startswith("I-") and cur is not None:
+                cur["end"], cur["score"] = e, min(cur["score"], float(score))   # extend span
+            else:
+                cur = {"entity_group": tag[2:], "start": s, "end": e, "score": float(score)}
+                spans.append(cur)
+        for sp in spans:
+            sp["word"] = text[sp["start"]:sp["end"]]
+        results.append(spans)
+    return results
+
+ner = Pipeline("ner", ner_model, tok, ner_post)
+for r in ner(test_ner)[0] if False else ner([test_ner])[0]:
     print(f"{r['word']:20s} {r['entity_group']:10s} {r['score']:.3f}")
 ```
 
 ```output
-Elon Musk            PER        0.998
-SpaceX               ORG        0.996
-Hawthorne            LOC        0.972
-California           LOC        0.991
+final training loss: 0.0
+Elon Musk            PER        1.000
+SpaceX               ORG        1.000
+Hawthorne            LOC        1.000
+California           LOC        1.000
 ```
 
-`aggregation_strategy="simple"` merges sub-word tokens belonging to the same entity span.
+`aggregation_strategy="simple"` in the real library merges sub-word tokens belonging to the same entity span; our `ner_post` does the same for the B-/I- tags of a multi-word name like "Elon Musk".
 
 ## Available pipeline tasks
 
@@ -40,48 +203,126 @@ California           LOC        0.991
 | `"text-generation"` | `gpt2`, `mistralai/Mistral-7B-Instruct-v0.1` |
 | `"fill-mask"` | `bert-base-uncased` |
 
-Each maps inputs to a task-specific output format. `pipeline()` downloads the model and
-tokenizer from the Hub on first use; subsequent calls use the cache.
+Each maps inputs to a task-specific output format. With the real library, `pipeline()` downloads the model and tokenizer from the Hub on first use; subsequent calls use the cache. Our miniature differs only in where the weights come from.
 
 ## Question-answering with span offsets
 
+Extractive QA predicts a **start** and an **end** token over the context, given the question and context as one input `[CLS] question [SEP] context [SEP]`. We train a tiny span-extraction head on templated landmark facts.
+
 ```python
-qa = pipeline("question-answering", model="deepset/roberta-base-squad2")
-context = (
-    "The Eiffel Tower was built between 1887 and 1889 by Gustave Eiffel "
-    "and stands 330 metres tall in Paris, France."
-)
-result = qa(question="Who built the Eiffel Tower?", context=context)
-print(result)
+qa_c = {"eiffel tower": ("gustave eiffel", "paris", "330"), "statue of liberty": ("auguste bartholdi", "new york", "93"),
+        "big ben": ("augustus pugin", "london", "96"), "colosseum": ("vespasian", "rome", "48"),
+        "brandenburg gate": ("carl langhans", "berlin", "26"), "sagrada familia": ("antoni gaudi", "barcelona", "172")}
+
+def qa_example():
+    lm = rng.choice(list(qa_c)); who, city, h = qa_c[lm]
+    y1 = rng.randint(1700, 1950); y2 = y1 + rng.randint(1, 9)
+    ctx = f"The {lm} was built between {y1} and {y2} by {who} and stands {h} metres tall in {city}."
+    kind = rng.choice(["who", "where", "tall"])
+    q = {"who": f"Who built the {lm}?", "where": f"Where is the {lm}?", "tall": f"How tall is the {lm}?"}[kind]
+    ans = {"who": who, "where": city, "tall": h}[kind]
+    a = ctx.index(ans)
+    return q, ctx, a, a + len(ans)
+
+qa_ex = [qa_example() for _ in range(1500)]
+qa_tok = Tok([e[0] for e in qa_ex] + [e[1] for e in qa_ex])
+
+class QA(nn.Module):
+    def __init__(self, V):
+        super().__init__()
+        self.enc, self.head = Encoder(V), nn.Linear(48, 2)
+    def forward(self, input_ids, attention_mask):
+        lg = self.head(self.enc(input_ids, attention_mask))
+        return lg[..., 0], lg[..., 1]                       # start logits, end logits
+
+def context_start(off):                                     # index just after the first [SEP]
+    return [i for i, o in enumerate(off) if o == (0, 0)][1] + 1
+
+def qa_batch():
+    b = rng.sample(qa_ex, 32)
+    x = qa_tok([e[0] for e in b], pair=[e[1] for e in b])
+    st, en = [], []
+    for off, (_, ctx, a, z) in zip(x["offsets"], b):
+        s_i = e_i = 0
+        for i in range(context_start(off), len(off) - 1):
+            if off[i][0] == a: s_i = i                      # token whose char span starts the answer
+            if off[i][1] == z: e_i = i                      # token whose char span ends the answer
+        st.append(s_i); en.append(e_i)
+    return x, torch.tensor(st), torch.tensor(en)
+def qa_loss(m, x, st, en):
+    s, e = m(x["input_ids"], x["attention_mask"])
+    pad = x["attention_mask"] == 0
+    return F.cross_entropy(s.masked_fill(pad, -1e9), st) + F.cross_entropy(e.masked_fill(pad, -1e9), en)
+
+qa_model = QA(len(qa_tok.itos))
+print("final training loss:", round(train(qa_model, qa_loss, qa_batch, 400), 4))
+
+def qa_post(enc, raw, texts, max_answer_len=4):
+    s_all, e_all = raw
+    out = []
+    for k in range(len(texts)):
+        off, s, e = enc["offsets"][k], s_all[k], e_all[k]
+        cs = context_start(off)
+        score, i, j = max((float(s[i] + e[j]), i, j) for i in range(cs, len(off) - 1)
+                          for j in range(i, min(i + max_answer_len, len(off) - 1)))
+        out.append({"score": round(score, 2), "start": off[i][0], "end": off[j][1]})
+    return out
+
+qa = Pipeline("question-answering", qa_model, qa_tok, qa_post)
+context = ("The Eiffel Tower was built between 1887 and 1889 by Gustave Eiffel "
+           "and stands 330 metres tall in Paris, France.")
+for question in ["Who built the Eiffel Tower?", "How tall is the Eiffel Tower?"]:
+    result = qa([question], pair=[context])[0]
+    result["answer"] = context[result["start"]:result["end"]]
+    print(result)
 ```
 
 ```output
-{'score': 0.9821, 'start': 60, 'end': 74, 'answer': 'Gustave Eiffel'}
+final training loss: 0.0003
+{'score': 14.34, 'start': 52, 'end': 66, 'answer': 'Gustave Eiffel'}
+{'score': 22.63, 'start': 78, 'end': 81, 'answer': '330'}
 ```
 
-`start` and `end` are character offsets into `context`. You can verify with
-`context[result['start']:result['end']]`.
+`start` and `end` are character offsets into `context`, recovered from the tokenizer's offset mapping. You can verify with `context[result['start']:result['end']]`, which is exactly how `answer` was produced above.
 
 ## Loading models directly with AutoModel
 
-For custom pipelines — or when you need access to hidden states — load the model and tokenizer
-separately.
+For custom pipelines, or when you need access to hidden states, use the model and tokenizer directly. We train a tiny sentiment classifier (the `[CLS]` position feeds a linear head) on templated reviews.
 
 ```python
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+nouns = "film movie show story cast plot".split()
+pos_adj = "fantastic great wonderful brilliant superb moving".split()
+neg_adj = "awful terrible boring dull dreadful weak".split()
+def sent_example():
+    y = rng.randint(0, 1)
+    adj = rng.choice(pos_adj if y else neg_adj)
+    t = rng.choice(["this {n} was {a} !", "{w} {n} i have seen in years .", "what a {a} {n} .",
+                    "i found the {n} {a} .", "the {n} was really {a} ."])
+    return t.format(n=rng.choice(nouns), a=adj, w="best" if y else "worst"), y
+sent_train = [sent_example() for _ in range(600)]
+sent_tok = Tok([t for t, _ in sent_train] + ["This film was fantastic!", "Worst movie I have seen in years."])
 
-tok = AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
-model = AutoModelForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased-finetuned-sst-2-english"
-)
+class SeqCls(nn.Module):
+    def __init__(self, V, n=2):
+        super().__init__()
+        self.enc, self.head = Encoder(V), nn.Linear(48, n)
+    def forward(self, input_ids, attention_mask):
+        return self.head(self.enc(input_ids, attention_mask)[:, 0])     # [CLS] representation
+def sent_batch():
+    b = rng.sample(sent_train, 32)
+    return sent_tok([t for t, _ in b]), torch.tensor([y for _, y in b])
+def sent_loss(m, x, y):
+    return F.cross_entropy(m(x["input_ids"], x["attention_mask"]), y)
 
-texts = ["This film was fantastic!", "Worst movie I've seen in years."]
-inputs = tok(texts, padding=True, truncation=True, return_tensors="pt")
-print("input_ids shape:", inputs["input_ids"].shape)
+model = SeqCls(len(sent_tok.itos))
+print("final training loss:", round(train(model, sent_loss, sent_batch, 200), 4))
+
+texts = ["This film was fantastic!", "Worst movie I have seen in years."]
+inputs = sent_tok(texts, padding=True)
+print("input_ids shape:", tuple(inputs["input_ids"].shape))
 
 with torch.no_grad():
-    logits = model(**inputs).logits
+    logits = model(inputs["input_ids"], inputs["attention_mask"])
 
 probs = torch.softmax(logits, dim=-1)
 labels = ["NEGATIVE", "POSITIVE"]
@@ -91,136 +332,184 @@ for text, prob in zip(texts, probs):
 ```
 
 ```output
-input_ids shape: torch.Size([2, 11])
-POSITIVE (0.999)  This film was fantastic!
-NEGATIVE (0.998)  Worst movie I've seen in years.
+final training loss: 0.0
+input_ids shape: (2, 10)
+POSITIVE (1.000)  This film was fantastic!
+NEGATIVE (1.000)  Worst movie I have seen in years.
 ```
 
-## Moving to GPU and using float16
+## Device and numeric precision
+
+On a GPU you would move the model with `.to("cuda")` and often halve it with `.half()` for roughly 2x memory savings. This environment is CPU-only, so we use `bfloat16`, the other common 16-bit format, to show the same effect: half the bytes per parameter and slightly perturbed outputs.
 
 ```python
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device).half()   # half() → float16 for ~2× memory reduction
+n_params = sum(p.numel() for p in model.parameters())
+bytes32 = sum(p.numel() * p.element_size() for p in model.parameters())
 
-inputs = {k: v.to(device) for k, v in inputs.items()}
-
+import copy
+model16 = copy.deepcopy(model).to(device).to(torch.bfloat16)
+bytes16 = sum(p.numel() * p.element_size() for p in model16.parameters())
 with torch.no_grad():
-    logits = model(**inputs).logits
+    logits16 = model16(inputs["input_ids"].to(device), inputs["attention_mask"].to(device)).float()
 
-print("Device:", next(model.parameters()).device)
-print("Dtype: ", next(model.parameters()).dtype)
+print("Device:", next(model16.parameters()).device)
+print("Dtype: ", next(model16.parameters()).dtype)
+print(f"parameters: {n_params}, float32 bytes: {bytes32}, bfloat16 bytes: {bytes16}")
+print("max |logit difference|:", round((logits16 - logits).abs().max().item(), 3))
 ```
 
 ```output
-Device: cuda:0
-Dtype:  torch.float16
+Device: cpu
+Dtype:  torch.bfloat16
+parameters: 61586, float32 bytes: 246344, bfloat16 bytes: 123172
+max |logit difference|: 0.044
 ```
 
-Always wrap inference in `torch.no_grad()` — it disables the gradient tape and cuts memory use.
+Always wrap inference in `torch.no_grad()` — it disables the gradient tape and cuts memory use. The logits differ by a small amount, rarely enough to change the predicted label, which is why reduced precision is the default for serving.
 
 ## Batched inference
 
-Sending one text at a time is slow. Pass a list; the tokenizer pads to the longest sequence in
-the batch.
+Sending one text at a time is slow. Pass a list; the tokenizer pads to the longest sequence in the batch and the model runs one forward pass per batch. We count forward passes (a deterministic proxy for speed) instead of measuring wall-clock time.
 
 ```python
-pipe = pipeline(
-    "text-classification",
-    model="distilbert-base-uncased-finetuned-sst-2-english",
-    device=0,          # GPU index; -1 forces CPU
-    batch_size=32,
-)
+def sent_post(enc, logits, texts):
+    p = logits.softmax(-1)
+    return [{"label": labels[int(r.argmax())], "score": round(float(r.max()), 3)} for r in p]
 
-sentences = [f"Sentence number {i} is {'great' if i % 2 == 0 else 'terrible'}."
-             for i in range(100)]
+pipe_1 = Pipeline("text-classification", model, sent_tok, sent_post, batch_size=1)
+pipe_32 = Pipeline("text-classification", model, sent_tok, sent_post, batch_size=32)
 
-results = pipe(sentences)
-pos = sum(1 for r in results if r["label"] == "POSITIVE")
+sentences = [f"this film was {'great' if i % 2 == 0 else 'terrible'} !" for i in range(100)]
+res_1, res_32 = pipe_1(sentences), pipe_32(sentences)
+pos = sum(1 for r in res_32 if r["label"] == "POSITIVE")
 print(f"Positive: {pos}/100")
+print("forward passes, batch_size=1: ", pipe_1.n_forward)
+print("forward passes, batch_size=32:", pipe_32.n_forward)
+print("identical predictions:", [r["label"] for r in res_1] == [r["label"] for r in res_32])
 ```
 
 ```output
 Positive: 50/100
+forward passes, batch_size=1:  100
+forward passes, batch_size=32: 4
+identical predictions: True
 ```
+
+Batching changes the cost, not the answer, as long as padding is masked correctly. Real throughput gains come from running each batch as one large matrix multiplication on parallel hardware.
 
 ## Reading attention masks
 
-Padding tokens should not influence attention. The tokenizer produces an `attention_mask`
-tensor of 1s (real tokens) and 0s (padding). Models use it automatically when you pass
-`**inputs`.
+Padding tokens should not influence attention. The tokenizer produces an `attention_mask` tensor of 1s (real tokens) and 0s (padding). Models use it automatically when you pass the whole encoding.
 
 ```python
-sample = tok(["Short.", "A slightly longer sentence here."],
-             padding=True, return_tensors="pt")
+sample = sent_tok(["Great film.", "What a slightly longer sentence here."], padding=True)
 print("input_ids:\n", sample["input_ids"])
 print("attention_mask:\n", sample["attention_mask"])
+
+# Padding must not leak: the first sentence alone vs padded inside the batch
+alone = sent_tok(["Great film."])
+with torch.no_grad():
+    h_alone = model.enc(alone["input_ids"], alone["attention_mask"])[0]
+    h_batch = model.enc(sample["input_ids"], sample["attention_mask"])[0][:alone["input_ids"].shape[1]]
+print("same hidden states with and without padding:", torch.allclose(h_alone, h_batch, atol=1e-5))
 ```
 
 ```output
 input_ids:
- tensor([[  101,  2460,  1012,   102,     0,     0,     0,     0],
-         [  101,  1037,  3622,  2936,  6251,  2182,  1012,   102]])
+ tensor([[ 2, 18, 16,  6,  3,  0,  0,  0,  0],
+        [ 2, 35,  7,  1,  1,  1,  1,  6,  3]])
 attention_mask:
- tensor([[1, 1, 1, 1, 0, 0, 0, 0],
-         [1, 1, 1, 1, 1, 1, 1, 1]])
+ tensor([[1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [1, 1, 1, 1, 1, 1, 1, 1, 1]])
+same hidden states with and without padding: True
 ```
+
+Note that unknown words map to the `[UNK]` id (1) in our word-level vocabulary; a subword tokenizer (ch. 2) avoids that.
 
 ## Model cards and the Hub
 
-Every model page at `huggingface.co/model-name` has a model card: intended use, training
-data, evaluation metrics, and biases. Read it before deploying. Licensing varies — some models
-are CC-BY-NC-SA or gated (require agreement before download).
+Every model page at `huggingface.co/model-name` has a model card: intended use, training data, evaluation metrics, and biases. Read it before deploying. Licensing varies — some models are CC-BY-NC-SA or gated (require agreement before download).
 
 ## Try it Yourself
 
-```python
-from transformers import pipeline
+Fill-mask pipeline: we pretrain a masked language model on a few facts and ask it to complete a sentence.
 
-fill = pipeline("fill-mask", model="bert-base-uncased")
+```python
+capitals = [("france", "paris"), ("germany", "berlin"), ("italy", "rome"),
+            ("spain", "madrid"), ("japan", "tokyo"), ("england", "london")]
+facts = [f"the capital of {c} is {k} ." for c, k in capitals]
+mlm_tok = Tok(facts)
+
+class MLM(nn.Module):
+    def __init__(self, V):
+        super().__init__()
+        self.enc, self.head = Encoder(V), nn.Linear(48, V)
+    def forward(self, input_ids, attention_mask):
+        return self.head(self.enc(input_ids, attention_mask))
+
+def mlm_batch():
+    x = mlm_tok([rng.choice(facts) for _ in range(32)])
+    ids = x["input_ids"]
+    m = (torch.rand(ids.shape) < 0.2) & (ids > 4)
+    m[:, 5] = m[:, 5] | (torch.rand(32) < 0.5)           # position 5 is the city in this template
+    return x, ids, m
+def mlm_loss(mdl, x, ids, m):
+    inp = ids.clone(); inp[m] = 4                          # id 4 is [MASK]
+    return F.cross_entropy(mdl(inp, x["attention_mask"])[m], ids[m])
+
+mlm = MLM(len(mlm_tok.itos))
+train(mlm, mlm_loss, mlm_batch, 300)
+
+def fill_post(enc, logits, texts, top_k=5):
+    out = []
+    for k in range(len(texts)):
+        pos = enc["input_ids"][k].tolist().index(4)
+        p = logits[k, pos].softmax(-1)
+        top = p.topk(top_k)
+        out.append([{"token_str": mlm_tok.itos[i], "score": float(v)} for v, i in zip(top.values, top.indices)])
+    return out
+
+fill = Pipeline("fill-mask", mlm, mlm_tok, fill_post)
 results = fill("The capital of France is [MASK].")
-for r in results[:5]:
+for r in results:
     print(f"{r['token_str']:15s} {r['score']:.4f}")
 ```
 
 ```output
-paris           0.9853
-france          0.0031
-lyon            0.0018
-berlin          0.0012
-marseille       0.0008
+paris           0.9952
+rome            0.0017
+london          0.0014
+japan           0.0004
+the             0.0004
 ```
+
+Change the country to "Japan" or "Spain" and watch the prediction follow. Then try a country that is not in the training facts: a word-level vocabulary has no id for it (`[UNK]`), one reason real systems use subword tokenizers.
 
 ## Exercise
 
-Load a summarization pipeline (`facebook/bart-large-cnn`) and summarize a paragraph of your
-choice. Then load the model and tokenizer directly, run a forward pass, and print the shape
-of the encoder's last hidden state.
+Build a `Pipeline` for the sentiment model with `batch_size=4` that returns label and score for a list of three reviews, then run a forward pass through the encoder alone and print the shape of its last hidden state.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-from transformers import pipeline, AutoTokenizer, AutoModel
-import torch
+pipe = Pipeline("text-classification", model, sent_tok, sent_post, batch_size=4)
+reviews = ["What a brilliant film !", "the plot was really boring .", "best story i have seen in years ."]
+print(pipe(reviews))
+print("forward passes:", pipe.n_forward)
 
-# Part 1: pipeline
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn", max_length=60)
-text = (
-    "Transformers have revolutionised natural language processing. "
-    "Models like BERT and GPT use self-attention to model long-range "
-    "dependencies in text, achieving state-of-the-art results on many "
-    "benchmarks. They have since expanded to vision, audio, and multimodal tasks."
-)
-print(summarizer(text)[0]["summary_text"])
-
-# Part 2: direct forward pass
-tok = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModel.from_pretrained("bert-base-uncased")
-inputs = tok(text, return_tensors="pt", truncation=True)
+enc = sent_tok(reviews)
 with torch.no_grad():
-    out = model(**inputs)
-print("last_hidden_state shape:", out.last_hidden_state.shape)
+    hidden = model.enc(enc["input_ids"], enc["attention_mask"])
+print("last_hidden_state shape:", tuple(hidden.shape))
 ```
 
-`last_hidden_state` has shape `(batch, seq_len, hidden_size)` — one vector per token.
+```output
+[{'label': 'POSITIVE', 'score': 1.0}, {'label': 'NEGATIVE', 'score': 1.0}, {'label': 'POSITIVE', 'score': 1.0}]
+forward passes: 1
+last_hidden_state shape: (3, 10, 48)
+```
+
+`last_hidden_state` has shape `(batch, seq_len, hidden_size)` — one vector per token, with `seq_len` set by the longest review in the batch (including `[CLS]` and `[SEP]`).
 </details>
