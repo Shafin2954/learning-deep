@@ -17,29 +17,92 @@ a larger corpus and no next-sentence-prediction, outperforming mBERT on most ben
 **LaBSE** (Language-Agnostic BERT Sentence Encoder) is fine-tuned specifically for sentence
 similarity across 109 languages — the right choice for cross-lingual retrieval.
 
+None of these checkpoints can be downloaded in this course environment, so we reproduce the key idea on a toy scale: a small transformer sentence encoder trained with a **translation-pair contrastive loss** (the LaBSE recipe). The toy language has 16 concepts with an English, a Bengali and a French word each, and sentences are three concepts long. The three languages share no tokens, so any alignment the model finds comes only from the parallel data.
+
 ```python
-from sentence_transformers import SentenceTransformer
-import numpy as np
+import random, re, unicodedata, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+from collections import Counter
+torch.set_num_threads(1)
+torch.manual_seed(0)
+rng = random.Random(0)
 
-model = SentenceTransformer("LaBSE")
+LEX = [("dog", "কুকুর", "chien"), ("cat", "বিড়াল", "chat"), ("water", "জল", "eau"), ("book", "বই", "livre"),
+       ("house", "বাড়ি", "maison"), ("sun", "সূর্য", "soleil"), ("river", "নদী", "rivière"), ("school", "স্কুল", "école"),
+       ("teacher", "শিক্ষক", "professeur"), ("food", "খাবার", "nourriture"), ("big", "বড়", "grand"),
+       ("small", "ছোট", "petit"), ("red", "লাল", "rouge"), ("eats", "খায়", "mange"), ("sees", "দেখে", "voit"),
+       ("reads", "পড়ে", "lit")]
+LANGS = {"en": 0, "bn": 1, "fr": 2}
+render = lambda concepts, lang: " ".join(LEX[c][LANGS[lang]] for c in concepts)
+vocab = ["[PAD]", "[CLS]", "[UNK]"] + sorted({w for row in LEX for w in row})
+stoi = {w: i for i, w in enumerate(vocab)}
 
-en = "The quick brown fox jumps over the lazy dog."
-bn = "দ্রুত বাদামী শিয়াল অলস কুকুরের উপর দিয়ে লাফ দেয়।"   # same sentence in Bengali
-fr = "Le renard brun rapide saute par-dessus le chien paresseux."
+def encode(texts):
+    rows = [[1] + [stoi.get(w, 2) for w in t.split()] for t in texts]
+    L = max(map(len, rows))
+    ids = torch.tensor([r + [0] * (L - len(r)) for r in rows])
+    return ids, (ids != 0).long()
 
-embs = model.encode([en, bn, fr], normalize_embeddings=True)
+class SentenceEncoder(nn.Module):
+    def __init__(self, V, d=48):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(V, d), nn.Embedding(16, d)
+        layer = nn.TransformerEncoderLayer(d, 4, 4 * d, dropout=0.0, batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, 2, enable_nested_tensor=False)
+    def forward(self, texts):
+        ids, mask = encode(texts)
+        h = self.enc(self.tok(ids) + self.pos(torch.arange(ids.shape[1])), src_key_padding_mask=(mask == 0))
+        m = mask.unsqueeze(-1).float()
+        return F.normalize((h * m).sum(1) / m.sum(1), dim=-1)
+
+model = SentenceEncoder(len(vocab))
+opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+for step in range(200):
+    batch = [tuple(rng.sample(range(16), 3)) for _ in range(32)]
+    la, lb = rng.sample(list(LANGS), 2)                          # a random language pair each step
+    A, B = model([render(c, la) for c in batch]), model([render(c, lb) for c in batch])
+    S, y = A @ B.T / 0.1, torch.arange(len(batch))              # translations are positives, the rest negatives
+    loss = (F.cross_entropy(S, y) + F.cross_entropy(S.T, y)) / 2
+    opt.zero_grad(); loss.backward(); opt.step()
+model.eval()
+
+c = (0, 1, 2)                                                    # "dog cat water"
+en, bn, fr = render(c, "en"), render(c, "bn"), render(c, "fr")
+other = render((3, 4, 5), "fr")                                  # a different meaning, in French
+print(en, "|", bn, "|", fr)
+with torch.no_grad():
+    embs = model([en, bn, fr, other])
 print(f"EN-BN similarity: {embs[0] @ embs[1]:.4f}")
 print(f"EN-FR similarity: {embs[0] @ embs[2]:.4f}")
 print(f"BN-FR similarity: {embs[1] @ embs[2]:.4f}")
+print(f"EN-other (different meaning, French): {embs[0] @ embs[3]:.4f}")
 ```
 
 ```output
-EN-BN similarity: 0.9312
-EN-FR similarity: 0.9541
-EN-FR similarity: 0.9021
+dog cat water | কুকুর বিড়াল জল | chien chat eau
+EN-BN similarity: 0.9653
+EN-FR similarity: 0.9708
+BN-FR similarity: 0.9679
+EN-other (different meaning, French): -0.3233
 ```
 
-All three are near 0.9 — the model correctly maps the same meaning across scripts.
+The same meaning scores near 1 across all three languages, while a different meaning scores far lower: the model maps meaning across scripts. A fair test is cross-lingual retrieval on fresh sentences, where each English sentence must find its own Bengali translation among 100 candidates:
+
+```python
+tr = [tuple(rng.sample(range(16), 3)) for _ in range(100)]
+with torch.no_grad():
+    E_en = model([render(c, "en") for c in tr])
+    E_bn = model([render(c, "bn") for c in tr])
+    E_fr = model([render(c, "fr") for c in tr])
+print("EN -> BN retrieval accuracy:", ((E_en @ E_bn.T).argmax(1) == torch.arange(100)).float().mean().item())
+print("EN -> FR retrieval accuracy:", ((E_en @ E_fr.T).argmax(1) == torch.arange(100)).float().mean().item())
+```
+
+```output
+EN -> BN retrieval accuracy: 0.9900000095367432
+EN -> FR retrieval accuracy: 0.9900000095367432
+```
+
+With only 16 concepts, many of these triples were also seen in training, so treat this as a sanity check, not a generalisation benchmark.
 
 ## The Bengali Script
 
@@ -74,31 +137,75 @@ atomic units.
 ## How BPE Handles Bengali
 
 GPT-2-style byte-level BPE treats every byte as a potential merge unit. Bengali characters
-use 3 bytes each in UTF-8. A 5-letter Bengali word like বাংলা uses 15 bytes and may be
-tokenised into 5–10 tokens — 3–7× the token count of the same word in English.
+use 3 bytes each in UTF-8, so a Bengali word costs three times as many bytes as characters, and a tokeniser that never learned Bengali merges can only split it into byte pieces. We cannot load GPT-2, mBERT or XLM-R here, so we train two small character-level BPE tokenizers with byte fallback (as in ch. 2): one on English only, one on a small English + Bengali + Arabic corpus. The corpora are tiny and the Bengali test words appear in the multilingual training text, so the numbers show the *direction* of the effect (coverage), not real-world magnitudes.
 
 ```python
-from transformers import AutoTokenizer
+def get_vocab(words):
+    c = Counter()
+    for w in words:
+        c[" ".join(list(w)) + " </w>"] += 1
+    return dict(c)
 
-gpt2_tok   = AutoTokenizer.from_pretrained("gpt2")
-bert_tok    = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
-xlmr_tok    = AutoTokenizer.from_pretrained("xlm-roberta-base")
+def pair_counts(v):
+    c = Counter()
+    for seq, f in v.items():
+        sy = seq.split()
+        for a, b in zip(sy, sy[1:]):
+            c[(a, b)] += f
+    return c
 
+def merge(pair, v):
+    pat = re.compile(r"(?<!\S)" + re.escape(" ".join(pair)) + r"(?!\S)")
+    return {pat.sub("".join(pair), k): f for k, f in v.items()}
+
+def train_bpe(words, n):
+    v, merges = get_vocab(words), []
+    for _ in range(n):
+        pc = pair_counts(v)
+        if not pc:
+            break
+        best = max(pc, key=lambda p: (pc[p], p))
+        merges.append(best); v = merge(best, v)
+    return merges
+
+def bpe_encode(word, merges, chars):
+    syms = []
+    for ch in word:
+        syms += [ch] if ch in chars else [f"<0x{b:02X}>" for b in ch.encode("utf-8")]   # byte fallback
+    syms.append("</w>")
+    for a, b in merges:
+        i = 0
+        while i < len(syms) - 1:
+            if syms[i] == a and syms[i + 1] == b:
+                syms[i:i + 2] = [a + b]
+            else:
+                i += 1
+    return syms
+
+en_train = ("the machine learning model was trained on large datasets . the model learns from data and the data is large . "
+            "machine translation helps people read the news").split() * 2
+bn_train = ("মেশিন লার্নিং মডেলটি বড় ডেটাসেটে প্রশিক্ষিত হয়েছিল । মডেলটি ডেটা থেকে শেখে এবং ডেটা বড় । বাংলাদেশ একটি সুন্দর দেশ । "
+            "বাংলাদেশের রাজধানী ঢাকা । প্রযুক্তি ও বিজ্ঞান সভ্যতাকে এগিয়ে নিয়েছে").split() * 2
+ar_train = "تم تدريب نموذج التعلم الآلي على مجموعات بيانات كبيرة . يتعلم النموذج من البيانات . اللغة العربية جميلة".split() * 2
+
+tokenizers = {
+    "English-only BPE": (train_bpe(en_train, 60), set("".join(en_train))),
+    "Multilingual BPE": (train_bpe(en_train + bn_train + ar_train, 200), set("".join(en_train + bn_train + ar_train))),
+}
 word = "বাংলাদেশ"   # Bangladesh
-
-for name, tok in [("GPT-2", gpt2_tok), ("mBERT", bert_tok), ("XLM-R", xlmr_tok)]:
-    tokens = tok.tokenize(word)
-    print(f"{name:8s}: {len(tokens):2d} tokens  {tokens}")
+print(f"{word}: {len(word)} characters, {len(word.encode('utf-8'))} UTF-8 bytes")
+for name, (merges, chars) in tokenizers.items():
+    tokens = bpe_encode(word, merges, chars)
+    print(f"{name:17s}: {len(tokens):2d} tokens  {tokens[:6]}{' ...' if len(tokens) > 6 else ''}")
 ```
 
 ```output
-GPT-2   :  9 tokens  ['à', '¦', '¬', 'à', '¦', '¾', 'à', '¦', '82']
-mBERT   :  3 tokens  ['ব', '##াংলাদেশ', '[UNK]']
-XLM-R   :  2 tokens  ['▁বাংলাদেশ', '']
+বাংলাদেশ: 8 characters, 24 UTF-8 bytes
+English-only BPE : 25 tokens  ['<0xE0>', '<0xA6>', '<0xAC>', '<0xE0>', '<0xA6>', '<0xBE>'] ...
+Multilingual BPE :  1 tokens  ['বাংলাদেশ</w>']
 ```
 
-XLM-R has seen Bengali during training and merges more aggressively. GPT-2 falls back to
-raw bytes, producing meaningless fragments.
+The multilingual tokenizer has learned Bengali merges, so "বাংলাদেশ" is a single token (1 vs 25); the English-only tokenizer falls back to raw bytes. Real XLM-R or mBERT vocabularies sit between these extremes, while GPT-2's byte-level BPE needs several tokens per Bengali character.
 
 ## Fertility: Tokens per Word
 
@@ -109,53 +216,64 @@ vocabulary covers a language:
 sentences = {
     "English": "The machine learning model trained on large datasets.",
     "Bengali": "মেশিন লার্নিং মডেলটি বড় ডেটাসেটে প্রশিক্ষিত হয়েছিল।",
+    "Bengali (new combination)": "ঢাকা একটি বড় সুন্দর দেশ",
     "Arabic":  "تم تدريب نموذج التعلم الآلي على مجموعات بيانات كبيرة.",
 }
 
-for lang, sent in sentences.items():
-    words = sent.split()
-    tokens = xlmr_tok.tokenize(sent)
-    fertility = len(tokens) / len(words) if words else 0
-    print(f"{lang:10s}: {len(words):2d} words  {len(tokens):3d} tokens  fertility={fertility:.2f}")
+def n_tokens(sent, merges, chars):
+    return sum(len(bpe_encode(w, merges, chars)) for w in sent.split())
+
+for name, (merges, chars) in tokenizers.items():
+    print(name)
+    for lang, sent in sentences.items():
+        words = sent.split()
+        n = n_tokens(sent, merges, chars)
+        print(f"  {lang:26s}: {len(words):2d} words  {n:3d} tokens  fertility={n / len(words):.2f}")
 ```
 
 ```output
-English   :  9 words   10 tokens  fertility=1.11
-Bengali   :  7 words   22 tokens  fertility=3.14
-Arabic    :  9 words   19 tokens  fertility=2.11
+English-only BPE
+  English                   :  8 words   17 tokens  fertility=2.12
+  Bengali                   :  7 words  148 tokens  fertility=21.14
+  Bengali (new combination) :  5 words   65 tokens  fertility=13.00
+  Arabic                    :  9 words   97 tokens  fertility=10.78
+Multilingual BPE
+  English                   :  8 words   21 tokens  fertility=2.62
+  Bengali                   :  7 words    9 tokens  fertility=1.29
+  Bengali (new combination) :  5 words    5 tokens  fertility=1.00
+  Arabic                    :  9 words   11 tokens  fertility=1.22
 ```
 
-Bengali has 3× the fertility of English in XLM-R. This means Bengali inputs use more context
-window budget and Bengali generation is slower.
+With the English-only tokenizer, Bengali and Arabic fall back to bytes and pay a fertility of 13-21 (Arabic 10.8) against 2.1 for English. The multilingual tokenizer brings them down to about 1-1.3 tokens per word, because these words (or their pieces) were in its training text; its English fertility rises slightly (2.12 to 2.62) because the merge budget is now shared across three languages. The "new combination" Bengali sentence is cheap (1.0) because each of its words was seen individually. In real models the Bengali penalty is milder (about 3x English for XLM-R) yet still means Bengali inputs use more of the context window and Bengali generation is slower.
 
 ## Unicode Normalisation Pitfalls
 
-The same visual character can have multiple Unicode representations:
+The same visual text can have multiple Unicode representations. Bengali has real examples: the vowel sign ো (U+09CB) can be written as one codepoint or as the two codepoints ে (U+09C7) + া (U+09BE) that it is made of:
 
 ```python
-import unicodedata
+composed   = "কো"                 # ক + ো (U+09CB)
+decomposed = "\u0995\u09c7\u09be"   # ক + ে + া
+print(f"composed:   len={len(composed)},   codepoints={[hex(ord(c)) for c in composed]}")
+print(f"decomposed: len={len(decomposed)}, codepoints={[hex(ord(c)) for c in decomposed]}")
+print("equal as strings?        ", composed == decomposed)
+nfc = unicodedata.normalize("NFC", decomposed)
+print("equal after NFC?         ", composed == nfc)
 
-# Two ways to write বা (ba + aa matra)
-composed   = "বা"    # NFC: single precomposed sequence
-decomposed = "বা"    # already in this form for Bengali (NFC == NFD here)
-
-# More dangerous: NFC vs NFD with combining marks in some scripts
-nfd_a_acute = "á"        # 'a' + combining acute accent
+# The same idea in Latin script: a + combining acute accent
+nfd_a_acute = "a\u0301"
 nfc_a_acute = unicodedata.normalize("NFC", nfd_a_acute)
-
 print(f"NFD len={len(nfd_a_acute)}, NFC len={len(nfc_a_acute)}")
-print(f"NFC == NFD? {nfd_a_acute == nfc_a_acute}")
-print(f"After normalise: '{nfc_a_acute}'  len={len(nfc_a_acute)}")
 ```
 
 ```output
+composed:   len=2,   codepoints=['0x995', '0x9cb']
+decomposed: len=3, codepoints=['0x995', '0x9c7', '0x9be']
+equal as strings?         False
+equal after NFC?          True
 NFD len=2, NFC len=1
-NFC == NFD? False
-After normalise: 'á'  len=1
 ```
 
-Always normalise to NFC before tokenising. `unicodedata.normalize("NFC", text)` is a
-one-line fix that prevents silent mismatches.
+Two strings that render identically compare as unequal, so a tokenizer, dictionary lookup or de-duplication step would treat them differently. Always normalise to NFC before tokenising. `unicodedata.normalize("NFC", text)` is a one-line fix that prevents silent mismatches.
 
 ### Zero-Width Characters
 
@@ -164,7 +282,7 @@ They are common in copy-pasted Bengali text and can cause tokeniser mismatches:
 
 ```python
 clean  = "আমি"
-zwj    = "আ‍মি"    # zero-width joiner inserted
+zwj    = "আ\u200dমি"    # zero-width joiner inserted
 
 print(f"Clean:  len={len(clean)}, bytes={clean.encode('utf-8')}")
 print(f"ZWJ:    len={len(zwj)},   bytes={zwj.encode('utf-8')}")
@@ -173,71 +291,65 @@ print(f"Equal?  {clean == zwj}")
 
 ```output
 Clean:  len=3, bytes=b'\xe0\xa6\x86\xe0\xa6\xae\xe0\xa6\xbf'
-ZWJ:    len=4, bytes=b'\xe0\xa6\x86\xe2\x80\x8d\xe0\xa6\xae\xe0\xa6\xbf'
+ZWJ:    len=4,   bytes=b'\xe0\xa6\x86\xe2\x80\x8d\xe0\xa6\xae\xe0\xa6\xbf'
 Equal?  False
 ```
 
-Strip zero-width characters before tokenising in production: `text.replace("‍", "").replace("‌", "")`.
+Strip zero-width characters before tokenising in production: `text.replace("\u200d", "").replace("\u200c", "")`. (Careful: in some scripts, such as Persian, the non-joiner is meaningful; check your language.)
 
 ## Tokeniser Robustness Testing
 
 Before deploying a multilingual pipeline, run these checks on your target language:
 
 ```python
-def tokeniser_robustness_check(tok, word, name=""):
-    nfc  = unicodedata.normalize("NFC", word)
-    nfd  = unicodedata.normalize("NFD", word)
-    zwj  = word + "‍"
+def tokeniser_robustness_check(merges, chars, word, name=""):
     results = {}
-    for label, variant in [("NFC", nfc), ("NFD", nfd), ("ZWJ", zwj)]:
-        tokens = tok.tokenize(variant)
-        results[label] = len(tokens)
-    consistent = len(set([results["NFC"], results["NFD"]])) == 1
+    for label, variant in [("NFC", unicodedata.normalize("NFC", word)),
+                           ("NFD", unicodedata.normalize("NFD", word)),
+                           ("ZWJ", word + "\u200d")]:
+        results[label] = len(bpe_encode(variant, merges, chars))
+    consistent = results["NFC"] == results["NFD"]
     print(f"{name}: NFC={results['NFC']} NFD={results['NFD']} ZWJ={results['ZWJ']} consistent={consistent}")
 
-tokeniser_robustness_check(xlmr_tok, "বাংলাদেশ", "XLM-R")
-tokeniser_robustness_check(bert_tok,  "বাংলাদেশ", "mBERT")
+merges, chars = tokenizers["Multilingual BPE"]
+tokeniser_robustness_check(merges, chars, "বাংলাদেশ", "no matra-composition  ")
+tokeniser_robustness_check(merges, chars, "মোবাইল", "contains ো (U+09CB)")
 ```
 
 ```output
-XLM-R: NFC=2 NFD=2 ZWJ=3 consistent=True
-mBERT: NFC=3 NFD=3 ZWJ=4 consistent=True
+no matra-composition  : NFC=1 NFD=1 ZWJ=5 consistent=True
+contains ো (U+09CB): NFC=11 NFD=10 ZWJ=14 consistent=False
 ```
 
-NFC and NFD give the same count (good). ZWJ adds an extra token (expected — strip it first).
+For words with no decomposable characters NFC and NFD agree; for a word containing ো the counts differ (11 tokens vs 10 here), and a trailing ZWJ changes the count again (3 extra byte tokens for the joiner). This is why a pipeline should strip zero-width characters and normalise to NFC *before* tokenising.
 
 ## Try it Yourself
 
 ```python
-from transformers import AutoTokenizer
-import unicodedata
-
-xlmr_tok = AutoTokenizer.from_pretrained("xlm-roberta-base")
-
-# Tokenise several Bengali words and compare fertility
 words = ["বাংলাদেশ", "প্রযুক্তি", "শিক্ষা", "গণতন্ত্র", "সংস্কৃতি"]
-print("Word             | Tokens | IDs")
-print("-" * 50)
+print("Word             | EN-only | Multilingual")
+print("-" * 44)
 for w in words:
     w_nfc = unicodedata.normalize("NFC", w)
-    ids = xlmr_tok.encode(w_nfc, add_special_tokens=False)
-    toks = xlmr_tok.convert_ids_to_tokens(ids)
-    print(f"{w:16s} | {len(toks):6d} | {ids}")
+    counts = [len(bpe_encode(w_nfc, *tokenizers[name])) for name in ("English-only BPE", "Multilingual BPE")]
+    print(f"{w:16s} | {counts[0]:7d} | {counts[1]:12d}")
 ```
 
 ```output
-Word             | Tokens | IDs
---------------------------------------------------
-বাংলাদেশ         |      2 | [68843, 2]
-প্রযুক্তি        |      3 | [112834, 68843, 2]
-শিক্ষা           |      2 | [114234, 2]
-গণতন্ত্র         |      3 | [118234, 68843, 2]
-সংস্কৃতি         |      3 | [115234, 68843, 2]
+Word             | EN-only | Multilingual
+--------------------------------------------
+বাংলাদেশ         |      25 |            1
+প্রযুক্তি        |      28 |            1
+শিক্ষা           |      19 |            3
+গণতন্ত্র         |      25 |           10
+সংস্কৃতি         |      25 |           10
 ```
+
+Some of these words were in the multilingual training text and some were not ("শিক্ষা", "গণতন্ত্র", "সংস্কৃতি"). Compare the counts and see how coverage of the *training* data, not the script, drives token cost.
 
 ## Exercise
 
-Write a function that takes a Bengali sentence and a tokeniser, strips zero-width characters,
+Write a function that takes a Bengali sentence and a tokeniser (`merges, chars`), strips zero-width characters,
 normalises to NFC, tokenises, and returns the fertility (tokens per word). Test it on three
 sentences of different complexity and print which sentence has the highest fertility.
 
@@ -245,32 +357,34 @@ sentences of different complexity and print which sentence has the highest ferti
 <summary>Solution</summary>
 
 ```python
-import unicodedata
-from transformers import AutoTokenizer
-
-def bengali_fertility(sentence: str, tok) -> float:
-    # Clean
+def bengali_fertility(sentence: str, merges, chars) -> float:
     sentence = unicodedata.normalize("NFC", sentence)
-    sentence = sentence.replace("‍", "").replace("‌", "")
+    sentence = sentence.replace("\u200d", "").replace("\u200c", "")
     words = sentence.split()
-    tokens = tok.tokenize(sentence)
-    return len(tokens) / len(words) if words else 0.0
+    n = sum(len(bpe_encode(w, merges, chars)) for w in words)
+    return n / len(words) if words else 0.0
 
-xlmr_tok = AutoTokenizer.from_pretrained("xlm-roberta-base")
-
+merges, chars = tokenizers["Multilingual BPE"]
 sentences = [
     "আমি বাংলায় কথা বলি।",                         # simple
     "বাংলাদেশের রাজধানী ঢাকা।",                      # medium
     "প্রযুক্তি ও বিজ্ঞানের অগ্রগতি সভ্যতাকে এগিয়ে নিয়েছে।",  # complex
 ]
 
-for s in sentences:
-    f = bengali_fertility(s, xlmr_tok)
+scores = [bengali_fertility(s, merges, chars) for s in sentences]
+for s, f in zip(sentences, scores):
     print(f"Fertility={f:.2f}: {s}")
+print("Highest fertility:", sentences[scores.index(max(scores))])
 ```
 
-Higher fertility in complex scientific vocabulary reflects the tokeniser's lower coverage of
-technical Bengali terms — a key consideration when allocating context budget.
+```output
+Fertility=4.00: আমি বাংলায় কথা বলি।
+Fertility=2.00: বাংলাদেশের রাজধানী ঢাকা।
+Fertility=3.00: প্রযুক্তি ও বিজ্ঞানের অগ্রগতি সভ্যতাকে এগিয়ে নিয়েছে।
+Highest fertility: আমি বাংলায় কথা বলি।
+```
+
+The "simple" sentence has the highest fertility, because its words never appeared in the tokeniser's small training corpus, while the longer technical sentence contains words it did see. Fertility measures vocabulary coverage, not linguistic difficulty — a key consideration when allocating context budget.
 </details>
 
 ## Under the Trench
