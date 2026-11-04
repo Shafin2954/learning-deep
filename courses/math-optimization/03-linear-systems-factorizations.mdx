@@ -111,8 +111,7 @@ for piv in (False, True):
     print(f"pivot={piv!s:5}: x = {lu_solve_mine(p_, L_, U_, b2)} | U = {U_.ravel()} | max|L| = {np.abs(L_).max():.0e}")
 growth = lambda A, U: np.abs(U).max() / np.abs(A).max()
 def wilkinson(n):                                              # the textbook worst case for partial pivoting
-    W = np.eye(n) - np.tril(np.ones((n, n)), -1); W[:, -1] = 1.0
-    return W
+    W = np.eye(n) - np.tril(np.ones((n, n)), -1); W[:, -1] = 1.0; return W
 print(f"\n{'matrix':22} {'growth no-pivot':>15} {'growth pivot':>13} {'rel err pivot':>14} {'rel err np.solve':>16}")
 for name, M in [("Gaussian n=60", rng.standard_normal((60, 60))),
                 ("Gaussian n=400", rng.standard_normal((400, 400))),
@@ -179,16 +178,14 @@ forward_sub vs solve_triangular: 1.6e-12
 flops: factor 17,954,950 | two triangular solves 180,000 | ratio 100x
 ```
 
-Agreement to about $10^{-12}$ is rounding, not a bug: this matrix has $\kappa \approx 3000$, and differences of order
-$\kappa\varepsilon$ are expected. The two substitutions are 100 times cheaper than the factorization, exactly
-$\tfrac23 n^3 / 2n^2 = n/3$.
+Agreement to $10^{-12}$ is rounding ($\kappa \approx 3000$ here, so $\kappa\varepsilon$ differences are expected). The
+substitutions are 100 times cheaper than the factorization, exactly $\tfrac23 n^3 / 2n^2 = n/3$.
 
 ## Factor once, solve many
 
 The $\tfrac23 n^3$ factorization does not depend on $\mathbf{b}$: pay it once, then each right-hand side costs $2n^2$.
-Multi-output regression shares one $X^\top X$, a GP predicts thousands of test points against one kernel matrix, and
-quasi-Newton codes reuse a factorized matrix for several steps. scipy exposes this as `lu_factor` / `lu_solve` (and
-`cho_factor` / `cho_solve`). It is also the real case against `np.linalg.inv`: forming $A^{-1}$ costs $2n^3$, three LUs'
+Multi-output regression shares one $X^\top X$; a GP predicts thousands of points against one kernel matrix. scipy
+exposes this as `lu_factor` / `lu_solve` (and `cho_factor` / `cho_solve`). It is also the real case against `np.linalg.inv`: forming $A^{-1}$ costs $2n^3$, three LUs'
 worth, and $A^{-1}\mathbf{b}$ is not backward stable, so its residual grows with the condition number $\kappa(A)$, the
 factor by which $A$ can amplify relative errors (ch. 14). Accuracy below is the backward error
 $\|MX - B\| / (\|M\|\,\|X\|)$, which sits at $\varepsilon_{\text{mach}}$ for a backward-stable method.
@@ -250,9 +247,8 @@ relative error after steps 0..4: 2.0e-04 3.9e-08 6.7e-12 2.4e-13 2.7e-13
 float64 np.linalg.solve: 5.0e-13
 ```
 
-The float32 solve alone gives about 4 digits ($1.5 \times 10^{-4}$, close to $\kappa\,\varepsilon_{32}$); each round adds
-about four more, and after three rounds the error matches a full float64 `solve`. LAPACK's `dsgesv` and mixed-precision
-GPU solvers do exactly this.
+The float32 solve alone gives about 4 digits ($2 \times 10^{-4}$, close to $\kappa\,\varepsilon_{32}$); each round adds
+about four more, and after three rounds the error matches float64 `solve`. LAPACK's `dsgesv` does exactly this.
 
 ## Cholesky: the factorization for symmetric positive definite matrices
 
@@ -283,8 +279,7 @@ def cholesky_mine(A):
     n = len(A); L = np.zeros((n, n)); flops = 0
     for j in range(n):
         d = A[j, j] - L[j, :j] @ L[j, :j];                              flops += 2 * j
-        if d <= 0:
-            raise np.linalg.LinAlgError(f"not positive definite: pivot {j} is {d:.2e}")
+        if d <= 0: raise np.linalg.LinAlgError(f"not positive definite: pivot {j} is {d:.2e}")
         L[j, j] = np.sqrt(d)
         L[j + 1:, j] = (A[j + 1:, j] - L[j + 1:, :j] @ L[j, :j]) / L[j, j];  flops += (n - j - 1) * (2 * j + 1)
     return L, flops
@@ -303,22 +298,21 @@ flops: counted 9,044,750 | n^3/3 = 9,000,000 | LU on same matrix 17,954,950
 log det: 2 sum log diag(L) = -163.584769 | slogdet = -163.584769
 ```
 
-Your factor matches LAPACK's to $10^{-16}$, the flop count is within 0.5% of $n^3/3$ and half of LU on the same matrix,
-and the log-determinant agrees with `slogdet` to all printed digits.
+Your factor matches LAPACK's to $10^{-16}$, the flops are within 0.5% of $n^3/3$ and half of LU, and the log-determinant
+matches `slogdet`.
 
 ### A positive-definiteness test that costs a third of an LU
 
 Because the recurrence stops at the first non-positive pivot, *attempting* a Cholesky is the standard PD test, cheaper
 than eigenvalues ($\tfrac43 n^3$ flops for symmetric eigenvalues alone) and what scipy, PyMC and GP libraries do inside.
-Below, matrices with known eigenvalues straddle zero, then a GP kernel (Bayesian ML ch. 12) that is PD in exact
-arithmetic but numerically singular, because neighbouring grid points are nearly identical.
+Below: known eigenvalues straddling zero, then a GP kernel (Bayesian ML ch. 12), PD in exact arithmetic but
+numerically singular because neighbouring grid points are nearly identical.
 
 ```python
 Q, _ = np.linalg.qr(rng.standard_normal((6, 6)))
 print(f"{'smallest eigenvalue':>20}  cholesky_mine")
 for lam_min in (1e-2, 1e-12, -1e-12, -1e-2):
-    A_t = Q @ np.diag([5.0, 3.0, 2.0, 1.0, 0.5, lam_min]) @ Q.T
-    A_t = (A_t + A_t.T) / 2
+    A_t = Q @ np.diag([5.0, 3.0, 2.0, 1.0, 0.5, lam_min]) @ Q.T; A_t = (A_t + A_t.T) / 2
     try: cholesky_mine(A_t); msg = "succeeds"
     except np.linalg.LinAlgError as e: msg = str(e)
     print(f"{lam_min:>20.0e}  {msg}")
@@ -342,10 +336,10 @@ RBF kernel, 200 points: eigvalsh min = -7.3e-15
 np.linalg.cholesky(K + jitter I): 0e+00 fails, 1e-12 ok, 1e-10 ok, 1e-08 ok, 1e-06 ok
 ```
 
-The verdict flips exactly where the smallest eigenvalue changes sign, even at $\pm 10^{-12}$, and the failing pivot is
-close to the negative eigenvalue. The kernel's smallest computed eigenvalue is $-7 \times 10^{-15}$, so Cholesky fails,
-and a jitter of $10^{-12}$ fixes it. That is why GP libraries add $10^{-10}$ to $10^{-6}$ to the diagonal by default,
-and why a noise term $\sigma_n^2 I$ removes the problem.
+The verdict flips exactly where the smallest eigenvalue changes sign, even at $\pm 10^{-12}$; only the pivot's sign
+means anything (its value is a ratio of minors, not the eigenvalue). The kernel's smallest computed eigenvalue is
+$-7 \times 10^{-15}$, so Cholesky fails and a jitter of $10^{-12}$ fixes it: hence the default $10^{-10}$ to $10^{-6}$
+jitter in GP libraries, and why a noise term $\sigma_n^2 I$ removes the problem.
 
 ## QR: orthogonal triangularization
 
@@ -377,15 +371,12 @@ def householder_qr(A):
     """A = QR. Returns the reflector vectors V, R (n x n), and the flop count."""
     R = np.array(A, dtype=float); m, n = R.shape; V = []; flops = 0
     for k in range(n):
-        x = R[k:, k]
-        v = x.copy(); v[0] += np.copysign(np.linalg.norm(x), x[0]); v /= np.linalg.norm(v)
-        R[k:, k:] -= 2.0 * np.outer(v, v @ R[k:, k:]);  flops += 4 * (m - k) * (n - k)
-        V.append(v)
+        v = R[k:, k].copy(); v[0] += np.copysign(np.linalg.norm(v), v[0]); v /= np.linalg.norm(v)
+        R[k:, k:] -= 2.0 * np.outer(v, v @ R[k:, k:]);  flops += 4 * (m - k) * (n - k); V.append(v)
     return V, np.triu(R[:n]), flops
 def apply_qt(V, b):                                     # Q^T b without ever forming Q
     y = np.array(b, dtype=float)
-    for k, v in enumerate(V):
-        y[k:] -= 2.0 * v * (v @ y[k:])
+    for k, v in enumerate(V): y[k:] -= 2.0 * v * (v @ y[k:])
     return y
 def form_q(V, m):                                       # thin Q, built by applying reflectors to I
     Qm = np.eye(m)[:, :len(V)]
@@ -427,8 +418,8 @@ max |A - QR| 5.1e-15 | |R| vs numpy 5.3e-15 | flops 78,680 vs 2mn^2 - 2n^3/3 = 7
    1e+11   3.6e+00   3.6e-06      2.8e-15       1.6e-15
 ```
 
-At $\kappa = 10^5$ classical Gram-Schmidt has lost about half its digits of orthogonality ($7 \times 10^{-7}$), modified
-about 4 ($8 \times 10^{-12}$), Householder none; at $10^8$ the classical $Q$ is not orthogonal at all. Householder stays at
+At $\kappa = 10^5$ classical Gram-Schmidt has lost about half its digits of orthogonality ($10^{-7}$), modified about 4
+($3 \times 10^{-12}$), Householder none; at $10^8$ the classical $Q$ is not orthogonal at all. Householder stays at
 $2 \times 10^{-15}$ across nine decades, like `np.linalg.qr` (LAPACK `geqrf`). The flop count is 5% over the formula
 because the sum keeps lower-order terms; signs of $R$'s rows may differ from numpy's, so the check compares $|R|$.
 
@@ -437,7 +428,7 @@ because the sum keeps lower-order terms; signs of $R$'s rows may differ from num
 When $A$ is tall ($m$ observations, $n < m$ features), $A\mathbf{x} = \mathbf{b}$ usually has no solution, and least
 squares picks $\mathbf{x}$ minimizing $\|A\mathbf{x} - \mathbf{b}\|_2$: linear regression, with $A\mathbf{x}$ the
 projection of $\mathbf{b}$ onto the column space (ch. 2). The three standard algorithms agree on well-conditioned data and
-differ by many digits on the ill-conditioned designs that polynomial or nearly collinear features produce.
+differ by many digits on the ill-conditioned designs from polynomial or collinear features.
 
 ### Normal equations, QR, and SVD
 
@@ -485,7 +476,7 @@ for kappa in (1e1, 1e3, 1e5, 1e7, 1e9):
    1e+09    9.9e+16      fails    2.4e-09   6.2e-10   5.7e-10
 ```
 
-The normal-equations error tracks $\kappa^2\varepsilon$: $8 \times 10^{-12}$ at $\kappa = 10^3$, $6 \times 10^{-3}$ at
+The normal-equations error tracks $\kappa^2\varepsilon$: $5 \times 10^{-11}$ at $\kappa = 10^3$, $6 \times 10^{-3}$ at
 $10^7$, and at $10^9$ the computed $A^\top A$ is not even PD, so Cholesky fails. QR, SVD and `lstsq` stay near
 $\kappa\varepsilon$, keeping 8 to 9 digits at $10^9$. The normal equations still earn their place: half the cost of QR
 when $m \gg n$, accumulable one row batch at a time, fine on standardized features with modest $\kappa$. But they are the
@@ -539,12 +530,12 @@ pinv + 5*null: x = [ 3.753 -2.251 -3.241 -0.755  3.005] | ||x|| = 6.265 | residu
 ridge max |x_ridge - x_pinv|: lambda=1e-01: 1.8e-03, lambda=1e-04: 1.8e-06, lambda=1e-08: 4.9e-07
 ```
 
-One singular value is exactly 0 and $\kappa(X^\top X) \approx 3 \times 10^{16}$: the normal equations are hopeless.
-`pinv` and `lstsq` return the same minimum-norm vector. Moving along the null direction leaves the residual unchanged to
-the last bit while the norm grows: the data cannot tell these vectors apart. What *is* identified is intercept plus level
-effect, $1.253 + 0.248 = 1.50$, $1.253 - 0.749 = 0.50$, $1.253 + 1.754 = 3.01$ (true 1.5, 0.5, 3.0), and the slope 3.0.
-Ridge approaches $A^{+}\mathbf{b}$ in proportion to $\lambda$ until $10^{-8}$, where the nearly singular normal equations
-add their own $10^{-6}$ error. The fixes: drop one dummy, add ridge, or use QR with column pivoting
+One singular value is exactly 0 and $\kappa(X^\top X) \approx 2 \times 10^{16}$: the normal equations are hopeless.
+`pinv` and `lstsq` agree. Moving along the null direction changes the residual only at rounding level while the norm
+grows: the data cannot tell these vectors apart. What *is* identified is intercept plus level effect,
+$1.253 + 0.249 = 1.50$, $1.253 - 0.741 = 0.51$, $1.253 + 1.745 = 3.00$ (true 1.5, 0.5, 3.0), and the slope 3.0. Ridge
+approaches $A^{+}\mathbf{b}$ in proportion to $\lambda$ until $10^{-8}$, where the nearly singular normal equations add
+their own error ($5 \times 10^{-7}$, not the expected $2 \times 10^{-10}$). The fixes: drop one dummy, add ridge, or use QR with column pivoting
 (`scipy.linalg.qr(A, pivoting=True)`), which moves the redundant column last so its near-zero $r_{nn}$ reveals the rank.
 
 ## When not to factor at all
@@ -559,8 +550,7 @@ $2\,\mathrm{nnz}$ flops (nnz = number of nonzeros). The test matrix is the 2-D g
 from scipy import sparse
 from scipy.sparse.linalg import cg
 for side in (30, 100):
-    N = side * side
-    T = sparse.diags([-1.0, 2.0, -1.0], [-1, 0, 1], shape=(side, side))
+    N = side * side; T = sparse.diags([-1.0, 2.0, -1.0], [-1, 0, 1], shape=(side, side))
     Lap = (sparse.kron(sparse.eye(side), T) + sparse.kron(T, sparse.eye(side))).tocsr()   # 2-D grid Laplacian
     bL = np.ones(N); its = []
     xL, info = cg(Lap, bL, rtol=1e-10, maxiter=5000, callback=lambda xk: its.append(1))
@@ -573,11 +563,10 @@ N=   900 nnz=  4380 | dense LU 2N^3/3 = 4.9e+08 flops | CG 62 iters x 2*nnz = 5.
 N= 10000 nnz= 49600 | dense LU 2N^3/3 = 6.7e+11 flops | CG 208 iters x 2*nnz = 2.1e+07 flops | rel resid 7e-11
 ```
 
-At $N = 10^4$ a dense LU would cost $6.7 \times 10^{11}$ flops and 800 MB of storage; CG needs 208 products, $2 \times 10^7$
-flops, about 30000 times fewer. Iterations grow from 62 to 208 as the grid side goes from 30 to 100: $\kappa$ grows like
-side$^2$, so $\sqrt\kappa$ grows 3.3 times. Sparse direct solvers (`splu`, CHOLMOD) are the middle ground and often win in
-2-D; CG wins when you can only multiply by $A$. Rule of thumb: dense with $n \lesssim 10^4$, factor; sparse, huge or
-matrix-free, iterate (ch. 12).
+At $N = 10^4$ a dense LU would cost $6.7 \times 10^{11}$ flops and 800 MB; CG needs 208 products, $2 \times 10^7$ flops,
+30000 times fewer. Iterations grow 62 to 208 as the grid side goes 30 to 100: $\kappa$ grows like side$^2$, so
+$\sqrt\kappa$ grows 3.3 times. Sparse direct solvers (`splu`, CHOLMOD) sit in between. Rule of thumb: dense with
+$n \lesssim 10^4$, factor; sparse, huge or matrix-free, iterate (ch. 12).
 
 ## Try it Yourself
 
@@ -605,9 +594,8 @@ degree   cond(V)  normal eq coef err  QR coef err
     15   2.0e+11             1.0e+00      2.5e-13
 ```
 
-Polynomial features are the textbook ill-conditioned design. By degree 12, $\kappa(V) = 10^9$, so
-$\kappa(V^\top V) \approx 10^{18}$ exceeds $1/\varepsilon$ and the normal equations keep no correct digits, while QR is at
-$10^{-14}$. Try `np.polynomial.legendre.legvander(2 * x - 1, deg)` in place of `np.vander`: orthogonal polynomial
+By degree 12, $\kappa(V) = 10^9$, so $\kappa(V^\top V) \approx 10^{18}$ exceeds $1/\varepsilon$: the normal
+equations keep no correct digits while QR is at $10^{-14}$. Try `np.polynomial.legendre.legvander(2 * x - 1, deg)` in place of `np.vander`: orthogonal polynomial
 features shrink $\kappa$ by orders of magnitude. Often the best fix is better features, not a better solver.
 
 ## Exercise
@@ -627,12 +615,10 @@ def chol_solve_logdet(A, B, jitter0=1e-10, max_tries=8):
     jitter = 0.0
     for _ in range(max_tries):
         try:
-            L = np.linalg.cholesky(A + jitter * np.eye(len(A)))
-            break
+            L = np.linalg.cholesky(A + jitter * np.eye(len(A))); break
         except np.linalg.LinAlgError:
             jitter = jitter0 if jitter == 0.0 else 10 * jitter
-    else:
-        raise np.linalg.LinAlgError("still not PD after jitter")
+    else: raise np.linalg.LinAlgError("still not PD after jitter")
     X = linalg.solve_triangular(L.T, linalg.solve_triangular(L, B, lower=True), lower=False)
     return X, 2 * np.log(np.diag(L)).sum(), jitter
 
@@ -655,9 +641,8 @@ jitter used 1e-10 | residual 1.9e-05 | logdet -6404.5569 vs slogdet -6404.5568
 with noise 1e-2: jitter 0e+00 | max |X - solve| 5.8e-11 | logdet -1293.3496 vs -1293.3496
 ```
 
-The bare kernel needed jitter $10^{-10}$. Its relative residual is $2 \times 10^{-5}$, not $10^{-16}$: the solve is
-backward stable, but $K + 10^{-10}I$ has condition number about $8 \times 10^{11}$, so $X$ is enormous and the residual
-relative to $\|Y\|$ is amplified. The log-determinant still agrees with `slogdet` to 7 digits. With noise $10^{-2}$ the
-condition number drops to about 8000, no jitter is needed, and everything matches to $10^{-10}$. The insight: in a GP
-the noise variance is not only modelling, it is also the regularizer that keeps the Cholesky well defined.
+The bare kernel needed jitter $10^{-10}$. Its relative residual is $2 \times 10^{-5}$: the solve is backward stable, but
+$K + 10^{-10}I$ has $\kappa \approx 8 \times 10^{11}$, so $X$ is enormous and so is the residual relative to $\|Y\|$; the
+log-determinant still matches to 7 digits. With noise $10^{-2}$, $\kappa \approx 8000$, no jitter is needed and everything
+matches to $10^{-10}$. In a GP the noise variance is also the regularizer that keeps the Cholesky well defined.
 </details>
