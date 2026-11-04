@@ -100,9 +100,8 @@ it changes by $O(t)$. That second-order residue along the tangent is the level s
 A derivative can be written as a row or a column, and references disagree (the Matrix Cookbook and Parr and Howard
 each state theirs). Mixing conventions is the main source of stray transposes, so this chapter fixes one:
 
-- The **gradient** of a scalar with respect to anything has the **same shape as that thing**: $\nabla_x f \in \mathbb{R}^n$
-  for $x \in \mathbb{R}^n$, $\nabla_X f \in \mathbb{R}^{m \times n}$ for $X \in \mathbb{R}^{m \times n}$. This is what
-  PyTorch's `.grad` stores, and what you subtract in gradient descent.
+- The **gradient** of a scalar has the **same shape as the variable**: $\nabla_X f \in \mathbb{R}^{m \times n}$ for
+  $X \in \mathbb{R}^{m \times n}$. It is what PyTorch's `.grad` stores and what gradient descent subtracts.
 - The **Jacobian** of $y = g(x)$, $y \in \mathbb{R}^m$, $x \in \mathbb{R}^n$, is $m \times n$: row $i$ holds the
   partial derivatives of $y_i$ (numerator layout). For a scalar, $J = \nabla f^\top$.
 
@@ -186,9 +185,8 @@ tr(B X^-1)     shape (3, 3)  rel err 4.2e-10
 wrong transpose for x^T A x, i.e. 2Ax with non-symmetric A: rel err 0.54
 ```
 
-All six closed forms agree with brute force to about $10^{-10}$, the floor of central differences (section on gradient
-checking below). The last line is the classic slip: $2Ax$ is only right for symmetric $A$, and on a general matrix it
-is off by order one, which no rounding could explain.
+All six closed forms agree with brute force to about $10^{-10}$, the central-difference floor (see gradient checking
+below). The last line is the classic slip: $2Ax$ holds only for symmetric $A$, and here it is off by order one.
 
 ## Softmax cross-entropy: why the gradient is p minus y
 
@@ -404,8 +402,8 @@ $\varepsilon \approx 2.2 \times 10^{-16}$, and dividing by $h$ amplifies it to $
 
 ### The optimal step
 
-This balances the two errors. For central differences the total is about $C_3 h^2 + \varepsilon |f| / h$, where
-$C_3$ scales with $|f'''|$; setting the derivative in $h$ to zero gives
+This balances the two errors. For central differences the total is about $C_3 h^2 + \varepsilon |f| / h$ with
+$C_3 \propto |f'''|$; minimizing over $h$ gives
 
 $$
 h^\star \sim \varepsilon^{1/3} \approx 6 \times 10^{-6}, \qquad \text{error}(h^\star) \sim \varepsilon^{2/3} \approx 4 \times 10^{-11},
@@ -456,7 +454,7 @@ stray 1e-3 W   max abs diff 7.5e-04 | relative error 3.8e-03
 Read the columns as U-curves. Forward differences bottom out near $h = 10^{-8}$ at about $3 \times 10^{-8}$ error;
 central differences near $h = 10^{-6}$ at $10^{-10}$, and both get *worse* as $h$ shrinks further, until at $10^{-12}$
 even the central estimate is off by $10^{-4}$. "Use the smallest $h$ you can" is backwards. On the gradient itself, the
-correct implementation sits at $10^{-10}$, the missing $1/N$ is glaring, and the small stray term is $3 \times 10^{-3}$,
+correct implementation sits at $10^{-10}$, the missing $1/N$ is glaring, and the small stray term is $4 \times 10^{-3}$,
 far above the floor even though its absolute difference looks tiny. That gap of many orders is what makes a check
 unambiguous.
 
@@ -501,17 +499,16 @@ logistic regression needs regularization (ch. 10).
 
 ## Hessian–vector products without the Hessian
 
-A network with $10^6$ parameters has a Hessian with $10^{12}$ entries; you will never form it. But most second-order
-algorithms (conjugate gradient, Lanczos for the top eigenvalue, Newton–CG in ch. 12) only ever need $Hv$ for a given
-vector $v$, and that costs about as much as two gradients. The trick (Pearlmutter, 1994): $Hv$ is the directional
-derivative of the gradient,
+A network with $10^6$ parameters has a Hessian with $10^{12}$ entries; you will never form it. But conjugate gradient,
+Lanczos and Newton–CG (ch. 12) only need $Hv$ for a given vector $v$, which costs about two gradients. The trick
+(Pearlmutter, 1994): $Hv$ is the directional derivative of the gradient,
 
 $$
 Hv = \frac{d}{dt}\nabla f(x + tv)\Big|_{t=0} = \nabla_x\big(\nabla f(x)^\top v\big),
 $$
 
-so differentiate the scalar $\nabla f^\top v$ once more. In PyTorch that is a `backward` through a graph built with
-`create_graph=True` (reverse over reverse); JAX prefers forward over reverse, a dual-number JVP of the gradient.
+so differentiate the scalar $\nabla f^\top v$ once more: in PyTorch, a second `grad` through a graph built with
+`create_graph=True` (reverse over reverse); JAX prefers forward over reverse, a JVP of the gradient.
 
 ```python
 torch.manual_seed(0)
@@ -598,16 +595,14 @@ N, d, H, K = 32, 5, 8, 3                       # batch, inputs, hidden units, cl
 X = rng.standard_normal((N, d)); y = rng.integers(0, K, N); Y = np.eye(K)[y]
 W1, W2 = 0.5 * rng.standard_normal((d, H)), 0.5 * rng.standard_normal((H, K))
 # forward: A = tanh(X W1), Z = A W2, P = softmax(Z), L = mean CE
-A = np.tanh(X @ W1); Z = A @ W2
-P = np.exp(Z - Z.max(1, keepdims=True)); P /= P.sum(1, keepdims=True)
-# backward by the rules of this chapter (each gradient has the shape of its variable)
+A = np.tanh(X @ W1); Z = A @ W2; P = np.exp(Z - Z.max(1, keepdims=True)); P /= P.sum(1, keepdims=True)
+# backward by this chapter's rules (each gradient has the shape of its variable)
 dZ = (P - Y) / N                               # softmax + CE: p - y
 dW2 = A.T @ dZ                                 # Z = A W2  ->  dW2 = A^T dZ
 dA = dZ @ W2.T                                 #           ->  dA  = dZ W2^T
 dW1 = X.T @ (dA * (1 - A ** 2))                # elementwise tanh: multiply by its derivative
 t1, t2 = (torch.tensor(W, requires_grad=True) for W in (W1, W2))
-loss = torch.nn.functional.cross_entropy(torch.tanh(torch.tensor(X) @ t1) @ t2, torch.tensor(y))
-loss.backward()
+loss = torch.nn.functional.cross_entropy(torch.tanh(torch.tensor(X) @ t1) @ t2, torch.tensor(y)); loss.backward()
 rel = lambda a, b: np.linalg.norm(a - b) / max(np.linalg.norm(a), np.linalg.norm(b))
 print(f"loss {loss.item():.6f} | rel err dW1 {rel(dW1, t1.grad.numpy()):.1e} | dW2 {rel(dW2, t2.grad.numpy()):.1e}")
 ```
@@ -616,8 +611,7 @@ print(f"loss {loss.item():.6f} | rel err dW1 {rel(dW1, t1.grad.numpy()):.1e} | d
 loss 1.066069 | rel err dW1 1.9e-16 | dW2 1.5e-16
 ```
 
-Both hand-derived gradients match autograd to machine precision. Swap `tanh` for a ReLU (derivative `(A > 0)`), add a
-bias row, or break a transpose on purpose and watch the relative error jump from $10^{-16}$ to order one.
+Both match autograd to machine precision. Swap in ReLU (derivative `A > 0`) or break a transpose and watch the error jump.
 
 ## Exercise
 
@@ -636,8 +630,7 @@ p, Ns = 4, 500
 C = rng.standard_normal((p, p)); Sigma_true = C @ C.T + np.eye(p)
 S = (lambda Xs: Xs.T @ Xs / Ns)(rng.multivariate_normal(np.zeros(p), Sigma_true, Ns))
 nll = lambda Sg: 0.5 * Ns * (np.linalg.slogdet(Sg)[1] + np.trace(S @ np.linalg.inv(Sg)))
-def nll_grad(Sg):
-    Si = np.linalg.inv(Sg); return 0.5 * Ns * (Si - Si @ S @ Si)
+nll_grad = lambda Sg: 0.5 * Ns * (np.linalg.inv(Sg) - np.linalg.inv(Sg) @ S @ np.linalg.inv(Sg))
 Sg0 = np.cov(rng.standard_normal((p, 50))) + np.eye(p)             # a random symmetric PD point
 print(f"rel err gradient vs central differences: {rel(nll_grad(Sg0), num_grad(nll, Sg0)):.1e}")
 print(f"||grad|| at Sigma = S: {np.linalg.norm(nll_grad(S)):.1e} | at Sigma_true: {np.linalg.norm(nll_grad(Sigma_true)):.1f}")
@@ -650,8 +643,8 @@ rel err gradient vs central differences: 1.4e-09
 
 The log-det rule gives $\operatorname{tr}(\Sigma^{-1}d\Sigma)$ and the inverse rule (with $B = S$) gives
 $-\operatorname{tr}(\Sigma^{-1}S\Sigma^{-1}d\Sigma)$, so $\nabla_\Sigma L = \tfrac N2(\Sigma^{-1} - \Sigma^{-1}S\Sigma^{-1})$,
-already symmetric. Multiplying by $\Sigma$ on both sides shows it vanishes exactly when $\Sigma = S$; at the true
-covariance it does not, because $S$ is the best fit to *this* sample. Differentiating once more, the curvature along a
-symmetric direction $V$ is $\tfrac N2\operatorname{tr}\big(\Sigma^{-1}V\Sigma^{-1}(2S - \Sigma)\Sigma^{-1}V\big)$: positive
-at $\Sigma = S$, but able to turn negative when $\Sigma \gg S$, so this NLL is not convex in $\Sigma$ (it is in $\Sigma^{-1}$).
+already symmetric. Since $\Sigma\,\nabla_\Sigma L\,\Sigma = \tfrac N2(\Sigma - S)$, it vanishes exactly at $\Sigma = S$, not at
+the true covariance: $S$ fits *this* sample best. Differentiating again, the curvature along a symmetric $V$ is
+$\tfrac N2\operatorname{tr}\big(\Sigma^{-1}V\Sigma^{-1}(2S - \Sigma)\Sigma^{-1}V\big)$: positive at $\Sigma = S$ but negative
+once $\Sigma \succ 2S$, so this NLL is not convex in $\Sigma$ (it is in $\Sigma^{-1}$).
 </details>
