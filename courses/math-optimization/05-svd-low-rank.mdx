@@ -1,223 +1,571 @@
 ---
 course: math-optimization
 chapter: 05-svd-low-rank
-title: "SVD: The Workhorse Decomposition"
+title: "The SVD and Low-Rank Approximation"
 order: 5
 ---
 
-## Every matrix has a singular value decomposition
+## Every matrix is rotate, stretch, rotate
 
-The SVD factors any real $m \times n$ matrix $A$ as
-
-$$
-A = U \Sigma V^T
-$$
-
-where $U \in \mathbb{R}^{m \times m}$ is orthogonal (left singular vectors), $\Sigma \in \mathbb{R}^{m \times n}$ is diagonal with non-negative entries $\sigma_1 \ge \sigma_2 \ge \cdots \ge 0$ (singular values), and $V \in \mathbb{R}^{n \times n}$ is orthogonal (right singular vectors).
-
-Unlike eigendecomposition, SVD works for **any** matrix — rectangular, rank-deficient, or asymmetric.
+P1
 
 ```python
 import numpy as np
+from scipy import linalg
+np.set_printoptions(precision=4, suppress=True)
 
-rng = np.random.default_rng(0)
-A = rng.standard_normal((4, 6))   # 4×6 rectangular matrix
+A = np.array([[3.0, 0.0],
+              [4.0, 5.0]])
+U, s, Vt = np.linalg.svd(A)
+print("singular values s =", s, "| U^T U = I:", np.allclose(U.T @ U, np.eye(2)),
+      "| V^T V = I:", np.allclose(Vt @ Vt.T, np.eye(2)))
+for i in range(2):
+    print(f"A v{i+1} = {A @ Vt[i]}   s{i+1} u{i+1} = {s[i] * U[:, i]}")
 
-U, s, Vt = np.linalg.svd(A, full_matrices=True)
-print("A shape :", A.shape)
-print("U shape :", U.shape)   # 4×4
-print("s shape :", s.shape)   # 4  (min(4,6) singular values)
-print("Vt shape:", Vt.shape)  # 6×6
-print("singular values:", np.round(s, 4))
+theta = np.linspace(0, 2 * np.pi, 100_000, endpoint=False)
+circle = np.vstack([np.cos(theta), np.sin(theta)])
+radii = np.linalg.norm(A @ circle, axis=0)
+print(f"ellipse radii by brute force: longest {radii.max():.4f}, shortest {radii.min():.4f}")
+step1 = Vt @ circle                                # rotate: still the unit circle
+step2 = s[:, None] * step1                         # stretch the axes: an axis-aligned ellipse
+step3 = U @ step2                                  # rotate the ellipse into place
+print("after V^T: radii all 1?", np.allclose(np.linalg.norm(step1, axis=0), 1),
+      "| U S V^T x == A x?", np.allclose(step3, A @ circle))
 ```
 
 ```output
-A shape : (4, 6)
-U shape : (4, 4)
-s shape : (4,)
-Vt shape: (6, 6)
-singular values: [3.0069 2.1916 1.7491 0.8347]
+singular values s = [6.7082 2.2361] | U^T U = I: True | V^T V = I: True
+A v1 = [-2.1213 -6.364 ]   s1 u1 = [-2.1213 -6.364 ]
+A v2 = [-2.1213  0.7071]   s2 u2 = [-2.1213  0.7071]
+ellipse radii by brute force: longest 6.7082, shortest 2.2361
+after V^T: radii all 1? True | U S V^T x == A x? True
 ```
 
-Reconstruct $A$ from its factors:
+P
+
+## Where the SVD comes from: the eigenvectors of $A^\top A$
+
+P
+
+### Existence from the spectral theorem
+
+P
 
 ```python
-import numpy as np
-
 rng = np.random.default_rng(0)
-A = rng.standard_normal((4, 6))
-U, s, Vt = np.linalg.svd(A, full_matrices=True)
-
-# Build full Σ (same shape as A)
-Sigma = np.zeros_like(A)
-np.fill_diagonal(Sigma, s)
-
-A_reconstructed = U @ Sigma @ Vt
-print("Max reconstruction error:", np.max(np.abs(A - A_reconstructed)))
-```
-
-```output
-Max reconstruction error: 2.220446049250313e-15
-```
-
-The reconstruction is numerically exact (error at floating-point epsilon).
-
-## Connection to eigendecomposition
-
-The singular values and vectors relate directly to the eigendecomposition of $A^T A$ and $A A^T$:
-
-$$
-A^T A = V \Sigma^T \Sigma V^T \qquad A A^T = U \Sigma \Sigma^T U^T
-$$
-
-So the right singular vectors $V$ are the eigenvectors of $A^T A$, and the singular values are $\sigma_i = \sqrt{\lambda_i(A^T A)}$. You never need to form $A^T A$ explicitly — the SVD extracts this information more stably.
-
-```python
-import numpy as np
-
-rng = np.random.default_rng(1)
 A = rng.standard_normal((5, 3))
+lam, V = np.linalg.eigh(A.T @ A)                   # ascending order: flip to descending
+lam, V = lam[::-1], V[:, ::-1]
+sig = np.sqrt(lam)
+U_built = A @ V / sig                              # u_i = A v_i / sigma_i
+print("sqrt(eig(A^T A)):", sig)
+print("np.linalg.svd    :", np.linalg.svd(A, compute_uv=False))
+print("eig(A A^T)       :", np.linalg.eigvalsh(A @ A.T)[::-1] + 0.0)
+print(f"built U orthonormal: {np.allclose(U_built.T @ U_built, np.eye(3))} | "
+      f"U S V^T == A: {np.allclose(U_built @ np.diag(sig) @ V.T, A)}")
 
-U, s, Vt = np.linalg.svd(A, full_matrices=False)
-ATA = A.T @ A
-eigvals, eigvecs = np.linalg.eigh(ATA)
-
-# eigh returns ascending order; SVD gives descending
-eigvals_desc = eigvals[::-1]
-print("sigma^2 from SVD:", np.round(s**2, 6))
-print("eigvals of A^T A:", np.round(eigvals_desc, 6))
+S_sym = np.array([[2.0, 3.0], [3.0, -4.0]])        # symmetric: sigma = |lambda|
+J = np.array([[1.0, 10.0], [0.0, 1.0]])            # non-normal: eigenvalues tell you little
+for name, M in [("symmetric", S_sym), ("shear J", J)]:
+    ev, sv = np.linalg.eigvals(M), np.linalg.svd(M, compute_uv=False)
+    print(f"{name:9} eigenvalues {np.sort(ev.real)[::-1]} | singular values {sv} | "
+          f"|prod eig| {abs(ev.prod()):.4f} = prod sigma {sv.prod():.4f}")
 ```
 
 ```output
-sigma^2 from SVD: [3.645085 1.686197 0.236021]
-eigvals of A^T A: [3.645085 1.686197 0.236021]
+sqrt(eig(A^T A)): [3.1509 1.7093 0.3349]
+np.linalg.svd    : [3.1509 1.7093 0.3349]
+eig(A A^T)       : [ 9.9282  2.9218  0.1121  0.     -0.    ]
+built U orthonormal: True | U S V^T == A: True
+symmetric eigenvalues [ 3.2426 -5.2426] | singular values [5.2426 3.2426] | |prod eig| 17.0000 = prod sigma 17.0000
+shear J   eigenvalues [1. 1.] | singular values [10.099  0.099] | |prod eig| 1.0000 = prod sigma 1.0000
 ```
 
-## The Eckart–Young theorem: best low-rank approximation
+P
 
-Truncate the SVD to the top $k$ singular values:
+## Thin, full, and compact: which SVD to store
 
-$$
-\hat{A}_k = U_k \Sigma_k V_k^T = \sum_{i=1}^k \sigma_i u_i v_i^T
-$$
-
-The Eckart–Young theorem states this is the **best rank-$k$ approximation** in both Frobenius and spectral norm:
-
-$$
-\hat{A}_k = \arg\min_{\text{rank}(B) \le k} \|A - B\|_F \qquad \|A - \hat{A}_k\|_F^2 = \sum_{i=k+1}^r \sigma_i^2
-$$
+P
 
 ```python
-import numpy as np
+X = rng.standard_normal((1000, 20))
+Uf, sf, Vtf = np.linalg.svd(X, full_matrices=True)
+Ut, st, Vtt = np.linalg.svd(X, full_matrices=False)
+print(f"full U {Uf.shape} ({Uf.size:,d} numbers) | thin U {Ut.shape} ({Ut.size:,d} numbers)")
+print("same singular values:", np.allclose(sf, st), "| thin reconstructs X:", np.allclose((Ut * st) @ Vtt, X))
+outer = sum(st[i] * np.outer(Ut[:, i], Vtt[i]) for i in range(20))
+print("sum of 20 rank-one pieces s_i u_i v_i^T == X:", np.allclose(outer, X))
+print(f"extra columns of full U are orthogonal to C(X): {np.abs(X.T @ Uf[:, 20:]).max():.1e}")
+print("scipy gesvd vs numpy gesdd:", np.allclose(linalg.svd(X, compute_uv=False, lapack_driver="gesvd"), st))
+```
 
+```output
+full U (1000, 1000) (1,000,000 numbers) | thin U (1000, 20) (20,000 numbers)
+same singular values: True | thin reconstructs X: True
+sum of 20 rank-one pieces s_i u_i v_i^T == X: True
+extra columns of full U are orthogonal to C(X): 7.1e-15
+scipy gesvd vs numpy gesdd: True
+```
+
+P
+
+## Truncation and the Eckart–Young–Mirsky theorem
+
+P
+
+### Why nothing beats truncation in the spectral norm
+
+P
+
+```python
+rng = np.random.default_rng(1)
+m, n, k = 40, 30, 5
+Q1, _ = np.linalg.qr(rng.standard_normal((m, n)))
+Q2, _ = np.linalg.qr(rng.standard_normal((n, n)))
+s_true = 0.8 ** np.arange(n)                       # geometrically decaying spectrum
+A = Q1 @ np.diag(s_true) @ Q2.T
+U, s, Vt = np.linalg.svd(A, full_matrices=False)
+A_k = (U[:, :k] * s[:k]) @ Vt[:k]
+print(f"truncated SVD, k={k}: spectral err {np.linalg.norm(A - A_k, 2):.6f} = s_(k+1) {s[k]:.6f}")
+print(f"                    Frobenius err {np.linalg.norm(A - A_k):.6f} = sqrt(sum tail s^2) "
+      f"{np.sqrt((s[k:] ** 2).sum()):.6f}")
+
+best2, bestF = np.inf, np.inf
+for _ in range(2000):                               # random rank-k competitors, each optimally fitted
+    Q, _ = np.linalg.qr(rng.standard_normal((m, k)))
+    B = Q @ (Q.T @ A)                              # best matrix with column space span(Q)
+    best2 = min(best2, np.linalg.norm(A - B, 2))
+    bestF = min(bestF, np.linalg.norm(A - B))
+print(f"best of 2000 random rank-{k} subspaces: spectral {best2:.6f} | Frobenius {bestF:.6f}")
+
+L, R = rng.standard_normal((m, k)), rng.standard_normal((n, k))
+for it in range(200):                               # alternating least squares on ||A - L R^T||_F
+    R = np.linalg.lstsq(L, A, rcond=None)[0].T
+    L = np.linalg.lstsq(R, A.T, rcond=None)[0].T
+print(f"ALS local search after 200 sweeps: Frobenius {np.linalg.norm(A - L @ R.T):.6f}")
+```
+
+```output
+truncated SVD, k=5: spectral err 0.327680 = s_(k+1) 0.327680
+                    Frobenius err 0.546129 = sqrt(sum tail s^2) 0.546129
+best of 2000 random rank-5 subspaces: spectral 0.773445 | Frobenius 1.429893
+ALS local search after 200 sweeps: Frobenius 0.546129
+```
+
+P
+
+## How much a few components capture
+
+P
+
+```python
 rng = np.random.default_rng(2)
-A = rng.standard_normal((20, 15))
-U, s, Vt = np.linalg.svd(A, full_matrices=False)
-
-frob_total = np.linalg.norm(A, 'fro')**2
-print(f"{'rank k':>8}  {'fro error':>12}  {'% variance kept':>16}")
-for k in [1, 3, 5, 10, 15]:
-    Ak = (U[:, :k] * s[:k]) @ Vt[:k, :]
-    err = np.linalg.norm(A - Ak, 'fro')**2
-    kept = 100 * (1 - err / frob_total)
-    print(f"{k:>8}  {err:>12.4f}  {kept:>15.1f}%")
+h = w = 128
+yy, xx = np.mgrid[0:h, 0:w] / h
+clean = (np.sin(3 * np.pi * xx) * np.cos(2 * np.pi * yy) + 0.6 * np.exp(-((xx - 0.3) ** 2 + (yy - 0.6) ** 2) / 0.02)
+         + 0.8 * ((xx - 0.7) ** 2 + (yy - 0.3) ** 2 < 0.03))      # waves + a blob + a hard-edged disc
+img = clean + 0.1 * rng.standard_normal((h, w))
+U, s, Vt = np.linalg.svd(img, full_matrices=False)
+energy = np.cumsum(s ** 2) / (s ** 2).sum()
+print(f"{'k':>4} {'energy':>8} {'rel err vs noisy':>17} {'rel err vs clean':>17} {'storage':>9}")
+for k in (1, 2, 5, 10, 20, 40, 128):
+    Ik = (U[:, :k] * s[:k]) @ Vt[:k]
+    print(f"{k:>4} {energy[k-1]:>8.4f} {np.linalg.norm(img - Ik) / np.linalg.norm(img):>17.4f} "
+          f"{np.linalg.norm(clean - Ik) / np.linalg.norm(clean):>17.4f} {k * (h + w + 1):>9,d}")
+print(f"full image storage {h * w:,d} | noise-level singular values ~ {s[60]:.3f}, top one {s[0]:.2f}")
 ```
 
 ```output
-  rank k     fro error   % variance kept
-       1      250.3740             19.4%
-       3      158.9114             48.8%
-       5       98.9062             68.2%
-      10       17.6685             94.3%
-      15        0.0000            100.0%
+   k   energy  rel err vs noisy  rel err vs clean   storage
+   1   0.7572            0.4928            0.4646       257
+   2   0.9254            0.2730            0.2154       514
+   5   0.9650            0.1872            0.0925     1,285
+  10   0.9718            0.1679            0.0901     2,570
+  20   0.9795            0.1431            0.1181     5,140
+  40   0.9896            0.1022            0.1516    10,280
+ 128   1.0000            0.0000            0.1816    32,896
+full image storage 16,384 | noise-level singular values ~ 1.035, top one 62.57
 ```
 
-### Image compression analogy
+P
+
+## The pseudoinverse and minimum-norm least squares
+
+P
+
+### Deriving $A^+$ from the SVD
+
+P
 
 ```python
-import numpy as np
+rng = np.random.default_rng(3)
+A = rng.standard_normal((6, 2)) @ rng.standard_normal((2, 4))     # 6 x 4, rank 2
+b = rng.standard_normal(6)
+U, s, Vt = np.linalg.svd(A, full_matrices=False)
+print("singular values:", s)
+tol = max(A.shape) * np.finfo(float).eps * s[0]
+s_inv = np.where(s > tol, 1 / s, 0.0)              # invert only the real singular values
+A_plus = Vt.T @ np.diag(s_inv) @ U.T
+naive = Vt.T @ np.diag(1 / s) @ U.T                # inverting the rounding-noise ones too
+print(f"matches np.linalg.pinv: {np.allclose(A_plus, np.linalg.pinv(A))} | "
+      f"x+ matches lstsq: {np.allclose(A_plus @ b, np.linalg.lstsq(A, b, rcond=None)[0])}")
+checks = [A @ A_plus @ A - A, A_plus @ A @ A_plus - A_plus, (A @ A_plus).T - A @ A_plus, (A_plus @ A).T - A_plus @ A]
+print("Moore-Penrose conditions, max violation:", [f"{np.abs(c).max():.0e}" for c in checks])
+x_plus = A_plus @ b
+x_other = x_plus + Vt[2:].T @ np.array([1.0, -1.0])     # add a null-space vector
+print(f"||x+|| {np.linalg.norm(x_plus):.4f}, residual {np.linalg.norm(A @ x_plus - b):.4f} | "
+      f"x+ + null: norm {np.linalg.norm(x_other):.4f}, residual {np.linalg.norm(A @ x_other - b):.4f}")
+print(f"without the cutoff: ||x|| = {np.linalg.norm(naive @ b):.2e}")
+```
+
+```output
+singular values: [7.1196 1.7419 0.     0.    ]
+matches np.linalg.pinv: True | x+ matches lstsq: True
+Moore-Penrose conditions, max violation: ['9e-16', '6e-17', '1e-16', '1e-16']
+||x+|| 0.1407, residual 1.7136 | x+ + null: norm 1.4212, residual 1.7136
+without the cutoff: ||x|| = 7.47e+15
+```
+
+P
+
+## The condition number is a ratio of singular values
+
+P
+
+```python
+rng = np.random.default_rng(4)
+n = 50
+Q1, _ = np.linalg.qr(rng.standard_normal((n, n)))
+Q2, _ = np.linalg.qr(rng.standard_normal((n, n)))
+s_c = np.logspace(0, -6, n)                        # sigma from 1 down to 1e-6
+M = Q1 @ np.diag(s_c) @ Q2.T
+print(f"cond = s_max / s_min = {s_c[0] / s_c[-1]:.3e} | np.linalg.cond {np.linalg.cond(M):.3e}")
+b = Q1[:, 0]                                        # b along u_1 (the easy direction)
+x = np.linalg.solve(M, b)
+for name, d in [("worst: delta along u_n", Q1[:, -1]), ("random delta", rng.standard_normal(n))]:
+    db = 1e-8 * d / np.linalg.norm(d)
+    dx = np.linalg.solve(M, b + db) - x
+    amp = (np.linalg.norm(dx) / np.linalg.norm(x)) / (np.linalg.norm(db) / np.linalg.norm(b))
+    print(f"{name:24} relative error amplification {amp:.3e}")
+```
+
+```output
+cond = s_max / s_min = 1.000e+06 | np.linalg.cond 1.000e+06
+worst: delta along u_n   relative error amplification 1.000e+06
+random delta             relative error amplification 1.640e+05
+```
+
+P
+
+## Truncated SVD and ridge are both spectral filters
+
+P
+
+### Ridge in SVD coordinates
+
+P
+
+```python
+rng = np.random.default_rng(5)
+N, p = 100, 30
+Q1, _ = np.linalg.qr(rng.standard_normal((N, p)))
+Q2, _ = np.linalg.qr(rng.standard_normal((p, p)))
+s_x = np.logspace(1, -3, p)                        # cond(X) = 1e4: nearly collinear features
+X = Q1 @ np.diag(s_x) @ Q2.T
+beta_true = Q2 @ (1.0 / (1 + np.arange(p)))        # most signal on the leading directions
+y = X @ beta_true + 0.05 * rng.standard_normal(N)
+U, s, Vt = np.linalg.svd(X, full_matrices=False)
+coef = U.T @ y / s                                 # OLS coefficient along each v_i
+
+def filtered(f):                                   # beta = sum_i f_i (u_i^T y / s_i) v_i
+    return Vt.T @ (f * coef)
+
+print(f"{'method':>16} {'||beta - beta*||':>17} {'train RMSE':>11}")
+fits = {"OLS": np.ones(p)}
+fits.update({f"TSVD k={k}": (np.arange(p) < k).astype(float) for k in (5, 10, 15, 20)})
+fits.update({f"ridge lam={lam:g}": s ** 2 / (s ** 2 + lam) for lam in (1e-4, 1e-2, 1)})
+for name, f in fits.items():
+    bh = filtered(f)
+    print(f"{name:>16} {np.linalg.norm(bh - beta_true):>17.4f} {np.sqrt(np.mean((X @ bh - y) ** 2)):>11.4f}")
+lam = 1e-2
+ridge_direct = np.linalg.solve(X.T @ X + lam * np.eye(p), X.T @ y)
+print("filter form equals (X^T X + lam I)^-1 X^T y:", np.allclose(filtered(s ** 2 / (s ** 2 + lam)), ridge_direct))
+print("ridge filter factors at lam=1e-2 for s =", s[[0, 9, 14, 19, 29]].round(4), "->",
+      (s ** 2 / (s ** 2 + lam))[[0, 9, 14, 19, 29]].round(4))
+```
+
+```output
+          method  ||beta - beta*||  train RMSE
+             OLS           50.0835      0.0447
+        TSVD k=5            0.3856      0.0612
+       TSVD k=10            0.2652      0.0482
+       TSVD k=15            0.3010      0.0473
+       TSVD k=20            2.0696      0.0467
+ridge lam=0.0001            5.2464      0.0460
+  ridge lam=0.01            0.3359      0.0471
+     ridge lam=1            0.2830      0.0520
+filter form equals (X^T X + lam I)^-1 X^T y: True
+ridge filter factors at lam=1e-2 for s = [10.      0.5736  0.1172  0.024   0.001 ] -> [0.9999 0.9705 0.5787 0.0542 0.0001]
+```
+
+P
+
+## Low rank in real data: completing a ratings matrix
+
+P
+
+```python
+rng = np.random.default_rng(6)
+n_users, n_items, r_true = 300, 120, 4
+R_full = 3.5 + rng.standard_normal((n_users, r_true)) @ rng.standard_normal((r_true, n_items)) / 2 \
+         + 0.3 * rng.standard_normal((n_users, n_items))
+mask = rng.random((n_users, n_items)) < 0.25        # only 25% of ratings observed
+test = (~mask) & (rng.random((n_users, n_items)) < 0.2)
+rmse = lambda P: np.sqrt(np.mean((P[test] - R_full[test]) ** 2))
+item_mean = np.nanmean(np.where(mask, R_full, np.nan), axis=0)
+print(f"baseline item-mean RMSE {rmse(np.tile(item_mean, (n_users, 1))):.4f}")
+
+def hard_impute(k, iters=100):
+    Z = np.where(mask, R_full, item_mean)          # start: fill missing with item means
+    for _ in range(iters):
+        U, s, Vt = np.linalg.svd(Z, full_matrices=False)
+        L = (U[:, :k] * s[:k]) @ Vt[:k]            # project onto rank k (Eckart-Young)
+        Z = np.where(mask, R_full, L)              # keep what you know, impute the rest
+    return L
+
+for k in (1, 2, 4, 8, 16):
+    print(f"hard-impute rank {k:>2}: test RMSE {rmse(hard_impute(k)):.4f}")
+```
+
+```output
+baseline item-mean RMSE 1.0826
+hard-impute rank  1: test RMSE 1.0944
+hard-impute rank  2: test RMSE 0.9344
+hard-impute rank  4: test RMSE 0.6175
+hard-impute rank  8: test RMSE 0.4682
+hard-impute rank 16: test RMSE 0.7361
+```
+
+P
+
+### Latent semantic analysis on a toy corpus
+
+P
+
+```python
+terms = ["car", "automobile", "engine", "wheel", "fruit", "apple", "banana", "juice"]
+docs = {"d1": "car engine wheel", "d2": "automobile engine", "d3": "car wheel",
+        "d4": "apple banana fruit", "d5": "fruit juice apple", "d6": "automobile wheel"}
+T = np.array([[d.split().count(t) for d in docs.values()] for t in terms], float)   # 8 terms x 6 docs
+U, s, Vt = np.linalg.svd(T, full_matrices=False)
+print("singular values:", s.round(3))
+D2 = (s[:2, None] * Vt[:2]).T                      # each document in the 2-d latent space
+cos = lambda a, b: a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+names = list(docs)
+for a, b in [("d2", "d3"), ("d3", "d6"), ("d2", "d4"), ("d4", "d5")]:
+    i, j = names.index(a), names.index(b)
+    print(f"cos({a}, {b}): raw counts {cos(T[:, i], T[:, j]):.3f} | LSA k=2 {cos(D2[i], D2[j]):.3f}")
+print("term loadings on concept 2:", dict(zip(terms, (U[:, 1] * np.sign(U[0, 1])).round(2))))
+```
+
+```output
+singular values: [2.356 2.236 1.477 1.095 1.    0.262]
+cos(d2, d3): raw counts 0.000 | LSA k=2 1.000
+cos(d3, d6): raw counts 0.500 | LSA k=2 1.000
+cos(d2, d4): raw counts 0.000 | LSA k=2 0.000
+cos(d4, d5): raw counts 0.667 | LSA k=2 1.000
+term loadings on concept 2: {'car': np.float64(0.0), 'automobile': np.float64(0.0), 'engine': np.float64(0.0), 'wheel': np.float64(0.0), 'fruit': np.float64(-0.0), 'apple': np.float64(-0.0), 'banana': np.float64(-0.0), 'juice': np.float64(-0.0)}
+```
+
+P
+
+## Randomized SVD: sketch, then decompose a small matrix
+
+P
+
+### The Halko–Martinsson–Tropp algorithm
+
+P
+
+```python
+from scipy.sparse.linalg import svds
+from sklearn.utils.extmath import randomized_svd
+
+def rsvd(A, k, p=10, q=0, seed=0):
+    G = np.random.default_rng(seed).standard_normal((A.shape[1], k + p))
+    Q, _ = np.linalg.qr(A @ G)                     # sketch the range of A
+    for _ in range(q):                             # power iterations sharpen the spectrum
+        Q, _ = np.linalg.qr(A.T @ Q)               # re-orthonormalize each pass
+        Q, _ = np.linalg.qr(A @ Q)
+    Ub, sb, Vtb = np.linalg.svd(Q.T @ A, full_matrices=False)   # (k+p) x n: cheap
+    return (Q @ Ub)[:, :k], sb[:k], Vtb[:k]
 
 rng = np.random.default_rng(7)
-# Simulate a 32×32 grayscale "image"
-img = rng.uniform(0, 255, (32, 32))
-
-U, s, Vt = np.linalg.svd(img, full_matrices=False)
-
-for k in [1, 4, 8, 16, 32]:
-    approx = (U[:, :k] * s[:k]) @ Vt[:k, :]
-    err = np.linalg.norm(img - approx, 'fro') / np.linalg.norm(img, 'fro')
-    params_original = 32 * 32
-    params_compressed = k * (32 + 1 + 32)
-    print(f"k={k:2d}  rel error={err:.3f}  params={params_compressed} vs {params_original}")
+m, n, k = 2000, 600, 20
+Qa, _ = np.linalg.qr(rng.standard_normal((m, n)))
+Qb, _ = np.linalg.qr(rng.standard_normal((n, n)))
+s_A = 1.0 / np.sqrt(1 + np.arange(n))              # slow decay: the hard case for sketching
+A = (Qa * s_A) @ Qb.T
+print(f"optimal rank-{k} spectral error s_(k+1) = {s_A[k]:.4f}")
+print(f"{'p':>3} {'q':>2} {'||A - U S V^T||_2':>18} {'ratio to optimal':>17} {'products with A':>16}")
+for p, q in [(0, 0), (10, 0), (10, 1), (10, 2), (10, 4)]:
+    Ur, sr, Vtr = rsvd(A, k, p, q)
+    err = linalg.svdvals(A - (Ur * sr) @ Vtr)[0]
+    print(f"{p:>3} {q:>2} {err:>18.4f} {err / s_A[k]:>17.3f} {(k + p) * (2 * q + 2):>16,d}")
+s_svds = np.sort(svds(A, k=k, random_state=0)[1])[::-1]
+s_skl = randomized_svd(A, k, n_oversamples=10, n_iter=4, random_state=0)[1]
+print(f"top-{k} singular values, max abs diff vs exact: rsvd(q=4) {np.abs(rsvd(A, k, 10, 4)[1] - s_A[:k]).max():.1e}"
+      f" | scipy svds {np.abs(s_svds - s_A[:k]).max():.1e} | sklearn {np.abs(s_skl - s_A[:k]).max():.1e}")
 ```
 
 ```output
-k= 1  rel error=0.486  params=65 vs 1024
-k= 4  rel error=0.406  params=260 vs 1024
-k= 8  rel error=0.317  params=520 vs 1024
-k=16  rel error=0.171  params=1040 vs 1024
-k=32  rel error=0.000  params=2080 vs 1024
+optimal rank-20 spectral error s_(k+1) = 0.2182
+  p  q  ||A - U S V^T||_2  ratio to optimal  products with A
+  0  0             0.5263             2.412               40
+ 10  0             0.4468             2.048               60
+ 10  1             0.2355             1.079              120
+ 10  2             0.2196             1.007              180
+ 10  4             0.2182             1.000              300
+top-20 singular values, max abs diff vs exact: rsvd(q=4) 6.1e-04 | scipy svds 4.4e-16 | sklearn 1.9e-03
 ```
 
-For a random image there's no structure to compress. Real photographs have low intrinsic rank — a handful of singular values capture most visual information.
+P
+
+## LoRA: fine-tuning as a rank-r update
+
+P
+
+```python
+d = 4096
+print(f"{'rank r':>7} {'LoRA params 2dr':>16} {'full d^2':>12} {'fraction':>9}")
+for r in (4, 8, 16, 64):
+    print(f"{r:>7} {2 * d * r:>16,d} {d * d:>12,d} {2 * d * r / d**2:>9.4%}")
+print(f"7B-style model, 32 layers, LoRA r=8 on W_q and W_v: {32 * 2 * 2 * d * 8:,d} trainable parameters")
+
+rng = np.random.default_rng(8)
+dm = 256
+W0 = rng.standard_normal((dm, dm)) / np.sqrt(dm)
+dW = (rng.standard_normal((dm, 64)) * 0.7 ** np.arange(64)) @ rng.standard_normal((64, dm)) / dm  # task update
+Ud, sd, Vtd = np.linalg.svd(dW)
+for r in (1, 4, 8, 16):
+    B, A_lo = Ud[:, :r] * sd[:r], Vtd[:r]          # best rank-r factors: B (d x r), A (r x d)
+    left = np.linalg.norm(dW - B @ A_lo) / np.linalg.norm(dW)
+    print(f"r={r:>2}: rank(BA) = {np.linalg.matrix_rank(B @ A_lo)}, fraction of ||dW||_F missed {left:.4f}")
+B0 = np.zeros((dm, 8)); A0 = rng.standard_normal((8, dm)) * 0.01
+print("LoRA init B = 0 starts exactly at W0:", np.array_equal(W0 + B0 @ A0, W0))
+```
+
+```output
+ rank r  LoRA params 2dr     full d^2  fraction
+      4           32,768   16,777,216   0.1953%
+      8           65,536   16,777,216   0.3906%
+     16          131,072   16,777,216   0.7812%
+     64          524,288   16,777,216   3.1250%
+7B-style model, 32 layers, LoRA r=8 on W_q and W_v: 4,194,304 trainable parameters
+r= 1: rank(BA) = 1, fraction of ||dW||_F missed 0.6853
+r= 4: rank(BA) = 4, fraction of ||dW||_F missed 0.2399
+r= 8: rank(BA) = 8, fraction of ||dW||_F missed 0.0547
+r=16: rank(BA) = 16, fraction of ||dW||_F missed 0.0029
+LoRA init B = 0 starts exactly at W0: True
+```
+
+P
+
+## Spectral norm: how much a layer can stretch its input
+
+P
+
+```python
+rng = np.random.default_rng(9)
+W = rng.standard_normal((64, 32))
+v = rng.standard_normal(32)
+for it in range(30):                               # power iteration on W^T W
+    v = W.T @ (W @ v); v /= np.linalg.norm(v)
+print(f"power iteration (30 steps) {np.linalg.norm(W @ v):.6f} | exact s_max {np.linalg.norm(W, 2):.6f}")
+dx = rng.standard_normal((32, 10_000))
+print(f"max ||W dx|| / ||dx|| over 10,000 random dx: {(np.linalg.norm(W @ dx, axis=0) / np.linalg.norm(dx, axis=0)).max():.4f}")
+
+Ws = [rng.standard_normal((64, 32)) / np.sqrt(32), rng.standard_normal((64, 64)) / np.sqrt(64),
+      rng.standard_normal((1, 64)) / np.sqrt(64)]
+net = lambda x, Ws: Ws[2] @ np.maximum(Ws[1] @ np.maximum(Ws[0] @ x, 0), 0)
+bound = np.prod([np.linalg.norm(Wl, 2) for Wl in Ws])
+x0, x1 = rng.standard_normal((32, 20_000)), rng.standard_normal((32, 20_000))
+ratio = np.abs(net(x0, Ws) - net(x1, Ws)).ravel() / np.linalg.norm(x0 - x1, axis=0)
+print(f"3-layer ReLU net: product of spectral norms {bound:.4f} | largest observed ratio {ratio.max():.4f}")
+Wsn = [Wl / np.linalg.norm(Wl, 2) for Wl in Ws]   # spectral normalization
+ratio_sn = np.abs(net(x0, Wsn) - net(x1, Wsn)).ravel() / np.linalg.norm(x0 - x1, axis=0)
+print(f"after spectral normalization: bound 1.0000 | largest observed ratio {ratio_sn.max():.4f}")
+```
+
+```output
+power iteration (30 steps) 12.818540 | exact s_max 12.823321
+max ||W dx|| / ||dx|| over 10,000 random dx: 10.6586
+3-layer ReLU net: product of spectral norms 4.7446 | largest observed ratio 0.2536
+after spectral normalization: bound 1.0000 | largest observed ratio 0.0535
+```
+
+P
 
 ## Try it Yourself
 
 ```python
 import numpy as np
 
-rng = np.random.default_rng(42)
-A = rng.standard_normal((10, 8))
-U, s, Vt = np.linalg.svd(A, full_matrices=False)
+rng = np.random.default_rng(11)
+m, n, r_true, noise = 500, 300, 10, 0.05           # change the true rank, the noise, the shape
+A = rng.standard_normal((m, r_true)) @ rng.standard_normal((r_true, n)) / np.sqrt(n)
+A += noise * rng.standard_normal((m, n)) / np.sqrt(n)
+s = np.linalg.svd(A, compute_uv=False)
+print("top singular values:", s[:r_true + 3].round(3))
 
-frob_A = np.linalg.norm(A, 'fro')
-for k in range(1, 9):
-    Ak = (U[:, :k] * s[:k]) @ Vt[:k, :]
-    rel_err = np.linalg.norm(A - Ak, 'fro') / frob_A
-    print(f"k={k}  relative Frobenius error: {rel_err:.4f}")
+k, p = r_true, 5
+for q in (0, 1, 2):                                # power iterations
+    Q, _ = np.linalg.qr(A @ rng.standard_normal((n, k + p)))
+    for _ in range(q):
+        Q, _ = np.linalg.qr(A @ (A.T @ Q))
+    Ub, sb, Vtb = np.linalg.svd(Q.T @ A, full_matrices=False)
+    Ak = (Q @ Ub[:, :k] * sb[:k]) @ Vtb[:k]
+    print(f"q={q}: ||A - A_k||_F = {np.linalg.norm(A - Ak):.4f} vs optimal {np.sqrt((s[k:] ** 2).sum()):.4f}")
 ```
 
 ```output
-k=1  relative Frobenius error: 0.8180
-k=2  relative Frobenius error: 0.6325
-k=3  relative Frobenius error: 0.4676
-k=4  relative Frobenius error: 0.3513
-k=5  relative Frobenius error: 0.2236
-k=6  relative Frobenius error: 0.1513
-k=7  relative Frobenius error: 0.0397
-k=8  relative Frobenius error: 0.0000
+top singular values: [27.74  26.09  24.365 24.127 22.644 21.882 20.422 20.028 19.98  18.683
+  0.112  0.111  0.109]
+q=0: ||A - A_k||_F = 1.6514 vs optimal 1.0877
+q=1: ||A - A_k||_F = 1.0877 vs optimal 1.0877
+q=2: ||A - A_k||_F = 1.0877 vs optimal 1.0877
 ```
+
+P
 
 ## Exercise
 
-Reconstruct a $10 \times 8$ random matrix at rank 3. Verify that your Frobenius reconstruction error equals $\sqrt{\sigma_4^2 + \cdots + \sigma_8^2}$ (the Eckart–Young bound).
+P
 
 <details>
 <summary>Solution</summary>
 
 ```python
-import numpy as np
+def soft_impute(lam, iters=200):
+    Z = np.where(mask, R_full, item_mean)
+    for _ in range(iters):
+        U, s, Vt = np.linalg.svd(Z, full_matrices=False)
+        s_shrunk = np.maximum(s - lam, 0)          # soft-threshold the singular values
+        L = (U * s_shrunk) @ Vt
+        Z = np.where(mask, R_full, L)
+    return L, int((s_shrunk > 0).sum())
 
-rng = np.random.default_rng(0)
-A = rng.standard_normal((10, 8))
-U, s, Vt = np.linalg.svd(A, full_matrices=False)
-
-k = 3
-Ak = (U[:, :k] * s[:k]) @ Vt[:k, :]
-
-actual_err  = np.linalg.norm(A - Ak, 'fro')
-optimal_err = np.sqrt(np.sum(s[k:]**2))
-
-print(f"Actual error   : {actual_err:.8f}")
-print(f"Eckart-Young   : {optimal_err:.8f}")
-print(f"Match: {np.isclose(actual_err, optimal_err)}")
+for lam in (5, 10, 20, 40):
+    L, rank = soft_impute(lam)
+    print(f"soft-impute lam={lam:>2}: rank {rank:>3}, test RMSE {rmse(L):.4f}")
 ```
 
 ```output
-Actual error   : 4.49351857
-Eckart-Young   : 4.49351857
-Match: True
+soft-impute lam= 5: rank   5, test RMSE 0.4683
+soft-impute lam=10: rank   5, test RMSE 0.6744
+soft-impute lam=20: rank   5, test RMSE 1.0489
+soft-impute lam=40: rank   1, test RMSE 1.4059
 ```
 
-The two values agree exactly, confirming the rank-3 truncated SVD is the optimal rank-3 approximation.
+P
 </details>

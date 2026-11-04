@@ -5,228 +5,761 @@ title: "Eigendecomposition and What It Means for Data"
 order: 4
 ---
 
-## Eigenvectors: fixed directions under a linear map
+## Directions a map only stretches
 
-A vector $v \neq 0$ is an **eigenvector** of $A$ if $Av = \lambda v$ for some scalar
-$\lambda$ (the **eigenvalue**). Applying $A$ to $v$ only scales it — no rotation.
+Push every direction in the plane through a matrix and almost all of them get turned as well as stretched. A few
+special directions come out pointing exactly the way they went in, only longer, shorter or flipped. Those are the
+**eigenvectors**, and the stretch factors are the **eigenvalues**. Find them and a messy map becomes "stretch along
+these axes by these amounts".
 
-For a symmetric matrix $A \in \mathbb{R}^{n \times n}$, the eigendecomposition is:
+In symbols: $v \neq 0$ is an eigenvector of a square matrix $A$ with eigenvalue $\lambda$ (a scalar) when
+$Av = \lambda v$. A quick test in 2D: $Av$ is parallel to $v$ exactly when the 2D cross product $v_1 (Av)_2 - v_2
+(Av)_1$ is zero. Below, a brute-force scan over a million directions finds where that happens.
+
+```python
+import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+
+A = np.array([[3.0, 1.0],
+              [0.0, 2.0]])
+for v in [np.array([1.0, 1.0]), np.array([0.0, 1.0]), np.array([1.0, 0.0]), np.array([1.0, -1.0])]:
+    Av = A @ v
+    print(f"v = {v} -> Av = {Av} | cross(v, Av) = {v[0] * Av[1] - v[1] * Av[0]:+.1f}")
+
+theta = np.linspace(-0.1, np.pi - 0.1, 1_000_000, endpoint=False)
+V = np.vstack([np.cos(theta), np.sin(theta)])
+AV = A @ V
+cross = V[0] * AV[1] - V[1] * AV[0]
+for i in np.where(np.sign(cross[:-1]) != np.sign(cross[1:]))[0]:
+    print(f"parallel at {np.degrees(theta[i]):7.2f} deg | stretch v.Av = {V[:, i] @ AV[:, i]:.4f}")
+lam, vecs = np.linalg.eig(A)
+print("np.linalg.eig: eigenvalues", lam, "| eigenvectors (columns)\n", vecs)
+```
+
+```output
+v = [1. 1.] -> Av = [4. 2.] | cross(v, Av) = -2.0
+v = [0. 1.] -> Av = [1. 2.] | cross(v, Av) = -1.0
+v = [1. 0.] -> Av = [3. 0.] | cross(v, Av) = +0.0
+v = [ 1. -1.] -> Av = [ 2. -2.] | cross(v, Av) = +0.0
+parallel at   -0.00 deg | stretch v.Av = 3.0000
+parallel at  135.00 deg | stretch v.Av = 2.0000
+np.linalg.eig: eigenvalues [3.+0.j 2.+0.j] | eigenvectors (columns)
+ [[ 1.    +0.j -0.7071+0.j]
+ [ 0.    +0.j  0.7071+0.j]]
+```
+
+Two directions survive: the horizontal axis (stretched by 3) and the diagonal at $-45$ degrees, i.e. $(1, -1)$
+(stretched by 2). Every other direction, like $(1, 1)$ or $(0, 1)$, gets rotated. `np.linalg.eig` returns the same pair,
+with each eigenvector scaled to unit length (the sign and scale of an eigenvector are arbitrary: any nonzero multiple
+works).
+
+## The characteristic polynomial, and why you never compute with it
+
+$Av = \lambda v$ means $(A - \lambda I)v = 0$ has a nonzero solution, so $A - \lambda I$ must be singular: $\det(A -
+\lambda I) = 0$. That determinant is a polynomial in $\lambda$, the **characteristic polynomial**, and its roots are
+the eigenvalues. It is the textbook route and the wrong numerical one.
+
+### The 2x2 formula
+
+This shows the eigenvalues of a $2 \times 2$ matrix depend only on its trace and determinant. With $A = \begin{pmatrix}
+a & b \\ c & d \end{pmatrix}$,
 
 $$
-A = Q \Lambda Q^\top
+\det(A - \lambda I) = (a - \lambda)(d - \lambda) - bc = \lambda^2 - \underbrace{(a + d)}_{\operatorname{tr} A}\lambda +
+\underbrace{(ad - bc)}_{\det A} = 0,
+\qquad
+\lambda = \frac{\operatorname{tr} A \pm \sqrt{(\operatorname{tr} A)^2 - 4 \det A}}{2}.
 $$
 
-where $Q$ is orthogonal ($Q^\top Q = I$, columns are eigenvectors) and $\Lambda$ is
-diagonal (eigenvalues on the diagonal). This is the **spectral theorem** — symmetric
-matrices are always diagonalizable with an orthonormal eigenbasis.
+For the matrix above, $\operatorname{tr} A = 5$ and $\det A = 6$, so $\lambda^2 - 5\lambda + 6 = (\lambda - 2)(\lambda
+- 3)$. In general $\operatorname{tr} A = \sum_i \lambda_i$ and $\det A = \prod_i \lambda_i$ (expand the polynomial as
+$\prod_i (\lambda_i - \lambda)$). A negative discriminant gives complex eigenvalues: the map rotates every direction.
+
+The trouble with polynomials is that their roots are hypersensitive to their coefficients. Wilkinson's classic example
+is the polynomial with roots $1, 2, \dots, 20$: just storing its coefficients in float64 already rounds them.
 
 ```python
-import numpy as np
+roots_true = np.arange(1.0, 21.0)
+coeffs = np.poly(roots_true)                       # expand prod (x - k): coefficients up to 20! ~ 2.4e18
+print(f"largest coefficient {np.abs(coeffs).max():.2e}")
+r = np.sort_complex(np.roots(coeffs))
+print(f"roots from float64 coefficients: max error {np.abs(r - roots_true).max():.2e}")
+c2 = coeffs.copy()
+c2[1] += 2.0 ** -23                                # Wilkinson: nudge the x^19 coefficient (-210) by 1e-7
+r2 = np.sort_complex(np.roots(c2))
+print(f"after nudging one coefficient by {2.0 ** -23:.1e}: {int((np.abs(r2.imag) > 1e-6).sum())} complex roots, "
+      f"max |imag| {np.abs(r2.imag).max():.2f}")
+print("eigvals of diag(1..20):", np.linalg.eigvals(np.diag(roots_true))[:5], "... exact")
+```
 
+```output
+largest coefficient 1.38e+19
+roots from float64 coefficients: max error 6.98e-02
+after nudging one coefficient by 1.2e-07: 10 complex roots, max |imag| 2.78
+eigvals of diag(1..20): [1.+0.j 2.+0.j 3.+0.j 4.+0.j 5.+0.j] ... exact
+```
+
+A relative change of $10^{-9}$ in a single coefficient turns ten of the twenty real roots into complex pairs with
+imaginary parts near 2.8. The matrix with those eigenvalues is perfectly harmless: its eigenvalues are well conditioned,
+only the polynomial is not. So libraries never form the characteristic polynomial; they run the QR algorithm (later in
+this chapter) directly on the matrix. Use the polynomial for $2 \times 2$ reasoning and proofs only.
+
+## Diagonalization: powers become easy
+
+If an $n \times n$ matrix has $n$ independent eigenvectors, stack them as the columns of $V$ and the eigenvalues on the
+diagonal of $\Lambda$. Then $AV = V\Lambda$ (column $i$ says $Av_i = \lambda_i v_i$), so
+
+$$
+A = V \Lambda V^{-1}, \qquad A^k = V \Lambda^k V^{-1}.
+$$
+
+This is ch. 2's change of basis with the best possible basis: in eigenvector coordinates the map is a pure diagonal
+stretch. The power formula follows because the inner $V^{-1}V$ pairs cancel. Raising a matrix to the 50th power becomes
+raising $n$ numbers to the 50th power, and the long-run behaviour of $A^k x$ is ruled by the largest $|\lambda_i|$.
+
+The Fibonacci recurrence $F_{k+1} = F_k + F_{k-1}$ is the linear map $(F_{k+1}, F_k) = M (F_k, F_{k-1})$ with $M =
+\begin{pmatrix} 1 & 1 \\ 1 & 0 \end{pmatrix}$, whose eigenvalues are $\varphi = (1 + \sqrt 5)/2$ and $\psi = (1 - \sqrt
+5)/2$ (from the 2x2 formula: trace 1, determinant $-1$).
+
+```python
+M = np.array([[1.0, 1.0], [1.0, 0.0]])
+lam, V = np.linalg.eig(M)
+print("eigenvalues", lam, "| golden ratio", (1 + np.sqrt(5)) / 2)
+fib_exact = [0, 1]
+for _ in range(60):
+    fib_exact.append(fib_exact[-1] + fib_exact[-2])
+for k in (10, 30, 60):
+    Mk = V @ np.diag(lam ** k) @ np.linalg.inv(V)          # M^k = [[F(k+1), F(k)], [F(k), F(k-1)]]
+    print(f"k={k:2d}: F(k) from V Lambda^k V^-1 = {Mk[0, 1]:.6e} | exact {fib_exact[k]} | "
+          f"phi^k/sqrt5 = {lam.max() ** k / np.sqrt(5):.6e}")
+print(f"F(61)/F(60) = {fib_exact[61] / fib_exact[60]:.15f}")
+```
+
+```output
+eigenvalues [ 1.618+0.j -0.618+0.j] | golden ratio 1.618033988749895
+k=10: F(k) from V Lambda^k V^-1 = 5.500000e+01+0.000000e+00j | exact 55 | phi^k/sqrt5 = 5.500364e+01+0.000000e+00j
+k=30: F(k) from V Lambda^k V^-1 = 8.320400e+05+0.000000e+00j | exact 832040 | phi^k/sqrt5 = 8.320400e+05+0.000000e+00j
+k=60: F(k) from V Lambda^k V^-1 = 1.548009e+12+0.000000e+00j | exact 1548008755920 | phi^k/sqrt5 = 1.548009e+12+0.000000e+00j
+F(61)/F(60) = 1.618033988749895
+```
+
+Fibonacci numbers grow like $\varphi^k/\sqrt 5$ because $|\psi| < 1$ makes the second term vanish: Binet's formula is
+just the eigendecomposition read off. The ratio of consecutive terms locks onto the dominant eigenvalue. The
+eigen-route result agrees with the exact integers to about 15 significant digits, the limit of float64.
+
+### Long-run behaviour of a Markov chain
+
+This shows a Markov chain forgets its starting state at the rate of its second-largest eigenvalue. Let $P$ be a
+row-stochastic transition matrix (row $i$ holds the probabilities of moving from state $i$ to each state, so rows sum
+to 1). A distribution $p_k$ (a row vector) evolves as $p_{k+1} = p_k P$. Since $P\mathbf{1} = \mathbf{1}$, 1 is an
+eigenvalue, and for a chain that can reach every state from every state and is aperiodic, every other eigenvalue has
+$|\lambda| < 1$. Expanding $p_0$ in left eigenvectors,
+
+$$
+p_k = p_0 P^k = \pi + \sum_{i \ge 2} c_i \lambda_i^k u_i^\top \;\longrightarrow\; \pi,
+\qquad \|p_k - \pi\| = O(|\lambda_2|^k),
+$$
+
+where $\pi$ is the **stationary distribution**, the left eigenvector for $\lambda = 1$ normalized to sum to 1.
+
+```python
+P = np.array([[0.90, 0.08, 0.02],                 # customer states: active, lapsing, churned-but-returnable
+              [0.30, 0.50, 0.20],
+              [0.10, 0.10, 0.80]])
+lamL, U = np.linalg.eig(P.T)                       # left eigenvectors of P = right eigenvectors of P^T
+order = np.argsort(-np.abs(lamL))
+lamL, U = lamL[order].real, U[:, order].real
+pi = U[:, 0] / U[:, 0].sum()
+print("eigenvalues", lamL, "| stationary pi", pi, "| pi P == pi:", np.allclose(pi @ P, pi))
+p = np.array([0.0, 0.0, 1.0])                      # start everyone in state 3
+for k in range(1, 41):
+    p = p @ P
+    if k in (5, 10, 20, 40):
+        print(f"k={k:2d}: ||p_k - pi|| = {np.linalg.norm(p - pi):.3e} | ratio to |lambda2|^k = "
+              f"{np.linalg.norm(p - pi) / abs(lamL[1]) ** k:.4f}")
+```
+
+```output
+eigenvalues [1.     0.7897 0.4103] | stationary pi [0.6452 0.1452 0.2097] | pi P == pi: True
+k= 5: ||p_k - pi|| = 3.130e-01 | ratio to |lambda2|^k = 1.0190
+k=10: ||p_k - pi|| = 9.621e-02 | ratio to |lambda2|^k = 1.0195
+k=20: ||p_k - pi|| = 9.079e-03 | ratio to |lambda2|^k = 1.0195
+k=40: ||p_k - pi|| = 8.085e-05 | ratio to |lambda2|^k = 1.0195
+```
+
+The stationary distribution falls out as an eigenvector, and the distance to it shrinks by $|\lambda_2|$ per step: the
+ratio column settles to a constant, the exact signature of geometric decay at that rate. The **spectral gap** $1 -
+|\lambda_2|$ is the mixing speed of the chain. MCMC diagnostics (Bayesian ML course) and PageRank (this chapter's
+exercise) both live on this fact.
+
+## When diagonalization fails: defective matrices
+
+Not every matrix has a full set of eigenvectors. A shear pushes every vector sideways except along one line, so it
+has a single eigenvector direction where the plane needs two. Such a matrix is **defective**, and $A = V\Lambda V^{-1}$
+does not exist for it.
+
+The standard example is the **Jordan block** $J = \begin{pmatrix} 2 & 1 \\ 0 & 2 \end{pmatrix}$. Its characteristic
+polynomial is $(\lambda - 2)^2$, so $\lambda = 2$ twice (**algebraic multiplicity** 2), but $J - 2I = \begin{pmatrix} 0
+& 1 \\ 0 & 0 \end{pmatrix}$ has a one-dimensional null space (**geometric multiplicity** 1). Its powers are not pure
+exponentials: $J^k = \begin{pmatrix} 2^k & k\,2^{k-1} \\ 0 & 2^k \end{pmatrix}$, with a polynomial factor $k$ in front.
+Every square matrix is similar to a block diagonal of such blocks (the **Jordan form**), but the form is so unstable that
+nobody computes it numerically.
+
+```python
+J = np.array([[2.0, 1.0], [0.0, 2.0]])
+lamJ, VJ = np.linalg.eig(J)
+print("eigenvalues", lamJ, "| eigenvector matrix\n", VJ)
+print(f"cond(V) = {np.linalg.cond(VJ):.1e}   (columns are numerically parallel)")
+print("J^10 =", np.linalg.matrix_power(J, 10).tolist(), "| k 2^(k-1) =", 10 * 2 ** 9)
+for eps in (1e-6, 1e-10, 1e-14):
+    l = np.linalg.eigvals(J + np.array([[0.0, 0.0], [eps, 0.0]]))
+    print(f"perturb by {eps:.0e}: eigenvalues split by {abs(l[0] - l[1]):.2e} = 2 sqrt(eps) {2 * np.sqrt(eps):.2e}")
+```
+
+```output
+eigenvalues [2.+0.j 2.+0.j] | eigenvector matrix
+ [[ 1.+0.j -1.+0.j]
+ [ 0.+0.j  0.+0.j]]
+cond(V) = 4.5e+15   (columns are numerically parallel)
+J^10 = [[1024.0, 5120.0], [0.0, 1024.0]] | k 2^(k-1) = 5120
+perturb by 1e-06: eigenvalues split by 2.00e-03 = 2 sqrt(eps) 2.00e-03
+perturb by 1e-10: eigenvalues split by 2.00e-05 = 2 sqrt(eps) 2.00e-05
+perturb by 1e-14: eigenvalues split by 2.00e-07 = 2 sqrt(eps) 2.00e-07
+```
+
+`eig` does not refuse; it returns two "eigenvectors" that agree to 15 digits, and $V$ has condition number around
+$10^{15}$, so $V\Lambda V^{-1}$ would be garbage. A perturbation of size $\varepsilon$ moves the eigenvalues by
+$\sqrt{\varepsilon}$, so $10^{-14}$ noise gives $10^{-7}$ eigenvalue error: defective eigenvalues are ill-conditioned.
+Diagonalizability is guaranteed when the eigenvalues are distinct (eigenvectors for distinct eigenvalues are
+independent) or when the matrix is symmetric, which is the next section. For general matrices the robust tools are the
+Schur form (from the QR algorithm) and the SVD (ch. 5).
+
+## Symmetric matrices: the spectral theorem
+
+Covariance matrices, Hessians, kernel matrices and graph Laplacians are all symmetric, $S = S^\top$, and symmetric
+matrices are the best-behaved case in all of linear algebra: every eigenvalue is real, and you can always pick the
+eigenvectors perpendicular to each other. Geometrically, a symmetric map is a pure stretch along $n$ perpendicular axes,
+with no shear and no rotation.
+
+$$
+S = Q \Lambda Q^\top = \sum_{i=1}^{n} \lambda_i\, q_i q_i^\top, \qquad Q^\top Q = I,\;\; \lambda_i \in \mathbb{R}.
+$$
+
+Here $Q$ is orthogonal (columns $q_i$ orthonormal), so $V^{-1} = Q^\top$ costs nothing and the decomposition is a sum
+of rank-one projections $q_i q_i^\top$, each scaled by its eigenvalue.
+
+### Proof: real eigenvalues and orthogonal eigenvectors
+
+This shows the two key facts take one line each, using only $S^\top = S$. **Real eigenvalues:** let $Sv = \lambda v$
+with $v$ possibly complex, and $\bar v$ its complex conjugate. Then $\bar v^\top S v = \lambda \bar v^\top v$. Taking
+the conjugate transpose of the scalar and using that $S$ is real and symmetric, $\bar v^\top S v = \overline{\bar
+v^\top S v}$, so $\lambda \|v\|^2$ equals its own conjugate and $\lambda$ is real.
+
+**Orthogonal eigenvectors:** let $Sx = \lambda x$ and $Sy = \mu y$ with $\lambda \neq \mu$. Compute $x^\top S y$ two
+ways:
+
+$$
+x^\top S y = x^\top (\mu y) = \mu\, x^\top y,
+\qquad
+x^\top S y = (S^\top x)^\top y = (Sx)^\top y = \lambda\, x^\top y
+\;\Longrightarrow\;
+(\lambda - \mu)\, x^\top y = 0 \;\Longrightarrow\; x^\top y = 0.
+$$
+
+Within a repeated eigenvalue every vector of its eigenspace is an eigenvector, so you can choose an orthonormal basis
+there (Gram-Schmidt). That symmetric matrices are never defective needs one more step (induction: $S$ maps the
+subspace orthogonal to $q_1$ into itself, because $q_1^\top S x = \lambda_1 q_1^\top x = 0$), which completes the
+theorem. The practical consequence: use `eigh` for symmetric matrices. It guarantees real, sorted eigenvalues and an
+orthonormal $Q$; `eig` guarantees neither.
+
+```python
 rng = np.random.default_rng(0)
-X = rng.standard_normal((4, 4))
-A = X.T @ X    # symmetric PSD: eigenvalues ≥ 0
-
-eigenvalues, eigenvectors = np.linalg.eigh(A)   # eigh for symmetric/Hermitian
-print("eigenvalues :", eigenvalues.round(4))
-print("eigenvectors (columns):\n", eigenvectors.round(4))
-
-# Verify: A v_i = λ_i v_i
-for i in range(4):
-    lhs = A @ eigenvectors[:, i]
-    rhs = eigenvalues[i] * eigenvectors[:, i]
-    print(f"||Av_{i} - λ v_{i}|| = {np.linalg.norm(lhs - rhs):.2e}")
+Q0, _ = np.linalg.qr(rng.standard_normal((4, 4)))
+S = Q0 @ np.diag([1.0, 1.0, 1.0, 3.0]) @ Q0.T      # symmetric, eigenvalue 1 repeated three times
+lam_h, Qh = np.linalg.eigh(S)
+lam_e, Ve = np.linalg.eig(S)
+print("eigh:", lam_h, f"| ||Q^T Q - I|| = {np.linalg.norm(Qh.T @ Qh - np.eye(4)):.1e}")
+print("eig :", lam_e.real, f"| ||V^T V - I|| = {np.linalg.norm(Ve.T @ Ve - np.eye(4)):.1e}")
+print(f"reconstruction sum lambda_i q_i q_i^T: {np.linalg.norm(S - (Qh * lam_h) @ Qh.T):.1e}")
+R90 = np.array([[0.0, -1.0], [1.0, 0.0]])
+print("non-symmetric rotation: eigenvalues", np.linalg.eigvals(R90), "(complex: no real direction is kept)")
 ```
 
 ```output
-eigenvalues : [0.1013 1.3354 2.8512 9.2105]
-eigenvectors (columns):
- [[ 0.0501  0.0619 -0.6815 -0.7275]
- [ 0.2401 -0.9184  0.1963 -0.2455]
- [-0.5607  0.1312  0.5828 -0.5734]
- [ 0.7909  0.368   0.3967 -0.2859]]
-||Av_0 - λ v_0|| = 4.75e-16
-||Av_1 - λ v_1|| = 6.45e-16
-||Av_2 - λ v_2|| = 1.81e-15
-||Av_3 - λ v_3|| = 3.32e-15
+eigh: [1. 1. 1. 3.] | ||Q^T Q - I|| = 5.4e-16
+eig : [3. 1. 1. 1.] | ||V^T V - I|| = 5.1e-01
+reconstruction sum lambda_i q_i q_i^T: 8.0e-16
+non-symmetric rotation: eigenvalues [0.+1.j 0.-1.j] (complex: no real direction is kept)
 ```
 
-Use `np.linalg.eigh` (not `eig`) for symmetric matrices — it exploits symmetry for speed
-and guarantees real eigenvalues with sorted output.
+`eigh` returns an orthonormal basis to rounding. `eig` returns valid eigenvectors, but inside the triple eigenvalue it
+picks an arbitrary non-orthogonal basis, so $V^\top V$ is far from $I$ and the cheap inverse $V^{-1} = V^\top$ is
+wrong. The 90-degree rotation shows what symmetry rules out: no real direction survives it, and its eigenvalues are
+$\pm i$.
 
-## What eigenvalues tell you about data
+## The Rayleigh quotient: eigenvalues as extremes
 
-The covariance matrix $\Sigma = \frac{1}{n-1} X_c^\top X_c$ (where $X_c$ is mean-centered
-$X$) is symmetric PSD. Its eigenvectors are the **principal directions** of variance; its
-eigenvalues are the **variance along each direction**.
+Feed a unit vector $x$ into a symmetric $S$ and measure how much of $Sx$ points back along $x$. That number,
+$x^\top S x$, is largest when $x$ is the top eigenvector and smallest at the bottom one. Eigenvalues are the answers to
+optimization problems, which is why they turn up whenever you maximize variance or minimize energy.
+
+### The variational characterization
+
+This shows the Rayleigh quotient is a weighted average of the eigenvalues. Define $R(x) = \dfrac{x^\top S x}{x^\top
+x}$ for $x \neq 0$. Write $x = Qc$ in the eigenbasis (coefficients $c = Q^\top x$). Because $Q$ is orthogonal,
+
+$$
+R(x) = \frac{c^\top \Lambda c}{c^\top c} = \sum_{i=1}^{n} \lambda_i \frac{c_i^2}{\sum_j c_j^2}
+\quad\Longrightarrow\quad
+\lambda_{\min} \le R(x) \le \lambda_{\max},
+$$
+
+with equality exactly at the corresponding eigenvectors. The gradient is $\nabla R = \frac{2}{x^\top x}(Sx - R(x)x)$,
+zero precisely at eigenvectors: every eigenvector is a stationary point of $R$, and only the extremes are maxima or
+minima. Restricting $x \perp q_1$ removes $\lambda_1$ from the average, so the next eigenvalue is the next maximum. The
+general statement is the **Courant-Fischer** min-max theorem, for eigenvalues sorted $\lambda_1 \ge \dots \ge \lambda_n$:
+
+$$
+\lambda_k = \max_{\dim W = k} \;\min_{x \in W,\, x \neq 0} R(x).
+$$
 
 ```python
-import numpy as np
-
-rng = np.random.default_rng(3)
-N = 200
-# Strongly correlated 2D data
-x1 = rng.standard_normal(N)
-x2 = 0.9 * x1 + 0.1 * rng.standard_normal(N)
-X = np.column_stack([x1, x2])
-X -= X.mean(axis=0)                    # center
-
-Sigma = X.T @ X / (N - 1)
-vals, vecs = np.linalg.eigh(Sigma)
-
-print("Covariance matrix:\n", Sigma.round(4))
-print("Eigenvalues:", vals.round(4))
-print("Eigenvectors:\n", vecs.round(4))
-print("\nFraction of variance in PC1:", round(vals[-1] / vals.sum(), 4))
-```
-
-```output
-Covariance matrix:
- [[1.0664 0.9632]
- [0.9632 0.8796]]
-Eigenvalues: [0.0054 1.9407]
-Eigenvectors:
- [[ 0.6721 -0.7404]
- [-0.7404 -0.6721]]
-
-Fraction of variance in PC1: 0.9972
-```
-
-The largest eigenvalue captures about 99.7% of the variance. The corresponding eigenvector points
-along the main correlation axis of the data. This is exactly PCA (ch. 6).
-
-## Reconstruction from eigendecomposition
-
-Because $A = Q\Lambda Q^\top = \sum_i \lambda_i q_i q_i^\top$, you can reconstruct
-$A$ from its eigencomponents, or approximate it with only the top $k$ components:
-
-```python
-import numpy as np
-
-rng = np.random.default_rng(0)
-X = rng.standard_normal((5, 5))
-A = X.T @ X
-
-vals, vecs = np.linalg.eigh(A)
-# eigh returns eigenvalues in ascending order; reverse for descending
-vals = vals[::-1]; vecs = vecs[:, ::-1]
-
-# Full reconstruction
-A_recon = sum(vals[i] * np.outer(vecs[:, i], vecs[:, i]) for i in range(5))
-print("full recon error:", np.linalg.norm(A - A_recon))
-
-# Rank-2 approximation
-A_r2 = sum(vals[i] * np.outer(vecs[:, i], vecs[:, i]) for i in range(2))
-print("rank-2 recon error:", np.linalg.norm(A - A_r2).round(4))
-print("rank-2 captures:",
-      round(vals[:2].sum() / vals.sum() * 100, 1), "% of spectral energy")
-```
-
-```output
-full recon error: 1.2083338123214528e-14
-rank-2 recon error: 3.3782
-rank-2 captures: 79.8 % of spectral energy
-```
-
-## Matrix powers and the exponential via eigendecomposition
-
-$A^k = Q \Lambda^k Q^\top$ (just raise each eigenvalue to the $k$-th power). Similarly
-$e^A = Q e^\Lambda Q^\top$ (exponentiate each eigenvalue). Both come for free once you
-have the eigendecomposition.
-
-```python
-import numpy as np
-
 rng = np.random.default_rng(1)
-A = rng.standard_normal((3, 3))
-A = A.T @ A    # symmetric PSD
-
-vals, vecs = np.linalg.eigh(A)
-
-# A^3 via eigendecomposition
-A3_eigen = vecs @ np.diag(vals**3) @ vecs.T
-A3_direct = A @ A @ A
-
-print("max diff A^3:", np.abs(A3_eigen - A3_direct).max())
+B = rng.standard_normal((5, 5))
+S = B @ B.T                                        # symmetric positive semi-definite
+lam, Q = np.linalg.eigh(S)
+lam, Q = lam[::-1], Q[:, ::-1]                     # sort descending
+X = rng.standard_normal((5, 200_000))
+Rq = np.einsum("ij,ij->j", X, S @ X) / np.einsum("ij,ij->j", X, X)
+print("eigenvalues      ", lam)
+print(f"R over 200k random x: min {Rq.min():.4f}, max {Rq.max():.4f}")
+Xp = X - np.outer(Q[:, 0], Q[:, 0] @ X)           # project out the top eigenvector
+Rp = np.einsum("ij,ij->j", Xp, S @ Xp) / np.einsum("ij,ij->j", Xp, Xp)
+print(f"R restricted to x perp q1: max {Rp.max():.4f}  (lambda_2 = {lam[1]:.4f})")
+print(f"R(q1) = {Q[:, 0] @ S @ Q[:, 0]:.4f} | R(q3) = {Q[:, 2] @ S @ Q[:, 2]:.4f}")
 ```
 
 ```output
-max diff A^3: 7.105427357601002e-15
+eigenvalues       [11.7483  2.4918  1.8654  0.618   0.0815]
+R over 200k random x: min 0.0826, max 11.7106
+R restricted to x perp q1: max 2.4916  (lambda_2 = 2.4918)
+R(q1) = 11.7483 | R(q3) = 1.8654
 ```
+
+No random direction escapes the interval $[\lambda_{\min}, \lambda_{\max}]$, and random sampling gets near the top
+only slowly (in 5 dimensions a random vector rarely lines up with $q_1$). Projecting out $q_1$ caps the quotient below
+$\lambda_2$. The interior eigenvector $q_3$ sits at a saddle of $R$: it is a stationary point, but neither max nor min.
+
+## Power iteration: the algorithm behind the top eigenvector
+
+Multiply a random vector by $A$ over and over and the component along the dominant eigenvector grows fastest, so the
+direction converges to it. That is power iteration, and it needs nothing but matrix-vector products, which is why it
+scales to PageRank's billions of nodes and is how spectral normalization estimates a layer's largest singular value.
+
+### Why it converges at rate $|\lambda_2/\lambda_1|^k$
+
+This shows the error shrinks by the eigenvalue ratio each step. Write $x_0 = \sum_i c_i v_i$ with $|\lambda_1| >
+|\lambda_2| \ge \dots$ and $c_1 \neq 0$. Then
+
+$$
+A^k x_0 = \lambda_1^k \Big( c_1 v_1 + \sum_{i \ge 2} c_i \Big(\frac{\lambda_i}{\lambda_1}\Big)^k v_i \Big),
+\qquad
+\text{direction error} = O\big(|\lambda_2/\lambda_1|^k\big).
+$$
+
+Normalizing each step keeps the numbers finite without changing the direction. For symmetric $A$ the Rayleigh quotient
+of the iterate converges twice as fast, $O(|\lambda_2/\lambda_1|^{2k})$, because $R$ is stationary at eigenvectors
+(first-order errors in $x$ give second-order errors in $R$).
+
+```python
+def sym_with_eigs(eigs, seed):
+    Qs, _ = np.linalg.qr(np.random.default_rng(seed).standard_normal((len(eigs), len(eigs))))
+    return Qs @ np.diag(eigs) @ Qs.T, Qs
+
+def power_iteration(A, x0, iters):
+    x, errs = x0 / np.linalg.norm(x0), []
+    for _ in range(iters):
+        x = A @ x
+        x /= np.linalg.norm(x)
+        errs.append(x)
+    return x, x @ A @ x, np.array(errs)
+
+for eigs in ([10.0, 9.0, 5.0, 2.0, 1.0], [10.0, 5.0, 4.0, 2.0, 1.0]):
+    S, Qs = sym_with_eigs(eigs, seed=2)
+    x, rq, its = power_iteration(S, np.ones(5), 80)
+    angle_err = np.sqrt(np.maximum(0.0, 1 - (its @ Qs[:, 0]) ** 2))    # sin of angle to the true q1
+    rates = angle_err[30:40] / angle_err[29:39]
+    print(f"eigs {eigs}: ratio l2/l1 = {eigs[1] / eigs[0]:.2f} | measured error ratio per step {rates.mean():.4f} | "
+          f"sin(angle) after 20, 40 steps {angle_err[19]:.1e}, {angle_err[39]:.1e} | Rayleigh {rq:.10f}")
+```
+
+```output
+eigs [10.0, 9.0, 5.0, 2.0, 1.0]: ratio l2/l1 = 0.90 | measured error ratio per step 0.9000 | sin(angle) after 20, 40 steps 2.2e-02, 2.6e-03 | Rayleigh 9.9999999985
+eigs [10.0, 5.0, 4.0, 2.0, 1.0]: ratio l2/l1 = 0.50 | measured error ratio per step 1.0656 | sin(angle) after 20, 40 steps 1.7e-07, 2.1e-08 | Rayleigh 10.0000000000
+```
+
+The measured per-step error ratio matches $\lambda_2/\lambda_1$: 0.9 for the close pair, 0.5 when the gap is wide.
+Forty steps reach about $10^{-2}$ in the first case and $10^{-12}$ in the second. The eigenvalue itself is exact to ten
+digits even when the vector is only roughly right, the doubled rate in action. The gap, not the matrix size, sets the
+cost.
+
+### Shift-and-invert, and deflation
+
+This shows how to aim power iteration at any eigenvalue, and how to peel off eigenpairs one at a time. $(A - \sigma
+I)^{-1}$ has the same eigenvectors as $A$ with eigenvalues $1/(\lambda_i - \sigma)$, so power iteration on it (solving a
+linear system each step, never forming the inverse) finds the eigenvalue **closest to the shift** $\sigma$, at rate
+$|\lambda_{\text{closest}} - \sigma| / |\lambda_{\text{next}} - \sigma|$. With $\sigma$ near the target that ratio is
+tiny. For deflation, once $(\lambda_1, q_1)$ is known, $S - \lambda_1 q_1 q_1^\top$ has the same eigenpairs except that
+$\lambda_1$ is replaced by 0, so power iteration on it finds $\lambda_2$.
+
+```python
+S, Qs = sym_with_eigs([10.0, 9.0, 5.0, 2.0, 1.0], seed=2)
+for sigma in (4.0, 4.8):
+    x = np.ones(5) / np.sqrt(5)
+    for k in range(1, 6):
+        x = np.linalg.solve(S - sigma * np.eye(5), x)
+        x /= np.linalg.norm(x)
+    rate = abs(5 - sigma) / abs(2 - sigma)
+    print(f"shift {sigma}: after 5 solves eigenvalue {x @ S @ x:.12f} | predicted rate {rate:.3f}")
+x1, l1, _ = power_iteration(S, np.ones(5), 500)
+x2, l2, _ = power_iteration(S - l1 * np.outer(x1, x1), np.ones(5), 500)
+print(f"power iteration: lambda1 {l1:.8f} | after deflation lambda2 {l2:.8f}")
+```
+
+```output
+shift 4.0: after 5 solves eigenvalue 4.998214159957 | predicted rate 0.500
+shift 4.8: after 5 solves eigenvalue 4.999999999994 | predicted rate 0.071
+power iteration: lambda1 10.00000000 | after deflation lambda2 9.00000000
+```
+
+Five linear solves with $\sigma = 4.8$ pin $\lambda = 5$ to all printed digits, because each step shrinks the error by
+$0.2/2.8 \approx 0.07$. A shift of 4 gives a slower rate of 1/2, still far better than plain power iteration could do
+for an interior eigenvalue (it cannot reach one at all). Updating the shift to the current Rayleigh quotient every step
+gives **Rayleigh quotient iteration**, cubically convergent for symmetric matrices. Deflation recovers $\lambda_2 = 9$,
+though the slow 0.9 ratio needs hundreds of steps; errors in $q_1$ also leak into later eigenpairs, so deflation is only
+used for a handful of them.
+
+## The QR algorithm: how eig actually works
+
+Power iteration on one vector finds one eigenvector. Run it on a whole orthonormal basis at once, re-orthonormalizing
+each step, and you get all of them. Written compactly that is the **QR algorithm**: factor $A_k = Q_k R_k$ (ch. 3),
+then multiply back in reverse order, $A_{k+1} = R_k Q_k$.
+
+Since $A_{k+1} = Q_k^\top A_k Q_k$, every iterate is similar to $A$ (same eigenvalues), and for real distinct
+$|\lambda_i|$ the iterates converge to an upper triangular matrix with the eigenvalues on the diagonal (the **Schur
+form**). Entry $(i, j)$ below the diagonal decays like $|\lambda_i / \lambda_j|^k$.
+
+```python
+rng = np.random.default_rng(3)
+T = np.triu(rng.standard_normal((4, 4))) + np.diag([6.0, -4.0, 2.0, 1.0])
+Vr = rng.standard_normal((4, 4))
+A_ns = Vr @ T @ np.linalg.inv(Vr)                  # non-symmetric, eigenvalues = diag(T)
+Ak = A_ns.copy()
+for k in range(1, 61):
+    Qk, Rk = np.linalg.qr(Ak)
+    Ak = Rk @ Qk
+    if k in (1, 10, 30, 60):
+        print(f"iter {k:2d}: max |below diagonal| {np.abs(np.tril(Ak, -1)).max():.1e} | diagonal {np.diag(Ak)}")
+print("np.linalg.eigvals:", np.sort(np.linalg.eigvals(A_ns).real)[::-1])
+```
+
+```output
+iter  1: max |below diagonal| 3.7e+00 | diagonal [-3.2483  7.5514  2.2713  0.0858]
+iter 10: max |below diagonal| 1.1e-01 | diagonal [ 8.0009 -4.1759  2.226   0.6092]
+iter 30: max |below diagonal| 2.8e-07 | diagonal [ 8.0409 -4.2156  2.2258  0.6092]
+iter 60: max |below diagonal| 1.1e-15 | diagonal [ 8.0409 -4.2156  2.2258  0.6092]
+np.linalg.eigvals: [ 8.0409  2.2258  0.6092 -4.2156]
+```
+
+Below-diagonal entries die geometrically and the diagonal settles on $6, -4, 2, 1$. The slowest entry is controlled by
+the closest ratio, here $|1/2|$, so 60 iterations reach about $10^{-18}$ times its starting size. Real implementations
+(LAPACK, behind `eig` and `eigh`) first reduce to Hessenberg or tridiagonal form so each step costs $O(n^2)$ instead of
+$O(n^3)$, and add shifts (the shift-and-invert idea again) that make convergence cubic. Total cost is $O(n^3)$ for all
+eigenvalues.
+
+## Covariance eigenvalues are variances along directions
+
+Point a ruler in direction $u$ through a cloud of data and measure the spread of the shadows; that spread is $u^\top
+\Sigma u$, a Rayleigh quotient of the covariance matrix $\Sigma$. So the direction of greatest spread is the top
+eigenvector, and the spread there is the top eigenvalue. That sentence is PCA (ch. 6).
+
+For centered data $X_c$ ($N$ rows, one per sample), $\Sigma = X_c^\top X_c / (N - 1)$, and the projections $X_c u$ have
+sample variance $u^\top \Sigma u$. Because $\Sigma$ is symmetric positive semi-definite, the eigenvalues are real and
+non-negative, and they add up to the total variance: $\sum_i \lambda_i = \operatorname{tr}\Sigma = \sum_j
+\operatorname{Var}(x_j)$.
+
+```python
+rng = np.random.default_rng(4)
+N = 2000
+height = rng.normal(170, 8, N)
+weight = 0.9 * (height - 170) + rng.normal(70, 4, N)    # weight tracks height
+Xd = np.column_stack([height, weight])
+Xc = Xd - Xd.mean(axis=0)
+Sigma = Xc.T @ Xc / (N - 1)
+lamS, QS = np.linalg.eigh(Sigma)
+angles = np.linspace(0, np.pi, 3600, endpoint=False)
+U2 = np.vstack([np.cos(angles), np.sin(angles)])
+var_dir = (Xc @ U2).var(axis=0, ddof=1)
+best = U2[:, var_dir.argmax()]
+print("Sigma\n", Sigma, "\neigenvalues", lamS, "| top eigenvector", QS[:, 1] * np.sign(QS[0, 1]))
+print(f"brute-force max variance {var_dir.max():.4f} at direction {best} | min {var_dir.min():.4f}")
+print(f"trace {np.trace(Sigma):.4f} = sum of eigenvalues {lamS.sum():.4f} | top share {lamS[1] / lamS.sum():.4f}")
+```
+
+```output
+Sigma
+ [[63.0496 55.9899]
+ [55.9899 65.7673]]
+eigenvalues [  8.402  120.4148] | top eigenvector [0.6985 0.7156]
+brute-force max variance 120.4148 at direction [0.6984 0.7157] | min 8.4020
+trace 128.8168 = sum of eigenvalues 128.8168 | top share 0.9348
+```
+
+The direction of maximum variance found by scanning 3600 angles matches the top eigenvector, and the maximum and
+minimum variances are the two eigenvalues to the scan's resolution. The top direction carries almost all of the
+variance, so a single coordinate along it ("overall size") describes most of what distinguishes people here. Ch. 6 turns
+this into PCA, including why the SVD of $X_c$ is the better way to compute it.
+
+## The graph Laplacian and spectral clustering
+
+Picture a social network with two friend groups joined by a single acquaintance. Assign each person a number so that
+friends get similar numbers; the smoothest non-constant assignment puts one group positive and the other negative.
+That assignment is an eigenvector of the graph Laplacian, and reading off its signs is spectral clustering.
+
+For a graph with symmetric edge weights $w_{ij} \ge 0$, let $D$ be the diagonal matrix of node degrees $d_i = \sum_j
+w_{ij}$ and $L = D - W$. The quadratic form measures roughness:
+
+$$
+x^\top L x = \frac{1}{2} \sum_{i,j} w_{ij} (x_i - x_j)^2 \;\ge\; 0 .
+$$
+
+So $L$ is positive semi-definite; the constant vector has $x^\top L x = 0$, giving $\lambda_1 = 0$, and the number of
+zero eigenvalues equals the number of connected components. The minimizer of the Rayleigh quotient orthogonal to the
+constant vector is the **Fiedler vector** (eigenvector of $\lambda_2$), a relaxed version of the minimum balanced cut.
+
+```python
+W = np.zeros((10, 10))
+for group in (range(0, 5), range(5, 10)):
+    for i in group:
+        for j in group:
+            if i != j:
+                W[i, j] = 1.0                       # two 5-node cliques
+W[4, 5] = W[5, 4] = 1.0                             # one bridge edge
+L = np.diag(W.sum(axis=1)) - W
+lamL, QL = np.linalg.eigh(L)
+fiedler = QL[:, 1] * np.sign(QL[0, 1])
+print("Laplacian eigenvalues", lamL)
+print("Fiedler vector", fiedler, "\nclusters", (fiedler > 0).astype(int))
+x_test = rng.standard_normal(10)
+print(f"x^T L x = {x_test @ L @ x_test:.4f} | half sum w_ij (x_i - x_j)^2 = "
+      f"{0.5 * (W * (x_test[:, None] - x_test[None, :]) ** 2).sum():.4f}")
+W[4, 5] = W[5, 4] = 0.0
+print("bridge removed: eigenvalues", np.linalg.eigvalsh(np.diag(W.sum(axis=1)) - W)[:3], "(two zeros = two components)")
+```
+
+```output
+Laplacian eigenvalues [-0.      0.2984  5.      5.      5.      5.      5.      5.      5.
+  6.7016]
+Fiedler vector [ 0.3336  0.3336  0.3336  0.3336  0.2341 -0.2341 -0.3336 -0.3336 -0.3336
+ -0.3336]
+clusters [1 1 1 1 1 0 0 0 0 0]
+x^T L x = 50.1810 | half sum w_ij (x_i - x_j)^2 = 50.1810
+bridge removed: eigenvalues [-0. -0.  5.] (two zeros = two components)
+```
+
+The second eigenvalue is small (the graph is almost disconnected) and then a jump: a large gap after $\lambda_k$ says
+"$k$ clusters". The Fiedler vector is positive on one clique and negative on the other, with the two bridge nodes
+closest to zero, and its signs recover the groups exactly. Remove the bridge and a second exact zero appears. Real
+spectral clustering builds $W$ from a similarity kernel on data points and runs k-means on the first few eigenvectors;
+that pipeline, and why it handles non-convex clusters, is in Classical ML (ch. 15).
+
+## Spectral radius and the stability of iterations
+
+Apply the same linear map over and over, $x_{k+1} = A x_k$: a population model, a linear filter, an RNN without its
+nonlinearity, the error of an iterative solver. Whether $x_k$ dies, holds steady or explodes is decided by the largest
+eigenvalue magnitude, the **spectral radius** $\rho(A) = \max_i |\lambda_i|$.
+
+From $A^k = V\Lambda^k V^{-1}$, $x_k \to 0$ for every start iff $\rho(A) < 1$ (true even for defective matrices, where
+the Jordan factor $k$ only delays the decay). But $\rho$ governs the long run only. A **non-normal** matrix (one with
+non-orthogonal eigenvectors, $A A^\top \neq A^\top A$) can amplify vectors enormously for a while before the decay wins,
+because $\|A\|$ can far exceed $\rho(A)$.
+
+```python
+A_n = np.array([[0.9, 10.0], [0.0, 0.8]])           # rho = 0.9 but strongly non-normal
+A_s = np.diag([0.9, 0.8])                           # same eigenvalues, normal
+print(f"rho = {max(abs(np.linalg.eigvals(A_n))):.2f} for both | ||A_n||_2 = {np.linalg.norm(A_n, 2):.2f}")
+for k in (1, 5, 10, 30, 100):
+    print(f"k={k:3d}: ||A_n^k||_2 = {np.linalg.norm(np.linalg.matrix_power(A_n, k), 2):9.3f} | "
+          f"||A_s^k||_2 = {np.linalg.norm(np.linalg.matrix_power(A_s, k), 2):.3f}")
+```
+
+```output
+rho = 0.90 for both | ||A_n||_2 = 10.07
+k=  1: ||A_n^k||_2 =    10.072 | ||A_s^k||_2 = 0.900
+k=  5: ||A_n^k||_2 =    26.290 | ||A_s^k||_2 = 0.590
+k= 10: ||A_n^k||_2 =    24.133 | ||A_s^k||_2 = 0.349
+k= 30: ||A_n^k||_2 =     4.116 | ||A_s^k||_2 = 0.042
+k=100: ||A_n^k||_2 =     0.003 | ||A_s^k||_2 = 0.000
+```
+
+Both matrices have spectral radius 0.9 and both decay eventually, but the non-normal one first amplifies by a factor
+of about 40 before turning around near step 10. The normal (here diagonal) matrix just decays as $0.9^k$. Transient
+growth like this is why stability analysis of optimizers and of recurrent nets looks at norms and singular values
+(ch. 5), not eigenvalues alone.
+
+### Exploding and vanishing gradients in a linear RNN
+
+This shows the gradient through $T$ time steps scales like $\rho(W)^T$. In a linear recurrence $h_{t+1} = W h_t$ the
+Jacobian of $h_T$ with respect to $h_0$ is $W^T$ (here $T$ is a step count, not a transpose), and backpropagation
+multiplies the upstream gradient by $(W^\top)^T$. Expanding in eigenvectors, components along $|\lambda| > 1$ grow as
+$|\lambda|^T$ and the rest shrink. A real RNN inserts $\tanh$ derivatives (at most 1) between factors, which can only
+add shrinkage, so $\rho(W) < 1$ guarantees vanishing gradients and $\rho(W) > 1$ allows explosion (Sequence Models &
+Transformers, ch. 3).
+
+```python
+rng = np.random.default_rng(5)
+W0 = rng.standard_normal((64, 64)) / np.sqrt(64)
+W0 /= max(abs(np.linalg.eigvals(W0)))               # rescale to spectral radius exactly 1
+g = rng.standard_normal(64)
+for rho in (0.9, 1.0, 1.1):
+    Wr = rho * W0
+    norms = [np.linalg.norm(np.linalg.matrix_power(Wr.T, T) @ g) / np.linalg.norm(g) for T in (10, 50, 100)]
+    print(f"rho {rho}: gradient gain after T = 10, 50, 100 steps: " + ", ".join(f"{n_:.2e}" for n_ in norms)
+          + f" | rho^100 = {rho ** 100:.2e}")
+```
+
+```output
+rho 0.9: gradient gain after T = 10, 50, 100 steps: 1.07e-01, 8.94e-04, 4.58e-06 | rho^100 = 2.66e-05
+rho 1.0: gradient gain after T = 10, 50, 100 steps: 3.06e-01, 1.73e-01, 1.72e-01 | rho^100 = 1.00e+00
+rho 1.1: gradient gain after T = 10, 50, 100 steps: 7.95e-01, 2.04e+01, 2.37e+03 | rho^100 = 1.38e+04
+```
+
+At $\rho = 0.9$ the signal from 100 steps back is attenuated by roughly $10^{-5}$; at $1.1$ it is amplified by
+roughly $10^4$, tracking $\rho^{100}$ up to a modest constant from the non-normal transient. Only $\rho \approx 1$
+keeps long-range gradients usable, which motivates orthogonal initialization, gradient clipping, and the additive
+cell-state path of LSTMs.
+
+## Hessian eigenvalues are curvatures
+
+Stand at the bottom of a valley: in some directions the walls rise steeply, in others the floor is almost flat. Near a
+minimum a loss looks like a quadratic bowl $f(x) \approx f^* + \tfrac{1}{2}(x - x^*)^\top H (x - x^*)$, where the
+Hessian $H$ (matrix of second derivatives, ch. 8) is symmetric. Its eigenvectors are the principal axes of the bowl and
+its eigenvalues are the curvatures along them.
+
+All eigenvalues positive means a minimum, all negative a maximum, mixed signs a saddle (ch. 7). For gradient descent
+with step $\eta$ on the quadratic, the error along eigenvector $q_i$ is multiplied by $(1 - \eta \lambda_i)$ each step,
+so the iteration is stable iff $\eta < 2/\lambda_{\max}$, and the flattest direction then shrinks only by $1 -
+2\lambda_{\min}/\lambda_{\max}$ per step: the **condition number** $\kappa = \lambda_{\max}/\lambda_{\min}$ sets the
+number of iterations (ch. 10).
+
+```python
+H, QH = sym_with_eigs([100.0, 10.0, 1.0], seed=6)
+x_init = QH @ np.ones(3)                            # unit error along each principal axis
+for eta_scale in (1.0, 1.9, 2.1):
+    eta = eta_scale / 100.0
+    x = x_init.copy()
+    for _ in range(200):
+        x = x - eta * (H @ x)                       # gradient of 0.5 x^T H x is H x
+    print(f"eta = {eta_scale}/lambda_max: error along axes after 200 steps {np.abs(QH.T @ x)} | "
+          f"factors 1 - eta*lambda {1 - eta * np.array([100.0, 10.0, 1.0])}")
+```
+
+```output
+eta = 1.0/lambda_max: error along axes after 200 steps [0.    0.    0.134] | factors 1 - eta*lambda [0.   0.9  0.99]
+eta = 1.9/lambda_max: error along axes after 200 steps [0.     0.     0.0216] | factors 1 - eta*lambda [-0.9    0.81   0.981]
+eta = 2.1/lambda_max: error along axes after 200 steps [1.8991e+08 3.1605e-09 1.4340e-02] | factors 1 - eta*lambda [-1.1    0.79   0.979]
+```
+
+With $\eta = 1/\lambda_{\max}$ the steep direction is solved in one step, but the flat direction (curvature 1, factor
+0.99) still holds most of its error after 200 steps. Pushing to $1.9/\lambda_{\max}$ helps the flat direction a bit
+while the steep one oscillates; just past $2/\lambda_{\max}$ the steep direction's factor exceeds 1 in magnitude and the
+iteration explodes. Ch. 7 develops definiteness and quadratic forms, ch. 10 the convergence rates, and ch. 11-12 the
+methods (momentum, Newton, conjugate gradient) that fight a large $\kappa$.
 
 ## Try it Yourself
 
 ```python
 import numpy as np
 
-# 1) Verify Q is orthogonal: Q^T Q = I
-rng = np.random.default_rng(5)
-A = rng.standard_normal((4, 4))
-A = A.T @ A
-
-vals, Q = np.linalg.eigh(A)
-print("Q^T Q:\n", (Q.T @ Q).round(6) + 0.0)   # + 0.0 turns -0. into 0.  # should be identity
-
-# 2) Condition number = ratio of largest to smallest eigenvalue
-cond_via_eig = vals.max() / vals.min()
-cond_via_np  = np.linalg.cond(A)
-print(f"cond (eig ratio): {cond_via_eig:.2f}")
-print(f"cond (np.linalg): {cond_via_np:.2f}")
-
-# 3) Perturb A slightly and see how eigenvalues change
-A_perturbed = A + 0.001 * np.eye(4)
-vals_p, _ = np.linalg.eigh(A_perturbed)
-print("eigenvalue shift:", (vals_p - vals).round(4))   # should be ~0.001 each
+rng = np.random.default_rng(7)
+eigs = np.array([5.0, 4.5, 2.0, 1.0, 0.5])          # try closing or widening the gap between the first two
+Q, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+S = Q @ np.diag(eigs) @ Q.T
+x = rng.standard_normal(5)
+for k in range(1, 61):
+    x = S @ x
+    x /= np.linalg.norm(x)
+    if k % 15 == 0:
+        err = np.sqrt(max(0.0, 1 - (x @ Q[:, 0]) ** 2))
+        print(f"step {k:2d}: Rayleigh {x @ S @ x:.10f} | sin(angle to q1) {err:.2e} | "
+              f"(l2/l1)^k {(eigs[1] / eigs[0]) ** k:.2e}")
+print("eigh:", np.linalg.eigvalsh(S)[::-1])
 ```
 
 ```output
-Q^T Q:
- [[1. 0. 0. 0.]
- [0. 1. 0. 0.]
- [0. 0. 1. 0.]
- [0. 0. 0. 1.]]
-cond (eig ratio): 669.96
-cond (np.linalg): 669.96
-eigenvalue shift: [0.001 0.001 0.001 0.001]
+step 15: Rayleigh 4.9994125821 | sin(angle to q1) 3.43e-02 | (l2/l1)^k 2.06e-01
+step 30: Rayleigh 4.9999750706 | sin(angle to q1) 7.06e-03 | (l2/l1)^k 4.24e-02
+step 45: Rayleigh 4.9999989432 | sin(angle to q1) 1.45e-03 | (l2/l1)^k 8.73e-03
+step 60: Rayleigh 4.9999999552 | sin(angle to q1) 2.99e-04 | (l2/l1)^k 1.80e-03
+eigh: [5.  4.5 2.  1.  0.5]
 ```
+
+Set `eigs[1]` to 4.95 and the vector barely moves toward $q_1$ in 60 steps, while a gap like 5 vs 1 converges in a
+handful. Try a shift: replace `S @ x` with `np.linalg.solve(S - 4.4 * np.eye(5), x)` and watch it lock onto 4.5 instead.
 
 ## Exercise
 
-Implement a function `spectral_norm(A)` that returns the largest singular value of $A$
-(which equals $\sqrt{\lambda_{\max}(A^\top A)}$). Verify it matches `np.linalg.norm(A, ord=2)`.
-Then use it to check whether a random weight matrix initialized with `randn / sqrt(n)`
-has spectral norm approximately 1.
+PageRank ranks web pages by the stationary distribution of a random surfer. On a 6-page link graph, the surfer follows
+a random outgoing link with probability $d = 0.85$ and teleports to a uniformly random page otherwise; a page with no
+outgoing links teleports always. Build the row-stochastic matrix $G$, then:
+
+1. Find the PageRank vector by power iteration on $p \mapsto pG$ until the change is below $10^{-12}$, and compare with
+   the eigenvector of $G^\top$ for eigenvalue 1 from `np.linalg.eig`.
+2. Check that $|\lambda_2(G)| \le d$ and measure the per-step error ratio of the iteration. What does the damping factor
+   control?
+
+Links: 0 -> 1, 2; 1 -> 2; 2 -> 0; 3 -> 2; 4 -> 3, 5; 5 -> none.
 
 <details>
 <summary>Solution</summary>
 
 ```python
-import numpy as np
-
-def spectral_norm(A):
-    ATA = A.T @ A
-    vals = np.linalg.eigh(ATA)[0]
-    return np.sqrt(vals.max())
-
-rng = np.random.default_rng(7)
-A = rng.standard_normal((10, 8))
-print("spectral_norm (ours):", round(spectral_norm(A), 6))
-print("np.linalg.norm ord=2:", round(np.linalg.norm(A, ord=2), 6))
-
-# Weight matrix initialized with He/Xavier scaling
-n = 512
-W = rng.standard_normal((n, n)) / np.sqrt(n)
-print(f"\nW shape {W.shape}: spectral_norm ≈ {spectral_norm(W):.4f}  (expected ~1)")
+links = {0: [1, 2], 1: [2], 2: [0], 3: [2], 4: [3, 5], 5: []}
+n, d = 6, 0.85
+Pl = np.zeros((n, n))
+for i, outs in links.items():
+    if outs:
+        Pl[i, outs] = 1.0 / len(outs)
+    else:
+        Pl[i, :] = 1.0 / n                         # dangling page: teleport
+G = d * Pl + (1 - d) / n * np.ones((n, n))
+p, k, diffs = np.ones(n) / n, 0, []
+while True:
+    p_new = p @ G
+    diffs.append(np.abs(p_new - p).sum())
+    p, k = p_new, k + 1
+    if diffs[-1] < 1e-12:
+        break
+lamG, UG = np.linalg.eig(G.T)
+order = np.argsort(-np.abs(lamG))
+pi_eig = UG[:, order[0]].real / UG[:, order[0]].real.sum()
+print(f"power iteration converged in {k} steps | PageRank {p}")
+print(f"matches eigenvector of G^T: {np.allclose(p, pi_eig)} | ranking {np.argsort(-p)}")
+print(f"|eigenvalues| {np.abs(lamG[order])}")
+print(f"measured step ratio {np.mean(np.array(diffs[20:40]) / np.array(diffs[19:39])):.4f} | "
+      f"|lambda2| {np.abs(lamG[order[1]]):.4f} | d {d}")
 ```
 
 ```output
-spectral_norm (ours): 4.667268
-np.linalg.norm ord=2: 4.667268
-
-W shape (512, 512): spectral_norm ≈ 1.9927  (expected ~1)
+power iteration converged in 54 steps | PageRank [0.3402 0.1759 0.3633 0.0446 0.0313 0.0446]
+matches eigenvector of G^T: True | ranking [2 0 1 3 5 4]
+|eigenvalues| [1.     0.601  0.601  0.3262 0.1846 0.    ]
+measured step ratio 0.6198 | |lambda2| 0.6010 | d 0.85
 ```
 
-For Gaussian $W$ with entries $\sim \mathcal{N}(0, 1/n)$, the Marchenko-Pastur law
-predicts the largest singular value converges to $\approx 2$ for square matrices
-($n \times n$), so you'll see a value near 2, not 1.
+The iteration and the eigen-solver agree: page 2, which every cycle passes through, ranks first. The subdominant
+eigenvalue magnitude is at most $d$ (teleportation mixes every row with the uniform distribution, which scales all
+non-unit eigenvalues of the link matrix by $d$), and the measured contraction per step matches $|\lambda_2|$. So the
+damping factor is the spectral gap knob: smaller $d$ converges faster but listens less to the link structure. Google's
+original 0.85 needs about 50 to 100 iterations at any web scale, using only sparse matrix-vector products.
 </details>

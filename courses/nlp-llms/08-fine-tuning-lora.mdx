@@ -28,7 +28,22 @@ in FP32:
 | **Total** | **16** |
 
 A 7B model needs $7 \times 10^9 \times 16 = 112\ \text{GB}$ — more than a single A100. This
-is why PEFT methods exist.
+is why PEFT methods exist. (Activations come on top of this.)
+
+```python
+def full_ft_gb(n_params, bytes_per_param=16):
+    return n_params * bytes_per_param / 1e9
+
+for name, n in [("distilbert", 66e6), ("1B model", 1e9), ("7B model", 7e9), ("70B model", 70e9)]:
+    print(f"{name:11s}: {full_ft_gb(n):8.1f} GB for weights + grads + Adam (fp32)")
+```
+
+```output
+distilbert :      1.1 GB for weights + grads + Adam (fp32)
+1B model   :     16.0 GB for weights + grads + Adam (fp32)
+7B model   :    112.0 GB for weights + grads + Adam (fp32)
+70B model  :   1120.0 GB for weights + grads + Adam (fp32)
+```
 
 ## LoRA: Low-Rank Adaptation
 
@@ -53,110 +68,201 @@ of $r$.
 Applying LoRA to the attention projection matrices (Q, K, V, O) captures most of the
 representational change. Adding it to the FFN layers helps more for task adaptation.
 
+Pretrained checkpoints and the `peft`/`datasets` libraries are unavailable in this environment, so we implement LoRA directly (it is only a few lines) and apply it to a small transformer classifier that we first "pretrain" on a two-class sentiment task. We then adapt it to a **new, three-class task** (negative / positive / neutral) with only 30 labelled examples, comparing full fine-tuning against LoRA. The model, data and numbers are toy-scale; the mechanics are exactly those of `peft`.
+
 ```python
-from peft import LoraConfig, get_peft_model, TaskType
-from transformers import AutoModelForSequenceClassification
-import torch
+import math, copy, random, torch, torch.nn as nn, torch.nn.functional as F
+torch.set_num_threads(1)
+torch.manual_seed(0)
+rng = random.Random(0)
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased", num_labels=2
-)
+nouns = "film movie show story cast plot".split()
+pos_adj = "fantastic great wonderful brilliant superb moving".split()
+neg_adj = "awful terrible boring dull dreadful weak".split()
+neu_adj = "okay average fine ordinary regular standard".split()
+TPL = ["this {n} was {a} !", "what a {a} {n} .", "i found the {n} {a} .", "the {n} was really {a} ."]
+def make(three):
+    y = rng.randrange(3 if three else 2)
+    a = rng.choice([neg_adj, pos_adj, neu_adj][y])
+    return rng.choice(TPL).format(n=rng.choice(nouns), a=a), y
+pre_data = [make(False) for _ in range(600)]            # pretraining task: 2 classes
+ft_data = [make(True) for _ in range(30)]               # downstream task: 3 classes, tiny labelled set
+ft_test = [make(True) for _ in range(300)]
+words = sorted({w for t, _ in pre_data + ft_data + ft_test for w in t.split()})
+stoi = {w: i + 1 for i, w in enumerate(words)}
+def enc(texts):
+    rows = [[stoi[w] for w in t.split()] for t in texts]
+    L = max(map(len, rows))
+    return torch.tensor([r + [0] * (L - len(r)) for r in rows])
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total params: {total_params:,}")
+class Attn(nn.Module):
+    def __init__(self, d, h):
+        super().__init__()
+        self.h = h
+        self.q, self.k, self.v, self.o = (nn.Linear(d, d) for _ in range(4))
+    def forward(self, x, pad):
+        B, T, D = x.shape
+        split = lambda t: t.view(B, T, self.h, D // self.h).transpose(1, 2)
+        q, k, v = split(self.q(x)), split(self.k(x)), split(self.v(x))
+        s = (q @ k.transpose(-1, -2) / math.sqrt(D // self.h)).masked_fill(pad[:, None, None, :], -1e9)
+        return self.o((s.softmax(-1) @ v).transpose(1, 2).reshape(B, T, D))
 
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    target_modules=["q_lin", "k_lin", "v_lin", "out_lin"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type=TaskType.SEQ_CLS,
-)
+class Block(nn.Module):
+    def __init__(self, d, h):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.attn = Attn(d, h)
+        self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+    def forward(self, x, pad):
+        x = x + self.attn(self.n1(x), pad)
+        return x + self.ff(self.n2(x))
 
-peft_model = get_peft_model(model, lora_config)
-trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
-print(f"Trainable params: {trainable:,} ({100*trainable/total_params:.2f}%)")
+class Classifier(nn.Module):
+    def __init__(self, V, n_classes, d=64, h=4, L=2):
+        super().__init__()
+        self.emb, self.pos = nn.Embedding(V, d), nn.Embedding(16, d)
+        self.blocks = nn.ModuleList(Block(d, h) for _ in range(L))
+        self.head = nn.Linear(d, n_classes)
+    def forward(self, ids):
+        pad = ids == 0
+        x = self.emb(ids) + self.pos(torch.arange(ids.shape[1]))
+        for b in self.blocks:
+            x = b(x, pad)
+        m = (~pad).unsqueeze(-1).float()
+        return self.head((x * m).sum(1) / m.sum(1))
+
+def fit(model, data, steps, lr):
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
+    for _ in range(steps):
+        b = rng.sample(data, min(32, len(data)))
+        loss = F.cross_entropy(model(enc([t for t, _ in b])), torch.tensor([y for _, y in b]))
+        opt.zero_grad(); loss.backward(); opt.step()
+    return loss.item()
+
+def accuracy(model, data):
+    with torch.no_grad():
+        pred = model(enc([t for t, _ in data])).argmax(-1)
+    return (pred == torch.tensor([y for _, y in data])).float().mean().item()
+
+base = Classifier(len(words) + 1, 2)
+fit(base, pre_data, 150, 3e-3)
+print(f"pretrained base: {sum(p.numel() for p in base.parameters()):,} parameters, "
+      f"accuracy on pretraining task {accuracy(base, pre_data[:200]):.3f}")
 ```
 
 ```output
-Total params: 66,955,010
-Trainable params: 147,456 (0.22%)
+pretrained base: 103,362 parameters, accuracy on pretraining task 1.000
 ```
 
-Only 0.22% of parameters update — the rest are frozen. Memory drops proportionally.
+### The LoRA layer
 
-## Training with PEFT
-
-The training loop is unchanged from standard fine-tuning; PEFT handles the gradient routing:
+LoRA wraps a frozen linear layer with the low-rank update $BA$, scaled by $\alpha / r$. $B$ starts at zero, so the wrapped model initially computes exactly what the base model computes:
 
 ```python
-from transformers import AutoTokenizer, TrainingArguments, Trainer
-from datasets import load_dataset
+class LoRALinear(nn.Module):
+    def __init__(self, base, r, alpha):
+        super().__init__()
+        self.base, self.scale = base, alpha / r
+        self.A = nn.Parameter(torch.randn(r, base.in_features) * 0.02)    # Gaussian init
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))          # zero init => Delta W = 0
+    def forward(self, x):
+        return self.base(x) + (x @ self.A.T @ self.B.T) * self.scale
 
-tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-dataset = load_dataset("imdb", split={"train": "train[:2000]", "test": "test[:500]"})
+def adapt(base, mode, r=4, n_classes=3):
+    m = copy.deepcopy(base)
+    m.head = nn.Linear(m.head.in_features, n_classes)       # new task head (PEFT's "modules_to_save")
+    if mode == "lora":
+        for p in m.parameters():
+            p.requires_grad = False
+        for blk in m.blocks:                                  # target_modules = query and value projections
+            blk.attn.q = LoRALinear(blk.attn.q, r, 2 * r)
+            blk.attn.v = LoRALinear(blk.attn.v, r, 2 * r)
+        for p in m.head.parameters():
+            p.requires_grad = True
+    return m
 
-def tokenize(batch):
-    return tokenizer(batch["text"], truncation=True, max_length=256)
+def count(m):
+    total = sum(p.numel() for p in m.parameters())
+    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    return total, trainable
 
-dataset = dataset.map(tokenize, batched=True)
-
-args = TrainingArguments(
-    output_dir="./lora-imdb",
-    num_train_epochs=2,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=32,
-    evaluation_strategy="epoch",
-    learning_rate=3e-4,          # higher LR OK for LoRA (fewer params)
-    logging_steps=50,
-    report_to="none",
-)
-
-trainer = Trainer(
-    model=peft_model,
-    args=args,
-    train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
-)
-trainer.train()
+# Zero-init check: before training, the LoRA model equals the base model on the shared features
+ids = enc(["this film was great !"])
+lora_model = adapt(base, "lora")
+with torch.no_grad():
+    h_base = base.blocks[1](base.blocks[0](base.emb(ids) + base.pos(torch.arange(ids.shape[1])), ids == 0), ids == 0)
+    x = lora_model.emb(ids) + lora_model.pos(torch.arange(ids.shape[1]))
+    for blk in lora_model.blocks:
+        x = blk(x, ids == 0)
+print("max |difference| at init:", (h_base - x).abs().max().item())
+total, trainable = count(lora_model)
+print(f"Total params: {total:,}")
+print(f"Trainable params: {trainable:,} ({100*trainable/total:.2f}%)")
 ```
 
 ```output
-{'loss': 0.6821, 'learning_rate': 3e-4, 'epoch': 0.4}
-{'loss': 0.4203, 'learning_rate': 2e-4, 'epoch': 0.8}
-{'eval_loss': 0.3841, 'eval_accuracy': 0.844, 'epoch': 1.0}
-{'loss': 0.2917, 'learning_rate': 1e-4, 'epoch': 1.4}
-{'eval_loss': 0.3102, 'eval_accuracy': 0.878, 'epoch': 2.0}
+max |difference| at init: 0.0
+Total params: 105,475
+Trainable params: 2,243 (2.13%)
 ```
+
+Only a few percent of parameters update (including the new 3-class head) — the rest are frozen. Optimizer memory drops proportionally, because Adam keeps $m$ and $v$ only for trainable tensors.
+
+### Where to apply
+
+Applying LoRA to the attention projection matrices (Q, K, V, O) captures most of the
+representational change. Adding it to the FFN layers helps more for task adaptation. In `adapt` above, changing the two lines that wrap `q` and `v` is all it takes to change `target_modules`.
+
+## Training: full fine-tuning vs LoRA
+
+The training loop is unchanged from standard fine-tuning; freezing handles the gradient routing. LoRA uses a higher learning rate (fewer, freshly initialised parameters):
+
+```python
+results = {}
+for mode, lr in [("full", 1e-3), ("lora", 3e-3)]:
+    torch.manual_seed(1)
+    m = adapt(base, mode)
+    loss = fit(m, ft_data, 25, lr)
+    total, trainable = count(m)
+    results[mode] = m
+    print(f"{mode:4s}: trainable {trainable:7,} / {total:,} | final loss {loss:.3f} | "
+          f"test accuracy {accuracy(m, ft_test):.3f}")
+```
+
+```output
+full: trainable 103,427 / 103,427 | final loss 0.112 | test accuracy 0.917
+lora: trainable   2,243 / 105,475 | final loss 0.445 | test accuracy 0.850
+```
+
+With the same 25 steps, LoRA trains about 2% of the parameters and reaches a similar but slightly lower accuracy than full fine-tuning. On a toy model the saving is only in optimizer state; on a 7B model it is the difference between 112 GB and a few GB of trainable state.
 
 ## QLoRA
 
 QLoRA (Dettmers et al. 2023) quantises the base model weights to 4-bit (NF4) using
 `bitsandbytes`, then applies LoRA on top. The 4-bit base stays frozen; only LoRA adapters
-are in BF16 and train normally.
+are in BF16 and train normally. `bitsandbytes` needs a GPU, so here is the core idea in NumPy-style PyTorch: block-wise absmax quantisation to 16 levels (uniform rather than NF4's normal-quantile levels, a simplification), then dequantisation on the fly:
 
 ```python
-from transformers import BitsAndBytesConfig
+def quantize_4bit(W, block=64):
+    flat = W.reshape(-1, block)
+    scale = flat.abs().amax(1, keepdim=True) / 7             # 4-bit signed: integers -8..7
+    q = torch.clamp(torch.round(flat / scale), -8, 7).to(torch.int8)
+    return q, scale
+def dequantize_4bit(q, scale, shape):
+    return (q.float() * scale).reshape(shape)
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
-
-# model = AutoModelForCausalLM.from_pretrained(
-#     "meta-llama/Llama-3.2-3B",
-#     quantization_config=bnb_config,
-#     device_map="auto",
-# )
-# peft_model = get_peft_model(model, lora_config)
-print("QLoRA config ready — apply to any causal LM for 4-bit fine-tuning")
+W = results["full"].blocks[0].ff[0].weight.detach()          # a (256, 64) feed-forward weight
+q, scale = quantize_4bit(W)
+W_hat = dequantize_4bit(q, scale, W.shape)
+bytes_fp32 = W.numel() * 4
+bytes_4bit = W.numel() // 2 + scale.numel() * 4              # two 4-bit values per byte + fp32 block scales
+print(f"fp32: {bytes_fp32} bytes, 4-bit: {bytes_4bit} bytes ({bytes_fp32 / bytes_4bit:.1f}x smaller)")
+print(f"mean abs error: {(W - W_hat).abs().mean().item():.5f}  (mean |W| = {W.abs().mean().item():.5f})")
 ```
 
 ```output
-QLoRA config ready — apply to any causal LM for 4-bit fine-tuning
+fp32: 65536 bytes, 4-bit: 9216 bytes (7.1x smaller)
+mean abs error: 0.00557  (mean |W| = 0.06458)
 ```
 
 A 7B model in 4-bit needs ~4 GB for weights, leaving headroom for LoRA adapters and activations
@@ -164,74 +270,74 @@ on a 24 GB GPU.
 
 ## Merging LoRA Back
 
-After training you can merge adapters into the base model so inference needs no PEFT overhead:
+After training you can merge adapters into the base model so inference needs no adapter overhead: $W = W_0 + \frac{\alpha}{r} BA$.
 
 ```python
-merged_model = peft_model.merge_and_unload()
-merged_model.save_pretrained("./lora-imdb-merged")
-print("Adapter merged. Model is now a standard HuggingFace model.")
+lora = results["lora"]
+x = enc(["the plot was really boring ."])
+with torch.no_grad():
+    before = lora(x)
+    for blk in lora.blocks:
+        for name in ("q", "v"):
+            layer = getattr(blk.attn, name)
+            merged = nn.Linear(layer.base.in_features, layer.base.out_features)
+            merged.weight.copy_(layer.base.weight + layer.scale * layer.B @ layer.A)
+            merged.bias.copy_(layer.base.bias)
+            setattr(blk.attn, name, merged)
+    after = lora(x)
+print("merged output matches adapter output:", (before - after).abs().max().item() < 1e-5)
+print("params after merge:", f"{count(lora)[0]:,}", "(same as the original base model + head)")
 ```
 
 ```output
-Adapter merged. Model is now a standard HuggingFace model.
+merged output matches adapter output: True
+params after merge: 103,427 (same as the original base model + head)
 ```
 
-The merged model has the same parameter count as the original and can be loaded without PEFT.
+The merged model has the same parameter count as the original and runs as a plain model.
 
 ## Try it Yourself
 
-```python
-from peft import LoraConfig, get_peft_model, TaskType
-from transformers import AutoModelForSequenceClassification
+Rank sweep: how does the trainable fraction change with the LoRA rank?
 
-# Try different ranks and see the trainable % change
+```python
 for r in [4, 8, 16, 32]:
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "distilbert-base-uncased", num_labels=2
-    )
-    cfg = LoraConfig(r=r, lora_alpha=r*2,
-                     target_modules=["q_lin", "v_lin"],
-                     task_type=TaskType.SEQ_CLS)
-    pm = get_peft_model(model, cfg)
-    total = sum(p.numel() for p in pm.parameters())
-    trainable = sum(p.numel() for p in pm.parameters() if p.requires_grad)
+    m = adapt(base, "lora", r=r)
+    total, trainable = count(m)
     print(f"r={r:2d}: trainable={trainable:,} ({100*trainable/total:.3f}%)")
 ```
 
 ```output
-r= 4: trainable=73,728 (0.110%)
-r= 8: trainable=147,456 (0.220%)
-r=16: trainable=294,912 (0.440%)
-r=32: trainable=589,824 (0.881%)
+r= 4: trainable=2,243 (2.127%)
+r= 8: trainable=4,291 (3.991%)
+r=16: trainable=8,387 (7.514%)
+r=32: trainable=16,579 (13.838%)
 ```
+
+Trainable parameters grow linearly with $r$: each adapted $d \times d$ matrix adds $r(d + d)$. Try training each rank for 25 steps and compare test accuracy: does a bigger rank help on this task?
 
 ## Exercise
 
-Apply LoRA to a BERT model for token classification (NER). Use `target_modules=["query", "value"]`
-and `task_type=TaskType.TOKEN_CLS`. Print the trainable parameter percentage. Then describe in
-one sentence why a lower rank is preferred when the target task is closely related to the
-pretraining objective.
+Derive the number of LoRA parameters for adapting the query and value projections of every layer of a model with $L$ layers and hidden size $d$ at rank $r$, then check it against `count`. Then compute the figure for BERT-base ($L=12$, $d=768$, $r=8$). Finally, describe in one sentence why a lower rank is preferred when the target task is closely related to the pretraining objective.
 
 <details>
 <summary>Solution</summary>
 
-```python
-from peft import LoraConfig, get_peft_model, TaskType
-from transformers import AutoModelForTokenClassification
+Each adapted matrix adds $A \in \mathbb{R}^{r \times d}$ and $B \in \mathbb{R}^{d \times r}$, i.e. $2dr$ parameters; two matrices per layer gives $4dLr$ in total.
 
-model = AutoModelForTokenClassification.from_pretrained(
-    "bert-base-uncased", num_labels=9
-)
-cfg = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    target_modules=["query", "value"],
-    task_type=TaskType.TOKEN_CLS,
-)
-pm = get_peft_model(model, cfg)
-total = sum(p.numel() for p in pm.parameters())
-trainable = sum(p.numel() for p in pm.parameters() if p.requires_grad)
-print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+```python
+def lora_params(L, d, r, matrices=2):
+    return L * matrices * 2 * d * r
+
+m = adapt(base, "lora", r=4)
+adapter_only = count(m)[1] - sum(p.numel() for p in m.head.parameters())
+print("our model, formula:", lora_params(L=2, d=64, r=4), "| counted:", adapter_only)
+print("BERT-base, r=8:", f"{lora_params(L=12, d=768, r=8):,}")
+```
+
+```output
+our model, formula: 2048 | counted: 2048
+BERT-base, r=8: 294,912
 ```
 
 **Why low rank works for related tasks**: when the downstream task is similar to pretraining
