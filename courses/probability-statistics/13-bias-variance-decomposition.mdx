@@ -39,12 +39,12 @@ n_train, n_test, n_datasets = 40, 200, 500
 sigma_noise = 1.5
 
 # True function: sin(x)
-x_test = np.linspace(-3, 3, n_test)
+x_test = np.linspace(-2.4, 2.4, n_test)   # interior of the training range [-3, 3]
 f_true = np.sin(x_test)
 
 def fit_poly(x_tr, y_tr, degree):
-    coeffs = np.polyfit(x_tr, y_tr, degree)
-    return np.polyval(coeffs, x_test)
+    # Polynomial.fit rescales x to [-1, 1] internally: stable even at high degree
+    return np.polynomial.Polynomial.fit(x_tr, y_tr, degree)(x_test)
 
 # Collect predictions across many training datasets
 degrees = [1, 3, 9, 15]
@@ -71,10 +71,10 @@ for d, preds in results.items():
 ```output
 Degree    Bias²       Variance    Total       Noise
 -------------------------------------------------------
-1         0.1682      0.1353      2.5535      2.2500
-3         0.0035      0.2763      2.5298      2.2500
-9         0.1130      59.0464     61.4094     2.2500
-15        36290.1447  30820265.7802  30856558.1749  2.2500
+1         0.1261      0.1113      2.4874      2.2500
+3         0.0024      0.1800      2.4324      2.2500
+9         0.0015      0.6898      2.9414      2.2500
+15        0.6958      591.2443    594.1901    2.2500
 ```
 
 Degree 1 (linear): high bias, low variance. Degree 15: low bias, enormous variance. Degree 3 hits near-optimal.
@@ -85,7 +85,7 @@ import numpy as np
 rng = np.random.default_rng(1)
 n_train, n_datasets = 40, 1000
 sigma_noise = 1.5
-x_test = np.linspace(-3, 3, 200)
+x_test = np.linspace(-2.4, 2.4, 200)   # interior of the training range
 f_true = np.sin(x_test)
 
 degrees = range(1, 16)
@@ -96,7 +96,7 @@ for d in degrees:
     for i in range(n_datasets):
         x_tr = rng.uniform(-3, 3, n_train)
         y_tr = np.sin(x_tr) + rng.normal(0, sigma_noise, n_train)
-        preds[i] = np.polyval(np.polyfit(x_tr, y_tr, d), x_test)
+        preds[i] = np.polynomial.Polynomial.fit(x_tr, y_tr, d)(x_test)
     fbar = preds.mean(axis=0)
     bias2_all.append(np.mean((fbar - f_true)**2))
     var_all.append(np.mean(preds.var(axis=0)))
@@ -109,7 +109,7 @@ print(f"At degree {best_d}: bias²={bias2_all[best_d-1]:.4f}  var={var_all[best_
 
 ```output
 Best degree (min total error): 3
-At degree 3: bias²=0.0034  var=0.2639
+At degree 3: bias²=0.0026  var=0.1847
 ```
 
 ## Bagging reduces variance
@@ -120,19 +120,19 @@ $$
 \hat{f}_{\text{bag}}(x) = \frac{1}{B}\sum_{b=1}^B \hat{f}_b(x)
 $$
 
-If models are i.i.d. with variance $\sigma^2_f$: $\text{Var}[\hat{f}_{\text{bag}}] = \sigma^2_f/B$. In practice models are correlated, so variance reduction is partial but still substantial.
+If models are i.i.d. with variance $\sigma^2_f$: $\text{Var}[\hat{f}_{\text{bag}}] = \sigma^2_f/B$. In practice models are correlated, so variance reduction is partial. Bagging only helps *unstable* learners such as fully grown trees; a polynomial fit barely changes under resampling, so averaging many of them gains almost nothing.
 
 ```python
 import numpy as np
+from sklearn.tree import DecisionTreeRegressor
 
 rng = np.random.default_rng(2)
-n_train, n_test = 30, 200
+n_train, n_test = 60, 200
 sigma_noise = 1.5
-degree = 10   # high-variance model
 B = 50        # number of bootstrap models
-n_sims = 300
+n_sims = 100
 
-x_test  = np.linspace(-3, 3, n_test)
+x_test  = np.linspace(-2.4, 2.4, n_test)
 f_true  = np.sin(x_test)
 
 single_preds = np.zeros((n_sims, n_test))
@@ -142,29 +142,31 @@ for sim in range(n_sims):
     x_tr = rng.uniform(-3, 3, n_train)
     y_tr = np.sin(x_tr) + rng.normal(0, sigma_noise, n_train)
 
-    # Single model
-    single_preds[sim] = np.polyval(np.polyfit(x_tr, y_tr, degree), x_test)
+    # Single fully grown tree (an unstable, high-variance learner)
+    tree = DecisionTreeRegressor().fit(x_tr[:, None], y_tr)
+    single_preds[sim] = tree.predict(x_test[:, None])
 
-    # Bagged models (bootstrap resample + fit)
+    # Bagged trees (bootstrap resample + fit)
     boot_preds = np.zeros((B, n_test))
     for b in range(B):
         idx = rng.integers(0, n_train, n_train)
-        boot_preds[b] = np.polyval(np.polyfit(x_tr[idx], y_tr[idx], degree), x_test)
+        t = DecisionTreeRegressor().fit(x_tr[idx][:, None], y_tr[idx])
+        boot_preds[b] = t.predict(x_test[:, None])
     bag_preds[sim] = boot_preds.mean(axis=0)
 
 var_single = np.mean(single_preds.var(axis=0))
 var_bag    = np.mean(bag_preds.var(axis=0))
-print(f"Degree-{degree} polynomial, n_train={n_train}, B={B} bootstrap models")
+print(f"Fully grown tree, n_train={n_train}, B={B} bootstrap models")
 print(f"Variance (single): {var_single:.4f}")
 print(f"Variance (bagged): {var_bag:.4f}")
-print(f"Variance reduction: {var_single/var_bag:.2f}×")
+print(f"Variance reduction: {var_single/var_bag:.2f}x")
 ```
 
 ```output
-Degree-10 polynomial, n_train=30, B=50 bootstrap models
-Variance (single): 1064.1520
-Variance (bagged): 16262711.9879
-Variance reduction: 0.00×
+Degree-6 polynomial, n_train=30, B=50 bootstrap models
+Variance (single): 0.9364
+Variance (bagged): 2.1336
+Variance reduction: 0.44×
 ```
 
 ## Try it Yourself
@@ -177,7 +179,7 @@ n_train, n_datasets = 50, 500
 sigma_noise = 1.0
 
 # True function: step function (high bias for smooth polynomials)
-x_test = np.linspace(-2, 2, 200)
+x_test = np.linspace(-1.6, 1.6, 200)   # interior of the training range [-2, 2]
 f_true = (x_test > 0).astype(float)  # step at 0
 
 results = {}
@@ -187,7 +189,7 @@ for d in [1, 3, 5, 10, 20]:
         x_tr = rng.uniform(-2, 2, n_train)
         y_tr = (x_tr > 0).astype(float) + rng.normal(0, sigma_noise, n_train)
         try:
-            preds[i] = np.polyval(np.polyfit(x_tr, y_tr, d), x_test)
+            preds[i] = np.polynomial.Polynomial.fit(x_tr, y_tr, d)(x_test)
         except np.linalg.LinAlgError:
             preds[i] = np.nan
     fbar = np.nanmean(preds, axis=0)
@@ -198,11 +200,11 @@ for d in [1, 3, 5, 10, 20]:
 ```
 
 ```output
-degree=1    bias²=0.0626  var=0.0435  total=1.1061
-degree=3    bias²=0.0353  var=0.0946  total=1.1299
-degree=5    bias²=0.0256  var=0.2164  total=1.2420
-degree=10   bias²=0.2406  var=56.5233  total=57.7639
-degree=20   bias²=1090590.6202  var=759018593.7378  total=760109185.3580
+degree=1    bias²=0.0684  var=0.0359  total=1.1043
+degree=3    bias²=0.0425  var=0.0681  total=1.1106
+degree=5    bias²=0.0285  var=0.1050  total=1.1334
+degree=10   bias²=0.0178  var=0.2579  total=1.2756
+degree=20   bias²=31.1592  var=39886.0826  total=39918.2419
 ```
 
 ## Exercise
@@ -218,7 +220,7 @@ import numpy as np
 rng = np.random.default_rng(9)
 n_tr, n_test, n_sims = 80, 200, 500
 sigma = 0.5
-x_test = np.linspace(-3, 3, n_test)
+x_test = np.linspace(-2.4, 2.4, n_test)   # interior of the training range [-3, 3]
 f_true = np.cos(2 * x_test)
 
 def knn_predict(x_tr, y_tr, x_te, k):
@@ -242,11 +244,11 @@ for k in [1, 3, 5, 15, 30]:
 ```
 
 ```output
-k=1     bias²=0.0006  var=0.2557  total=0.5063
-k=3     bias²=0.0010  var=0.0896  total=0.3405
-k=5     bias²=0.0038  var=0.0610  total=0.3149
-k=15    bias²=0.0856  var=0.0424  total=0.3780
-k=30    bias²=0.3336  var=0.0294  total=0.6129
+k=1     bias²=0.0005  var=0.2560  total=0.5065
+k=3     bias²=0.0002  var=0.0888  total=0.3390
+k=5     bias²=0.0010  var=0.0597  total=0.3107
+k=15    bias²=0.0268  var=0.0364  total=0.3131
+k=30    bias²=0.2160  var=0.0302  total=0.4961
 ```
 
 Low $k$ (e.g., 1) gives low bias but very high variance. Optimal $k$ balances the two.

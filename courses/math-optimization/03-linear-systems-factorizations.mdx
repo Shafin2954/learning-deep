@@ -66,8 +66,7 @@ def lu_factor_mine(A, pivot=True):
 rng = np.random.default_rng(0)
 A4 = rng.standard_normal((4, 4))
 perm, L, U, _ = lu_factor_mine(A4)
-print("L =\n", L.round(3)); print("U =\n", U.round(3))
-print("max |A[perm] - L U| =", f"{np.abs(A4[perm] - L @ U).max():.1e}", "| max |L_ij| =", f"{np.abs(L).max():.3f}")
+print("diag(U) =", U.diagonal().round(3), "| max |A[perm] - L U| =", f"{np.abs(A4[perm] - L @ U).max():.1e}", "| max |L_ij| =", f"{np.abs(L).max():.3f}")
 P_s, L_s, U_s = linalg.lu(A4)                                 # scipy convention: A = P L U
 print("scipy agrees: L", np.allclose(L, L_s), "U", np.allclose(U, U_s), "P", np.allclose(P_s.T @ A4, A4[perm]))
 print(f"{'n':>5} {'counted flops':>14} {'2n^3/3':>12} {'ratio':>6}")
@@ -77,17 +76,7 @@ for n in (10, 50, 200, 800):
 ```
 
 ```output
-L =
- [[ 1.     0.     0.     0.   ]
- [ 0.303  1.     0.     0.   ]
- [ 0.23  -0.344  1.     0.   ]
- [-0.054  0.12   0.4    1.   ]]
-U =
- [[-2.325 -0.219 -1.246 -0.732]
- [ 0.    -1.199 -0.246  0.263]
- [ 0.     0.     1.506  1.206]
- [ 0.     0.     0.    -0.449]]
-max |A[perm] - L U| = 2.2e-16 | max |L_ij| = 1.000
+diag(U) = [-2.325 -1.199  1.506 -0.449] | max |A[perm] - L U| = 2.2e-16 | max |L_ij| = 1.000
 scipy agrees: L True U True P True
     n  counted flops       2n^3/3  ratio
    10            615          667  0.923
@@ -330,20 +319,16 @@ print(f"{'smallest eigenvalue':>20}  cholesky_mine")
 for lam_min in (1e-2, 1e-12, -1e-12, -1e-2):
     A_t = Q @ np.diag([5.0, 3.0, 2.0, 1.0, 0.5, lam_min]) @ Q.T
     A_t = (A_t + A_t.T) / 2
-    try:
-        cholesky_mine(A_t); msg = "succeeds"
-    except np.linalg.LinAlgError as e:
-        msg = str(e)
+    try: cholesky_mine(A_t); msg = "succeeds"
+    except np.linalg.LinAlgError as e: msg = str(e)
     print(f"{lam_min:>20.0e}  {msg}")
 xs = np.linspace(0, 10, 200)                                   # GP kernel on a dense grid (Bayesian ML ch. 12)
 K = np.exp(-0.5 * (xs[:, None] - xs[None, :]) ** 2 / 1.0 ** 2)
 print(f"\nRBF kernel, 200 points: eigvalsh min = {np.linalg.eigvalsh(K).min():.1e}")
-for jitter in (0.0, 1e-12, 1e-10, 1e-8, 1e-6):
-    try:
-        np.linalg.cholesky(K + jitter * np.eye(200)); msg = "ok"
-    except np.linalg.LinAlgError:
-        msg = "fails"
-    print(f"jitter {jitter:.0e}: np.linalg.cholesky {msg}")
+def chol_ok(Mx):
+    try: np.linalg.cholesky(Mx); return "ok"
+    except np.linalg.LinAlgError: return "fails"
+print("np.linalg.cholesky(K + jitter I):", ", ".join(f"{j:.0e} {chol_ok(K + j * np.eye(200))}" for j in (0.0, 1e-12, 1e-10, 1e-8, 1e-6)))
 ```
 
 ```output
@@ -354,11 +339,7 @@ for jitter in (0.0, 1e-12, 1e-10, 1e-8, 1e-6):
               -1e-02  not positive definite: pivot 5 is -1.61e-02
 
 RBF kernel, 200 points: eigvalsh min = -7.3e-15
-jitter 0e+00: np.linalg.cholesky fails
-jitter 1e-12: np.linalg.cholesky ok
-jitter 1e-10: np.linalg.cholesky ok
-jitter 1e-08: np.linalg.cholesky ok
-jitter 1e-06: np.linalg.cholesky ok
+np.linalg.cholesky(K + jitter I): 0e+00 fails, 1e-12 ok, 1e-10 ok, 1e-08 ok, 1e-06 ok
 ```
 
 The verdict flips exactly where the smallest eigenvalue changes sign, even at $\pm 10^{-12}$, and the failing pivot is
@@ -425,8 +406,8 @@ def form_q(V, m):                                       # thin Q, built by apply
     return Qm
 
 def cgs(A):                                             # classical Gram-Schmidt
-    m, n = A.shape; Qm = np.zeros((m, n))
-    for j in range(n):
+    Qm = np.zeros(A.shape)
+    for j in range(A.shape[1]):
         v = A[:, j] - Qm[:, :j] @ (Qm[:, :j].T @ A[:, j]); Qm[:, j] = v / np.linalg.norm(v)
     return Qm
 
@@ -614,19 +595,17 @@ n = 300
 M = with_cond(n, n, 1e4, rng); x_true = rng.standard_normal(n); b = M @ x_true
 lu32 = linalg.lu_factor(M.astype(np.float32))                  # factor in single precision
 x = linalg.lu_solve(lu32, b.astype(np.float32)).astype(np.float64)
+errs = []
 for it in range(5):
-    print(f"step {it}: relative error {np.linalg.norm(x - x_true) / np.linalg.norm(x_true):.1e}")
+    errs.append(np.linalg.norm(x - x_true) / np.linalg.norm(x_true))
     r = b - M @ x                                              # residual in double precision: 2n^2 flops
     x = x + linalg.lu_solve(lu32, r.astype(np.float32)).astype(np.float64)
+print("relative error after steps 0..4:", " ".join(f"{e:.1e}" for e in errs))
 print(f"float64 np.linalg.solve: {np.linalg.norm(np.linalg.solve(M, b) - x_true) / np.linalg.norm(x_true):.1e}")
 ```
 
 ```output
-step 0: relative error 1.5e-04
-step 1: relative error 2.0e-08
-step 2: relative error 3.1e-12
-step 3: relative error 2.0e-13
-step 4: relative error 1.9e-13
+relative error after steps 0..4: 1.5e-04 2.0e-08 3.1e-12 2.0e-13 1.9e-13
 float64 np.linalg.solve: 3.9e-13
 ```
 
